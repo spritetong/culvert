@@ -548,7 +548,7 @@ impl SessionManager {
 ### 7.5 中继转发引擎与 poll_fn 状态机 (`core::relay`)
 在性能核心路径（高吞吐双向中继循环）中，不使用 `tokio::select!`（避免反复取消和重新实例化 Future，以及分支优先级偏置），而是采用 `std::future::poll_fn` 状态机直接驱动：
 * 在单个事件循环内并发驱动 **RX（A -> B）** 与 **TX（B -> A）**；
-* 直接在同一个轮询周期内检查 `cancel_token` 退出信号，优雅执行写刷新与单向 `shutdown`，杜绝丢弃在途缓冲；
+* **无轮询纯事件驱动的退出监控**：在循环外利用 `std::pin::pin!(cancel_token.cancelled_owned())` 预先在栈上完成 Future Pin 绑定，循环内直接调用 `cancel_fut.as_mut().poll(cx)` 将当前任务的 `Waker` 注册到 Token 中。连接空闲挂起时一旦收到 Cancel 信号，立即可被精准唤醒执行安全挥手，杜绝盲目轮询与循环内重复创建 Future；
 * 维持 64KB 对称环形切片，实现真正的零中间协程、零额外 Task 分配与最高吞吐。
 
 ```rust

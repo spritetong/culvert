@@ -1,8 +1,8 @@
 //! High-performance bidirectional byte relay engine.
 //! All comments and docstrings must be in English.
 
-use std::future::poll_fn;
-use std::pin::Pin;
+use std::future::{poll_fn, Future};
+use std::pin::{pin, Pin};
 use std::task::Poll;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::sync::CancellationToken;
@@ -63,8 +63,12 @@ impl RelayEngine {
         let mut a_to_b = TransferState::new(RELAY_BUFFER_SIZE);
         let mut b_to_a = TransferState::new(RELAY_BUFFER_SIZE);
 
+        // Pre-create the cancellation future once on the stack to register wakers
+        // and achieve zero-allocation, purely event-driven cancellation without polling.
+        let mut cancel_fut = pin!(cancel_token.cancelled_owned());
+
         poll_fn(|cx| {
-            let is_cancelled = cancel_token.is_cancelled();
+            let is_cancelled = cancel_fut.as_mut().poll(cx).is_ready();
 
             // Drive A -> B transfer (RX direction)
             let mut progress = false;
@@ -218,5 +222,36 @@ mod tests {
         let (bytes_a, bytes_b) = relay_handle.await.unwrap().unwrap();
         assert_eq!(bytes_a, 19);
         assert_eq!(bytes_b, 20);
+    }
+
+    #[tokio::test]
+    async fn test_poll_fn_relay_engine_event_driven_cancellation() {
+        let (_client_app, client_side) = duplex(65536);
+        let (_server_app, server_side) = duplex(65536);
+
+        let cancel_token = CancellationToken::new();
+        let trigger_token = cancel_token.clone();
+
+        let relay_handle = tokio::spawn(async move {
+            RelayEngine::relay_with_cancel(
+                Box::new(client_side),
+                Box::new(server_side),
+                cancel_token,
+            )
+            .await
+        });
+
+        // Ensure relay task is actively waiting/sleeping in Poll::Pending
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Cancel token: should immediately wake up the sleeping poll_fn without I/O
+        trigger_token.cancel();
+
+        // Must finish promptly without hanging
+        let res = tokio::time::timeout(std::time::Duration::from_millis(500), relay_handle)
+            .await
+            .expect("Relay task did not wake up promptly upon cancellation");
+
+        assert!(res.is_ok());
     }
 }
