@@ -545,27 +545,26 @@ impl SessionManager {
 }
 ```
 
-### 7.5 中继转发引擎 (`core::relay`)
+### 7.5 中继转发引擎与 poll_fn 状态机 (`core::relay`)
+在性能核心路径（高吞吐双向中继循环）中，不使用 `tokio::select!`（避免反复取消和重新实例化 Future，以及分支优先级偏置），而是采用 `std::future::poll_fn` 状态机直接驱动：
+* 在单个事件循环内并发驱动 **RX（A -> B）** 与 **TX（B -> A）**；
+* 直接在同一个轮询周期内检查 `cancel_token` 退出信号，优雅执行写刷新与单向 `shutdown`，杜绝丢弃在途缓冲；
+* 维持 64KB 对称环形切片，实现真正的零中间协程、零额外 Task 分配与最高吞吐。
+
 ```rust
-use tokio::io::copy_bidirectional_with_sizes;
-use crate::core::stream::TunnelStream;
-use crate::core::error::TunnelError;
-use crate::constants::RELAY_BUFFER_SIZE;
+pub struct RelayEngine;
 
-pub async fn relay_streams(
-    mut stream_a: Box<dyn TunnelStream>,
-    mut stream_b: Box<dyn TunnelStream>,
-) -> Result<(u64, u64), TunnelError> {
-    let (from_a_to_b, from_b_to_a) = copy_bidirectional_with_sizes(
-        &mut stream_a,
-        &mut stream_b,
-        RELAY_BUFFER_SIZE,
-        RELAY_BUFFER_SIZE,
-    )
-    .await
-    .map_err(TunnelError::Io)?;
+impl RelayEngine {
+    pub async fn relay(
+        stream_a: Box<dyn TunnelStream>,
+        stream_b: Box<dyn TunnelStream>,
+    ) -> Result<(u64, u64), TunnelError>;
 
-    Ok((from_a_to_b, from_b_to_a))
+    pub async fn relay_with_cancel(
+        mut stream_a: Box<dyn TunnelStream>,
+        mut stream_b: Box<dyn TunnelStream>,
+        cancel_token: CancellationToken,
+    ) -> Result<(u64, u64), TunnelError>;
 }
 ```
 
