@@ -174,6 +174,26 @@ pub struct TunnelConfig {
     pub failover: Option<FailoverConfig>,
     #[serde(default)]
     pub pool_size: Option<usize>,
+    pub multiplex: Option<MultiplexConfig>,
+}
+
+/// Stream multiplexing configuration (sing-box style generic layer over any transport).
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+pub struct MultiplexConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Maximum concurrent logical streams over a single underlying transport (default: 128).
+    #[serde(default = "default_mux_max_streams")]
+    pub max_streams: usize,
+
+    /// Enable frame padding to obfuscate packet length distributions.
+    #[serde(default)]
+    pub padding: bool,
+}
+
+fn default_mux_max_streams() -> usize {
+    128
 }
 
 /// Endpoint definition supporting either a simple URL or detailed context.

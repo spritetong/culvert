@@ -96,6 +96,7 @@ async fn test_forward_tunnel_ws_e2e() {
         token: auth_token.to_string(),
         pool_size: None,
         failover: None,
+        multiplex: None,
     };
 
     let app_config = AppConfig::default();
@@ -182,6 +183,7 @@ async fn test_reverse_tunnel_ws_e2e() {
         token: auth_token.to_string(),
         pool_size: None,
         failover: None,
+        multiplex: None,
     };
 
     let app_config = AppConfig::default();
@@ -252,6 +254,7 @@ async fn test_supervisor_multi_tunnel_concurrency_e2e() {
         token: auth_token.to_string(),
         pool_size: None,
         failover: None,
+        multiplex: None,
     });
 
     app_config.tunnels.push(TunnelConfig {
@@ -263,6 +266,7 @@ async fn test_supervisor_multi_tunnel_concurrency_e2e() {
         token: auth_token.to_string(),
         pool_size: None,
         failover: None,
+        multiplex: None,
     });
 
     // 3. Launch supervisor

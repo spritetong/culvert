@@ -287,6 +287,7 @@ async fn test_wss_forward_tunnel_with_custom_ca_and_sni() {
         token: auth_token.to_string(),
         pool_size: None,
         failover: None,
+        multiplex: None,
         endpoint: EndpointConfig::Detailed {
             url: format!("wss://127.0.0.1:{}/tunnel", tls_ingress_port),
             dns: None,
@@ -392,6 +393,7 @@ async fn test_wss_forward_tunnel_insecure_mode() {
         token: auth_token.to_string(),
         pool_size: None,
         failover: None,
+        multiplex: None,
         endpoint: EndpointConfig::Detailed {
             url: format!("wss://127.0.0.1:{}/tunnel", tls_ingress_port),
             dns: None,
@@ -496,6 +498,7 @@ async fn test_wss_mtls_mutual_authentication() {
         token: auth_token.to_string(),
         pool_size: None,
         failover: None,
+        multiplex: None,
         endpoint: EndpointConfig::Detailed {
             url: format!("wss://127.0.0.1:{}/tunnel", tls_ingress_port),
             dns: None,
@@ -602,6 +605,7 @@ async fn test_wss_reverse_tunnel_e2e() {
         token: auth_token.to_string(),
         pool_size: None,
         failover: None,
+        multiplex: None,
         endpoint: EndpointConfig::Detailed {
             url: format!("wss://127.0.0.1:{}/tunnel", tls_ingress_port),
             dns: None,

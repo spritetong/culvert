@@ -89,6 +89,7 @@ async fn test_high_volume_duplex_stream_integrity() {
         token: auth_token.to_string(),
         pool_size: None,
         failover: None,
+        multiplex: None,
         endpoint: EndpointConfig::Simple(format!("ws://{}/ws", server_ws_listen)),
     };
 
@@ -204,6 +205,7 @@ async fn test_stream_half_close_and_draining() {
         token: auth_token.to_string(),
         pool_size: None,
         failover: None,
+        multiplex: None,
         endpoint: EndpointConfig::Simple(format!("ws://{}/ws", server_ws_listen)),
     };
 
@@ -286,6 +288,7 @@ async fn test_pool_prewarm_and_reuse() {
         token: auth_token.to_string(),
         pool_size: Some(4), // Pre-warm 4 connections
         failover: None,
+        multiplex: None,
         endpoint: EndpointConfig::Simple(format!("ws://{}/ws", server_ws_listen)),
     };
 

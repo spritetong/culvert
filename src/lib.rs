@@ -7,6 +7,7 @@ pub mod constants;
 pub mod control;
 pub mod core;
 pub mod dialer;
+pub mod mux;
 pub mod pool;
 pub mod server;
 pub mod session;

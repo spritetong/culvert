@@ -46,6 +46,9 @@ pub enum TunnelError {
     #[error("Control protocol error: {0}")]
     ControlProtocol(String),
 
+    #[error("Multiplexer error: {0}")]
+    Multiplex(String),
+
     #[error("Connection pool exhausted or shut down")]
     PoolExhausted,
 
