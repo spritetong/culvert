@@ -1,13 +1,19 @@
 log:
   level: "info"
   output: "stdout"
+  no_color: false
 
-# Global default DNS strategy (sing-box style)
+# Worker threads (default: auto-detected CPU cores; 1 for single-thread runtime)
+worker_threads: 4
+
+# Global default DNS resolver settings (wstunnel & sing-box compatible)
 dns:
   strategy: "prefer_ipv4"
-  servers:
-    - "system"
-    - "udp://1.1.1.1:53"
+  resolvers:
+    - "dns://1.1.1.1"
+    - "dns+https://1.1.1.1?sni=cloudflare-dns.com"
+    - "dns+tls://8.8.8.8?sni=dns.google"
+    - "system://0.0.0.0"
 
 # Global default dialer settings
 dialer:
@@ -47,3 +53,6 @@ tunnels:
     target: "10.0.0.5:3306"
     token: "SECURE_PRESHARED_TOKEN"
     endpoint: "https://tunnel.example.com/tunnel"
+    multiplex:
+      enabled: true
+      max_streams: 128
