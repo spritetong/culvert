@@ -59,4 +59,16 @@ tunnels:
             "wss://tunnel.example.com/ws"
         );
     }
+
+    #[test]
+    fn test_load_config_example_file() {
+        let path = std::path::Path::new("config-example.yaml");
+        if path.exists() {
+            let config =
+                ConfigLoader::from_file(path).expect("config-example.yaml must parse cleanly");
+            assert_eq!(config.log.level, "info");
+            assert_eq!(config.worker_threads, Some(4));
+            assert_eq!(config.tunnels.len(), 2);
+        }
+    }
 }
