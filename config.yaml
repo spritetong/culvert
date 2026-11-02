@@ -1,0 +1,49 @@
+log:
+  level: "info"
+  output: "stdout"
+
+# Global default DNS strategy (sing-box style)
+dns:
+  strategy: "prefer_ipv4"
+  servers:
+    - "system"
+    - "udp://1.1.1.1:53"
+
+# Global default dialer settings
+dialer:
+  connect_timeout: "5s"
+  tcp_keepalive: "15s"
+  tcp_nodelay: true
+
+# Global default TLS settings
+tls:
+  enabled: true
+  insecure: false
+  alpn: ["h3", "http/1.1"]
+
+# Concurrent multi-tunnel definitions
+tunnels:
+  # Tunnel 1: Reverse forwarding (map VPS 2222 back to local SSH 22)
+  - tag: "vps-ssh-reverse"
+    mode: "reverse"
+    listen: "0.0.0.0:2222"
+    target: "127.0.0.1:22"
+    token: "SECURE_PRESHARED_TOKEN"
+    endpoint:
+      url: "wss://tunnel.example.com/ws"
+      dns:
+        strategy: "ipv4_only"
+      tls:
+        enabled: true
+        server_name: "tunnel.example.com"
+        insecure: true
+      dialer:
+        connect_timeout: "3s"
+
+  # Tunnel 2: Forward forwarding (map local 13306 to cloud remote MySQL)
+  - tag: "cloud-mysql-forward"
+    mode: "forward"
+    listen: "127.0.0.1:13306"
+    target: "10.0.0.5:3306"
+    token: "SECURE_PRESHARED_TOKEN"
+    endpoint: "https://tunnel.example.com/tunnel"
