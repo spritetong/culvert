@@ -8,6 +8,7 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use micro_tunnel::config::ConfigLoader;
+use micro_tunnel::config::model::AppConfig;
 use micro_tunnel::supervisor::TunnelSupervisor;
 
 /// High-performance lightweight HTTP/3 & WSS bidirectional TCP tunnel system.
@@ -17,28 +18,61 @@ struct Cli {
     /// Path to the YAML configuration file.
     #[arg(short, long, default_value = "config.yaml")]
     config: PathBuf,
+
+    /// Override the number of Tokio worker threads.
+    #[arg(short = 'w', long)]
+    worker_threads: Option<usize>,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    // Initialize structured logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
-    info!(config = ?cli.config, "Loading micro-tunnel configuration");
     let app_config = match ConfigLoader::from_file(&cli.config) {
         Ok(cfg) => cfg,
         Err(e) => {
-            error!("Failed to load configuration file: {:?}", e);
+            eprintln!(
+                "Failed to load configuration file '{:?}': {:?}",
+                cli.config, e
+            );
             std::process::exit(1);
         }
     };
 
+    // Initialize structured logging respecting LogConfig
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&app_config.log.level));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_ansi(!app_config.log.no_color)
+        .init();
+
+    info!(config = ?cli.config, "Loaded micro-tunnel configuration");
+
+    let threads = cli.worker_threads.or(app_config.worker_threads);
+
+    let mut builder = match threads {
+        Some(1) => {
+            tracing::info!("Initialized single-threaded (current_thread) Tokio runtime");
+            tokio::runtime::Builder::new_current_thread()
+        }
+        Some(n) => {
+            tracing::info!(
+                "Initialized multi-threaded Tokio runtime with {} worker threads",
+                n
+            );
+            let mut b = tokio::runtime::Builder::new_multi_thread();
+            b.worker_threads(n);
+            b
+        }
+        None => tokio::runtime::Builder::new_multi_thread(),
+    };
+
+    let runtime = builder.enable_all().build()?;
+    runtime.block_on(async_main(app_config))
+}
+
+async fn async_main(app_config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     let cancel_token = CancellationToken::new();
     let shutdown_token = cancel_token.clone();
 

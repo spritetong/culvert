@@ -15,6 +15,9 @@ fn test_complex_yaml_config_parsing() {
 log:
   level: "debug"
   output: "stdout"
+  no_color: true
+
+worker_threads: 8
 
 dns:
   strategy: "prefer_ipv4"
@@ -73,6 +76,10 @@ tunnels:
     // Verify Log
     assert_eq!(app_config.log.level, "debug");
     assert_eq!(app_config.log.output, "stdout");
+    assert!(app_config.log.no_color);
+
+    // Verify Worker Threads
+    assert_eq!(app_config.worker_threads, Some(8));
 
     // Verify DNS
     let dns = app_config.dns.as_ref().unwrap();

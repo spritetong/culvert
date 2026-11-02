@@ -17,6 +17,9 @@ pub struct AppConfig {
 
     pub server: Option<ServerConfig>,
 
+    /// Number of Tokio worker threads (None = auto-detect based on CPU cores).
+    pub worker_threads: Option<usize>,
+
     #[serde(default)]
     pub tunnels: Vec<TunnelConfig>,
 }
@@ -37,6 +40,9 @@ pub struct LogConfig {
 
     #[serde(default = "default_log_output")]
     pub output: String,
+
+    #[serde(default)]
+    pub no_color: bool,
 }
 
 fn default_log_level() -> String {
@@ -52,6 +58,7 @@ impl Default for LogConfig {
         Self {
             level: default_log_level(),
             output: default_log_output(),
+            no_color: false,
         }
     }
 }
