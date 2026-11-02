@@ -657,3 +657,26 @@ micro-tunnel/
         ├── forward.rs          # 正向隧道实现
         └── reverse.rs          # 反向穿透隧道实现
 ```
+
+---
+
+## 10. 高性能现代架构优化演进
+
+### 10.1 控制信道二进制化：MessagePack (`to_vec_named`)
+* 全面废除文本型 JSON，采用极度紧凑高效的二进制 MessagePack (`rmp-serde`)。
+* 序列化统一使用 `rmp_serde::to_vec_named()`，在编码时输出带字段名的 Map 键值对，而非位置数组。
+* **协议演进兼容性**：即使服务端与客户端版本不一致、新版本增加可选字段或重排字段，旧版本反序列化时自动忽略未知字段，新版本处理旧消息自动填充 `#[serde(default)]` 默认值，完美实现跨版本前后兼容。
+
+### 10.2 WebSocket 传输流直驱：Zero-Task 纯状态机 (`WsTunnelStream`)
+* 废弃常规基于 `tokio::io::duplex` 内存桥接及为每个连接额外 `spawn` 两个读写 pump task 的做法。
+* 直接基于 `fastwebsockets::after_handshake_split` 取得底层的 `WebSocketRead` 与 `WebSocketWrite`。
+* 运用**所有权转移状态机模式（Ownership Transfer Pattern）**，在 `poll_read` 和 `poll_write` 触发异步读写时将流的所有权安全借出/收回，直接实现 `tokio::io::AsyncRead` 与 `AsyncWrite`。
+* **效果**：
+  - 每条连接彻底**消灭 2 个后台 Task**（零额外 Task 消耗）；
+  - 彻底消灭中间 duplex 环形缓冲区的双重内存拷贝；
+  - 保持 100% 安全 Rust（Safe Rust），无自引用结构体困扰。
+
+### 10.3 全链路 TCP Socket 底层性能调优 (`SocketTuner`)
+* 针对正向监听、反向访客入站、服务端代理回拨、本地目标回拨的所有 TCP Stream，在连接建立或 `accept()` 的第一时刻立即通过 `SocketTuner` 强制应用：
+  - `set_nodelay(true)`：彻底禁用 Nagle 延迟缓冲算法，杜绝 40ms~200ms ACK 延迟；
+  - `socket2::TcpKeepalive`：自动配置 15s 空闲保活与探测间隔，及时清理网络死连接并防范中间 NAT 超时掉线。
