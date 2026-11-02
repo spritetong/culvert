@@ -6,6 +6,7 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
+use crate::common::net::SocketTuner;
 use crate::common::task::TaskTracker;
 use crate::config::model::TunnelConfig;
 use crate::core::error::TunnelError;
@@ -53,6 +54,7 @@ pub async fn run_forward_tunnel(
             accept_res = listener.accept() => {
                 match accept_res {
                     Ok((inbound_stream, peer_addr)) => {
+                        let _ = SocketTuner::tune_tcp_stream(&inbound_stream, true, None);
                         info!(tag = %config.tag, peer = %peer_addr, "Inbound connection accepted");
                         let connector = match transport_registry.create_connector(&endpoint_ctx, &config.token, config.mode) {
                             Ok(c) => c,

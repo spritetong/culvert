@@ -9,6 +9,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+use crate::common::net::SocketTuner;
 use crate::common::task::TaskTracker;
 use crate::config::model::{ServerConfig, TunnelMode};
 use crate::constants::DEFAULT_SESSION_PAIR_TIMEOUT;
@@ -99,7 +100,10 @@ impl ServerRunner {
 
                                         info!(target = %target, "Dialing forward target in local/internal network");
                                         let target_conn = match TcpStream::connect(target.to_string()).await {
-                                            Ok(s) => s,
+                                            Ok(s) => {
+                                                let _ = SocketTuner::tune_tcp_stream(&s, true, None);
+                                                s
+                                            }
                                             Err(e) => {
                                                 error!(target = %target, "Failed to connect to forward target: {:?}", e);
                                                 return;
@@ -190,6 +194,7 @@ impl ServerRunner {
                 accept_res = listener.accept() => {
                     match accept_res {
                         Ok((visitor_stream, visitor_addr)) => {
+                            let _ = SocketTuner::tune_tcp_stream(&visitor_stream, true, None);
                             let session_id = format!(
                                 "sess_{}_{}",
                                 std::process::id(),

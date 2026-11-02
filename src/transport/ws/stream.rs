@@ -4,17 +4,47 @@
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use fastwebsockets::{Frame, OpCode, Payload, Role, WebSocket};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
-use tokio_util::sync::CancellationToken;
+use bytes::Bytes;
+use fastwebsockets::{after_handshake_split, Frame, OpCode, Payload, Role, WebSocketError, WebSocketRead, WebSocketWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::constants::RELAY_BUFFER_SIZE;
+use crate::core::stream::BoxFuture;
 
-/// Dynamic tunnel stream adapter wrapping a `fastwebsockets::WebSocket`.
-pub struct WsTunnelStream {
-    inner: DuplexStream,
-    cancel_token: CancellationToken,
+type DynRead = Box<dyn AsyncRead + Send + Unpin>;
+type DynWrite = Box<dyn AsyncWrite + Send + Unpin>;
+
+enum ReadState {
+    Idle(WebSocketRead<DynRead>),
+    Reading(BoxFuture<'static, (WebSocketRead<DynRead>, Result<(OpCode, Bytes), WebSocketError>)>),
+    Buffered {
+        rx: WebSocketRead<DynRead>,
+        payload: Bytes,
+        cursor: usize,
+    },
+    Eof,
+    Failed,
 }
+
+enum WriteState {
+    Idle(WebSocketWrite<DynWrite>),
+    Writing(BoxFuture<'static, (WebSocketWrite<DynWrite>, Result<(), WebSocketError>)>),
+    Closing(BoxFuture<'static, (WebSocketWrite<DynWrite>, Result<(), WebSocketError>)>),
+    Closed,
+    Failed,
+}
+
+/// Dynamic tunnel stream adapter directly wrapping split `WebSocketRead` and `WebSocketWrite`.
+///
+/// Implements `AsyncRead` and `AsyncWrite` purely using state-machine transitions without
+/// intermediate duplex pipes, background tasks, or multi-copy buffering.
+pub struct WsTunnelStream {
+    read_state: ReadState,
+    write_state: WriteState,
+}
+
+// Safety: WsTunnelStream exposes no methods taking `&self` that mutate state without
+// synchronization. All reading and writing require `Pin<&mut Self>`.
+unsafe impl Sync for WsTunnelStream {}
 
 impl WsTunnelStream {
     /// Constructs a `WsTunnelStream` from an upgraded underlying I/O stream.
@@ -22,85 +52,16 @@ impl WsTunnelStream {
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
-        let mut ws = WebSocket::after_handshake(stream, role);
-        ws.set_writev(true);
-        ws.set_auto_close(true);
-        ws.set_auto_pong(true);
-
-        let (app_stream, bridge_stream) = tokio::io::duplex(RELAY_BUFFER_SIZE);
-        let cancel_token = CancellationToken::new();
-        let loop_token = cancel_token.clone();
-
-        // Split websocket and bridge stream into independent halves
-        let (mut ws_rx, mut ws_tx) = ws.split(tokio::io::split);
-        let (mut bridge_rx, mut bridge_tx) = tokio::io::split(bridge_stream);
-
-        // Spawn read pump: reads binary WebSocket frames and writes into duplex bridge
-        let read_token = loop_token.clone();
-        tokio::spawn(async move {
-            let mut send_pong = |_| async { Ok::<(), std::io::Error>(()) };
-            loop {
-                tokio::select! {
-                    _ = read_token.cancelled() => break,
-                    frame_res = ws_rx.read_frame(&mut send_pong) => {
-                        match frame_res {
-                            Ok(frame) => match frame.opcode {
-                                OpCode::Binary => {
-                                    if bridge_tx.write_all(&frame.payload).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                OpCode::Close => {
-                                    let _ = bridge_tx.shutdown().await;
-                                    break;
-                                }
-                                _ => {}
-                            },
-                            Err(_) => break,
-                        }
-                    }
-                }
-            }
-            let _ = bridge_tx.shutdown().await;
-        });
-
-        // Spawn write pump: reads raw application bytes from duplex bridge and writes binary frames
-        let write_token = loop_token.clone();
-        tokio::spawn(async move {
-            let mut buffer = vec![0u8; RELAY_BUFFER_SIZE];
-            loop {
-                tokio::select! {
-                    _ = write_token.cancelled() => break,
-                    read_res = bridge_rx.read(&mut buffer) => {
-                        match read_res {
-                            Ok(0) => {
-                                // EOF from application
-                                let _ = ws_tx.write_frame(Frame::close(1000, &[])).await;
-                                break;
-                            }
-                            Ok(n) => {
-                                let frame = Frame::binary(Payload::Borrowed(&buffer[..n]));
-                                if ws_tx.write_frame(frame).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                }
-            }
-        });
+        let (r, w) = tokio::io::split(stream);
+        let (mut rx, mut tx) = after_handshake_split(Box::new(r) as DynRead, Box::new(w) as DynWrite, role);
+        rx.set_auto_pong(true);
+        rx.set_auto_close(true);
+        tx.set_writev(true);
 
         Self {
-            inner: app_stream,
-            cancel_token,
+            read_state: ReadState::Idle(rx),
+            write_state: WriteState::Idle(tx),
         }
-    }
-}
-
-impl Drop for WsTunnelStream {
-    fn drop(&mut self) {
-        self.cancel_token.cancel();
     }
 }
 
@@ -110,7 +71,85 @@ impl AsyncRead for WsTunnelStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        loop {
+            match std::mem::replace(&mut self.read_state, ReadState::Failed) {
+                ReadState::Buffered { rx, payload, cursor } => {
+                    let remaining = payload.len() - cursor;
+                    let to_read = remaining.min(buf.remaining());
+                    buf.put_slice(&payload[cursor..cursor + to_read]);
+                    let new_cursor = cursor + to_read;
+                    if new_cursor < payload.len() {
+                        self.read_state = ReadState::Buffered {
+                            rx,
+                            payload,
+                            cursor: new_cursor,
+                        };
+                    } else {
+                        self.read_state = ReadState::Idle(rx);
+                    }
+                    return Poll::Ready(Ok(()));
+                }
+                ReadState::Idle(mut rx) => {
+                    let fut = Box::pin(async move {
+                        let res = loop {
+                            let frame = match rx.read_frame(&mut |_| async { Ok::<(), io::Error>(()) }).await {
+                                Ok(f) => f,
+                                Err(e) => break Err(e),
+                            };
+                            match frame.opcode {
+                                OpCode::Binary | OpCode::Text => {
+                                    break Ok((frame.opcode, Bytes::copy_from_slice(&frame.payload)));
+                                }
+                                OpCode::Close => {
+                                    break Ok((OpCode::Close, Bytes::new()));
+                                }
+                                _ => {}
+                            }
+                        };
+                        (rx, res)
+                    });
+                    self.read_state = ReadState::Reading(fut);
+                }
+                ReadState::Reading(mut fut) => {
+                    match fut.as_mut().poll(cx) {
+                        Poll::Pending => {
+                            self.read_state = ReadState::Reading(fut);
+                            return Poll::Pending;
+                        }
+                        Poll::Ready((_rx, Ok((OpCode::Close, _)))) => {
+                            self.read_state = ReadState::Eof;
+                            return Poll::Ready(Ok(()));
+                        }
+                        Poll::Ready((rx, Ok((_, payload)))) => {
+                            if payload.is_empty() {
+                                self.read_state = ReadState::Idle(rx);
+                                continue;
+                            }
+                            self.read_state = ReadState::Buffered {
+                                rx,
+                                payload,
+                                cursor: 0,
+                            };
+                            continue;
+                        }
+                        Poll::Ready((_rx, Err(e))) => {
+                            self.read_state = ReadState::Failed;
+                            return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, e)));
+                        }
+                    }
+                }
+                ReadState::Eof => {
+                    self.read_state = ReadState::Eof;
+                    return Poll::Ready(Ok(()));
+                }
+                ReadState::Failed => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "WebSocket read half in failed state",
+                    )));
+                }
+            }
+        }
     }
 }
 
@@ -120,22 +159,181 @@ impl AsyncWrite for WsTunnelStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        loop {
+            match std::mem::replace(&mut self.write_state, WriteState::Failed) {
+                WriteState::Idle(mut tx) => {
+                    let len = buf.len();
+                    let payload = buf.to_vec();
+                    let mut fut = Box::pin(async move {
+                        let res = tx.write_frame(Frame::binary(Payload::Owned(payload))).await;
+                        (tx, res)
+                    });
+                    match fut.as_mut().poll(cx) {
+                        Poll::Ready((tx, Ok(()))) => {
+                            self.write_state = WriteState::Idle(tx);
+                            return Poll::Ready(Ok(len));
+                        }
+                        Poll::Ready((_tx, Err(e))) => {
+                            self.write_state = WriteState::Failed;
+                            return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
+                        }
+                        Poll::Pending => {
+                            self.write_state = WriteState::Writing(fut);
+                            return Poll::Ready(Ok(len));
+                        }
+                    }
+                }
+                WriteState::Writing(mut fut) => {
+                    match fut.as_mut().poll(cx) {
+                        Poll::Pending => {
+                            self.write_state = WriteState::Writing(fut);
+                            return Poll::Pending;
+                        }
+                        Poll::Ready((tx, Ok(()))) => {
+                            self.write_state = WriteState::Idle(tx);
+                            continue;
+                        }
+                        Poll::Ready((_tx, Err(e))) => {
+                            self.write_state = WriteState::Failed;
+                            return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
+                        }
+                    }
+                }
+                WriteState::Closing(mut fut) => {
+                    match fut.as_mut().poll(cx) {
+                        Poll::Pending => {
+                            self.write_state = WriteState::Closing(fut);
+                            return Poll::Pending;
+                        }
+                        Poll::Ready((_tx, _)) => {
+                            self.write_state = WriteState::Closed;
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "WebSocket write half closed",
+                            )));
+                        }
+                    }
+                }
+                WriteState::Closed => {
+                    self.write_state = WriteState::Closed;
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "WebSocket write half closed",
+                    )));
+                }
+                WriteState::Failed => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "WebSocket write half in failed state",
+                    )));
+                }
+            }
+        }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        loop {
+            match std::mem::replace(&mut self.write_state, WriteState::Failed) {
+                WriteState::Idle(tx) => {
+                    self.write_state = WriteState::Idle(tx);
+                    return Poll::Ready(Ok(()));
+                }
+                WriteState::Writing(mut fut) => {
+                    match fut.as_mut().poll(cx) {
+                        Poll::Pending => {
+                            self.write_state = WriteState::Writing(fut);
+                            return Poll::Pending;
+                        }
+                        Poll::Ready((tx, Ok(()))) => {
+                            self.write_state = WriteState::Idle(tx);
+                            return Poll::Ready(Ok(()));
+                        }
+                        Poll::Ready((_tx, Err(e))) => {
+                            self.write_state = WriteState::Failed;
+                            return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
+                        }
+                    }
+                }
+                WriteState::Closing(mut fut) => {
+                    match fut.as_mut().poll(cx) {
+                        Poll::Pending => {
+                            self.write_state = WriteState::Closing(fut);
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(_) => {
+                            self.write_state = WriteState::Closed;
+                            return Poll::Ready(Ok(()));
+                        }
+                    }
+                }
+                WriteState::Closed => {
+                    self.write_state = WriteState::Closed;
+                    return Poll::Ready(Ok(()));
+                }
+                WriteState::Failed => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "WebSocket write half in failed state",
+                    )));
+                }
+            }
+        }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        loop {
+            match std::mem::replace(&mut self.write_state, WriteState::Failed) {
+                WriteState::Idle(mut tx) => {
+                    let fut = Box::pin(async move {
+                        let res = tx.write_frame(Frame::close(1000, &[])).await;
+                        (tx, res)
+                    });
+                    self.write_state = WriteState::Closing(fut);
+                    continue;
+                }
+                WriteState::Writing(mut fut) => {
+                    match fut.as_mut().poll(cx) {
+                        Poll::Pending => {
+                            self.write_state = WriteState::Writing(fut);
+                            return Poll::Pending;
+                        }
+                        Poll::Ready((tx, _)) => {
+                            self.write_state = WriteState::Idle(tx);
+                            continue;
+                        }
+                    }
+                }
+                WriteState::Closing(mut fut) => {
+                    match fut.as_mut().poll(cx) {
+                        Poll::Pending => {
+                            self.write_state = WriteState::Closing(fut);
+                            return Poll::Pending;
+                        }
+                        Poll::Ready((_tx, _)) => {
+                            self.write_state = WriteState::Closed;
+                            return Poll::Ready(Ok(()));
+                        }
+                    }
+                }
+                WriteState::Closed => {
+                    self.write_state = WriteState::Closed;
+                    return Poll::Ready(Ok(()));
+                }
+                WriteState::Failed => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "WebSocket write half in failed state",
+                    )));
+                }
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::duplex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
     #[tokio::test]
     async fn test_ws_tunnel_stream_bidirectional() {

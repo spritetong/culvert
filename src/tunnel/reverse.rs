@@ -8,6 +8,7 @@ use tokio::time::{interval, Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+use crate::common::net::SocketTuner;
 use crate::common::task::TaskTracker;
 use crate::config::model::TunnelConfig;
 use crate::constants::DEFAULT_HEARTBEAT_INTERVAL;
@@ -125,7 +126,10 @@ pub async fn run_reverse_tunnel(
                                 conn_tracker.spawn_with_cancel(move |token| async move {
                                     // 1. Dial local target service
                                     let local_stream = match TcpStream::connect(&target_addr).await {
-                                        Ok(s) => s,
+                                        Ok(s) => {
+                                            let _ = SocketTuner::tune_tcp_stream(&s, true, None);
+                                            s
+                                        }
                                         Err(e) => {
                                             error!("Failed to connect to local target {}: {:?}", target_addr, e);
                                             return;

@@ -84,7 +84,7 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(bytes))) => match serde_json::from_slice::<ControlMessage>(&bytes) {
+            Poll::Ready(Some(Ok(bytes))) => match rmp_serde::from_slice::<ControlMessage>(&bytes) {
                 Ok(msg) => Poll::Ready(Some(Ok(msg))),
                 Err(e) => Poll::Ready(Some(Err(TunnelError::ControlProtocol(e.to_string())))),
             },
@@ -106,9 +106,9 @@ where
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: ControlMessage) -> Result<(), Self::Error> {
-        let json_vec =
-            serde_json::to_vec(&item).map_err(|e| TunnelError::ControlProtocol(e.to_string()))?;
-        Sink::<Bytes>::start_send(Pin::new(&mut self.inner), Bytes::from(json_vec))
+        let msgpack_vec = rmp_serde::to_vec_named(&item)
+            .map_err(|e| TunnelError::ControlProtocol(e.to_string()))?;
+        Sink::<Bytes>::start_send(Pin::new(&mut self.inner), Bytes::from(msgpack_vec))
             .map_err(TunnelError::Io)
     }
 

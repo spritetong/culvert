@@ -11,6 +11,7 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
+use crate::common::net::SocketTuner;
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, TunnelStream};
 use crate::transport::ws::model::WsHandshakeHeaders;
@@ -48,7 +49,10 @@ impl WsListener {
         tokio::spawn(async move {
             loop {
                 let (stream, _) = match listener.accept().await {
-                    Ok(conn) => conn,
+                    Ok((conn, addr)) => {
+                        let _ = SocketTuner::tune_tcp_stream(&conn, true, None);
+                        (conn, addr)
+                    }
                     Err(_) => break,
                 };
 
