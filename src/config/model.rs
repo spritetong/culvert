@@ -78,7 +78,10 @@ pub enum DnsStrategy {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct DnsConfig {
     pub strategy: Option<DnsStrategy>,
+
+    #[serde(alias = "resolvers")]
     pub servers: Option<Vec<String>>,
+
     pub cache_capacity: Option<usize>,
 }
 

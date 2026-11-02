@@ -210,3 +210,53 @@ async fn test_dns_resolver_strategies_and_caching() {
         vec![std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]
     );
 }
+
+#[tokio::test]
+async fn test_wstunnel_style_dns_resolvers() {
+    // 1. System libc resolver
+    let sys_cfg = DnsConfig {
+        strategy: Some(DnsStrategy::PreferIpv4),
+        servers: Some(vec!["system://0.0.0.0".to_string()]),
+        cache_capacity: Some(10),
+    };
+    let sys_resolver = CachedDnsResolver::new(sys_cfg);
+    let sys_addrs = sys_resolver.resolve("localhost").await.unwrap();
+    assert!(!sys_addrs.is_empty());
+
+    // 2. Custom multi-protocol DNS configurations
+    let multi_cfg = DnsConfig {
+        strategy: Some(DnsStrategy::PreferIpv4),
+        servers: Some(vec![
+            "dns://1.1.1.1".to_string(),
+            "dns+https://1.1.1.1?sni=cloudflare-dns.com".to_string(),
+            "dns+tls://8.8.8.8?sni=dns.google".to_string(),
+            "system://0.0.0.0".to_string(),
+        ]),
+        cache_capacity: Some(100),
+    };
+    let multi_resolver = CachedDnsResolver::new(multi_cfg);
+    // Direct literal fast path
+    let fast_path = multi_resolver.resolve("1.1.1.1").await.unwrap();
+    assert_eq!(
+        fast_path,
+        vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1))]
+    );
+
+    // 3. YAML parsing with 'resolvers' alias
+    let yaml = r#"
+dns:
+  strategy: "ipv4_only"
+  resolvers:
+    - "dns://1.1.1.1"
+    - "dns+https://1.1.1.1?sni=cloudflare-dns.com"
+    - "dns+tls://8.8.8.8?sni=dns.google"
+"#;
+    let config = ConfigLoader::from_yaml_str(yaml).unwrap();
+    let dns = config.dns.unwrap();
+    assert_eq!(dns.strategy, Some(DnsStrategy::Ipv4Only));
+    let servers = dns.servers.unwrap();
+    assert_eq!(servers.len(), 3);
+    assert_eq!(servers[0], "dns://1.1.1.1");
+    assert_eq!(servers[1], "dns+https://1.1.1.1?sni=cloudflare-dns.com");
+    assert_eq!(servers[2], "dns+tls://8.8.8.8?sni=dns.google");
+}

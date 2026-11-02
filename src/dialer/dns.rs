@@ -1,10 +1,17 @@
-//! DNS resolution engine supporting IPv4/IPv6 strategy selection and caching.
+//! DNS resolution engine supporting IPv4/IPv6 strategy selection, caching,
+//! and modern DNS transports (UDP, DoH, DoT, and system/libc resolver).
 //! All comments and docstrings must be in English.
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, ToSocketAddrs};
+use std::sync::Arc;
 use std::time::Instant;
+
+use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::{Resolver, TokioResolver};
+use tracing::{debug, warn};
 
 use crate::config::model::{DnsConfig, DnsStrategy};
 use crate::constants::{DEFAULT_DNS_CACHE_CAPACITY, DEFAULT_DNS_CACHE_TTL};
@@ -20,21 +27,189 @@ pub trait DnsResolver: Send + Sync {
     fn strategy(&self) -> DnsStrategy;
 }
 
-/// In-memory cached DNS resolver using `parking_lot::RwLock`.
+/// Parsed DNS resolver target backend.
+#[derive(Debug, Clone)]
+pub enum ParsedDnsServer {
+    /// Native operating system libc resolver (system://0.0.0.0).
+    System,
+    /// Upstream DNS nameserver (UDP, DNS-over-HTTPS, or DNS-over-TLS).
+    NameServer(NameServerConfig),
+}
+
+/// In-memory cached DNS resolver supporting UDP, DoH, DoT, and system libc.
 pub struct CachedDnsResolver {
     config: DnsConfig,
     cache: RwLock<HashMap<String, (Instant, Vec<IpAddr>)>>,
     capacity: usize,
+    hickory_resolver: Option<Arc<TokioResolver>>,
+    has_system_resolver: bool,
 }
 
 impl CachedDnsResolver {
     /// Creates a new `CachedDnsResolver` with the provided configuration.
     pub fn new(config: DnsConfig) -> Self {
         let capacity = config.cache_capacity.unwrap_or(DEFAULT_DNS_CACHE_CAPACITY);
+        let mut name_servers = Vec::new();
+        let mut has_system_resolver = false;
+
+        if let Some(ref servers) = config.servers {
+            for server in servers {
+                match Self::parse_server(server) {
+                    Ok(ParsedDnsServer::System) => {
+                        has_system_resolver = true;
+                    }
+                    Ok(ParsedDnsServer::NameServer(ns)) => {
+                        name_servers.push(ns);
+                    }
+                    Err(e) => {
+                        warn!(server = %server, error = ?e, "Failed to parse DNS resolver, skipping");
+                    }
+                }
+            }
+        }
+
+        let hickory_resolver = if !name_servers.is_empty() {
+            let resolver_config = ResolverConfig::from_name_servers(name_servers);
+            match Resolver::builder_with_config(resolver_config, TokioRuntimeProvider::default())
+                .build()
+            {
+                Ok(res) => Some(Arc::new(res)),
+                Err(e) => {
+                    warn!(
+                        error = ?e,
+                        "Failed to build custom Hickory DNS resolver, falling back to system"
+                    );
+                    has_system_resolver = true;
+                    None
+                }
+            }
+        } else if !has_system_resolver {
+            // When no custom servers are configured, attempt system-config TokioResolver
+            match TokioResolver::builder_tokio() {
+                Ok(builder) => match builder.build() {
+                    Ok(res) => Some(Arc::new(res)),
+                    Err(_) => {
+                        has_system_resolver = true;
+                        None
+                    }
+                },
+                Err(_) => {
+                    has_system_resolver = true;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             config,
             cache: RwLock::new(HashMap::with_capacity(capacity)),
             capacity,
+            hickory_resolver,
+            has_system_resolver,
+        }
+    }
+
+    /// Parses a DNS resolver server URI into a `ParsedDnsServer`.
+    ///
+    /// Supported formats (aligned with wstunnel):
+    /// - `system://0.0.0.0`: Use native libc resolver.
+    /// - `dns://1.1.1.1[:port]`: Standard unencrypted UDP DNS.
+    /// - `dns+https://1.1.1.1[:port][/path]?sni=cloudflare-dns.com`: DNS over HTTPS (DoH).
+    /// - `dns+tls://8.8.8.8[:port]?sni=dns.google`: DNS over TLS (DoT).
+    pub fn parse_server(raw: &str) -> Result<ParsedDnsServer, TunnelError> {
+        let clean = raw.trim();
+        if clean.starts_with("system://") {
+            return Ok(ParsedDnsServer::System);
+        }
+
+        let url_str = if clean.contains("://") {
+            clean.to_string()
+        } else {
+            format!("dns://{}", clean)
+        };
+
+        let parsed = url::Url::parse(&url_str).map_err(|e| {
+            TunnelError::Config(format!("Invalid DNS resolver URL '{}': {}", raw, e))
+        })?;
+
+        let host_str = parsed.host_str().ok_or_else(|| {
+            TunnelError::Config(format!("Missing host in DNS resolver URL '{}'", raw))
+        })?;
+
+        let clean_host = host_str.trim_start_matches('[').trim_end_matches(']');
+        let ip: IpAddr = if let Ok(ip) = clean_host.parse::<IpAddr>() {
+            ip
+        } else {
+            let port = parsed.port().unwrap_or(53);
+            let addr_str = format!("{}:{}", clean_host, port);
+            match addr_str.to_socket_addrs() {
+                Ok(mut addrs) => addrs.next().map(|sa| sa.ip()).ok_or_else(|| {
+                    TunnelError::Config(format!("No IP found for DNS host '{}'", clean_host))
+                })?,
+                Err(e) => {
+                    return Err(TunnelError::Config(format!(
+                        "Invalid or unresolvable DNS server address '{}': {}",
+                        clean_host, e
+                    )));
+                }
+            }
+        };
+
+        let scheme = parsed.scheme();
+        let query_sni = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "sni")
+            .map(|(_, v)| v.to_string());
+
+        let sni: Arc<str> = query_sni
+            .as_deref()
+            .map(Arc::from)
+            .unwrap_or_else(|| Arc::from(clean_host));
+
+        match scheme {
+            "dns" | "udp" => {
+                let port = parsed.port().unwrap_or(53);
+                let mut ns = NameServerConfig::udp(ip);
+                if let Some(conn) = ns.connections.first_mut() {
+                    conn.port = port;
+                }
+                Ok(ParsedDnsServer::NameServer(ns))
+            }
+            "dns+tls" | "tls" => {
+                let port = parsed.port().unwrap_or(853);
+                let mut ns = NameServerConfig::tls(ip, sni);
+                if let Some(conn) = ns.connections.first_mut() {
+                    conn.port = port;
+                }
+                Ok(ParsedDnsServer::NameServer(ns))
+            }
+            "dns+https" | "https" => {
+                let port = parsed.port().unwrap_or(443);
+                let path = if !parsed.path().is_empty() && parsed.path() != "/" {
+                    Some(Arc::from(parsed.path()))
+                } else {
+                    None
+                };
+                let mut ns = NameServerConfig::https(ip, sni, path);
+                if let Some(conn) = ns.connections.first_mut() {
+                    conn.port = port;
+                }
+                Ok(ParsedDnsServer::NameServer(ns))
+            }
+            "tcp" => {
+                let port = parsed.port().unwrap_or(53);
+                let mut ns = NameServerConfig::tcp(ip);
+                if let Some(conn) = ns.connections.first_mut() {
+                    conn.port = port;
+                }
+                Ok(ParsedDnsServer::NameServer(ns))
+            }
+            unknown => Err(TunnelError::Config(format!(
+                "Unsupported DNS resolver scheme '{}' in '{}'",
+                unknown, raw
+            ))),
         }
     }
 
@@ -73,12 +248,12 @@ impl CachedDnsResolver {
 impl DnsResolver for CachedDnsResolver {
     fn resolve<'a>(&'a self, host: &'a str) -> BoxFuture<'a, Result<Vec<IpAddr>, TunnelError>> {
         Box::pin(async move {
-            // Direct IP literal parse check
+            // 1. Direct IP literal fast path (0-RTT bypass)
             if let Ok(ip) = host.parse::<IpAddr>() {
                 return Self::apply_strategy(vec![ip], self.strategy());
             }
 
-            // Check cache
+            // 2. Check in-memory cache
             {
                 let read_guard = self.cache.read();
                 if let Some((inserted_at, ips)) = read_guard.get(host) {
@@ -88,29 +263,60 @@ impl DnsResolver for CachedDnsResolver {
                 }
             }
 
-            // Perform asynchronous system lookup
-            let lookup_res = tokio::net::lookup_host(format!("{}:0", host)).await;
-            match lookup_res {
-                Ok(addrs) => {
-                    let ips: Vec<IpAddr> = addrs.map(|sa| sa.ip()).collect();
-                    let filtered = Self::apply_strategy(ips, self.strategy())?;
+            // 3. Resolve using Hickory (UDP / DoH / DoT) if configured
+            let mut resolved_ips = Vec::new();
+            let mut hickory_failed = false;
 
-                    // Update cache
-                    {
-                        let mut write_guard = self.cache.write();
-                        if write_guard.len() >= self.capacity {
-                            write_guard.clear();
+            if let Some(ref resolver) = self.hickory_resolver {
+                match resolver.lookup_ip(host).await {
+                    Ok(lookup) => {
+                        for ip in lookup.iter() {
+                            if !resolved_ips.contains(&ip) {
+                                resolved_ips.push(ip);
+                            }
                         }
-                        write_guard.insert(host.to_string(), (Instant::now(), filtered.clone()));
                     }
-
-                    Ok(filtered)
+                    Err(e) => {
+                        debug!(host = %host, error = ?e, "Hickory DNS lookup failed");
+                        hickory_failed = true;
+                    }
                 }
-                Err(e) => Err(TunnelError::DnsResolutionFailed(
-                    host.to_string(),
-                    e.to_string(),
-                )),
             }
+
+            // 4. Fallback to system libc resolver if hickory failed or system:// was configured
+            let should_try_system = self.has_system_resolver
+                || self.hickory_resolver.is_none()
+                || (resolved_ips.is_empty() && hickory_failed);
+
+            if should_try_system {
+                if let Ok(addrs) = tokio::net::lookup_host(format!("{}:0", host)).await {
+                    for sa in addrs {
+                        if !resolved_ips.contains(&sa.ip()) {
+                            resolved_ips.push(sa.ip());
+                        }
+                    }
+                }
+            }
+
+            if resolved_ips.is_empty() {
+                return Err(TunnelError::DnsResolutionFailed(
+                    host.to_string(),
+                    "All configured DNS resolvers returned no addresses".to_string(),
+                ));
+            }
+
+            let filtered = Self::apply_strategy(resolved_ips, self.strategy())?;
+
+            // 5. Update cache
+            {
+                let mut write_guard = self.cache.write();
+                if write_guard.len() >= self.capacity {
+                    write_guard.clear();
+                }
+                write_guard.insert(host.to_string(), (Instant::now(), filtered.clone()));
+            }
+
+            Ok(filtered)
         })
     }
 
@@ -122,8 +328,57 @@ impl DnsResolver for CachedDnsResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
-    use std::net::Ipv6Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn test_parse_dns_resolver_schemes() {
+        // 1. UDP DNS
+        let udp = CachedDnsResolver::parse_server("dns://1.1.1.1").unwrap();
+        match udp {
+            ParsedDnsServer::NameServer(ns) => {
+                assert_eq!(ns.ip, IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+                assert_eq!(ns.connections[0].port, 53);
+            }
+            _ => panic!("Expected NameServer"),
+        }
+
+        // Custom port UDP
+        let udp_custom = CachedDnsResolver::parse_server("dns://1.1.1.1:5353").unwrap();
+        match udp_custom {
+            ParsedDnsServer::NameServer(ns) => {
+                assert_eq!(ns.connections[0].port, 5353);
+            }
+            _ => panic!("Expected NameServer"),
+        }
+
+        // 2. DNS over HTTPS (DoH)
+        let doh =
+            CachedDnsResolver::parse_server("dns+https://1.1.1.1?sni=cloudflare-dns.com").unwrap();
+        match doh {
+            ParsedDnsServer::NameServer(ns) => {
+                assert_eq!(ns.ip, IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+                assert_eq!(ns.connections[0].port, 443);
+            }
+            _ => panic!("Expected NameServer"),
+        }
+
+        // 3. DNS over TLS (DoT)
+        let dot = CachedDnsResolver::parse_server("dns+tls://8.8.8.8?sni=dns.google").unwrap();
+        match dot {
+            ParsedDnsServer::NameServer(ns) => {
+                assert_eq!(ns.ip, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+                assert_eq!(ns.connections[0].port, 853);
+            }
+            _ => panic!("Expected NameServer"),
+        }
+
+        // 4. System / libc resolver
+        let sys = CachedDnsResolver::parse_server("system://0.0.0.0").unwrap();
+        match sys {
+            ParsedDnsServer::System => {}
+            _ => panic!("Expected System resolver"),
+        }
+    }
 
     #[test]
     fn test_dns_strategy_prefer_ipv4() {
