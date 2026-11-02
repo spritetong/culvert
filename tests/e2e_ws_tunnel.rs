@@ -94,6 +94,7 @@ async fn test_forward_tunnel_ws_e2e() {
         target: format!("127.0.0.1:{}", echo_port),
         endpoint: EndpointConfig::Simple(format!("ws://{}/tunnel", server_listen)),
         token: auth_token.to_string(),
+        pool_size: None,
         failover: None,
     };
 
@@ -179,6 +180,7 @@ async fn test_reverse_tunnel_ws_e2e() {
         target: format!("127.0.0.1:{}", local_echo_port), // local target to forward to
         endpoint: EndpointConfig::Simple(format!("ws://{}/tunnel", server_ws_listen)),
         token: auth_token.to_string(),
+        pool_size: None,
         failover: None,
     };
 
@@ -248,6 +250,7 @@ async fn test_supervisor_multi_tunnel_concurrency_e2e() {
         target: format!("127.0.0.1:{}", echo_fwd_port),
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/ws", server_ws_port)),
         token: auth_token.to_string(),
+        pool_size: None,
         failover: None,
     });
 
@@ -258,6 +261,7 @@ async fn test_supervisor_multi_tunnel_concurrency_e2e() {
         target: format!("127.0.0.1:{}", echo_rev_port),
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/ws", server_ws_port)),
         token: auth_token.to_string(),
+        pool_size: None,
         failover: None,
     });
 

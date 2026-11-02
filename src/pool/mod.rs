@@ -3,4 +3,4 @@
 
 pub mod connection_pool;
 
-pub use connection_pool::{InMemoryStreamPool, PoolStats, StreamPool};
+pub use connection_pool::{InMemoryStreamPool, PoolStats, ReplenishingStreamPool, StreamPool};

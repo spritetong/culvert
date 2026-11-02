@@ -172,6 +172,8 @@ pub struct TunnelConfig {
     pub token: String,
     pub endpoint: EndpointConfig,
     pub failover: Option<FailoverConfig>,
+    #[serde(default)]
+    pub pool_size: Option<usize>,
 }
 
 /// Endpoint definition supporting either a simple URL or detailed context.

@@ -1,0 +1,652 @@
+//! Comprehensive integration tests for WSS (WebSocket over TLS 1.3 / Rustls).
+//! Covers SNI override, self-signed/insecure mode, custom CA verification, and mTLS.
+//! All comments and docstrings must be in English.
+
+use std::fs;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::WebPkiClientVerifier;
+use rustls::{RootCertStore, ServerConfig as RustlsServerConfig};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
+use tokio_util::sync::CancellationToken;
+
+use micro_tunnel::config::model::{
+    AppConfig, EndpointConfig, ServerConfig, TlsConfig, TunnelConfig, TunnelMode,
+};
+use micro_tunnel::dialer::endpoint::EndpointContext;
+use micro_tunnel::server::ServerRunner;
+use micro_tunnel::session::SessionManager;
+use micro_tunnel::transport::ws::WsTransportDriver;
+use micro_tunnel::transport::TransportRegistry;
+use micro_tunnel::tunnel::{run_forward_tunnel, run_reverse_tunnel};
+
+/// Helper to get an available random ephemeral port.
+fn get_available_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral port");
+    listener.local_addr().unwrap().port()
+}
+
+/// In-memory or temporary PKI credentials bundle generated via rcgen.
+#[allow(dead_code)]
+struct TestPki {
+    _temp_dir: tempfile_dummy::TempDir,
+    ca_cert_path: PathBuf,
+    server_cert_path: PathBuf,
+    server_key_path: PathBuf,
+    client_cert_path: PathBuf,
+    client_key_path: PathBuf,
+    server_rustls_config: Arc<RustlsServerConfig>,
+    mtls_server_rustls_config: Arc<RustlsServerConfig>,
+}
+
+mod tempfile_dummy {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static PKI_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    pub struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        pub fn new() -> Self {
+            let id = PKI_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("micro_tunnel_pki_{}_{}", std::process::id(), id));
+            let _ = std::fs::create_dir_all(&path);
+            Self { path }
+        }
+
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+/// Generates a test CA, a server certificate signed by CA, and a client certificate for mTLS.
+fn generate_test_pki() -> TestPki {
+    let temp_dir = tempfile_dummy::TempDir::new();
+    let dir = temp_dir.path();
+
+    // 1. Generate Root CA
+    let mut ca_params = CertificateParams::default();
+    let mut ca_dn = DistinguishedName::new();
+    ca_dn.push(DnType::CommonName, "MicroTunnel Root CA");
+    ca_params.distinguished_name = ca_dn;
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_key = KeyPair::generate().unwrap();
+    let ca = rcgen::CertifiedIssuer::self_signed(ca_params, &ca_key).unwrap();
+
+    let ca_cert_pem = ca.as_ref().pem();
+    let ca_cert_path = dir.join("ca.crt");
+    fs::write(&ca_cert_path, &ca_cert_pem).unwrap();
+
+    // 2. Generate Server Certificate signed by Root CA
+    let mut server_params = CertificateParams::default();
+    let mut server_dn = DistinguishedName::new();
+    server_dn.push(DnType::CommonName, "tunnel.secure.io");
+    server_params.distinguished_name = server_dn;
+    server_params.subject_alt_names = vec![
+        SanType::DnsName("localhost".try_into().unwrap()),
+        SanType::DnsName("tunnel.secure.io".try_into().unwrap()),
+        SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))),
+    ];
+    let server_key = KeyPair::generate().unwrap();
+    let server_cert = server_params.signed_by(&server_key, &ca).unwrap();
+
+    let server_cert_pem = server_cert.pem();
+    let server_key_pem = server_key.serialize_pem();
+    let server_cert_path = dir.join("server.crt");
+    let server_key_path = dir.join("server.key");
+    fs::write(&server_cert_path, &server_cert_pem).unwrap();
+    fs::write(&server_key_path, &server_key_pem).unwrap();
+
+    // 3. Generate Client Certificate for mTLS
+    let mut client_params = CertificateParams::default();
+    let mut client_dn = DistinguishedName::new();
+    client_dn.push(DnType::CommonName, "test-client");
+    client_params.distinguished_name = client_dn;
+    let client_key = KeyPair::generate().unwrap();
+    let client_cert = client_params.signed_by(&client_key, &ca).unwrap();
+
+    let client_cert_pem = client_cert.pem();
+    let client_key_pem = client_key.serialize_pem();
+    let client_cert_path = dir.join("client.crt");
+    let client_key_path = dir.join("client.key");
+    fs::write(&client_cert_path, &client_cert_pem).unwrap();
+    fs::write(&client_key_path, &client_key_pem).unwrap();
+
+    // Server rustls config without client auth
+    let server_cert_der = CertificateDer::from(server_cert.der().to_vec());
+    let server_key_der = PrivateKeyDer::try_from(server_key.serialize_der()).unwrap();
+
+    let server_rustls_config = RustlsServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![server_cert_der.clone()], server_key_der.clone_key())
+        .unwrap();
+
+    // Server rustls config with mTLS required
+    let mut client_roots = RootCertStore::empty();
+    let ca_cert_der = CertificateDer::from(ca.as_ref().der().to_vec());
+    client_roots.add(ca_cert_der).unwrap();
+
+    let client_verifier = WebPkiClientVerifier::builder(Arc::new(client_roots)).build().unwrap();
+    let mtls_server_rustls_config = RustlsServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(vec![server_cert_der], server_key_der)
+        .unwrap();
+
+    TestPki {
+        _temp_dir: temp_dir,
+        ca_cert_path,
+        server_cert_path,
+        server_key_path,
+        client_cert_path,
+        client_key_path,
+        server_rustls_config: Arc::new(server_rustls_config),
+        mtls_server_rustls_config: Arc::new(mtls_server_rustls_config),
+    }
+}
+
+/// Spawns a TLS-terminating server ingress proxy (simulating Caddy or direct TLS terminator)
+/// that decrypts TLS traffic and forwards plain TCP to the ServerRunner WsListener.
+fn spawn_tls_terminator(
+    tls_listen_addr: SocketAddr,
+    backend_plain_addr: SocketAddr,
+    tls_config: Arc<RustlsServerConfig>,
+    cancel_token: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    let acceptor = TlsAcceptor::from(tls_config);
+    tokio::spawn(async move {
+        let listener = TcpListener::bind(tls_listen_addr).await.expect("Failed to bind TLS terminator");
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => break,
+                res = listener.accept() => {
+                    let (tcp_stream, _) = match res {
+                        Ok(conn) => conn,
+                        Err(_) => break,
+                    };
+                    let acceptor = acceptor.clone();
+                    let backend_plain_addr = backend_plain_addr;
+                    tokio::spawn(async move {
+                        let tls_stream = match acceptor.accept(tcp_stream).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::warn!("TLS handshake rejected by server: {:?}", e);
+                                return;
+                            }
+                        };
+                        let backend_conn = match TcpStream::connect(backend_plain_addr).await {
+                            Ok(s) => s,
+                            Err(_) => return,
+                        };
+                        let (mut tls_rd, mut tls_wr) = tokio::io::split(tls_stream);
+                        let (mut be_rd, mut be_wr) = backend_conn.into_split();
+                        let _ = tokio::join!(
+                            tokio::io::copy(&mut tls_rd, &mut be_wr),
+                            tokio::io::copy(&mut be_rd, &mut tls_wr)
+                        );
+                    });
+                }
+            }
+        }
+    })
+}
+
+/// Spawns a simple TCP echo server.
+fn spawn_echo_server(addr: SocketAddr, cancel_token: CancellationToken) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let listener = TcpListener::bind(addr).await.expect("Failed to bind echo server");
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => break,
+                res = listener.accept() => {
+                    let (mut socket, _) = match res {
+                        Ok(conn) => conn,
+                        Err(_) => break,
+                    };
+                    tokio::spawn(async move {
+                        let (mut rd, mut wr) = socket.split();
+                        let _ = tokio::io::copy(&mut rd, &mut wr).await;
+                    });
+                }
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn test_wss_forward_tunnel_with_custom_ca_and_sni() {
+    let cancel_token = CancellationToken::new();
+    let pki = generate_test_pki();
+
+    let echo_port = get_available_port();
+    let backend_server_port = get_available_port();
+    let tls_ingress_port = get_available_port();
+    let client_listen_port = get_available_port();
+
+    let echo_addr: SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
+    let backend_addr: SocketAddr = format!("127.0.0.1:{}", backend_server_port).parse().unwrap();
+    let tls_addr: SocketAddr = format!("127.0.0.1:{}", tls_ingress_port).parse().unwrap();
+    let auth_token = "secure_wss_test_token";
+
+    // 1. Echo server
+    let echo_handle = spawn_echo_server(echo_addr, cancel_token.clone());
+
+    // 2. Micro-tunnel ServerRunner (backend plain listener)
+    let mut registry = TransportRegistry::new();
+    registry.register(WsTransportDriver);
+    let registry = Arc::new(registry);
+    let session_mgr = Arc::new(SessionManager::new());
+
+    let server_config = ServerConfig {
+        listen: format!("127.0.0.1:{}", backend_server_port),
+        token: auth_token.to_string(),
+        default_target: None,
+    };
+    let server_runner = ServerRunner::new(
+        server_config,
+        Arc::clone(&registry),
+        Arc::clone(&session_mgr),
+    );
+    let s_cancel = cancel_token.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = server_runner.run(s_cancel).await;
+    });
+
+    // 3. TLS Terminator (Caddy simulator) terminating TLS with server.crt and forwarding to backend
+    let tls_handle = spawn_tls_terminator(
+        tls_addr,
+        backend_addr,
+        pki.server_rustls_config.clone(),
+        cancel_token.clone(),
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // 4. Client forward tunnel connecting via wss:// with custom CA and SNI override
+    let tunnel_config = TunnelConfig {
+        tag: "test-wss-ca-sni".to_string(),
+        mode: TunnelMode::Forward,
+        listen: format!("127.0.0.1:{}", client_listen_port),
+        target: format!("127.0.0.1:{}", echo_port),
+        token: auth_token.to_string(),
+        pool_size: None,
+        failover: None,
+        endpoint: EndpointConfig::Detailed {
+            url: format!("wss://127.0.0.1:{}/tunnel", tls_ingress_port),
+            dns: None,
+            dialer: None,
+            tls: Some(TlsConfig {
+                enabled: true,
+                server_name: Some("tunnel.secure.io".to_string()),
+                insecure: false, // Strict CA validation!
+                ca_certificate: Some(pki.ca_cert_path.clone()),
+                client_certificate: None,
+                client_key: None,
+                alpn: None,
+                min_version: None,
+                max_version: None,
+            }),
+        },
+    };
+
+    let app_config = AppConfig::default();
+    let endpoint_ctx = EndpointContext::build(&tunnel_config.endpoint, &app_config).unwrap();
+    let client_cancel = cancel_token.clone();
+    let client_registry = Arc::clone(&registry);
+    let client_handle = tokio::spawn(async move {
+        let _ = run_forward_tunnel(
+            tunnel_config,
+            endpoint_ctx,
+            client_registry,
+            client_cancel,
+        ).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 5. Connect to client listen port and verify bidirectional echo
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", client_listen_port))
+        .await
+        .expect("Failed to connect client listen port");
+
+    let payload = b"Hello encrypted WSS tunnel with strict CA and SNI validation!";
+    stream.write_all(payload).await.unwrap();
+
+    let mut buf = vec![0u8; payload.len()];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, payload, "Echo mismatch over TLS 1.3 WSS");
+
+    // Cleanup
+    cancel_token.cancel();
+    let _ = tokio::join!(echo_handle, server_handle, tls_handle, client_handle);
+}
+
+#[tokio::test]
+async fn test_wss_forward_tunnel_insecure_mode() {
+    let cancel_token = CancellationToken::new();
+    let pki = generate_test_pki();
+
+    let echo_port = get_available_port();
+    let backend_server_port = get_available_port();
+    let tls_ingress_port = get_available_port();
+    let client_listen_port = get_available_port();
+
+    let echo_addr: SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
+    let backend_addr: SocketAddr = format!("127.0.0.1:{}", backend_server_port).parse().unwrap();
+    let tls_addr: SocketAddr = format!("127.0.0.1:{}", tls_ingress_port).parse().unwrap();
+    let auth_token = "insecure_wss_test_token";
+
+    let echo_handle = spawn_echo_server(echo_addr, cancel_token.clone());
+
+    let mut registry = TransportRegistry::new();
+    registry.register(WsTransportDriver);
+    let registry = Arc::new(registry);
+    let session_mgr = Arc::new(SessionManager::new());
+
+    let server_config = ServerConfig {
+        listen: format!("127.0.0.1:{}", backend_server_port),
+        token: auth_token.to_string(),
+        default_target: None,
+    };
+    let server_runner = ServerRunner::new(
+        server_config,
+        Arc::clone(&registry),
+        Arc::clone(&session_mgr),
+    );
+    let s_cancel = cancel_token.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = server_runner.run(s_cancel).await;
+    });
+
+    let tls_handle = spawn_tls_terminator(
+        tls_addr,
+        backend_addr,
+        pki.server_rustls_config.clone(),
+        cancel_token.clone(),
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Client connects with insecure: true (without CA cert)
+    let tunnel_config = TunnelConfig {
+        tag: "test-wss-insecure".to_string(),
+        mode: TunnelMode::Forward,
+        listen: format!("127.0.0.1:{}", client_listen_port),
+        target: format!("127.0.0.1:{}", echo_port),
+        token: auth_token.to_string(),
+        pool_size: None,
+        failover: None,
+        endpoint: EndpointConfig::Detailed {
+            url: format!("wss://127.0.0.1:{}/tunnel", tls_ingress_port),
+            dns: None,
+            dialer: None,
+            tls: Some(TlsConfig {
+                enabled: true,
+                server_name: Some("untrusted.host".to_string()),
+                insecure: true, // Should skip all cert validation!
+                ca_certificate: None,
+                client_certificate: None,
+                client_key: None,
+                alpn: None,
+                min_version: None,
+                max_version: None,
+            }),
+        },
+    };
+
+    let app_config = AppConfig::default();
+    let endpoint_ctx = EndpointContext::build(&tunnel_config.endpoint, &app_config).unwrap();
+    let client_cancel = cancel_token.clone();
+    let client_registry = Arc::clone(&registry);
+    let client_handle = tokio::spawn(async move {
+        let _ = run_forward_tunnel(
+            tunnel_config,
+            endpoint_ctx,
+            client_registry,
+            client_cancel,
+        ).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", client_listen_port))
+        .await
+        .expect("Failed to connect client listen port");
+
+    let payload = b"Testing insecure mode TLS bypass!";
+    stream.write_all(payload).await.unwrap();
+
+    let mut buf = vec![0u8; payload.len()];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, payload);
+
+    cancel_token.cancel();
+    let _ = tokio::join!(echo_handle, server_handle, tls_handle, client_handle);
+}
+
+#[tokio::test]
+async fn test_wss_mtls_mutual_authentication() {
+    let cancel_token = CancellationToken::new();
+    let pki = generate_test_pki();
+
+    let echo_port = get_available_port();
+    let backend_server_port = get_available_port();
+    let tls_ingress_port = get_available_port();
+    let client_listen_port = get_available_port();
+
+    let echo_addr: SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
+    let backend_addr: SocketAddr = format!("127.0.0.1:{}", backend_server_port).parse().unwrap();
+    let tls_addr: SocketAddr = format!("127.0.0.1:{}", tls_ingress_port).parse().unwrap();
+    let auth_token = "mtls_wss_test_token";
+
+    let echo_handle = spawn_echo_server(echo_addr, cancel_token.clone());
+
+    let mut registry = TransportRegistry::new();
+    registry.register(WsTransportDriver);
+    let registry = Arc::new(registry);
+    let session_mgr = Arc::new(SessionManager::new());
+
+    let server_config = ServerConfig {
+        listen: format!("127.0.0.1:{}", backend_server_port),
+        token: auth_token.to_string(),
+        default_target: None,
+    };
+    let server_runner = ServerRunner::new(
+        server_config,
+        Arc::clone(&registry),
+        Arc::clone(&session_mgr),
+    );
+    let s_cancel = cancel_token.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = server_runner.run(s_cancel).await;
+    });
+
+    // Server requires mTLS with Root CA validation
+    let tls_handle = spawn_tls_terminator(
+        tls_addr,
+        backend_addr,
+        pki.mtls_server_rustls_config.clone(),
+        cancel_token.clone(),
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Client configures client_certificate and client_key
+    let tunnel_config = TunnelConfig {
+        tag: "test-wss-mtls".to_string(),
+        mode: TunnelMode::Forward,
+        listen: format!("127.0.0.1:{}", client_listen_port),
+        target: format!("127.0.0.1:{}", echo_port),
+        token: auth_token.to_string(),
+        pool_size: None,
+        failover: None,
+        endpoint: EndpointConfig::Detailed {
+            url: format!("wss://127.0.0.1:{}/tunnel", tls_ingress_port),
+            dns: None,
+            dialer: None,
+            tls: Some(TlsConfig {
+                enabled: true,
+                server_name: Some("localhost".to_string()),
+                insecure: false,
+                ca_certificate: Some(pki.ca_cert_path.clone()),
+                client_certificate: Some(pki.client_cert_path.clone()),
+                client_key: Some(pki.client_key_path.clone()),
+                alpn: None,
+                min_version: None,
+                max_version: None,
+            }),
+        },
+    };
+
+    let app_config = AppConfig::default();
+    let endpoint_ctx = EndpointContext::build(&tunnel_config.endpoint, &app_config).unwrap();
+    let client_cancel = cancel_token.clone();
+    let client_registry = Arc::clone(&registry);
+    let client_handle = tokio::spawn(async move {
+        let _ = run_forward_tunnel(
+            tunnel_config,
+            endpoint_ctx,
+            client_registry,
+            client_cancel,
+        ).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", client_listen_port))
+        .await
+        .expect("Failed to connect client listen port");
+
+    let payload = b"mTLS bidirectional authentication succeeded!";
+    stream.write_all(payload).await.unwrap();
+
+    let mut buf = vec![0u8; payload.len()];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, payload);
+
+    cancel_token.cancel();
+    let _ = tokio::join!(echo_handle, server_handle, tls_handle, client_handle);
+}
+
+#[tokio::test]
+async fn test_wss_reverse_tunnel_e2e() {
+    let cancel_token = CancellationToken::new();
+    let pki = generate_test_pki();
+
+    let local_echo_port = get_available_port();
+    let backend_server_port = get_available_port();
+    let tls_ingress_port = get_available_port();
+    let reverse_listen_port = get_available_port();
+
+    let local_echo_addr: SocketAddr = format!("127.0.0.1:{}", local_echo_port).parse().unwrap();
+    let backend_addr: SocketAddr = format!("127.0.0.1:{}", backend_server_port).parse().unwrap();
+    let tls_addr: SocketAddr = format!("127.0.0.1:{}", tls_ingress_port).parse().unwrap();
+    let auth_token = "wss_reverse_secret_token";
+
+    // 1. Local Echo Server
+    let echo_handle = spawn_echo_server(local_echo_addr, cancel_token.clone());
+
+    // 2. Micro-tunnel ServerRunner
+    let mut registry = TransportRegistry::new();
+    registry.register(WsTransportDriver);
+    let registry = Arc::new(registry);
+    let session_mgr = Arc::new(SessionManager::new());
+
+    let server_config = ServerConfig {
+        listen: format!("127.0.0.1:{}", backend_server_port),
+        token: auth_token.to_string(),
+        default_target: None,
+    };
+    let server_runner = ServerRunner::new(
+        server_config,
+        Arc::clone(&registry),
+        Arc::clone(&session_mgr),
+    );
+    let s_cancel = cancel_token.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = server_runner.run(s_cancel).await;
+    });
+
+    // 3. TLS Terminator
+    let tls_handle = spawn_tls_terminator(
+        tls_addr,
+        backend_addr,
+        pki.server_rustls_config.clone(),
+        cancel_token.clone(),
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // 4. Reverse tunnel client over WSS with CA cert
+    let tunnel_config = TunnelConfig {
+        tag: "test-wss-reverse".to_string(),
+        mode: TunnelMode::Reverse,
+        listen: format!("127.0.0.1:{}", reverse_listen_port),
+        target: format!("127.0.0.1:{}", local_echo_port),
+        token: auth_token.to_string(),
+        pool_size: None,
+        failover: None,
+        endpoint: EndpointConfig::Detailed {
+            url: format!("wss://127.0.0.1:{}/tunnel", tls_ingress_port),
+            dns: None,
+            dialer: None,
+            tls: Some(TlsConfig {
+                enabled: true,
+                server_name: Some("localhost".to_string()),
+                insecure: false,
+                ca_certificate: Some(pki.ca_cert_path.clone()),
+                client_certificate: None,
+                client_key: None,
+                alpn: None,
+                min_version: None,
+                max_version: None,
+            }),
+        },
+    };
+
+    let app_config = AppConfig::default();
+    let endpoint_ctx = EndpointContext::build(&tunnel_config.endpoint, &app_config).unwrap();
+    let client_cancel = cancel_token.clone();
+    let client_registry = Arc::clone(&registry);
+    let client_handle = tokio::spawn(async move {
+        let _ = run_reverse_tunnel(
+            tunnel_config,
+            endpoint_ctx,
+            client_registry,
+            client_cancel,
+        ).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 5. External visitor connects to reverse_listen_port on server
+    let mut visitor = TcpStream::connect(format!("127.0.0.1:{}", reverse_listen_port))
+        .await
+        .expect("Failed to connect reverse listener port on server");
+
+    let payload = b"Reverse tunnel over encrypted TLS 1.3 WebSocket!";
+    visitor.write_all(payload).await.unwrap();
+
+    let mut buf = vec![0u8; payload.len()];
+    visitor.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, payload, "Echo mismatch on reverse WSS tunnel");
+
+    cancel_token.cancel();
+    let _ = tokio::join!(echo_handle, server_handle, tls_handle, client_handle);
+}
