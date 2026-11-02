@@ -592,11 +592,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ddc03d96684f9226b8a787cdb71488417b53ab5ea8fdb1dac946cb9431cc8bff"
 dependencies = [
  "bytes",
+ "futures-channel",
  "http",
  "http-body",
  "hyper",
  "pin-project-lite",
  "tokio",
+ "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -859,6 +862,9 @@ dependencies = [
  "h3",
  "h3-quinn",
  "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "parking_lot",
  "quinn",
  "rustls",
@@ -1628,6 +1634,12 @@ dependencies = [
  "pin-project-lite",
  "tokio",
 ]
+
+[[package]]
+name = "tower-service"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "tracing"
