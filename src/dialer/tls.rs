@@ -65,8 +65,8 @@ impl ServerCertVerifier for NoVerifyVerifier {
 pub struct TlsConfigBuilder;
 
 impl TlsConfigBuilder {
-    /// Builds a `tokio_rustls::TlsConnector` from the given configuration.
-    pub fn build_connector(config: &TlsConfig) -> Result<TlsConnector, TunnelError> {
+    /// Builds a `rustls::ClientConfig` from the given configuration.
+    pub fn build_client_config(config: &TlsConfig) -> Result<ClientConfig, TunnelError> {
         let mut root_store = RootCertStore {
             roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
         };
@@ -125,6 +125,12 @@ impl TlsConfigBuilder {
             client_config.alpn_protocols = alpn_list.iter().map(|s| s.as_bytes().to_vec()).collect();
         }
 
+        Ok(client_config)
+    }
+
+    /// Builds a `tokio_rustls::TlsConnector` from the given configuration.
+    pub fn build_connector(config: &TlsConfig) -> Result<TlsConnector, TunnelError> {
+        let client_config = Self::build_client_config(config)?;
         Ok(TlsConnector::from(Arc::new(client_config)))
     }
 }

@@ -7,6 +7,8 @@ use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, TunnelStream};
 use crate::dialer::endpoint::EndpointContext;
 
+use serde::{Deserialize, Serialize};
+
 pub mod h3;
 pub mod registry;
 pub mod uds;
@@ -15,7 +17,7 @@ pub mod ws;
 pub use registry::TransportRegistry;
 
 /// Target address abstraction for remote forwarding.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TargetAddr {
     Ip(SocketAddr),
     Domain(String, u16),
@@ -31,7 +33,7 @@ impl std::fmt::Display for TargetAddr {
 }
 
 /// Metadata extracted during inbound handshake.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamMetadata {
     pub mode: TunnelMode,
     pub session_id: Option<String>,

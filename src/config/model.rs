@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 use std::time::Duration;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Top-level application configuration structure.
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -155,7 +155,7 @@ pub struct TlsConfig {
 }
 
 /// Operational mode of the tunnel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TunnelMode {
     Forward,

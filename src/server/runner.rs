@@ -49,6 +49,10 @@ impl ServerRunner {
         // Determine scheme (e.g. "uds" or default "ws")
         let scheme = if self.config.listen.starts_with('/') || self.config.listen.starts_with("uds://") {
             "uds"
+        } else if self.config.listen.starts_with("h3://") || self.config.listen.starts_with("https://") {
+            "h3"
+        } else if self.config.listen.starts_with("quic://") {
+            "quic"
         } else {
             "ws"
         };
