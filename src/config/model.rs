@@ -15,8 +15,18 @@ pub struct AppConfig {
     pub dialer: Option<DialerConfig>,
     pub tls: Option<TlsConfig>,
 
+    pub server: Option<ServerConfig>,
+
     #[serde(default)]
     pub tunnels: Vec<TunnelConfig>,
+}
+
+/// Server configuration for running as an ingress listener on VPS or cloud host.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ServerConfig {
+    pub listen: String,
+    pub token: String,
+    pub default_target: Option<String>,
 }
 
 /// Logging configuration options.

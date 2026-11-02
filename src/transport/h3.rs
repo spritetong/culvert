@@ -10,14 +10,15 @@ use crate::transport::{StreamMetadata, TargetAddr, TransportConnector, Transport
 pub struct H3TransportDriver;
 
 impl TransportDriver for H3TransportDriver {
-    fn scheme(&self) -> &'static str {
-        "h3"
+    fn schemes(&self) -> &[&'static str] {
+        &["h3", "https"]
     }
 
     fn build_connector(
         &self,
         endpoint: &EndpointContext,
         auth_token: &str,
+        _mode: crate::config::model::TunnelMode,
     ) -> Result<Box<dyn TransportConnector>, TunnelError> {
         Ok(Box::new(H3Connector {
             endpoint: endpoint.clone(),

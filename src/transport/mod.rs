@@ -61,14 +61,15 @@ pub trait TransportListener: Send + Sync {
 
 /// Plugin driver interface for transport factory registration.
 pub trait TransportDriver: Send + Sync + 'static {
-    /// Returns the URI scheme identifier handled by this driver (e.g. "wss", "h3", "p2p").
-    fn scheme(&self) -> &'static str;
+    /// Returns the URI scheme identifiers handled by this driver (e.g. ["ws", "wss"]).
+    fn schemes(&self) -> &[&'static str];
 
     /// Builds a connector bound to the given endpoint context.
     fn build_connector(
         &self,
         endpoint: &EndpointContext,
         auth_token: &str,
+        mode: TunnelMode,
     ) -> Result<Box<dyn TransportConnector>, TunnelError>;
 
     /// Builds a listener bound to the given listening address.

@@ -25,7 +25,10 @@ impl TransportRegistry {
     /// Registers a new transport driver into the registry.
     pub fn register(&mut self, driver: impl TransportDriver) {
         let drivers = Arc::make_mut(&mut self.drivers);
-        drivers.insert(driver.scheme(), Arc::new(driver));
+        let driver_arc: Arc<dyn TransportDriver> = Arc::new(driver);
+        for &scheme in driver_arc.schemes() {
+            drivers.insert(scheme, Arc::clone(&driver_arc));
+        }
     }
 
     /// Looks up a driver by scheme name.
@@ -38,13 +41,14 @@ impl TransportRegistry {
         &self,
         endpoint: &EndpointContext,
         auth_token: &str,
+        mode: crate::config::model::TunnelMode,
     ) -> Result<Box<dyn TransportConnector>, TunnelError> {
         let scheme = endpoint.endpoint.scheme.as_str();
         let driver = self
             .get_driver(scheme)
             .ok_or_else(|| TunnelError::UnsupportedScheme(scheme.to_string()))?;
 
-        driver.build_connector(endpoint, auth_token)
+        driver.build_connector(endpoint, auth_token, mode)
     }
 
     /// Creates a dynamic `TransportListener` for the specified scheme.

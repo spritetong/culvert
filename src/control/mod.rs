@@ -3,4 +3,4 @@
 
 pub mod stream;
 
-pub use stream::{ControlMessage, ControlStream};
+pub use stream::{ControlMessage, ControlStream, FramedControlStream};

@@ -9,6 +9,8 @@ use crate::common::task::TaskTracker;
 use crate::config::model::{AppConfig, TunnelConfig, TunnelMode};
 use crate::core::error::TunnelError;
 use crate::dialer::endpoint::EndpointContext;
+use crate::server::ServerRunner;
+use crate::session::SessionManager;
 use crate::transport::h3::H3TransportDriver;
 use crate::transport::uds::UdsTransportDriver;
 use crate::transport::ws::WsTransportDriver;
@@ -20,6 +22,7 @@ pub struct TunnelSupervisor {
     config: AppConfig,
     cancel_token: CancellationToken,
     transport_registry: Arc<TransportRegistry>,
+    session_manager: Arc<SessionManager>,
 }
 
 impl TunnelSupervisor {
@@ -34,6 +37,7 @@ impl TunnelSupervisor {
             config,
             cancel_token,
             transport_registry: Arc::new(registry),
+            session_manager: Arc::new(SessionManager::new()),
         }
     }
 
@@ -41,6 +45,19 @@ impl TunnelSupervisor {
     pub async fn run(&self) -> Result<(), TunnelError> {
         let mut tracker: TaskTracker<Result<(), TunnelError>> = TaskTracker::new(self.cancel_token.clone());
 
+        // Spawn server runner if ingress server is configured
+        if let Some(ref server_cfg) = self.config.server {
+            let server_runner = ServerRunner::new(
+                server_cfg.clone(),
+                Arc::clone(&self.transport_registry),
+                Arc::clone(&self.session_manager),
+            );
+            tracker.spawn_with_cancel(move |token| async move {
+                server_runner.run(token).await
+            });
+        }
+
+        // Spawn client tunnel workers
         for tunnel_cfg in &self.config.tunnels {
             let cfg = tunnel_cfg.clone();
             let registry = Arc::clone(&self.transport_registry);

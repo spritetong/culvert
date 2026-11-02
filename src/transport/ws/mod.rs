@@ -20,19 +20,20 @@ use crate::transport::{TransportConnector, TransportDriver, TransportListener};
 pub struct WsTransportDriver;
 
 impl TransportDriver for WsTransportDriver {
-    fn scheme(&self) -> &'static str {
-        "wss"
+    fn schemes(&self) -> &[&'static str] {
+        &["ws", "wss"]
     }
 
     fn build_connector(
         &self,
         endpoint: &EndpointContext,
         auth_token: &str,
+        mode: TunnelMode,
     ) -> Result<Box<dyn TransportConnector>, TunnelError> {
         Ok(Box::new(WsConnector::new(
             endpoint.clone(),
             auth_token,
-            TunnelMode::Forward,
+            mode,
         )))
     }
 

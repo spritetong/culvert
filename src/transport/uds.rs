@@ -10,14 +10,15 @@ use crate::transport::{StreamMetadata, TargetAddr, TransportConnector, Transport
 pub struct UdsTransportDriver;
 
 impl TransportDriver for UdsTransportDriver {
-    fn scheme(&self) -> &'static str {
-        "uds"
+    fn schemes(&self) -> &[&'static str] {
+        &["uds", "unix"]
     }
 
     fn build_connector(
         &self,
         endpoint: &EndpointContext,
         auth_token: &str,
+        _mode: crate::config::model::TunnelMode,
     ) -> Result<Box<dyn TransportConnector>, TunnelError> {
         Ok(Box::new(UdsConnector {
             endpoint: endpoint.clone(),

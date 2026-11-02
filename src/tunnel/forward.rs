@@ -6,6 +6,7 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
+use crate::common::task::TaskTracker;
 use crate::config::model::TunnelConfig;
 use crate::core::error::TunnelError;
 use crate::core::relay::RelayEngine;
@@ -27,6 +28,7 @@ pub async fn run_forward_tunnel(
     );
 
     let listener = TcpListener::bind(&config.listen).await?;
+    let mut conn_tracker = TaskTracker::<()>::new(cancel_token.clone());
 
     // Parse target address
     let target = if let Ok(sa) = config.target.parse() {
@@ -52,22 +54,26 @@ pub async fn run_forward_tunnel(
                 match accept_res {
                     Ok((inbound_stream, peer_addr)) => {
                         info!(tag = %config.tag, peer = %peer_addr, "Inbound connection accepted");
-                        let connector = transport_registry.create_connector(&endpoint_ctx, &config.token)?;
+                        let connector = match transport_registry.create_connector(&endpoint_ctx, &config.token, config.mode) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                error!(tag = %config.tag, "Failed to create connector: {:?}", e);
+                                continue;
+                            }
+                        };
                         let target = target.clone();
-                        let child_token = cancel_token.child_token();
 
-                        tokio::spawn(async move {
-                            tokio::select! {
-                                _ = child_token.cancelled() => {}
-                                stream_res = connector.connect(&target, None) => {
-                                    match stream_res {
-                                        Ok(remote_stream) => {
-                                            let _ = RelayEngine::relay(Box::new(inbound_stream), remote_stream).await;
-                                        }
-                                        Err(e) => {
-                                            error!("Failed to open remote tunnel stream: {:?}", e);
-                                        }
-                                    }
+                        conn_tracker.spawn_with_cancel(move |token| async move {
+                            match connector.connect(&target, None).await {
+                                Ok(remote_stream) => {
+                                    let _ = RelayEngine::relay_with_cancel(
+                                        Box::new(inbound_stream),
+                                        remote_stream,
+                                        token,
+                                    ).await;
+                                }
+                                Err(e) => {
+                                    error!("Failed to open remote tunnel stream: {:?}", e);
                                 }
                             }
                         });
@@ -80,5 +86,6 @@ pub async fn run_forward_tunnel(
         }
     }
 
+    conn_tracker.shutdown_and_wait().await;
     Ok(())
 }
