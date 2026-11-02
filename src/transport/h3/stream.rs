@@ -235,8 +235,13 @@ impl AsyncWrite for H3TunnelStream {
 
 /// Trait unifying `h3::client::RequestStream` and `h3::server::RequestStream`.
 pub trait H3BidirectionalStream {
-    fn send_chunk(&mut self, chunk: Bytes) -> impl std::future::Future<Output = Result<(), io::Error>> + Send;
-    fn recv_chunk(&mut self) -> impl std::future::Future<Output = Result<Option<Bytes>, io::Error>> + Send;
+    fn send_chunk(
+        &mut self,
+        chunk: Bytes,
+    ) -> impl std::future::Future<Output = Result<(), io::Error>> + Send;
+    fn recv_chunk(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Option<Bytes>, io::Error>> + Send;
     fn finish_stream(&mut self) -> impl std::future::Future<Output = Result<(), io::Error>> + Send;
 }
 

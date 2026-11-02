@@ -1,10 +1,10 @@
 //! Protocol-aware connection pool supporting 0-RTT acquisition and session draining.
 //! All comments and docstrings must be in English.
 
+use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
-use parking_lot::Mutex;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 

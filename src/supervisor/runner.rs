@@ -11,10 +11,10 @@ use crate::core::error::TunnelError;
 use crate::dialer::endpoint::EndpointContext;
 use crate::server::ServerRunner;
 use crate::session::SessionManager;
+use crate::transport::TransportRegistry;
 use crate::transport::h3::H3TransportDriver;
 use crate::transport::uds::UdsTransportDriver;
 use crate::transport::ws::WsTransportDriver;
-use crate::transport::TransportRegistry;
 use crate::tunnel::{run_forward_tunnel, run_reverse_tunnel};
 
 /// Multi-tunnel supervisor that concurrently runs multiple tunnels and ensures orderly shutdown.
@@ -43,7 +43,8 @@ impl TunnelSupervisor {
 
     /// Spawns and manages all configured tunnels until cancelled or interrupted.
     pub async fn run(&self) -> Result<(), TunnelError> {
-        let mut tracker: TaskTracker<Result<(), TunnelError>> = TaskTracker::new(self.cancel_token.clone());
+        let mut tracker: TaskTracker<Result<(), TunnelError>> =
+            TaskTracker::new(self.cancel_token.clone());
 
         // Spawn server runner if ingress server is configured
         if let Some(ref server_cfg) = self.config.server {
@@ -52,9 +53,7 @@ impl TunnelSupervisor {
                 Arc::clone(&self.transport_registry),
                 Arc::clone(&self.session_manager),
             );
-            tracker.spawn_with_cancel(move |token| async move {
-                server_runner.run(token).await
-            });
+            tracker.spawn_with_cancel(move |token| async move { server_runner.run(token).await });
         }
 
         // Spawn client tunnel workers
@@ -68,7 +67,10 @@ impl TunnelSupervisor {
             });
         }
 
-        info!(count = tracker.len(), "All configured tunnels successfully spawned");
+        info!(
+            count = tracker.len(),
+            "All configured tunnels successfully spawned"
+        );
 
         // Wait for cancellation signal
         tokio::select! {

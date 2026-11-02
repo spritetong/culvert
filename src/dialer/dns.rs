@@ -1,10 +1,10 @@
 //! DNS resolution engine supporting IPv4/IPv6 strategy selection and caching.
 //! All comments and docstrings must be in English.
 
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::Instant;
-use parking_lot::RwLock;
 
 use crate::config::model::{DnsConfig, DnsStrategy};
 use crate::constants::{DEFAULT_DNS_CACHE_CAPACITY, DEFAULT_DNS_CACHE_TTL};
@@ -39,7 +39,10 @@ impl CachedDnsResolver {
     }
 
     /// Sorts and filters the given IP addresses according to the specified strategy.
-    pub fn apply_strategy(ips: Vec<IpAddr>, strategy: DnsStrategy) -> Result<Vec<IpAddr>, TunnelError> {
+    pub fn apply_strategy(
+        ips: Vec<IpAddr>,
+        strategy: DnsStrategy,
+    ) -> Result<Vec<IpAddr>, TunnelError> {
         let (mut v4s, mut v6s): (Vec<IpAddr>, Vec<IpAddr>) =
             ips.into_iter().partition(|ip| ip.is_ipv4());
 
@@ -103,7 +106,10 @@ impl DnsResolver for CachedDnsResolver {
 
                     Ok(filtered)
                 }
-                Err(e) => Err(TunnelError::DnsResolutionFailed(host.to_string(), e.to_string())),
+                Err(e) => Err(TunnelError::DnsResolutionFailed(
+                    host.to_string(),
+                    e.to_string(),
+                )),
             }
         })
     }

@@ -33,10 +33,7 @@ pub struct FailoverTunnelStream {
 
 impl FailoverTunnelStream {
     /// Creates a new failover stream with primary and optional standby channels.
-    pub fn new(
-        primary: Box<dyn TunnelStream>,
-        standby: Option<Box<dyn TunnelStream>>,
-    ) -> Self {
+    pub fn new(primary: Box<dyn TunnelStream>, standby: Option<Box<dyn TunnelStream>>) -> Self {
         Self {
             primary,
             standby,

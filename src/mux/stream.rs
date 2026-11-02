@@ -3,15 +3,15 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use bytes::{Buf, Bytes};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 
-use crate::mux::frame::{MuxFrame, MAX_FRAME_PAYLOAD_SIZE};
+use crate::mux::frame::{MAX_FRAME_PAYLOAD_SIZE, MuxFrame};
 
 /// A logical bi-directional multiplexed sub-stream.
 pub struct MuxStream {
@@ -108,7 +108,10 @@ impl AsyncWrite for MuxStream {
 
         let chunk_size = std::cmp::min(buf.len(), MAX_FRAME_PAYLOAD_SIZE);
         let payload = Bytes::copy_from_slice(&buf[..chunk_size]);
-        match self.tx_frames.try_send(MuxFrame::data(self.stream_id, payload)) {
+        match self
+            .tx_frames
+            .try_send(MuxFrame::data(self.stream_id, payload))
+        {
             Ok(()) => Poll::Ready(Ok(chunk_size)),
             Err(mpsc::error::TrySendError::Full(_)) => {
                 cx.waker().wake_by_ref();

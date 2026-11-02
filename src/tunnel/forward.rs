@@ -38,7 +38,10 @@ pub async fn run_forward_tunnel(
     } else {
         let parts: Vec<&str> = config.target.rsplitn(2, ':').collect();
         if parts.len() != 2 {
-            return Err(TunnelError::Config(format!("Invalid target: {}", config.target)));
+            return Err(TunnelError::Config(format!(
+                "Invalid target: {}",
+                config.target
+            )));
         }
         let port: u16 = parts[0]
             .parse()

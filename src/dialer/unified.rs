@@ -16,7 +16,11 @@ use crate::dialer::dns::DnsResolver;
 /// Interface for establishing outbound raw TCP connections.
 pub trait Dialer: Send + Sync {
     /// Connects to the target host and port using the configured DNS and socket parameters.
-    fn dial<'a>(&'a self, host: &'a str, port: u16) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>>;
+    fn dial<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>>;
 }
 
 /// Default dialer implementation.
@@ -36,10 +40,17 @@ impl DefaultDialer {
 }
 
 impl Dialer for DefaultDialer {
-    fn dial<'a>(&'a self, host: &'a str, port: u16) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+    fn dial<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
         Box::pin(async move {
             let ips = self.dns_resolver.resolve(host).await?;
-            let connect_timeout = self.config.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
+            let connect_timeout = self
+                .config
+                .connect_timeout
+                .unwrap_or(DEFAULT_CONNECT_TIMEOUT);
 
             let mut last_error = None;
             for ip in ips {
@@ -63,7 +74,10 @@ impl Dialer for DefaultDialer {
             }
 
             Err(last_error.unwrap_or_else(|| {
-                TunnelError::Internal(format!("Failed to connect to any resolved IP for {}:{}", host, port))
+                TunnelError::Internal(format!(
+                    "Failed to connect to any resolved IP for {}:{}",
+                    host, port
+                ))
             }))
         })
     }

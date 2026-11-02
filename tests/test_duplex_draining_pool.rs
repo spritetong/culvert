@@ -15,19 +15,25 @@ use micro_tunnel::config::model::{
 use micro_tunnel::dialer::endpoint::EndpointContext;
 use micro_tunnel::server::ServerRunner;
 use micro_tunnel::session::SessionManager;
-use micro_tunnel::transport::ws::WsTransportDriver;
 use micro_tunnel::transport::TransportRegistry;
+use micro_tunnel::transport::ws::WsTransportDriver;
 use micro_tunnel::tunnel::run_forward_tunnel;
 
 fn get_available_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral port");
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral port");
     listener.local_addr().unwrap().port()
 }
 
 /// Spawns a full-duplex echo server that echoes all received data back.
-fn spawn_echo_server(addr: SocketAddr, cancel_token: CancellationToken) -> tokio::task::JoinHandle<()> {
+fn spawn_echo_server(
+    addr: SocketAddr,
+    cancel_token: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let listener = TcpListener::bind(addr).await.expect("Failed to bind echo server");
+        let listener = TcpListener::bind(addr)
+            .await
+            .expect("Failed to bind echo server");
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => break,
@@ -98,12 +104,8 @@ async fn test_high_volume_duplex_stream_integrity() {
     let client_cancel = cancel_token.clone();
     let client_registry = Arc::clone(&registry);
     let client_handle = tokio::spawn(async move {
-        let _ = run_forward_tunnel(
-            tunnel_config,
-            endpoint_ctx,
-            client_registry,
-            client_cancel,
-        ).await;
+        let _ =
+            run_forward_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
     });
 
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -138,7 +140,11 @@ async fn test_high_volume_duplex_stream_integrity() {
     let recv_data = recv_data.unwrap();
 
     assert_eq!(recv_data.len(), DATA_SIZE);
-    assert_eq!(&recv_data[..], &send_data[..], "High-volume duplex data mismatch!");
+    assert_eq!(
+        &recv_data[..],
+        &send_data[..],
+        "High-volume duplex data mismatch!"
+    );
 
     cancel_token.cancel();
     let _ = tokio::join!(echo_handle, server_handle, client_handle);
@@ -152,7 +158,9 @@ async fn test_stream_half_close_and_draining() {
     let server_ws_port = get_available_port();
     let client_listen_port = get_available_port();
 
-    let backend_addr: SocketAddr = format!("127.0.0.1:{}", backend_service_port).parse().unwrap();
+    let backend_addr: SocketAddr = format!("127.0.0.1:{}", backend_service_port)
+        .parse()
+        .unwrap();
     let server_ws_listen = format!("127.0.0.1:{}", server_ws_port);
     let client_listen = format!("127.0.0.1:{}", client_listen_port);
     let auth_token = "draining_test_token";
@@ -214,12 +222,8 @@ async fn test_stream_half_close_and_draining() {
     let client_cancel = cancel_token.clone();
     let client_registry = Arc::clone(&registry);
     let client_handle = tokio::spawn(async move {
-        let _ = run_forward_tunnel(
-            tunnel_config,
-            endpoint_ctx,
-            client_registry,
-            client_cancel,
-        ).await;
+        let _ =
+            run_forward_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
     });
 
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -297,12 +301,8 @@ async fn test_pool_prewarm_and_reuse() {
     let client_cancel = cancel_token.clone();
     let client_registry = Arc::clone(&registry);
     let client_handle = tokio::spawn(async move {
-        let _ = run_forward_tunnel(
-            tunnel_config,
-            endpoint_ctx,
-            client_registry,
-            client_cancel,
-        ).await;
+        let _ =
+            run_forward_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
     });
 
     // Give pool time to pre-warm the 4 idle connections

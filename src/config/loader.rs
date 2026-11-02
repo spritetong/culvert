@@ -1,10 +1,10 @@
 //! Configuration loader for parsing and validating YAML config files.
 //! All comments and docstrings must be in English.
 
-use std::fs;
-use std::path::Path;
 use crate::config::model::AppConfig;
 use crate::core::error::TunnelError;
+use std::fs;
+use std::path::Path;
 
 /// Configuration loader utility.
 pub struct ConfigLoader;
@@ -54,6 +54,9 @@ tunnels:
         assert_eq!(config.log.level, "debug");
         assert_eq!(config.tunnels.len(), 1);
         assert_eq!(config.tunnels[0].tag, "test-tunnel");
-        assert_eq!(config.tunnels[0].endpoint.url(), "wss://tunnel.example.com/ws");
+        assert_eq!(
+            config.tunnels[0].endpoint.url(),
+            "wss://tunnel.example.com/ws"
+        );
     }
 }

@@ -46,7 +46,9 @@ impl TransportDriver for H3TransportDriver {
         let key_der = cert_key.signing_key.serialize_der();
 
         let cert_chain = vec![rustls::pki_types::CertificateDer::from(cert_der)];
-        let private_key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(key_der));
+        let private_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
+        );
 
         let server_rustls = rustls::ServerConfig::builder()
             .with_no_client_auth()

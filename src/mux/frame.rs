@@ -140,7 +140,10 @@ impl Decoder for MuxCodec {
         let payload_len = u32::from_be_bytes([src[5], src[6], src[7], src[8]]) as usize;
 
         if payload_len > MAX_FRAME_PAYLOAD_SIZE {
-            return Err(MuxFrameError::PayloadTooLarge(payload_len, MAX_FRAME_PAYLOAD_SIZE));
+            return Err(MuxFrameError::PayloadTooLarge(
+                payload_len,
+                MAX_FRAME_PAYLOAD_SIZE,
+            ));
         }
 
         if src.len() < FRAME_HEADER_LEN + payload_len {
@@ -165,7 +168,10 @@ impl Encoder<MuxFrame> for MuxCodec {
     fn encode(&mut self, item: MuxFrame, dst: &mut BytesMut) -> Result<(), Self::Error> {
         let payload_len = item.payload.len();
         if payload_len > MAX_FRAME_PAYLOAD_SIZE {
-            return Err(MuxFrameError::PayloadTooLarge(payload_len, MAX_FRAME_PAYLOAD_SIZE));
+            return Err(MuxFrameError::PayloadTooLarge(
+                payload_len,
+                MAX_FRAME_PAYLOAD_SIZE,
+            ));
         }
 
         dst.reserve(FRAME_HEADER_LEN + payload_len);
@@ -206,7 +212,10 @@ mod tests {
         assert!(codec.decode(&mut partial).unwrap().is_none());
 
         partial.unsplit(buf);
-        let decoded = codec.decode(&mut partial).unwrap().expect("should complete");
+        let decoded = codec
+            .decode(&mut partial)
+            .unwrap()
+            .expect("should complete");
         assert_eq!(original, decoded);
     }
 }

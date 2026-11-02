@@ -26,7 +26,9 @@ impl Endpoint {
         let scheme = parsed.scheme().to_lowercase();
         let host = parsed
             .host_str()
-            .ok_or_else(|| TunnelError::Config(format!("Missing host in endpoint URL: {}", url_str)))?
+            .ok_or_else(|| {
+                TunnelError::Config(format!("Missing host in endpoint URL: {}", url_str))
+            })?
             .to_string();
 
         let port = parsed.port().unwrap_or_else(|| match scheme.as_str() {
@@ -74,7 +76,9 @@ impl EndpointContext {
         // Extract per-endpoint overrides if available
         let (endpoint_dns, endpoint_dialer, endpoint_tls) = match endpoint_cfg {
             EndpointConfig::Simple(_) => (None, None, None),
-            EndpointConfig::Detailed { dns, dialer, tls, .. } => (dns.as_ref(), dialer.as_ref(), tls.as_ref()),
+            EndpointConfig::Detailed {
+                dns, dialer, tls, ..
+            } => (dns.as_ref(), dialer.as_ref(), tls.as_ref()),
         };
 
         // Resolve effective DNS configuration
@@ -105,7 +109,12 @@ impl EndpointContext {
                 .or_else(|| global_app.dialer.as_ref().and_then(|d| d.tcp_nodelay)),
             bind_interface: endpoint_dialer
                 .and_then(|d| d.bind_interface.clone())
-                .or_else(|| global_app.dialer.as_ref().and_then(|d| d.bind_interface.clone())),
+                .or_else(|| {
+                    global_app
+                        .dialer
+                        .as_ref()
+                        .and_then(|d| d.bind_interface.clone())
+                }),
         };
 
         let dialer: Arc<dyn Dialer> = Arc::new(DefaultDialer::new(

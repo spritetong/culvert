@@ -1,9 +1,9 @@
 //! Declarative YAML configuration data models.
 //! All comments and docstrings must be in English.
 
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
-use serde::{Deserialize, Serialize};
 
 /// Top-level application configuration structure.
 #[derive(Debug, Clone, Deserialize, Default)]

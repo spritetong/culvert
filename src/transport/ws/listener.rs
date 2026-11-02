@@ -1,13 +1,13 @@
 //! WebSocket server listener implementing `TransportListener`.
 //! All comments and docstrings must be in English.
 
-use std::sync::Arc;
-use fastwebsockets::{upgrade::upgrade, Role};
+use fastwebsockets::{Role, upgrade::upgrade};
 use http_body_util::Empty;
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
@@ -67,7 +67,8 @@ impl WsListener {
 
                         async move {
                             // Validate custom handshake headers
-                            let headers = match WsHandshakeHeaders::from_http_headers(req.headers()) {
+                            let headers = match WsHandshakeHeaders::from_http_headers(req.headers())
+                            {
                                 Ok(h) => h,
                                 Err(_) => {
                                     let resp = Response::builder()
@@ -93,8 +94,14 @@ impl WsListener {
                                 Ok((response, fut)) => {
                                     tokio::spawn(async move {
                                         if let Ok(ws) = fut.await {
-                                            let stream = WsTunnelStream::new(ws.into_inner(), Role::Server);
-                                            let _ = tx.send(Ok((Box::new(stream) as Box<dyn TunnelStream>, metadata))).await;
+                                            let stream =
+                                                WsTunnelStream::new(ws.into_inner(), Role::Server);
+                                            let _ = tx
+                                                .send(Ok((
+                                                    Box::new(stream) as Box<dyn TunnelStream>,
+                                                    metadata,
+                                                )))
+                                                .await;
                                         }
                                     });
                                     Ok::<_, hyper::Error>(response)
@@ -136,7 +143,9 @@ impl TransportListener for WsListener {
                     .await
                     .ok_or_else(|| TunnelError::Internal("WsListener channel closed".to_string()))?
             } else {
-                Err(TunnelError::Internal("WsListener not initialized".to_string()))
+                Err(TunnelError::Internal(
+                    "WsListener not initialized".to_string(),
+                ))
             }
         })
     }

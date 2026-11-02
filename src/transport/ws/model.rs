@@ -173,7 +173,10 @@ mod tests {
             .with_session_id(Some("sess_abc".to_string()))
             .with_target(Some(&TargetAddr::Domain("127.0.0.1".to_string(), 22)));
 
-        let req = headers.apply_to_request_builder(Request::builder()).body(()).unwrap();
+        let req = headers
+            .apply_to_request_builder(Request::builder())
+            .body(())
+            .unwrap();
 
         let parsed = WsHandshakeHeaders::from_http_headers(req.headers()).unwrap();
         assert_eq!(parsed.auth_token, "secret_psk_123");

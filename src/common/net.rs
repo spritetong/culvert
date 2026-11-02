@@ -1,9 +1,9 @@
 //! Common networking utilities and socket tuning helpers.
 //! All comments and docstrings must be in English.
 
+use socket2::{SockRef, TcpKeepalive};
 use std::io;
 use std::time::Duration;
-use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
 
 /// Socket configuration helper.

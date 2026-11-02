@@ -49,9 +49,9 @@ impl TransportDriver for WsTransportDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use crate::config::model::{AppConfig, EndpointConfig};
     use crate::transport::TargetAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn test_ws_connector_listener_e2e() {

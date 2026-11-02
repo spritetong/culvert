@@ -1,11 +1,11 @@
 //! Transport layer traits and driver abstractions.
 //! All comments and docstrings must be in English.
 
-use std::net::SocketAddr;
 use crate::config::model::TunnelMode;
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, TunnelStream};
 use crate::dialer::endpoint::EndpointContext;
+use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 

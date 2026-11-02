@@ -1,13 +1,13 @@
 //! High-performance benchmarks for micro-tunnel components.
 //! All comments and docstrings must be in English.
 
+use bytes::{Bytes, BytesMut};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use fastwebsockets::Role;
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
-use bytes::{Bytes, BytesMut};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use fastwebsockets::Role;
-use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 use tokio::runtime::Runtime;
 use tokio_util::codec::{Decoder, Encoder};
 use tokio_util::sync::CancellationToken;

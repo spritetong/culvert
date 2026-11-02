@@ -1,8 +1,8 @@
 //! Entry point for the micro-tunnel daemon.
 //! All comments and docstrings must be in English.
 
-use std::path::PathBuf;
 use clap::Parser;
+use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;

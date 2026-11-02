@@ -1,9 +1,9 @@
 //! Unit tests for multiplexing framing, session driver, and stream isolation.
 //! All comments and docstrings must be in English.
 
-use std::time::Duration;
 use bytes::Bytes;
-use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 use tokio_util::sync::CancellationToken;
 
 use crate::mux::frame::MuxFrame;

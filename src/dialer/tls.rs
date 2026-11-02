@@ -1,12 +1,12 @@
 //! TLS connector builder based on Rustls.
 //! All comments and docstrings must be in English.
 
-use std::fs::File;
-use std::io::BufReader;
-use std::sync::Arc;
 use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use std::fs::File;
+use std::io::BufReader;
+use std::sync::Arc;
 use tokio_rustls::TlsConnector;
 
 use crate::config::model::TlsConfig;
@@ -73,8 +73,12 @@ impl TlsConfigBuilder {
 
         // Load custom CA certificate if configured
         if let Some(ref ca_path) = config.ca_certificate {
-            let file = File::open(ca_path)
-                .map_err(|e| TunnelError::Tls(format!("Failed to open CA certificate {:?}: {}", ca_path, e)))?;
+            let file = File::open(ca_path).map_err(|e| {
+                TunnelError::Tls(format!(
+                    "Failed to open CA certificate {:?}: {}",
+                    ca_path, e
+                ))
+            })?;
             let mut reader = BufReader::new(file);
             for cert in rustls_pemfile::certs(&mut reader) {
                 let cert = cert.map_err(|e| TunnelError::Tls(format!("Invalid CA cert: {}", e)))?;
@@ -102,9 +106,10 @@ impl TlsConfigBuilder {
                 TunnelError::Tls(format!("Failed to open client cert {:?}: {}", cert_path, e))
             })?;
             let mut cert_reader = BufReader::new(cert_file);
-            let client_certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| TunnelError::Tls(format!("Invalid client cert: {}", e)))?;
+            let client_certs: Vec<CertificateDer<'static>> =
+                rustls_pemfile::certs(&mut cert_reader)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| TunnelError::Tls(format!("Invalid client cert: {}", e)))?;
 
             let key_file = File::open(key_path).map_err(|e| {
                 TunnelError::Tls(format!("Failed to open client key {:?}: {}", key_path, e))
@@ -112,7 +117,9 @@ impl TlsConfigBuilder {
             let mut key_reader = BufReader::new(key_file);
             let key = rustls_pemfile::private_key(&mut key_reader)
                 .map_err(|e| TunnelError::Tls(format!("Failed to read client key: {}", e)))?
-                .ok_or_else(|| TunnelError::Tls("No private key found in client key file".to_string()))?;
+                .ok_or_else(|| {
+                    TunnelError::Tls("No private key found in client key file".to_string())
+                })?;
 
             builder
                 .with_client_auth_cert(client_certs, key)
@@ -122,7 +129,8 @@ impl TlsConfigBuilder {
         };
 
         if let Some(alpn_list) = &config.alpn {
-            client_config.alpn_protocols = alpn_list.iter().map(|s| s.as_bytes().to_vec()).collect();
+            client_config.alpn_protocols =
+                alpn_list.iter().map(|s| s.as_bytes().to_vec()).collect();
         }
 
         Ok(client_config)

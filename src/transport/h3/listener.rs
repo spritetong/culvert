@@ -36,24 +36,27 @@ impl H3Listener {
             listen_addr
         };
 
-        let addr: SocketAddr = clean_addr
-            .parse()
-            .map_err(|e| TunnelError::Config(format!("Invalid listen address '{}': {}", listen_addr, e)))?;
+        let addr: SocketAddr = clean_addr.parse().map_err(|e| {
+            TunnelError::Config(format!("Invalid listen address '{}': {}", listen_addr, e))
+        })?;
 
         let mut rustls_server = server_rustls_config;
         rustls_server.alpn_protocols = vec![b"h3".to_vec(), b"micro-tunnel-quic".to_vec()];
 
         let quic_server_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_server)
-            .map_err(|e| TunnelError::Tls(format!("Failed to build QUIC server crypto: {:?}", e)))?;
+            .map_err(|e| {
+            TunnelError::Tls(format!("Failed to build QUIC server crypto: {:?}", e))
+        })?;
 
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_crypto));
         let mut transport_config = quinn::TransportConfig::default();
-        transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
+        transport_config
+            .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
         transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
         server_config.transport_config(Arc::new(transport_config));
 
-        let quinn_endpoint = quinn::Endpoint::server(server_config, addr)
-            .map_err(|e| TunnelError::Io(e))?;
+        let quinn_endpoint =
+            quinn::Endpoint::server(server_config, addr).map_err(|e| TunnelError::Io(e))?;
 
         info!(addr = %addr, "Bound HTTP/3 & QUIC listener on UDP socket");
 

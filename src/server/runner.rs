@@ -1,9 +1,9 @@
 //! Ingress server daemon handling forward proxying and reverse tunnel pairing.
 //! All comments and docstrings must be in English.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use futures_util::{SinkExt, StreamExt};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -47,19 +47,24 @@ impl ServerRunner {
         info!(listen = %self.config.listen, "Starting micro-tunnel server ingress listener");
 
         // Determine scheme (e.g. "uds" or default "ws")
-        let scheme = if self.config.listen.starts_with('/') || self.config.listen.starts_with("uds://") {
-            "uds"
-        } else if self.config.listen.starts_with("h3://") || self.config.listen.starts_with("https://") {
-            "h3"
-        } else if self.config.listen.starts_with("quic://") {
-            "quic"
-        } else {
-            "ws"
-        };
+        let scheme =
+            if self.config.listen.starts_with('/') || self.config.listen.starts_with("uds://") {
+                "uds"
+            } else if self.config.listen.starts_with("h3://")
+                || self.config.listen.starts_with("https://")
+            {
+                "h3"
+            } else if self.config.listen.starts_with("quic://") {
+                "quic"
+            } else {
+                "ws"
+            };
 
-        let mut listener = self
-            .transport_registry
-            .create_listener(scheme, &self.config.listen, &self.config.token)?;
+        let mut listener = self.transport_registry.create_listener(
+            scheme,
+            &self.config.listen,
+            &self.config.token,
+        )?;
 
         let mut conn_tracker = TaskTracker::<()>::new(cancel_token.clone());
 
@@ -158,11 +163,15 @@ impl ServerRunner {
 
         // Await RegisterReverse
         let (listen_addr, target_addr) = match ctrl_stream.next().await {
-            Some(Ok(ControlMessage::RegisterReverse { listen_addr, target_addr })) => {
-                (listen_addr, target_addr)
-            }
+            Some(Ok(ControlMessage::RegisterReverse {
+                listen_addr,
+                target_addr,
+            })) => (listen_addr, target_addr),
             other => {
-                warn!("Expected RegisterReverse on reverse control channel, got: {:?}", other);
+                warn!(
+                    "Expected RegisterReverse on reverse control channel, got: {:?}",
+                    other
+                );
                 return;
             }
         };
@@ -171,20 +180,24 @@ impl ServerRunner {
 
         let listener = match TcpListener::bind(&listen_addr).await {
             Ok(l) => {
-                let _ = ctrl_stream.send(ControlMessage::RegisterAck {
-                    listen_addr: listen_addr.clone(),
-                    success: true,
-                    error_msg: None,
-                }).await;
+                let _ = ctrl_stream
+                    .send(ControlMessage::RegisterAck {
+                        listen_addr: listen_addr.clone(),
+                        success: true,
+                        error_msg: None,
+                    })
+                    .await;
                 l
             }
             Err(e) => {
                 warn!(addr = %listen_addr, "Failed to bind reverse listener: {:?}", e);
-                let _ = ctrl_stream.send(ControlMessage::RegisterAck {
-                    listen_addr: listen_addr.clone(),
-                    success: false,
-                    error_msg: Some(e.to_string()),
-                }).await;
+                let _ = ctrl_stream
+                    .send(ControlMessage::RegisterAck {
+                        listen_addr: listen_addr.clone(),
+                        success: false,
+                        error_msg: Some(e.to_string()),
+                    })
+                    .await;
                 return;
             }
         };

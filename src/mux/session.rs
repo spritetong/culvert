@@ -1,8 +1,8 @@
 //! Multiplexing session manager operating on any underlying `TunnelStream`.
 //! All comments and docstrings must be in English.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -164,7 +164,9 @@ impl MuxSession {
             FrameType::Syn => {
                 let stream_id = frame.stream_id;
                 // If stream was previously closed or is already active, ignore duplicate SYN
-                if closed_streams.contains_key(&stream_id) || active_streams.contains_key(&stream_id) {
+                if closed_streams.contains_key(&stream_id)
+                    || active_streams.contains_key(&stream_id)
+                {
                     return;
                 }
 
@@ -172,17 +174,15 @@ impl MuxSession {
                 let closed_flag = Arc::new(AtomicBool::new(false));
                 active_streams.insert(stream_id, (data_tx, Arc::clone(&closed_flag)));
 
-                let new_stream = MuxStream::new(
-                    stream_id,
-                    tx_frames.clone(),
-                    data_rx,
-                    closed_flag,
-                );
+                let new_stream = MuxStream::new(stream_id, tx_frames.clone(), data_rx, closed_flag);
 
                 match tx_new_streams.try_send(new_stream) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
-                        warn!(stream_id, "Multiplexer inbound stream backlog full; rejecting SYN with RST");
+                        warn!(
+                            stream_id,
+                            "Multiplexer inbound stream backlog full; rejecting SYN with RST"
+                        );
                         let _ = tx_frames.try_send(MuxFrame::rst(stream_id));
                         active_streams.remove(&stream_id);
                         closed_streams.insert(stream_id, ());
@@ -196,7 +196,10 @@ impl MuxSession {
                 let stream_id = frame.stream_id;
                 // Discard frames for already closed/reset streams to prevent cross-session contamination
                 if closed_streams.contains_key(&stream_id) {
-                    trace!(stream_id, "Silently discarding in-flight data frame for terminated stream");
+                    trace!(
+                        stream_id,
+                        "Silently discarding in-flight data frame for terminated stream"
+                    );
                     return;
                 }
 
@@ -205,7 +208,10 @@ impl MuxSession {
                     if let Err(e) = data_tx.try_send(frame.payload) {
                         match e {
                             mpsc::error::TrySendError::Full(_) => {
-                                warn!(stream_id, "Stream buffer full; dropping frame to avoid stall");
+                                warn!(
+                                    stream_id,
+                                    "Stream buffer full; dropping frame to avoid stall"
+                                );
                             }
                             mpsc::error::TrySendError::Closed(_) => {
                                 active_streams.remove(&stream_id);
@@ -233,7 +239,10 @@ impl MuxSession {
                 let _ = tx_frames.try_send(MuxFrame::pong(frame.stream_id));
             }
             FrameType::Pong => {
-                trace!(seq = frame.stream_id, "Multiplexer heartbeat pong acknowledged");
+                trace!(
+                    seq = frame.stream_id,
+                    "Multiplexer heartbeat pong acknowledged"
+                );
             }
         }
     }
@@ -250,7 +259,8 @@ impl MuxSession {
         let (data_tx, data_rx) = mpsc::channel(STREAM_BUFFER_SIZE);
         let closed_flag = Arc::new(AtomicBool::new(false));
 
-        self.active_streams.insert(stream_id, (data_tx, Arc::clone(&closed_flag)));
+        self.active_streams
+            .insert(stream_id, (data_tx, Arc::clone(&closed_flag)));
 
         // Send SYN to remote peer
         if let Err(e) = self.tx_frames.send(MuxFrame::syn(stream_id)).await {
@@ -270,7 +280,10 @@ impl MuxSession {
     }
 
     /// Sends a raw frame directly to the session writer queue (useful for testing or injects).
-    pub async fn send_frame(&self, frame: MuxFrame) -> Result<(), mpsc::error::SendError<MuxFrame>> {
+    pub async fn send_frame(
+        &self,
+        frame: MuxFrame,
+    ) -> Result<(), mpsc::error::SendError<MuxFrame>> {
         self.tx_frames.send(frame).await
     }
 

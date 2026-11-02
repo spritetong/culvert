@@ -1,12 +1,12 @@
 //! Reverse tunnel control channel messages and stream definitions.
 //! All comments and docstrings must be in English.
 
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use bytes::Bytes;
 use futures_core::Stream;
 use futures_sink::Sink;
 use serde::{Deserialize, Serialize};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 

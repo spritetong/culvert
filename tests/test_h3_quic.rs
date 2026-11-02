@@ -1,16 +1,16 @@
 //! Comprehensive integration test suite for HTTP/3 and raw QUIC transport.
 //! All comments and docstrings must be in English.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use micro_tunnel::config::model::{AppConfig, EndpointConfig, TlsConfig, TunnelMode};
 use micro_tunnel::core::error::TunnelError;
 use micro_tunnel::dialer::endpoint::EndpointContext;
-use micro_tunnel::transport::h3::listener::H3Listener;
 use micro_tunnel::transport::h3::H3Connector;
+use micro_tunnel::transport::h3::listener::H3Listener;
 use micro_tunnel::transport::{TargetAddr, TransportConnector, TransportListener};
 
 static PORT_COUNTER: AtomicUsize = AtomicUsize::new(51200);
@@ -22,8 +22,10 @@ fn get_ephemeral_port() -> u16 {
 }
 
 /// Helper to generate a test PKI certificate and ServerConfig for QUIC.
-fn generate_test_quic_pki(
-) -> (rustls::ServerConfig, rustls::pki_types::CertificateDer<'static>) {
+fn generate_test_quic_pki() -> (
+    rustls::ServerConfig,
+    rustls::pki_types::CertificateDer<'static>,
+) {
     let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
     let cert_key = rcgen::generate_simple_self_signed(subject_alt_names).unwrap();
 
@@ -31,15 +33,19 @@ fn generate_test_quic_pki(
     let key_der = cert_key.signing_key.serialize_der();
 
     let cert_chain = vec![rustls::pki_types::CertificateDer::from(cert_der.clone())];
-    let private_key =
-        rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(key_der));
+    let private_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
+    );
 
     let server_rustls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(cert_chain, private_key)
         .unwrap();
 
-    (server_rustls, rustls::pki_types::CertificateDer::from(cert_der))
+    (
+        server_rustls,
+        rustls::pki_types::CertificateDer::from(cert_der),
+    )
 }
 
 #[tokio::test]
@@ -109,7 +115,10 @@ async fn test_h3_transport_handshake_and_bidirectional_transfer() {
 
     let mut expected = test_data.clone();
     expected.reverse();
-    assert_eq!(response, expected, "HTTP/3 echoed data must match reversed original");
+    assert_eq!(
+        response, expected,
+        "HTTP/3 echoed data must match reversed original"
+    );
 
     let _ = tx_done.send(());
     server_task.await.unwrap();
@@ -207,7 +216,10 @@ async fn test_quic_raw_stream_bidirectional_transfer() {
 
     let mut expected = test_data.clone();
     expected.reverse();
-    assert_eq!(response, expected, "Raw QUIC echoed data must match reversed original");
+    assert_eq!(
+        response, expected,
+        "Raw QUIC echoed data must match reversed original"
+    );
 
     let _ = tx_done.send(());
     server_task.await.unwrap();
@@ -254,7 +266,8 @@ async fn test_h3_stream_multiplexing_over_single_quic_connection() {
 
     let app_cfg = AppConfig::default();
     let endpoint_ctx = EndpointContext::build(&endpoint_cfg, &app_cfg).unwrap();
-    let connector = Arc::new(H3Connector::new(&endpoint_ctx, auth_token, TunnelMode::Forward).unwrap());
+    let connector =
+        Arc::new(H3Connector::new(&endpoint_ctx, auth_token, TunnelMode::Forward).unwrap());
 
     let mut client_handles = Vec::new();
     for i in 0..STREAMS {

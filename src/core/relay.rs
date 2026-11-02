@@ -1,8 +1,8 @@
 //! High-performance bidirectional byte relay engine.
 //! All comments and docstrings must be in English.
 
-use std::future::{poll_fn, Future};
-use std::pin::{pin, Pin};
+use std::future::{Future, poll_fn};
+use std::pin::{Pin, pin};
 use std::task::Poll;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::sync::CancellationToken;
@@ -187,7 +187,7 @@ impl RelayEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
     #[tokio::test]
     async fn test_poll_fn_relay_engine() {

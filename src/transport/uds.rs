@@ -4,7 +4,9 @@
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, TunnelStream};
 use crate::dialer::endpoint::EndpointContext;
-use crate::transport::{StreamMetadata, TargetAddr, TransportConnector, TransportDriver, TransportListener};
+use crate::transport::{
+    StreamMetadata, TargetAddr, TransportConnector, TransportDriver, TransportListener,
+};
 
 /// UDS transport driver.
 pub struct UdsTransportDriver;
@@ -51,7 +53,9 @@ impl TransportConnector for UdsConnector {
         _session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
         Box::pin(async move {
-            Err(TunnelError::Internal("UdsConnector not supported on this platform".to_string()))
+            Err(TunnelError::Internal(
+                "UdsConnector not supported on this platform".to_string(),
+            ))
         })
     }
 
@@ -71,7 +75,9 @@ impl TransportListener for UdsListener {
         &'a mut self,
     ) -> BoxFuture<'a, Result<(Box<dyn TunnelStream>, StreamMetadata), TunnelError>> {
         Box::pin(async move {
-            Err(TunnelError::Internal("UdsListener not supported on this platform".to_string()))
+            Err(TunnelError::Internal(
+                "UdsListener not supported on this platform".to_string(),
+            ))
         })
     }
 }

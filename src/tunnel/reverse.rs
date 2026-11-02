@@ -1,10 +1,10 @@
 //! Reverse tunnel worker (`-R` mode).
 //! All comments and docstrings must be in English.
 
-use std::sync::Arc;
 use futures_util::{SinkExt, StreamExt};
+use std::sync::Arc;
 use tokio::net::TcpStream;
-use tokio::time::{interval, Duration};
+use tokio::time::{Duration, interval};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -36,7 +36,8 @@ pub async fn run_reverse_tunnel(
     let mut conn_tracker = TaskTracker::<()>::new(cancel_token.clone());
 
     while !cancel_token.is_cancelled() {
-        let connector = transport_registry.create_connector(&endpoint_ctx, &config.token, config.mode)?;
+        let connector =
+            transport_registry.create_connector(&endpoint_ctx, &config.token, config.mode)?;
 
         info!(tag = %config.tag, "Connecting reverse control channel to remote server...");
         let raw_stream = match connector.connect(&dummy_target, None).await {
@@ -65,7 +66,11 @@ pub async fn run_reverse_tunnel(
 
         // Await RegisterAck from remote server
         match ctrl_stream.next().await {
-            Some(Ok(ControlMessage::RegisterAck { listen_addr, success, error_msg })) => {
+            Some(Ok(ControlMessage::RegisterAck {
+                listen_addr,
+                success,
+                error_msg,
+            })) => {
                 if !success {
                     error!(
                         tag = %config.tag,

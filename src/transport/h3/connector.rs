@@ -48,17 +48,20 @@ impl H3Connector {
 
         let rustls_client = TlsConfigBuilder::build_client_config(&tls_config)?;
         let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_client)
-            .map_err(|e| TunnelError::Tls(format!("Failed to build QUIC client crypto: {:?}", e)))?;
+            .map_err(|e| {
+                TunnelError::Tls(format!("Failed to build QUIC client crypto: {:?}", e))
+            })?;
 
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
         let mut transport_config = quinn::TransportConfig::default();
-        transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
+        transport_config
+            .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
         transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
         client_config.transport_config(Arc::new(transport_config));
 
         let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-        let mut quinn_endpoint = quinn::Endpoint::client(bind_addr)
-            .map_err(|e| TunnelError::Io(e))?;
+        let mut quinn_endpoint =
+            quinn::Endpoint::client(bind_addr).map_err(|e| TunnelError::Io(e))?;
         quinn_endpoint.set_default_client_config(client_config);
 
         Ok(Self {
@@ -80,7 +83,11 @@ impl H3Connector {
             }
         }
 
-        let ips = self.endpoint.dns_resolver.resolve(&self.endpoint.endpoint.host).await?;
+        let ips = self
+            .endpoint
+            .dns_resolver
+            .resolve(&self.endpoint.endpoint.host)
+            .await?;
         let resolved_addr = SocketAddr::new(ips[0], self.endpoint.endpoint.port);
         let sni = self
             .endpoint
@@ -121,7 +128,9 @@ impl H3Connector {
             let (mut driver, sender) = h3::client::builder()
                 .build::<_, _, Bytes>(h3_quinn::Connection::new(conn))
                 .await
-                .map_err(|e| TunnelError::ControlProtocol(format!("H3 handshake failed: {:?}", e)))?;
+                .map_err(|e| {
+                    TunnelError::ControlProtocol(format!("H3 handshake failed: {:?}", e))
+                })?;
 
             tokio::spawn(async move {
                 let _ = driver.wait_idle().await;
@@ -139,7 +148,10 @@ impl H3Connector {
             &self.endpoint.endpoint.path
         };
 
-        let authority = format!("{}:{}", self.endpoint.endpoint.host, self.endpoint.endpoint.port);
+        let authority = format!(
+            "{}:{}",
+            self.endpoint.endpoint.host, self.endpoint.endpoint.port
+        );
         let mut req_builder = Request::builder()
             .method("CONNECT")
             .uri(path)
@@ -163,17 +175,17 @@ impl H3Connector {
             .map_err(|e| TunnelError::Config(format!("Invalid request headers: {:?}", e)))?;
 
         debug!(path = %path, target = %target, "Sending HTTP/3 CONNECT tunnel request");
-        let mut stream = send_request
-            .send_request(request)
-            .await
-            .map_err(|e| TunnelError::ControlProtocol(format!("Failed to send H3 request: {:?}", e)))?;
+        let mut stream = send_request.send_request(request).await.map_err(|e| {
+            TunnelError::ControlProtocol(format!("Failed to send H3 request: {:?}", e))
+        })?;
 
-        let response = stream
-            .recv_response()
-            .await
-            .map_err(|e| TunnelError::ControlProtocol(format!("Failed to receive H3 response: {:?}", e)))?;
+        let response = stream.recv_response().await.map_err(|e| {
+            TunnelError::ControlProtocol(format!("Failed to receive H3 response: {:?}", e))
+        })?;
 
-        if response.status() == StatusCode::UNAUTHORIZED || response.status() == StatusCode::FORBIDDEN {
+        if response.status() == StatusCode::UNAUTHORIZED
+            || response.status() == StatusCode::FORBIDDEN
+        {
             return Err(TunnelError::AuthFailed);
         }
 

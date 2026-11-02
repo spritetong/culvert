@@ -15,20 +15,26 @@ use micro_tunnel::dialer::endpoint::EndpointContext;
 use micro_tunnel::server::ServerRunner;
 use micro_tunnel::session::SessionManager;
 use micro_tunnel::supervisor::TunnelSupervisor;
-use micro_tunnel::transport::ws::WsTransportDriver;
 use micro_tunnel::transport::TransportRegistry;
+use micro_tunnel::transport::ws::WsTransportDriver;
 use micro_tunnel::tunnel::{run_forward_tunnel, run_reverse_tunnel};
 
 /// Helper to get an available random ephemeral port.
 fn get_available_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral port");
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral port");
     listener.local_addr().unwrap().port()
 }
 
 /// Spawns a simple TCP echo server that echoes all received data back to the client.
-fn spawn_echo_server(addr: SocketAddr, cancel_token: CancellationToken) -> tokio::task::JoinHandle<()> {
+fn spawn_echo_server(
+    addr: SocketAddr,
+    cancel_token: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let listener = TcpListener::bind(addr).await.expect("Failed to bind echo server");
+        let listener = TcpListener::bind(addr)
+            .await
+            .expect("Failed to bind echo server");
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => break,
@@ -49,7 +55,9 @@ fn spawn_echo_server(addr: SocketAddr, cancel_token: CancellationToken) -> tokio
 
 #[tokio::test]
 async fn test_forward_tunnel_ws_e2e() {
-    let _ = tracing_subscriber::fmt().with_env_filter("trace").try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("trace")
+        .try_init();
     let cancel_token = CancellationToken::new();
 
     let echo_port = get_available_port();
@@ -104,12 +112,8 @@ async fn test_forward_tunnel_ws_e2e() {
     let client_cancel = cancel_token.clone();
     let client_registry = Arc::clone(&registry);
     let client_handle = tokio::spawn(async move {
-        let _ = run_forward_tunnel(
-            tunnel_config,
-            endpoint_ctx,
-            client_registry,
-            client_cancel,
-        ).await;
+        let _ =
+            run_forward_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
     });
 
     // Give servers a brief moment to bind and listen
@@ -121,10 +125,16 @@ async fn test_forward_tunnel_ws_e2e() {
         .expect("Failed to connect to client forward listen port");
 
     let payload = b"Hello micro-tunnel forward WebSocket!";
-    stream.write_all(payload).await.expect("Failed to write to client");
+    stream
+        .write_all(payload)
+        .await
+        .expect("Failed to write to client");
 
     let mut buf = vec![0u8; payload.len()];
-    stream.read_exact(&mut buf).await.expect("Failed to read response");
+    stream
+        .read_exact(&mut buf)
+        .await
+        .expect("Failed to read response");
     assert_eq!(&buf, payload, "Echoed payload mismatch in forward tunnel");
 
     // 5. Graceful shutdown
@@ -191,12 +201,8 @@ async fn test_reverse_tunnel_ws_e2e() {
     let client_cancel = cancel_token.clone();
     let client_registry = Arc::clone(&registry);
     let client_handle = tokio::spawn(async move {
-        let _ = run_reverse_tunnel(
-            tunnel_config,
-            endpoint_ctx,
-            client_registry,
-            client_cancel,
-        ).await;
+        let _ =
+            run_reverse_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
     });
 
     // Give reverse registration time to connect and bind reverse_listen port on server
@@ -208,10 +214,16 @@ async fn test_reverse_tunnel_ws_e2e() {
         .expect("Failed to connect to reverse listener port on server");
 
     let payload = b"Hello micro-tunnel reverse WebSocket!";
-    visitor_stream.write_all(payload).await.expect("Failed to write to reverse port");
+    visitor_stream
+        .write_all(payload)
+        .await
+        .expect("Failed to write to reverse port");
 
     let mut buf = vec![0u8; payload.len()];
-    visitor_stream.read_exact(&mut buf).await.expect("Failed to read response from reverse port");
+    visitor_stream
+        .read_exact(&mut buf)
+        .await
+        .expect("Failed to read response from reverse port");
     assert_eq!(&buf, payload, "Echoed payload mismatch in reverse tunnel");
 
     // 5. Graceful shutdown
@@ -301,10 +313,7 @@ async fn test_supervisor_multi_tunnel_concurrency_e2e() {
         assert_eq!(&buf, payload);
     };
 
-    tokio::try_join!(
-        tokio::spawn(fwd_fut),
-        tokio::spawn(rev_fut)
-    ).unwrap();
+    tokio::try_join!(tokio::spawn(fwd_fut), tokio::spawn(rev_fut)).unwrap();
 
     // 6. Graceful shutdown
     cancel_token.cancel();

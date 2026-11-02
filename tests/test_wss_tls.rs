@@ -23,13 +23,14 @@ use micro_tunnel::config::model::{
 use micro_tunnel::dialer::endpoint::EndpointContext;
 use micro_tunnel::server::ServerRunner;
 use micro_tunnel::session::SessionManager;
-use micro_tunnel::transport::ws::WsTransportDriver;
 use micro_tunnel::transport::TransportRegistry;
+use micro_tunnel::transport::ws::WsTransportDriver;
 use micro_tunnel::tunnel::{run_forward_tunnel, run_reverse_tunnel};
 
 /// Helper to get an available random ephemeral port.
 fn get_available_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral port");
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral port");
     listener.local_addr().unwrap().port()
 }
 
@@ -59,7 +60,11 @@ mod tempfile_dummy {
     impl TempDir {
         pub fn new() -> Self {
             let id = PKI_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!("micro_tunnel_pki_{}_{}", std::process::id(), id));
+            let path = std::env::temp_dir().join(format!(
+                "micro_tunnel_pki_{}_{}",
+                std::process::id(),
+                id
+            ));
             let _ = std::fs::create_dir_all(&path);
             Self { path }
         }
@@ -143,7 +148,9 @@ fn generate_test_pki() -> TestPki {
     let ca_cert_der = CertificateDer::from(ca.as_ref().der().to_vec());
     client_roots.add(ca_cert_der).unwrap();
 
-    let client_verifier = WebPkiClientVerifier::builder(Arc::new(client_roots)).build().unwrap();
+    let client_verifier = WebPkiClientVerifier::builder(Arc::new(client_roots))
+        .build()
+        .unwrap();
     let mtls_server_rustls_config = RustlsServerConfig::builder()
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(vec![server_cert_der], server_key_der)
@@ -171,7 +178,9 @@ fn spawn_tls_terminator(
 ) -> tokio::task::JoinHandle<()> {
     let acceptor = TlsAcceptor::from(tls_config);
     tokio::spawn(async move {
-        let listener = TcpListener::bind(tls_listen_addr).await.expect("Failed to bind TLS terminator");
+        let listener = TcpListener::bind(tls_listen_addr)
+            .await
+            .expect("Failed to bind TLS terminator");
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => break,
@@ -208,9 +217,14 @@ fn spawn_tls_terminator(
 }
 
 /// Spawns a simple TCP echo server.
-fn spawn_echo_server(addr: SocketAddr, cancel_token: CancellationToken) -> tokio::task::JoinHandle<()> {
+fn spawn_echo_server(
+    addr: SocketAddr,
+    cancel_token: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let listener = TcpListener::bind(addr).await.expect("Failed to bind echo server");
+        let listener = TcpListener::bind(addr)
+            .await
+            .expect("Failed to bind echo server");
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => break,
@@ -240,7 +254,9 @@ async fn test_wss_forward_tunnel_with_custom_ca_and_sni() {
     let client_listen_port = get_available_port();
 
     let echo_addr: SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
-    let backend_addr: SocketAddr = format!("127.0.0.1:{}", backend_server_port).parse().unwrap();
+    let backend_addr: SocketAddr = format!("127.0.0.1:{}", backend_server_port)
+        .parse()
+        .unwrap();
     let tls_addr: SocketAddr = format!("127.0.0.1:{}", tls_ingress_port).parse().unwrap();
     let auth_token = "secure_wss_test_token";
 
@@ -311,12 +327,8 @@ async fn test_wss_forward_tunnel_with_custom_ca_and_sni() {
     let client_cancel = cancel_token.clone();
     let client_registry = Arc::clone(&registry);
     let client_handle = tokio::spawn(async move {
-        let _ = run_forward_tunnel(
-            tunnel_config,
-            endpoint_ctx,
-            client_registry,
-            client_cancel,
-        ).await;
+        let _ =
+            run_forward_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
     });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -349,7 +361,9 @@ async fn test_wss_forward_tunnel_insecure_mode() {
     let client_listen_port = get_available_port();
 
     let echo_addr: SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
-    let backend_addr: SocketAddr = format!("127.0.0.1:{}", backend_server_port).parse().unwrap();
+    let backend_addr: SocketAddr = format!("127.0.0.1:{}", backend_server_port)
+        .parse()
+        .unwrap();
     let tls_addr: SocketAddr = format!("127.0.0.1:{}", tls_ingress_port).parse().unwrap();
     let auth_token = "insecure_wss_test_token";
 
@@ -417,12 +431,8 @@ async fn test_wss_forward_tunnel_insecure_mode() {
     let client_cancel = cancel_token.clone();
     let client_registry = Arc::clone(&registry);
     let client_handle = tokio::spawn(async move {
-        let _ = run_forward_tunnel(
-            tunnel_config,
-            endpoint_ctx,
-            client_registry,
-            client_cancel,
-        ).await;
+        let _ =
+            run_forward_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
     });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -453,7 +463,9 @@ async fn test_wss_mtls_mutual_authentication() {
     let client_listen_port = get_available_port();
 
     let echo_addr: SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
-    let backend_addr: SocketAddr = format!("127.0.0.1:{}", backend_server_port).parse().unwrap();
+    let backend_addr: SocketAddr = format!("127.0.0.1:{}", backend_server_port)
+        .parse()
+        .unwrap();
     let tls_addr: SocketAddr = format!("127.0.0.1:{}", tls_ingress_port).parse().unwrap();
     let auth_token = "mtls_wss_test_token";
 
@@ -522,12 +534,8 @@ async fn test_wss_mtls_mutual_authentication() {
     let client_cancel = cancel_token.clone();
     let client_registry = Arc::clone(&registry);
     let client_handle = tokio::spawn(async move {
-        let _ = run_forward_tunnel(
-            tunnel_config,
-            endpoint_ctx,
-            client_registry,
-            client_cancel,
-        ).await;
+        let _ =
+            run_forward_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
     });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -558,7 +566,9 @@ async fn test_wss_reverse_tunnel_e2e() {
     let reverse_listen_port = get_available_port();
 
     let local_echo_addr: SocketAddr = format!("127.0.0.1:{}", local_echo_port).parse().unwrap();
-    let backend_addr: SocketAddr = format!("127.0.0.1:{}", backend_server_port).parse().unwrap();
+    let backend_addr: SocketAddr = format!("127.0.0.1:{}", backend_server_port)
+        .parse()
+        .unwrap();
     let tls_addr: SocketAddr = format!("127.0.0.1:{}", tls_ingress_port).parse().unwrap();
     let auth_token = "wss_reverse_secret_token";
 
@@ -629,12 +639,8 @@ async fn test_wss_reverse_tunnel_e2e() {
     let client_cancel = cancel_token.clone();
     let client_registry = Arc::clone(&registry);
     let client_handle = tokio::spawn(async move {
-        let _ = run_reverse_tunnel(
-            tunnel_config,
-            endpoint_ctx,
-            client_registry,
-            client_cancel,
-        ).await;
+        let _ =
+            run_reverse_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
     });
 
     tokio::time::sleep(Duration::from_millis(300)).await;

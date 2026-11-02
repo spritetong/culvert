@@ -1,13 +1,13 @@
 //! WebSocket client connector implementing `TransportConnector`.
 //! All comments and docstrings must be in English.
 
-use std::future::Future;
-use fastwebsockets::{handshake, Role};
-use http::header::{CONNECTION, HOST, UPGRADE};
+use fastwebsockets::{Role, handshake};
 use http::Request;
+use http::header::{CONNECTION, HOST, UPGRADE};
 use http_body_util::Empty;
 use hyper::body::Bytes;
 use rustls::pki_types::ServerName;
+use std::future::Future;
 
 use crate::config::model::TunnelMode;
 use crate::core::error::TunnelError;
@@ -63,13 +63,12 @@ impl TransportConnector for WsConnector {
             let raw_stream = self.endpoint.dialer.dial(host, port).await?;
 
             // 2. Perform TLS handshake if TLS is enabled for this endpoint
-            let tls_stream: Box<dyn TunnelStream> = if let Some(ref tls_cfg) = self.endpoint.tls_config {
+            let tls_stream: Box<dyn TunnelStream> = if let Some(ref tls_cfg) =
+                self.endpoint.tls_config
+            {
                 if tls_cfg.enabled {
                     let connector = TlsConfigBuilder::build_connector(tls_cfg)?;
-                    let sni = tls_cfg
-                        .server_name
-                        .as_deref()
-                        .unwrap_or(host.as_str());
+                    let sni = tls_cfg.server_name.as_deref().unwrap_or(host.as_str());
 
                     let server_name = ServerName::try_from(sni.to_string())
                         .map_err(|e| TunnelError::Tls(format!("Invalid SNI server name: {}", e)))?;
@@ -104,14 +103,19 @@ impl TransportConnector for WsConnector {
 
             req_builder = headers.apply_to_request_builder(req_builder);
 
-            let req = req_builder
-                .body(Empty::<Bytes>::new())
-                .map_err(|e| TunnelError::Internal(format!("Failed to build upgrade request: {}", e)))?;
+            let req = req_builder.body(Empty::<Bytes>::new()).map_err(|e| {
+                TunnelError::Internal(format!("Failed to build upgrade request: {}", e))
+            })?;
 
             // 4. Execute client-side WebSocket upgrade
             let (ws, _response) = handshake::client(&TokioSpawnExecutor, req, tls_stream)
                 .await
-                .map_err(|e| TunnelError::ControlProtocol(format!("WebSocket client handshake failed: {}", e)))?;
+                .map_err(|e| {
+                    TunnelError::ControlProtocol(format!(
+                        "WebSocket client handshake failed: {}",
+                        e
+                    ))
+                })?;
 
             // 5. Wrap upgraded stream as a dynamic TunnelStream
             let tunnel_stream = WsTunnelStream::new(ws.into_inner(), Role::Client);

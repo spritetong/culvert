@@ -1,8 +1,8 @@
 //! Session manager for pairing inbound reverse tunnel data streams.
 //! All comments and docstrings must be in English.
 
-use std::sync::Arc;
 use dashmap::DashMap;
+use std::sync::Arc;
 use tokio::sync::oneshot;
 
 use crate::core::error::TunnelError;
@@ -31,7 +31,11 @@ impl SessionManager {
     }
 
     /// Delivers an incoming reverse data stream to the waiting task.
-    pub fn fulfill(&self, session_id: &str, stream: Box<dyn TunnelStream>) -> Result<(), TunnelError> {
+    pub fn fulfill(
+        &self,
+        session_id: &str,
+        stream: Box<dyn TunnelStream>,
+    ) -> Result<(), TunnelError> {
         if let Some((_, tx)) = self.pending_sessions.remove(session_id) {
             tx.send(stream).map_err(|_| TunnelError::SessionClosed)
         } else {
