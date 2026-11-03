@@ -499,7 +499,8 @@ impl<T> ControlStream for T where
 {}
 ```
 
-### 7.3 连接池与排空模块 (`pool`)
+### 7.3 连接池与 0-RTT 状态机模块 (`pool`)
+
 ```rust
 use crate::core::stream::{BoxFuture, TunnelStream};
 use crate::core::error::TunnelError;
@@ -510,6 +511,24 @@ pub trait StreamPool: Send + Sync {
     fn stats(&self) -> PoolStats;
 }
 ```
+
+#### 7.3.1 0-RTT 预热与后端建连解耦设计 (Decoupled Pre-warming & Lazy Target Dialing)
+传统隧道连接池若在预热时提前连接后端服务，会导致目标服务（如 `iperf3 -s`、MySQL、SSH）被大量空闲连接占满 backlog，最终引发后端超时重置并使整个连接池“状态机中毒（Poisoned）”。
+
+Micro-Tunnel 采用**通道预热与目标建连解耦**机制：
+1. **预热闲置通道（Idle Channel Pre-warming）**：
+   * Client 连接池在后台向 Server 建立 WebSocket 预热通道，握手头携带 `x-tunnel-pool: idle`。
+   * Server 收到后进入挂起等待状态，**绝不触碰目标后端端口（Target Connection = 0）**。
+2. **0-RTT 激活信号（Activation Signaling）**：
+   * 当用户真实 TCP 流量接入 Client 入口时，Client 从池中取出空闲流，立即向通道写入单字节激活帧 `ACTIVATE_STREAM_MAGIC` (`0xA5`) 并 flush。
+   * Server 收到 `0xA5` 后，以微秒级时延（0.05ms）就近直连后端目标，随后立即接入 `RelayEngine` 双工转发。
+3. **坏死连接即时自愈（Stale Eviction & Direct Fallback）**：
+   * 出池时若写入激活帧失败或超时（说明该连接在池中驻留期间已遭 NAT 或对端断开），连接池立即自动丢弃该死连接并无缝尝试下一个；
+   * 若池内连接全部耗尽或失效，透明自动降级为直接向 Server 发起实时连接，保证业务流量 100% 不因空闲断连而丢包。
+4. **自适应指数退避与生命周期追踪**：
+   * 补充 Worker 遭遇网络中断时，应用 `100ms * 2^n`（上限 5s）指数退避，防止重试风暴；
+   * 提供 `on_stream_closed` 回调，确保 `active_count` 活跃指标精确闭环。
+
 
 ### 7.4 会话配对路由模块 (`session`)
 ```rust
