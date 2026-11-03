@@ -8,85 +8,77 @@ use tracing::{error, info};
 
 use crate::common::net::SocketTuner;
 use crate::common::task::TaskTracker;
-use crate::config::model::TunnelConfig;
+use crate::config::model::{TunnelConfig, TunnelMode};
 use crate::core::error::TunnelError;
 use crate::core::relay::RelayEngine;
 use crate::dialer::endpoint::EndpointContext;
 use crate::pool::ReplenishingStreamPool;
 use crate::transport::{TargetAddr, TransportConnector, TransportRegistry};
 
-/// Runs a forward tunnel worker that listens locally and relays to the remote peer.
-pub async fn run_forward_tunnel(
-    config: TunnelConfig,
-    endpoint_ctx: EndpointContext,
-    transport_registry: Arc<TransportRegistry>,
-    cancel_token: CancellationToken,
-) -> Result<(), TunnelError> {
-    info!(
-        tag = %config.tag,
-        listen = %config.listen,
-        target = %config.target,
-        "Starting forward tunnel listener"
-    );
-
-    let listener = TcpListener::bind(&config.listen).await?;
-    let mut conn_tracker = TaskTracker::<()>::new(cancel_token.clone());
-
-    // Parse target address
-    let target = if let Ok(sa) = config.target.parse() {
-        TargetAddr::Ip(sa)
+/// Helper to parse target address string.
+pub fn parse_target_addr(target_str: &str) -> Result<TargetAddr, TunnelError> {
+    if let Ok(sa) = target_str.parse() {
+        Ok(TargetAddr::Ip(sa))
     } else {
-        let parts: Vec<&str> = config.target.rsplitn(2, ':').collect();
+        let parts: Vec<&str> = target_str.rsplitn(2, ':').collect();
         if parts.len() != 2 {
             return Err(TunnelError::Config(format!(
                 "Invalid target: {}",
-                config.target
+                target_str
             )));
         }
         let port: u16 = parts[0]
             .parse()
             .map_err(|_| TunnelError::Config("Invalid target port".to_string()))?;
-        TargetAddr::Domain(parts[1].to_string(), port)
-    };
+        Ok(TargetAddr::Domain(parts[1].to_string(), port))
+    }
+}
 
-    let pool = if let Some(size) = config.pool_size.filter(|&s| s > 0) {
-        let connector: Arc<dyn TransportConnector> = Arc::from(
-            transport_registry.create_connector(&endpoint_ctx, &config.token, config.mode)?,
-        );
-        Some(Arc::new(ReplenishingStreamPool::new(
-            connector,
-            target.clone(),
-            size,
-            cancel_token.clone(),
-        )))
-    } else {
-        None
-    };
+/// Runs a single forward mapping listener and forwards inbound connections to remote peer.
+pub async fn run_forward_mapping(
+    tag: String,
+    listen: String,
+    target_str: String,
+    token: Option<String>,
+    endpoint_ctx: EndpointContext,
+    transport_registry: Arc<TransportRegistry>,
+    pool: Option<Arc<ReplenishingStreamPool>>,
+    cancel_token: CancellationToken,
+) -> Result<(), TunnelError> {
+    info!(
+        tag = %tag,
+        listen = %listen,
+        target = %target_str,
+        "Starting forward tunnel listener"
+    );
+
+    let listener = TcpListener::bind(&listen).await?;
+    let mut conn_tracker = TaskTracker::<()>::new(cancel_token.clone());
+    let target = parse_target_addr(&target_str)?;
 
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
-                info!(tag = %config.tag, "Forward tunnel received cancellation signal");
+                info!(tag = %tag, "Forward tunnel received cancellation signal");
                 break;
             }
             accept_res = listener.accept() => {
                 match accept_res {
                     Ok((inbound_stream, peer_addr)) => {
                         let _ = SocketTuner::tune_tcp_stream(&inbound_stream, true, None);
-                        info!(tag = %config.tag, peer = %peer_addr, "Inbound connection accepted");
+                        info!(tag = %tag, peer = %peer_addr, "Inbound connection accepted");
                         let target = target.clone();
                         let pool_clone = pool.clone();
                         let registry_clone = Arc::clone(&transport_registry);
                         let endpoint_clone = endpoint_ctx.clone();
-                        let token_clone = config.token.clone();
-                        let mode = config.mode;
-
+                        let token_clone = token.clone();
                         let pool_for_close = pool.clone();
-                        conn_tracker.spawn_with_cancel(move |token| async move {
+
+                        conn_tracker.spawn_with_cancel(move |conn_token| async move {
                             let remote_res = if let Some(ref p) = pool_clone {
-                                p.acquire().await
+                                p.acquire(Some(&target)).await
                             } else {
-                                match registry_clone.create_connector(&endpoint_clone, &token_clone, mode) {
+                                match registry_clone.create_connector(&endpoint_clone, token_clone.as_deref(), TunnelMode::Forward) {
                                     Ok(connector) => connector.connect(&target, None).await,
                                     Err(e) => Err(e),
                                 }
@@ -97,7 +89,7 @@ pub async fn run_forward_tunnel(
                                     let _ = RelayEngine::relay_with_cancel(
                                         Box::new(inbound_stream),
                                         remote_stream,
-                                        token,
+                                        conn_token,
                                     ).await;
                                     if let Some(ref p) = pool_for_close {
                                         p.on_stream_closed();
@@ -110,7 +102,7 @@ pub async fn run_forward_tunnel(
                         });
                     }
                     Err(e) => {
-                        error!(tag = %config.tag, "Listener accept failed: {:?}", e);
+                        error!(tag = %tag, "Listener accept failed: {:?}", e);
                     }
                 }
             }
@@ -119,4 +111,43 @@ pub async fn run_forward_tunnel(
 
     conn_tracker.shutdown_and_wait().await;
     Ok(())
+}
+
+/// Runs a forward tunnel worker that listens locally and relays to the remote peer.
+pub async fn run_forward_tunnel(
+    config: TunnelConfig,
+    endpoint_ctx: EndpointContext,
+    transport_registry: Arc<TransportRegistry>,
+    cancel_token: CancellationToken,
+) -> Result<(), TunnelError> {
+    let listen = config.listen.clone().unwrap_or_default();
+    let target = config.target.clone().unwrap_or_default();
+
+    let pool = if let Some(size) = config.pool_size.filter(|&s| s > 0) {
+        let connector: Arc<dyn TransportConnector> =
+            Arc::from(transport_registry.create_connector(
+                &endpoint_ctx,
+                config.token.as_deref(),
+                TunnelMode::Forward,
+            )?);
+        Some(Arc::new(ReplenishingStreamPool::new_shared(
+            connector,
+            size,
+            cancel_token.clone(),
+        )))
+    } else {
+        None
+    };
+
+    run_forward_mapping(
+        config.tag,
+        listen,
+        target,
+        config.token,
+        endpoint_ctx,
+        transport_registry,
+        pool,
+        cancel_token,
+    )
+    .await
 }

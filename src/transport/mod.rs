@@ -88,6 +88,7 @@ pub trait TransportDriver: Send + Sync + 'static {
     fn build_listener(
         &self,
         listen_addr: &str,
-        auth_token: &str,
+        auth_token: Option<&str>,
+        path: Option<&str>,
     ) -> Result<Box<dyn TransportListener>, TunnelError>;
 }

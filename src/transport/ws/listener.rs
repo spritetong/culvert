@@ -24,16 +24,22 @@ type AcceptedResult = Result<(Box<dyn TunnelStream>, StreamMetadata), TunnelErro
 /// WebSocket server listener.
 pub struct WsListener {
     listen_addr: String,
-    auth_token: String,
+    auth_token: Option<String>,
+    path: Option<String>,
     incoming_rx: Option<mpsc::Receiver<AcceptedResult>>,
 }
 
 impl WsListener {
     /// Creates a new `WsListener`.
-    pub fn new(listen_addr: impl Into<String>, auth_token: impl Into<String>) -> Self {
+    pub fn new(
+        listen_addr: impl Into<String>,
+        auth_token: Option<impl Into<String>>,
+        path: Option<impl Into<String>>,
+    ) -> Self {
         Self {
             listen_addr: listen_addr.into(),
-            auth_token: auth_token.into(),
+            auth_token: auth_token.map(|t| t.into()),
+            path: path.map(|p| p.into()),
             incoming_rx: None,
         }
     }
@@ -45,6 +51,7 @@ impl WsListener {
         self.incoming_rx = Some(rx);
 
         let auth_token = Arc::new(self.auth_token.clone());
+        let expected_path = Arc::new(self.path.clone());
 
         tokio::spawn(async move {
             loop {
@@ -58,14 +65,27 @@ impl WsListener {
 
                 let tx = tx.clone();
                 let token = Arc::clone(&auth_token);
+                let path = Arc::clone(&expected_path);
 
                 tokio::spawn(async move {
                     let io = TokioIo::new(stream);
                     let service = service_fn(move |mut req: Request<Incoming>| {
                         let tx = tx.clone();
                         let token = Arc::clone(&token);
+                        let path = Arc::clone(&path);
 
                         async move {
+                            // Validate URI path if configured on listener
+                            if let Some(ref p) = *path {
+                                if req.uri().path() != p.as_str() {
+                                    let resp = Response::builder()
+                                        .status(StatusCode::NOT_FOUND)
+                                        .body(Empty::<Bytes>::new())
+                                        .unwrap();
+                                    return Ok::<_, hyper::Error>(resp);
+                                }
+                            }
+
                             // Validate custom handshake headers
                             let headers = match WsHandshakeHeaders::from_http_headers(req.headers())
                             {
@@ -79,12 +99,22 @@ impl WsListener {
                                 }
                             };
 
-                            if headers.auth_token != *token {
-                                let resp = Response::builder()
-                                    .status(StatusCode::FORBIDDEN)
-                                    .body(Empty::<Bytes>::new())
-                                    .unwrap();
-                                return Ok::<_, hyper::Error>(resp);
+                            // Validate token if configured on listener
+                            if let Some(ref expected) = *token {
+                                if !expected.is_empty() {
+                                    let matches = headers
+                                        .auth_token
+                                        .as_ref()
+                                        .map(|t| t == expected)
+                                        .unwrap_or(false);
+                                    if !matches {
+                                        let resp = Response::builder()
+                                            .status(StatusCode::FORBIDDEN)
+                                            .body(Empty::<Bytes>::new())
+                                            .unwrap();
+                                        return Ok::<_, hyper::Error>(resp);
+                                    }
+                                }
                             }
 
                             let metadata = headers.to_stream_metadata();

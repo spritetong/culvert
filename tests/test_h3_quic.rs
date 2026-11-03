@@ -55,7 +55,8 @@ async fn test_h3_transport_handshake_and_bidirectional_transfer() {
     let auth_token = "secret_h3_token_12345";
 
     let (server_rustls, _cert) = generate_test_quic_pki();
-    let mut listener = H3Listener::bind(&listen_addr, auth_token, server_rustls).unwrap();
+    let mut listener =
+        H3Listener::bind(&listen_addr, Some(auth_token), None, server_rustls).unwrap();
     let (tx_done, rx_done) = tokio::sync::oneshot::channel::<()>();
 
     // Spawn server accept task
@@ -132,7 +133,7 @@ async fn test_h3_transport_auth_failure() {
     let invalid_token = "invalid_wrong_token";
 
     let (server_rustls, _) = generate_test_quic_pki();
-    let _listener = H3Listener::bind(&listen_addr, valid_token, server_rustls).unwrap();
+    let _listener = H3Listener::bind(&listen_addr, Some(valid_token), None, server_rustls).unwrap();
 
     let endpoint_cfg = EndpointConfig::Detailed {
         url: format!("h3://{}/tunnel", listen_addr),
@@ -167,7 +168,8 @@ async fn test_quic_raw_stream_bidirectional_transfer() {
     let auth_token = "secret_quic_raw_token";
 
     let (server_rustls, _) = generate_test_quic_pki();
-    let mut listener = H3Listener::bind(&listen_addr, auth_token, server_rustls).unwrap();
+    let mut listener =
+        H3Listener::bind(&listen_addr, Some(auth_token), None, server_rustls).unwrap();
     let (tx_done, rx_done) = tokio::sync::oneshot::channel::<()>();
 
     let server_task = tokio::spawn(async move {
@@ -232,7 +234,8 @@ async fn test_h3_stream_multiplexing_over_single_quic_connection() {
     let auth_token = "multiplex_token_789";
 
     let (server_rustls, _) = generate_test_quic_pki();
-    let mut listener = H3Listener::bind(&listen_addr, auth_token, server_rustls).unwrap();
+    let mut listener =
+        H3Listener::bind(&listen_addr, Some(auth_token), None, server_rustls).unwrap();
     let (tx_done, rx_done) = tokio::sync::oneshot::channel::<()>();
 
     const STREAMS: usize = 3;

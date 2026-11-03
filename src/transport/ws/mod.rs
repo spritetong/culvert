@@ -40,9 +40,10 @@ impl TransportDriver for WsTransportDriver {
     fn build_listener(
         &self,
         listen_addr: &str,
-        auth_token: &str,
+        auth_token: Option<&str>,
+        path: Option<&str>,
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
-        Ok(Box::new(WsListener::new(listen_addr, auth_token)))
+        Ok(Box::new(WsListener::new(listen_addr, auth_token, path)))
     }
 }
 
@@ -56,7 +57,7 @@ mod tests {
     #[tokio::test]
     async fn test_ws_connector_listener_e2e() {
         let auth_token = "test_secret_token_456";
-        let mut listener = WsListener::new("127.0.0.1:29876", auth_token);
+        let mut listener = WsListener::new("127.0.0.1:29876", Some(auth_token), Some("/ws"));
 
         let app_cfg = AppConfig::default();
         let ep_cfg = EndpointConfig::Simple("http://127.0.0.1:29876/ws".to_string());

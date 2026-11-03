@@ -40,7 +40,7 @@ impl TransportRegistry {
     pub fn create_connector(
         &self,
         endpoint: &EndpointContext,
-        auth_token: &str,
+        auth_token: Option<&str>,
         mode: crate::config::model::TunnelMode,
     ) -> Result<Box<dyn TransportConnector>, TunnelError> {
         let scheme = endpoint.endpoint.scheme.as_str();
@@ -48,7 +48,7 @@ impl TransportRegistry {
             .get_driver(scheme)
             .ok_or_else(|| TunnelError::UnsupportedScheme(scheme.to_string()))?;
 
-        driver.build_connector(endpoint, auth_token, mode)
+        driver.build_connector(endpoint, auth_token.unwrap_or(""), mode)
     }
 
     /// Creates a dynamic `TransportListener` for the specified scheme.
@@ -56,12 +56,13 @@ impl TransportRegistry {
         &self,
         scheme: &str,
         listen_addr: &str,
-        auth_token: &str,
+        auth_token: Option<&str>,
+        path: Option<&str>,
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
         let driver = self
             .get_driver(scheme)
             .ok_or_else(|| TunnelError::UnsupportedScheme(scheme.to_string()))?;
 
-        driver.build_listener(listen_addr, auth_token)
+        driver.build_listener(listen_addr, auth_token, path)
     }
 }

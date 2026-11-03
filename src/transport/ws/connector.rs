@@ -34,16 +34,18 @@ where
 /// WebSocket transport connector for opening outbound tunnels.
 pub struct WsConnector {
     pub endpoint: EndpointContext,
-    pub auth_token: String,
+    pub auth_token: Option<String>,
     pub mode: TunnelMode,
 }
 
 impl WsConnector {
     /// Creates a new `WsConnector`.
     pub fn new(endpoint: EndpointContext, auth_token: impl Into<String>, mode: TunnelMode) -> Self {
+        let tok: String = auth_token.into();
+        let auth_token = if tok.is_empty() { None } else { Some(tok) };
         Self {
             endpoint,
-            auth_token: auth_token.into(),
+            auth_token,
             mode,
         }
     }
@@ -94,7 +96,7 @@ impl WsConnector {
             .header("Sec-WebSocket-Key", key)
             .header("Sec-WebSocket-Version", "13");
 
-        let headers = WsHandshakeHeaders::new(&self.auth_token, self.mode)
+        let headers = WsHandshakeHeaders::new(self.auth_token.clone(), self.mode)
             .with_session_id(session_id.map(|s| s.to_string()))
             .with_target(Some(target))
             .with_pool_idle(pool_idle);

@@ -27,30 +27,44 @@ tls:
   insecure: false
   alpn: ["h3", "http/1.1"]
 
-# Concurrent multi-tunnel definitions
-tunnels:
-  # Tunnel 1: Reverse forwarding (map VPS 2222 back to local SSH 22)
-  - tag: "vps-ssh-reverse"
-    mode: "reverse"
-    listen: "0.0.0.0:2222"
-    target: "127.0.0.1:22"
-    token: "SECURE_PRESHARED_TOKEN"
-    endpoint:
-      url: "wss://tunnel.example.com/ws"
-      dns:
-        strategy: "ipv4_only"
-      tls:
-        enabled: true
-        server_name: "tunnel.example.com"
-        insecure: true
-      dialer:
-        connect_timeout: "3s"
+# Server Ingress configuration (can coexist with tunnels in same config!)
+server:
+  # Explicit scheme URL(s) with path routing support: ws, wss, h3, quic, uds
+  listen:
+    - "ws://0.0.0.0:8080/tunnel"
+    - "h3://0.0.0.0:8443/tunnel"
+  token: "SECURE_PRESHARED_TOKEN"   # Optional: omit or leave empty for no-auth mode
+  default_target: "127.0.0.1:5201"  # Optional: fallback target
 
-  # Tunnel 2: Forward forwarding (map local 13306 to cloud remote MySQL)
-  - tag: "cloud-mysql-forward"
+# Concurrent multi-tunnel definitions (single endpoint can carry multiple port mappings)
+tunnels:
+  # Tunnel 1: Cluster with multiple port mappings sharing one 0-RTT connection pool
+  - tag: "corp-cluster"
+    endpoint: "ws://127.0.0.1:8080/tunnel"
+    token: "SECURE_PRESHARED_TOKEN"
+    pool_size: 8
+    retry:
+      delay: "3s"
+      max_retries: 10
+    mappings:
+      # Forward mapping: local 15201 -> remote 5201 (iperf3)
+      - mode: "forward"
+        listen: "127.0.0.1:15201"
+        target: "127.0.0.1:5201"
+      # Forward mapping: local 13306 -> remote 3306 (MySQL)
+      - mode: "forward"
+        listen: "127.0.0.1:13306"
+        target: "10.0.0.5:3306"
+      # Reverse mapping: remote 2222 -> local 22 (SSH)
+      - mode: "reverse"
+        listen: "0.0.0.0:2222"
+        target: "127.0.0.1:22"
+
+  # Tunnel 2: Backward-compatible single-mapping tunnel with HTTP/3 & multiplexing
+  - tag: "cloud-h3-forward"
     mode: "forward"
-    listen: "127.0.0.1:13306"
-    target: "10.0.0.5:3306"
+    listen: "127.0.0.1:18080"
+    target: "10.0.0.8:8080"
     token: "SECURE_PRESHARED_TOKEN"
     endpoint: "https://tunnel.example.com/tunnel"
     multiplex:

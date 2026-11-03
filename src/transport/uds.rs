@@ -31,11 +31,12 @@ impl TransportDriver for UdsTransportDriver {
     fn build_listener(
         &self,
         socket_path: &str,
-        auth_token: &str,
+        auth_token: Option<&str>,
+        _path: Option<&str>,
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
         Ok(Box::new(UdsListener {
             socket_path: socket_path.to_string(),
-            auth_token: auth_token.to_string(),
+            auth_token: auth_token.unwrap_or("").to_string(),
         }))
     }
 }

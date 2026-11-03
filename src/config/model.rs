@@ -24,12 +24,120 @@ pub struct AppConfig {
     pub tunnels: Vec<TunnelConfig>,
 }
 
+/// Parsed server listening specification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerListenSpec {
+    pub scheme: String,
+    pub bind_addr: String,
+    pub path: Option<String>,
+}
+
+impl ServerListenSpec {
+    pub fn parse(raw: &str) -> Result<Self, crate::core::error::TunnelError> {
+        let raw = raw.trim();
+        let (scheme, rest) = if let Some(idx) = raw.find("://") {
+            let s = &raw[..idx];
+            let r = &raw[idx + 3..];
+            (s.to_lowercase(), r)
+        } else {
+            return Err(crate::core::error::TunnelError::Config(format!(
+                "Invalid server listen URL '{}'. Protocol scheme must be explicitly specified (e.g. ws://0.0.0.0:8080/tunnel, h3://0.0.0.0:8443/tunnel, uds:///tmp/tunnel.sock). Implicit protocol is not supported.",
+                raw
+            )));
+        };
+
+        match scheme.as_str() {
+            "ws" | "wss" | "h3" | "quic" | "https" => {
+                let (host_port, path_part) = if let Some(slash_idx) = rest.find('/') {
+                    let hp = &rest[..slash_idx];
+                    let p = &rest[slash_idx..];
+                    (hp, p)
+                } else {
+                    (rest, "/")
+                };
+
+                if host_port.is_empty() {
+                    return Err(crate::core::error::TunnelError::Config(format!(
+                        "Invalid server listen URL '{}': missing host and port",
+                        raw
+                    )));
+                }
+
+                let path = if path_part.is_empty() || path_part == "/" {
+                    None
+                } else {
+                    Some(path_part.to_string())
+                };
+
+                Ok(Self {
+                    scheme,
+                    bind_addr: host_port.to_string(),
+                    path,
+                })
+            }
+            "uds" => {
+                let socket_path = if rest.starts_with('/') {
+                    rest.to_string()
+                } else {
+                    format!("/{}", rest)
+                };
+                Ok(Self {
+                    scheme: "uds".to_string(),
+                    bind_addr: socket_path,
+                    path: None,
+                })
+            }
+            other => Err(crate::core::error::TunnelError::Config(format!(
+                "Unsupported server protocol scheme '{}' in URL '{}'. Supported schemes: ws, wss, h3, quic, uds",
+                other, raw
+            ))),
+        }
+    }
+}
+
+fn deserialize_one_or_many<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(s) => Ok(vec![s]),
+        OneOrMany::Many(vec) => Ok(vec),
+    }
+}
+
 /// Server configuration for running as an ingress listener on VPS or cloud host.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ServerConfig {
-    pub listen: String,
-    pub token: String,
+    /// Ingress listening URLs (e.g. "ws://0.0.0.0:8080/tunnel", ["ws://...", "h3://..."]).
+    #[serde(
+        default,
+        alias = "listens",
+        deserialize_with = "deserialize_one_or_many"
+    )]
+    pub listen: Vec<String>,
+
+    /// Authentication token for validating incoming tunnels. Optional.
+    pub token: Option<String>,
+
+    /// Default target to forward to when client doesn't specify one.
     pub default_target: Option<String>,
+}
+
+impl ServerConfig {
+    pub fn parse_specs(&self) -> Result<Vec<ServerListenSpec>, crate::core::error::TunnelError> {
+        let mut specs = Vec::new();
+        for url in &self.listen {
+            specs.push(ServerListenSpec::parse(url)?);
+        }
+        Ok(specs)
+    }
 }
 
 /// Logging configuration options.
@@ -172,19 +280,104 @@ pub enum TunnelMode {
     Reverse,
 }
 
+/// Individual bidirectional port mapping definition.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct PortMappingConfig {
+    #[serde(default = "default_mapping_mode")]
+    pub mode: TunnelMode,
+    pub listen: String,
+    pub target: String,
+}
+
+fn default_mapping_mode() -> TunnelMode {
+    TunnelMode::Forward
+}
+
+/// Tunnel retry configuration.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+pub struct TunnelRetryConfig {
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub delay: Option<Duration>,
+    pub max_retries: Option<usize>,
+}
+
+fn deserialize_optional_duration<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum DurHelper {
+        Str(String),
+        Secs(u64),
+    }
+
+    match Option::<DurHelper>::deserialize(deserializer)? {
+        Some(DurHelper::Str(s)) => {
+            let s = s.trim();
+            if let Some(stripped) = s.strip_suffix("ms") {
+                stripped
+                    .parse::<u64>()
+                    .map(|ms| Some(Duration::from_millis(ms)))
+                    .map_err(serde::de::Error::custom)
+            } else if let Some(stripped) = s.strip_suffix('s') {
+                stripped
+                    .parse::<u64>()
+                    .map(|sec| Some(Duration::from_secs(sec)))
+                    .map_err(serde::de::Error::custom)
+            } else {
+                s.parse::<u64>()
+                    .map(|sec| Some(Duration::from_secs(sec)))
+                    .map_err(serde::de::Error::custom)
+            }
+        }
+        Some(DurHelper::Secs(secs)) => Ok(Some(Duration::from_secs(secs))),
+        None => Ok(None),
+    }
+}
+
 /// Configuration for an individual tunnel instance.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TunnelConfig {
     pub tag: String,
-    pub mode: TunnelMode,
-    pub listen: String,
-    pub target: String,
-    pub token: String,
     pub endpoint: EndpointConfig,
-    pub failover: Option<FailoverConfig>,
+    pub token: Option<String>,
     #[serde(default)]
     pub pool_size: Option<usize>,
+    pub failover: Option<FailoverConfig>,
     pub multiplex: Option<MultiplexConfig>,
+    pub retry: Option<TunnelRetryConfig>,
+
+    /// Multiple bidirectional port mappings sharing this endpoint and connection pool.
+    #[serde(default)]
+    pub mappings: Vec<PortMappingConfig>,
+
+    // Backward-compatibility single mapping fields
+    pub mode: Option<TunnelMode>,
+    pub listen: Option<String>,
+    pub target: Option<String>,
+}
+
+impl TunnelConfig {
+    /// Returns the canonical list of port mappings configured for this tunnel.
+    pub fn canonical_mappings(
+        &self,
+    ) -> Result<Vec<PortMappingConfig>, crate::core::error::TunnelError> {
+        if !self.mappings.is_empty() {
+            Ok(self.mappings.clone())
+        } else if let (Some(listen), Some(target)) = (&self.listen, &self.target) {
+            Ok(vec![PortMappingConfig {
+                mode: self.mode.unwrap_or(TunnelMode::Forward),
+                listen: listen.clone(),
+                target: target.clone(),
+            }])
+        } else {
+            Err(crate::core::error::TunnelError::Config(format!(
+                "Tunnel '{}' has no port mappings configured. Please provide 'mappings: [...]' or 'listen' and 'target'.",
+                self.tag
+            )))
+        }
+    }
 }
 
 /// Stream multiplexing configuration (sing-box style generic layer over any transport).

@@ -41,7 +41,7 @@ tls:
   min_version: "1.3"
 
 server:
-  listen: "127.0.0.1:8443"
+  listen: "ws://127.0.0.1:8443/tunnel"
   token: "server_secret_token"
   default_target: "127.0.0.1:8080"
 
@@ -106,9 +106,15 @@ tunnels:
 
     // Verify Server
     let server = app_config.server.as_ref().unwrap();
-    assert_eq!(server.listen, "127.0.0.1:8443");
-    assert_eq!(server.token, "server_secret_token");
+    assert_eq!(server.listen, vec!["ws://127.0.0.1:8443/tunnel"]);
+    assert_eq!(server.token.as_deref(), Some("server_secret_token"));
     assert_eq!(server.default_target.as_deref(), Some("127.0.0.1:8080"));
+
+    let specs = server.parse_specs().expect("Should parse specs");
+    assert_eq!(specs.len(), 1);
+    assert_eq!(specs[0].scheme, "ws");
+    assert_eq!(specs[0].bind_addr, "127.0.0.1:8443");
+    assert_eq!(specs[0].path.as_deref(), Some("/tunnel"));
 
     // Verify Tunnels
     assert_eq!(app_config.tunnels.len(), 2);
@@ -116,7 +122,7 @@ tunnels:
     // Tunnel 1: detailed endpoint overriding global dns/tls/dialer
     let t1 = &app_config.tunnels[0];
     assert_eq!(t1.tag, "ssh-reverse");
-    assert_eq!(t1.mode, TunnelMode::Reverse);
+    assert_eq!(t1.mode, Some(TunnelMode::Reverse));
     assert_eq!(t1.pool_size, Some(4));
     assert_eq!(t1.endpoint.url(), "wss://vps.example.com:443/ws");
 
@@ -137,7 +143,7 @@ tunnels:
     // Tunnel 2: simple endpoint inheriting global defaults
     let t2 = &app_config.tunnels[1];
     assert_eq!(t2.tag, "web-forward");
-    assert_eq!(t2.mode, TunnelMode::Forward);
+    assert_eq!(t2.mode, Some(TunnelMode::Forward));
     assert_eq!(t2.endpoint.url(), "ws://10.0.0.1:8080/tunnel");
 
     let ep_ctx2 = EndpointContext::build(&t2.endpoint, &app_config)

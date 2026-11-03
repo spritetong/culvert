@@ -2,11 +2,12 @@
 //! All comments and docstrings must be in English.
 
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::common::task::TaskTracker;
-use crate::config::model::{AppConfig, TunnelConfig, TunnelMode};
+use crate::config::model::{AppConfig, TunnelConfig};
 use crate::core::error::TunnelError;
 use crate::dialer::endpoint::EndpointContext;
 use crate::server::ServerRunner;
@@ -15,7 +16,7 @@ use crate::transport::TransportRegistry;
 use crate::transport::h3::H3TransportDriver;
 use crate::transport::uds::UdsTransportDriver;
 use crate::transport::ws::WsTransportDriver;
-use crate::tunnel::{run_forward_tunnel, run_reverse_tunnel};
+use crate::tunnel::run_tunnel_cluster;
 
 /// Multi-tunnel supervisor that concurrently runs multiple tunnels and ensures orderly shutdown.
 pub struct TunnelSupervisor {
@@ -56,14 +57,14 @@ impl TunnelSupervisor {
             tracker.spawn_with_cancel(move |token| async move { server_runner.run(token).await });
         }
 
-        // Spawn client tunnel workers
+        // Spawn client tunnel workers with retry supervision
         for tunnel_cfg in &self.config.tunnels {
             let cfg = tunnel_cfg.clone();
             let registry = Arc::clone(&self.transport_registry);
             let endpoint_ctx = EndpointContext::build(&cfg.endpoint, &self.config)?;
 
             tracker.spawn_with_cancel(move |token| async move {
-                Self::run_single_tunnel(cfg, endpoint_ctx, registry, token).await
+                Self::run_tunnel_with_retry(cfg, endpoint_ctx, registry, token).await
             });
         }
 
@@ -89,15 +90,66 @@ impl TunnelSupervisor {
         Ok(())
     }
 
-    async fn run_single_tunnel(
+    /// Supervised retry loop for a tunnel instance.
+    async fn run_tunnel_with_retry(
         config: TunnelConfig,
         endpoint_ctx: EndpointContext,
         registry: Arc<TransportRegistry>,
         token: CancellationToken,
     ) -> Result<(), TunnelError> {
-        match config.mode {
-            TunnelMode::Forward => run_forward_tunnel(config, endpoint_ctx, registry, token).await,
-            TunnelMode::Reverse => run_reverse_tunnel(config, endpoint_ctx, registry, token).await,
+        let retry_cfg = config.retry.clone().unwrap_or_default();
+        let retry_delay = retry_cfg.delay.unwrap_or_else(|| Duration::from_secs(3));
+        let max_retries = retry_cfg.max_retries;
+
+        let mut attempts = 0usize;
+        loop {
+            if token.is_cancelled() {
+                break;
+            }
+
+            match run_tunnel_cluster(
+                config.clone(),
+                endpoint_ctx.clone(),
+                Arc::clone(&registry),
+                token.clone(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    info!(tag = %config.tag, "Tunnel exited cleanly");
+                    break;
+                }
+                Err(e) => {
+                    attempts += 1;
+                    if let Some(max) = max_retries {
+                        if attempts >= max {
+                            error!(
+                                tag = %config.tag,
+                                attempts,
+                                max,
+                                "Tunnel exceeded maximum retry attempts, giving up: {:?}",
+                                e
+                            );
+                            return Err(e);
+                        }
+                    }
+
+                    warn!(
+                        tag = %config.tag,
+                        attempts,
+                        retry_in = ?retry_delay,
+                        "Tunnel execution error: {:?}. Retrying...",
+                        e
+                    );
+
+                    tokio::select! {
+                        _ = token.cancelled() => break,
+                        _ = tokio::time::sleep(retry_delay) => {}
+                    }
+                }
+            }
         }
+
+        Ok(())
     }
 }

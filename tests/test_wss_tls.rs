@@ -270,8 +270,8 @@ async fn test_wss_forward_tunnel_with_custom_ca_and_sni() {
     let session_mgr = Arc::new(SessionManager::new());
 
     let server_config = ServerConfig {
-        listen: format!("127.0.0.1:{}", backend_server_port),
-        token: auth_token.to_string(),
+        listen: vec![format!("ws://127.0.0.1:{}/tunnel", backend_server_port)],
+        token: Some(auth_token.to_string()),
         default_target: None,
     };
     let server_runner = ServerRunner::new(
@@ -297,13 +297,15 @@ async fn test_wss_forward_tunnel_with_custom_ca_and_sni() {
     // 4. Client forward tunnel connecting via wss:// with custom CA and SNI override
     let tunnel_config = TunnelConfig {
         tag: "test-wss-ca-sni".to_string(),
-        mode: TunnelMode::Forward,
-        listen: format!("127.0.0.1:{}", client_listen_port),
-        target: format!("127.0.0.1:{}", echo_port),
-        token: auth_token.to_string(),
+        mode: Some(TunnelMode::Forward),
+        listen: Some(format!("127.0.0.1:{}", client_listen_port)),
+        target: Some(format!("127.0.0.1:{}", echo_port)),
+        token: Some(auth_token.to_string()),
         pool_size: None,
         failover: None,
         multiplex: None,
+        mappings: vec![],
+        retry: None,
         endpoint: EndpointConfig::Detailed {
             url: format!("wss://127.0.0.1:{}/tunnel", tls_ingress_port),
             dns: None,
@@ -375,8 +377,8 @@ async fn test_wss_forward_tunnel_insecure_mode() {
     let session_mgr = Arc::new(SessionManager::new());
 
     let server_config = ServerConfig {
-        listen: format!("127.0.0.1:{}", backend_server_port),
-        token: auth_token.to_string(),
+        listen: vec![format!("ws://127.0.0.1:{}/tunnel", backend_server_port)],
+        token: Some(auth_token.to_string()),
         default_target: None,
     };
     let server_runner = ServerRunner::new(
@@ -401,13 +403,15 @@ async fn test_wss_forward_tunnel_insecure_mode() {
     // Client connects with insecure: true (without CA cert)
     let tunnel_config = TunnelConfig {
         tag: "test-wss-insecure".to_string(),
-        mode: TunnelMode::Forward,
-        listen: format!("127.0.0.1:{}", client_listen_port),
-        target: format!("127.0.0.1:{}", echo_port),
-        token: auth_token.to_string(),
+        mode: Some(TunnelMode::Forward),
+        listen: Some(format!("127.0.0.1:{}", client_listen_port)),
+        target: Some(format!("127.0.0.1:{}", echo_port)),
+        token: Some(auth_token.to_string()),
         pool_size: None,
         failover: None,
         multiplex: None,
+        mappings: vec![],
+        retry: None,
         endpoint: EndpointConfig::Detailed {
             url: format!("wss://127.0.0.1:{}/tunnel", tls_ingress_port),
             dns: None,
@@ -477,8 +481,8 @@ async fn test_wss_mtls_mutual_authentication() {
     let session_mgr = Arc::new(SessionManager::new());
 
     let server_config = ServerConfig {
-        listen: format!("127.0.0.1:{}", backend_server_port),
-        token: auth_token.to_string(),
+        listen: vec![format!("ws://127.0.0.1:{}/tunnel", backend_server_port)],
+        token: Some(auth_token.to_string()),
         default_target: None,
     };
     let server_runner = ServerRunner::new(
@@ -504,13 +508,15 @@ async fn test_wss_mtls_mutual_authentication() {
     // Client configures client_certificate and client_key
     let tunnel_config = TunnelConfig {
         tag: "test-wss-mtls".to_string(),
-        mode: TunnelMode::Forward,
-        listen: format!("127.0.0.1:{}", client_listen_port),
-        target: format!("127.0.0.1:{}", echo_port),
-        token: auth_token.to_string(),
+        mode: Some(TunnelMode::Forward),
+        listen: Some(format!("127.0.0.1:{}", client_listen_port)),
+        target: Some(format!("127.0.0.1:{}", echo_port)),
+        token: Some(auth_token.to_string()),
         pool_size: None,
         failover: None,
         multiplex: None,
+        mappings: vec![],
+        retry: None,
         endpoint: EndpointConfig::Detailed {
             url: format!("wss://127.0.0.1:{}/tunnel", tls_ingress_port),
             dns: None,
@@ -582,8 +588,8 @@ async fn test_wss_reverse_tunnel_e2e() {
     let session_mgr = Arc::new(SessionManager::new());
 
     let server_config = ServerConfig {
-        listen: format!("127.0.0.1:{}", backend_server_port),
-        token: auth_token.to_string(),
+        listen: vec![format!("ws://127.0.0.1:{}/tunnel", backend_server_port)],
+        token: Some(auth_token.to_string()),
         default_target: None,
     };
     let server_runner = ServerRunner::new(
@@ -609,13 +615,15 @@ async fn test_wss_reverse_tunnel_e2e() {
     // 4. Reverse tunnel client over WSS with CA cert
     let tunnel_config = TunnelConfig {
         tag: "test-wss-reverse".to_string(),
-        mode: TunnelMode::Reverse,
-        listen: format!("127.0.0.1:{}", reverse_listen_port),
-        target: format!("127.0.0.1:{}", local_echo_port),
-        token: auth_token.to_string(),
+        mode: Some(TunnelMode::Reverse),
+        listen: Some(format!("127.0.0.1:{}", reverse_listen_port)),
+        target: Some(format!("127.0.0.1:{}", local_echo_port)),
+        token: Some(auth_token.to_string()),
         pool_size: None,
         failover: None,
         multiplex: None,
+        mappings: vec![],
+        retry: None,
         endpoint: EndpointConfig::Detailed {
             url: format!("wss://127.0.0.1:{}/tunnel", tls_ingress_port),
             dns: None,

@@ -16,7 +16,7 @@ use crate::transport::{StreamMetadata, TargetAddr};
 /// Structured representation of handshake metadata carried in HTTP upgrade headers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WsHandshakeHeaders {
-    pub auth_token: String,
+    pub auth_token: Option<String>,
     pub tunnel_mode: TunnelMode,
     pub session_id: Option<String>,
     pub target_host: Option<String>,
@@ -25,10 +25,10 @@ pub struct WsHandshakeHeaders {
 }
 
 impl WsHandshakeHeaders {
-    /// Creates a new `WsHandshakeHeaders` with the required authentication token and mode.
-    pub fn new(auth_token: impl Into<String>, tunnel_mode: TunnelMode) -> Self {
+    /// Creates a new `WsHandshakeHeaders` with the optional authentication token and mode.
+    pub fn new(auth_token: Option<String>, tunnel_mode: TunnelMode) -> Self {
         Self {
-            auth_token: auth_token.into(),
+            auth_token,
             tunnel_mode,
             session_id: None,
             target_host: None,
@@ -68,12 +68,11 @@ impl WsHandshakeHeaders {
 
     /// Parses and validates headers from an incoming HTTP request HeaderMap.
     pub fn from_http_headers(headers: &HeaderMap) -> Result<Self, TunnelError> {
-        // Extract authentication token
+        // Extract optional authentication token
         let auth_token = headers
             .get(HEADER_TUNNEL_AUTH)
             .and_then(|v| v.to_str().ok())
-            .ok_or(TunnelError::AuthFailed)?
-            .to_string();
+            .map(|s| s.to_string());
 
         // Extract and map tunnel mode
         let mode_str = headers
@@ -128,7 +127,11 @@ impl WsHandshakeHeaders {
 
     /// Injects these handshake headers into an outgoing HTTP request builder.
     pub fn apply_to_request_builder(&self, mut builder: RequestBuilder) -> RequestBuilder {
-        builder = builder.header(HEADER_TUNNEL_AUTH, &self.auth_token);
+        if let Some(ref token) = self.auth_token {
+            if !token.is_empty() {
+                builder = builder.header(HEADER_TUNNEL_AUTH, token);
+            }
+        }
 
         let mode_str = match self.tunnel_mode {
             TunnelMode::Forward => TUNNEL_MODE_FORWARD,
@@ -190,9 +193,10 @@ mod tests {
 
     #[test]
     fn test_ws_handshake_headers_roundtrip() {
-        let headers = WsHandshakeHeaders::new("secret_psk_123", TunnelMode::Forward)
-            .with_session_id(Some("sess_abc".to_string()))
-            .with_target(Some(&TargetAddr::Domain("127.0.0.1".to_string(), 22)));
+        let headers =
+            WsHandshakeHeaders::new(Some("secret_psk_123".to_string()), TunnelMode::Forward)
+                .with_session_id(Some("sess_abc".to_string()))
+                .with_target(Some(&TargetAddr::Domain("127.0.0.1".to_string(), 22)));
 
         let req = headers
             .apply_to_request_builder(Request::builder())
@@ -200,7 +204,7 @@ mod tests {
             .unwrap();
 
         let parsed = WsHandshakeHeaders::from_http_headers(req.headers()).unwrap();
-        assert_eq!(parsed.auth_token, "secret_psk_123");
+        assert_eq!(parsed.auth_token, Some("secret_psk_123".to_string()));
         assert_eq!(parsed.tunnel_mode, TunnelMode::Forward);
         assert_eq!(parsed.session_id, Some("sess_abc".to_string()));
         assert_eq!(parsed.target_host, Some("127.0.0.1".to_string()));
@@ -216,9 +220,10 @@ mod tests {
     }
 
     #[test]
-    fn test_ws_handshake_missing_auth() {
+    fn test_ws_handshake_optional_auth() {
         let req = Request::builder().body(()).unwrap();
-        let res = WsHandshakeHeaders::from_http_headers(req.headers());
-        assert!(res.is_err());
+        let parsed = WsHandshakeHeaders::from_http_headers(req.headers()).unwrap();
+        assert_eq!(parsed.auth_token, None);
+        assert_eq!(parsed.tunnel_mode, TunnelMode::Forward);
     }
 }

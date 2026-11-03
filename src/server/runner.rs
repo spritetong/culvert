@@ -45,138 +45,183 @@ impl ServerRunner {
 
     /// Runs the server listener and stream dispatch loop until cancelled.
     pub async fn run(&self, cancel_token: CancellationToken) -> Result<(), TunnelError> {
-        info!(listen = %self.config.listen, "Starting micro-tunnel server ingress listener");
+        let specs = self.config.parse_specs()?;
+        if specs.is_empty() {
+            info!("No server listen endpoints configured, skipping server runner");
+            return Ok(());
+        }
 
-        // Determine scheme (e.g. "uds" or default "ws")
-        let scheme =
-            if self.config.listen.starts_with('/') || self.config.listen.starts_with("uds://") {
-                "uds"
-            } else if self.config.listen.starts_with("h3://")
-                || self.config.listen.starts_with("https://")
-            {
-                "h3"
-            } else if self.config.listen.starts_with("quic://") {
-                "quic"
-            } else {
-                "ws"
-            };
+        info!(
+            listeners = ?self.config.listen,
+            "Starting micro-tunnel server ingress listeners"
+        );
 
-        let mut listener = self.transport_registry.create_listener(
-            scheme,
-            &self.config.listen,
-            &self.config.token,
-        )?;
+        let mut tracker = TaskTracker::<Result<(), TunnelError>>::new(cancel_token.clone());
 
-        let mut conn_tracker = TaskTracker::<()>::new(cancel_token.clone());
+        for spec in specs {
+            let spec_clone = spec.clone();
+            let registry = Arc::clone(&self.transport_registry);
+            let session_mgr = Arc::clone(&self.session_manager);
+            let default_target = self.config.default_target.clone();
+            let token_opt = self.config.token.clone();
 
-        loop {
-            tokio::select! {
-                _ = cancel_token.cancelled() => {
-                    info!("Server ingress listener received cancellation signal");
-                    break;
-                }
-                accept_res = listener.accept() => {
-                    match accept_res {
-                        Ok((stream, metadata)) => {
-                            let session_mgr = Arc::clone(&self.session_manager);
-                            let default_target = self.config.default_target.clone();
+            tracker.spawn_with_cancel(move |token| async move {
+                let mut listener = registry.create_listener(
+                    &spec_clone.scheme,
+                    &spec_clone.bind_addr,
+                    token_opt.as_deref(),
+                    spec_clone.path.as_deref(),
+                )?;
 
-                            conn_tracker.spawn_with_cancel(move |token| async move {
-                                match metadata.mode {
-                                    // 1. Forward mode: Dial remote target and relay
-                                    TunnelMode::Forward => {
-                                        let target_opt = metadata.target.or_else(|| {
-                                            default_target.and_then(|dt| {
-                                                if let Ok(sa) = dt.parse() {
-                                                    Some(TargetAddr::Ip(sa))
+                info!(
+                    scheme = %spec_clone.scheme,
+                    bind = %spec_clone.bind_addr,
+                    path = ?spec_clone.path,
+                    "Server ingress listener running"
+                );
+
+                let mut conn_tracker = TaskTracker::<()>::new(token.clone());
+
+                loop {
+                    tokio::select! {
+                        _ = token.cancelled() => break,
+                        accept_res = listener.accept() => {
+                            match accept_res {
+                                Ok((stream, metadata)) => {
+                                    let session_mgr = Arc::clone(&session_mgr);
+                                    let default_target = default_target.clone();
+
+                                    conn_tracker.spawn_with_cancel(move |conn_token| async move {
+                                        match metadata.mode {
+                                            // 1. Forward mode: Dial remote target and relay
+                                            TunnelMode::Forward => {
+                                                let mut stream = stream;
+                                                let mut dynamic_target: Option<TargetAddr> = None;
+
+                                                // If this stream was pre-warmed as an idle connection in client pool,
+                                                // wait for the client activation signal before touching the target service.
+                                                if metadata.pool_idle {
+                                                    let mut magic = [0u8; 1];
+                                                    tokio::select! {
+                                                        _ = conn_token.cancelled() => return,
+                                                        res = stream.read_exact(&mut magic) => {
+                                                            match res {
+                                                                Ok(_) if magic[0] == ACTIVATE_STREAM_MAGIC => {
+                                                                    // Activated! Check if dynamic target address is appended: [len: u16, target_str]
+                                                                    let mut len_bytes = [0u8; 2];
+                                                                    if let Ok(Ok(_)) = tokio::time::timeout(std::time::Duration::from_millis(200), stream.read_exact(&mut len_bytes)).await {
+                                                                        let target_len = u16::from_be_bytes(len_bytes) as usize;
+                                                                        if target_len > 0 && target_len < 512 {
+                                                                            let mut target_bytes = vec![0u8; target_len];
+                                                                            if let Ok(Ok(_)) = tokio::time::timeout(std::time::Duration::from_millis(200), stream.read_exact(&mut target_bytes)).await {
+                                                                                if let Ok(t_str) = std::str::from_utf8(&target_bytes) {
+                                                                                    if let Ok(sa) = t_str.parse() {
+                                                                                        dynamic_target = Some(TargetAddr::Ip(sa));
+                                                                                    } else if let Some((h, p)) = t_str.rsplit_once(':') {
+                                                                                        if let Ok(port) = p.parse() {
+                                                                                            dynamic_target = Some(TargetAddr::Domain(h.to_string(), port));
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                                Ok(_) => {
+                                                                    warn!("Received invalid activation magic from pool stream: {:02x}", magic[0]);
+                                                                    return;
+                                                                }
+                                                                Err(_) => {
+                                                                    // Stale or evicted stream closed by client pool without being used
+                                                                    return;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                                let target_opt = dynamic_target.or(metadata.target).or_else(|| {
+                                                    default_target.and_then(|dt| {
+                                                        if let Ok(sa) = dt.parse() {
+                                                            Some(TargetAddr::Ip(sa))
+                                                        } else {
+                                                            let parts: Vec<&str> = dt.rsplitn(2, ':').collect();
+                                                            if parts.len() == 2 {
+                                                                parts[0].parse().ok().map(|p| TargetAddr::Domain(parts[1].to_string(), p))
+                                                            } else {
+                                                                None
+                                                            }
+                                                        }
+                                                    })
+                                                });
+
+                                                let target = match target_opt {
+                                                    Some(t) => t,
+                                                    None => {
+                                                        error!("Forward stream arrived without target address");
+                                                        return;
+                                                    }
+                                                };
+
+                                                info!(target = %target, "Dialing forward target in local/internal network");
+                                                let target_conn = match TcpStream::connect(target.to_string()).await {
+                                                    Ok(s) => {
+                                                        let _ = SocketTuner::tune_tcp_stream(&s, true, None);
+                                                        s
+                                                    }
+                                                    Err(e) => {
+                                                        error!(target = %target, "Failed to connect to forward target: {:?}", e);
+                                                        return;
+                                                    }
+                                                };
+
+                                                let _ = RelayEngine::relay_with_cancel(
+                                                    stream,
+                                                    Box::new(target_conn),
+                                                    conn_token,
+                                                ).await;
+                                            }
+
+                                            // 2. Reverse mode: Either Control channel or Data channel pairing
+                                            TunnelMode::Reverse => {
+                                                if let Some(session_id) = metadata.session_id {
+                                                    // Data stream arrival: fulfill waiting session
+                                                    if let Err(e) = session_mgr.fulfill(&session_id, stream) {
+                                                        warn!(session = %session_id, "Failed to fulfill reverse session: {:?}", e);
+                                                    }
                                                 } else {
-                                                    let parts: Vec<&str> = dt.rsplitn(2, ':').collect();
-                                                    if parts.len() == 2 {
-                                                        parts[0].parse().ok().map(|p| TargetAddr::Domain(parts[1].to_string(), p))
-                                                    } else {
-                                                        None
-                                                    }
-                                                }
-                                            })
-                                        });
-
-                                        let target = match target_opt {
-                                            Some(t) => t,
-                                            None => {
-                                                error!("Forward stream arrived without target address");
-                                                return;
-                                            }
-                                        };
-
-                                        let mut stream = stream;
-
-                                        // If this stream was pre-warmed as an idle connection in client pool,
-                                        // wait for the client activation signal before touching the target service.
-                                        if metadata.pool_idle {
-                                            let mut magic = [0u8; 1];
-                                            tokio::select! {
-                                                _ = token.cancelled() => return,
-                                                res = stream.read_exact(&mut magic) => {
-                                                    match res {
-                                                        Ok(_) if magic[0] == ACTIVATE_STREAM_MAGIC => {
-                                                            // Activated! Proceed to dial target.
-                                                        }
-                                                        Ok(_) => {
-                                                            warn!("Received invalid activation magic from pool stream: {:02x}", magic[0]);
-                                                            return;
-                                                        }
-                                                        Err(_) => {
-                                                            // Stale or evicted stream closed by client pool without being used
-                                                            return;
-                                                        }
-                                                    }
+                                                    // Control stream arrival: handle registration and listen on requested port
+                                                    Self::handle_reverse_control(stream, session_mgr, conn_token).await;
                                                 }
                                             }
                                         }
-
-                                        info!(target = %target, "Dialing forward target in local/internal network");
-                                        let target_conn = match TcpStream::connect(target.to_string()).await {
-                                            Ok(s) => {
-                                                let _ = SocketTuner::tune_tcp_stream(&s, true, None);
-                                                s
-                                            }
-                                            Err(e) => {
-                                                error!(target = %target, "Failed to connect to forward target: {:?}", e);
-                                                return;
-                                            }
-                                        };
-
-                                        let _ = RelayEngine::relay_with_cancel(
-                                            stream,
-                                            Box::new(target_conn),
-                                            token,
-                                        ).await;
-                                    }
-
-                                    // 2. Reverse mode: Either Control channel or Data channel pairing
-                                    TunnelMode::Reverse => {
-                                        if let Some(session_id) = metadata.session_id {
-                                            // Data stream arrival: fulfill waiting session
-                                            if let Err(e) = session_mgr.fulfill(&session_id, stream) {
-                                                warn!(session = %session_id, "Failed to fulfill reverse session: {:?}", e);
-                                            }
-                                        } else {
-                                            // Control stream arrival: handle registration and listen on requested port
-                                            Self::handle_reverse_control(stream, session_mgr, token).await;
-                                        }
-                                    }
+                                    });
                                 }
-                            });
-                        }
-                        Err(e) => {
-                            error!("Error accepting stream on server ingress: {:?}", e);
+                                Err(e) => {
+                                    error!("Error accepting stream on server ingress: {:?}", e);
+                                }
+                            }
                         }
                     }
+                }
+
+                conn_tracker.shutdown_and_wait().await;
+                Ok(())
+            });
+        }
+
+        tokio::select! {
+            _ = cancel_token.cancelled() => {
+                info!("Server ingress runner received cancellation signal");
+            }
+            res = tracker.join_next() => {
+                if let Some(Ok(Err(e))) = res {
+                    error!("A server ingress listener terminated with error: {:?}", e);
                 }
             }
         }
 
-        conn_tracker.shutdown_and_wait().await;
+        tracker.shutdown_and_wait().await;
         Ok(())
     }
 

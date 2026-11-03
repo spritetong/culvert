@@ -26,7 +26,8 @@ impl H3Listener {
     /// Binds an `H3Listener` using an existing `rustls::ServerConfig`.
     pub fn bind(
         listen_addr: &str,
-        auth_token: &str,
+        auth_token: Option<&str>,
+        path: Option<&str>,
         server_rustls_config: rustls::ServerConfig,
     ) -> Result<Self, TunnelError> {
         let clean_addr = if let Some(idx) = listen_addr.find("://") {
@@ -65,7 +66,8 @@ impl H3Listener {
 
         Self::spawn_listener_loop(
             quinn_endpoint,
-            auth_token.to_string(),
+            auth_token.map(|s| s.to_string()),
+            path.map(|p| p.to_string()),
             tx_streams,
             cancel_token.clone(),
         );
@@ -79,11 +81,13 @@ impl H3Listener {
     /// Spawns the main listener event loop accepting QUIC connections.
     fn spawn_listener_loop(
         endpoint: quinn::Endpoint,
-        auth_token: String,
+        auth_token: Option<String>,
+        path: Option<String>,
         tx_streams: mpsc::Sender<(Box<dyn TunnelStream>, StreamMetadata)>,
         cancel_token: CancellationToken,
     ) {
         let auth_token = Arc::new(auth_token);
+        let path = Arc::new(path);
 
         tokio::spawn(async move {
             loop {
@@ -95,6 +99,7 @@ impl H3Listener {
                                 match incoming.accept() {
                                     Ok(mut connecting) => {
                                         let auth_clone = Arc::clone(&auth_token);
+                                        let path_clone = Arc::clone(&path);
                                         let tx_clone = tx_streams.clone();
                                         let cancel_conn = cancel_token.clone();
 
@@ -112,6 +117,7 @@ impl H3Listener {
                                                         conn,
                                                         alpn,
                                                         auth_clone,
+                                                        path_clone,
                                                         tx_clone,
                                                         cancel_conn,
                                                     ).await;
@@ -139,7 +145,8 @@ impl H3Listener {
     async fn handle_connection(
         conn: quinn::Connection,
         alpn: Option<Vec<u8>>,
-        auth_token: Arc<String>,
+        auth_token: Arc<Option<String>>,
+        path: Arc<Option<String>>,
         tx_streams: mpsc::Sender<(Box<dyn TunnelStream>, StreamMetadata)>,
         cancel_token: CancellationToken,
     ) {
@@ -153,14 +160,15 @@ impl H3Listener {
         if is_raw_quic {
             Self::handle_raw_quic_streams(conn, auth_token, tx_streams, cancel_token).await;
         } else {
-            Self::handle_h3_streams(conn, auth_token, tx_streams, cancel_token).await;
+            Self::handle_h3_streams(conn, auth_token, path, tx_streams, cancel_token).await;
         }
     }
 
     /// Processes HTTP/3 request streams on the connection.
     async fn handle_h3_streams(
         conn: quinn::Connection,
-        auth_token: Arc<String>,
+        auth_token: Arc<Option<String>>,
+        expected_path: Arc<Option<String>>,
         tx_streams: mpsc::Sender<(Box<dyn TunnelStream>, StreamMetadata)>,
         cancel_token: CancellationToken,
     ) {
@@ -183,20 +191,37 @@ impl H3Listener {
                         Ok(Some(resolver)) => {
                             match resolver.resolve_request().await {
                                 Ok((req, mut stream)) => {
-                                    let auth_header = req
-                                        .headers()
-                                        .get("authorization")
-                                        .and_then(|v| v.to_str().ok());
+                                    // Validate URI path
+                                    if let Some(ref p) = *expected_path {
+                                        if req.uri().path() != p.as_str() {
+                                            let resp = Response::builder()
+                                                .status(StatusCode::NOT_FOUND)
+                                                .body(())
+                                                .unwrap();
+                                            let _ = stream.send_response(resp).await;
+                                            continue;
+                                        }
+                                    }
 
-                                    let expected_auth = format!("Bearer {}", *auth_token);
-                                    if auth_header != Some(&expected_auth) {
-                                        warn!("H3 request authentication failed");
-                                        let resp = Response::builder()
-                                            .status(StatusCode::UNAUTHORIZED)
-                                            .body(())
-                                            .unwrap();
-                                        let _ = stream.send_response(resp).await;
-                                        continue;
+                                    // Validate authorization token if configured
+                                    if let Some(ref token) = *auth_token {
+                                        if !token.is_empty() {
+                                            let auth_header = req
+                                                .headers()
+                                                .get("authorization")
+                                                .and_then(|v| v.to_str().ok());
+
+                                            let expected_auth = format!("Bearer {}", token);
+                                            if auth_header != Some(&expected_auth) {
+                                                warn!("H3 request authentication failed");
+                                                let resp = Response::builder()
+                                                    .status(StatusCode::UNAUTHORIZED)
+                                                    .body(())
+                                                    .unwrap();
+                                                let _ = stream.send_response(resp).await;
+                                                continue;
+                                            }
+                                        }
                                     }
 
                                     let mode = match req.headers().get("x-tunnel-mode").and_then(|v| v.to_str().ok()) {
@@ -257,7 +282,7 @@ impl H3Listener {
     /// Processes raw QUIC bidirectional streams on the connection.
     async fn handle_raw_quic_streams(
         conn: quinn::Connection,
-        auth_token: Arc<String>,
+        auth_token: Arc<Option<String>>,
         tx_streams: mpsc::Sender<(Box<dyn TunnelStream>, StreamMetadata)>,
         cancel_token: CancellationToken,
     ) {
@@ -284,9 +309,11 @@ impl H3Listener {
                                 if recv.read_exact(&mut auth_buf).await.is_err() {
                                     return;
                                 }
-                                if auth_buf != auth_clone.as_bytes() {
-                                    warn!("Raw QUIC authentication failed");
-                                    return;
+                                if let Some(ref token) = *auth_clone {
+                                    if !token.is_empty() && auth_buf != token.as_bytes() {
+                                        warn!("Raw QUIC authentication failed");
+                                        return;
+                                    }
                                 }
 
                                 // Read metadata

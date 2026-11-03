@@ -79,8 +79,8 @@ async fn test_forward_tunnel_ws_e2e() {
     let session_mgr = Arc::new(SessionManager::new());
 
     let server_config = ServerConfig {
-        listen: server_listen.clone(),
-        token: auth_token.to_string(),
+        listen: vec![format!("ws://{}/tunnel", server_listen)],
+        token: Some(auth_token.to_string()),
         default_target: None,
     };
     let server_runner = ServerRunner::new(
@@ -97,14 +97,16 @@ async fn test_forward_tunnel_ws_e2e() {
     // 3. Setup client forward tunnel
     let tunnel_config = TunnelConfig {
         tag: "test-forward".to_string(),
-        mode: TunnelMode::Forward,
-        listen: client_listen.clone(),
-        target: format!("127.0.0.1:{}", echo_port),
+        mode: Some(TunnelMode::Forward),
+        listen: Some(client_listen.clone()),
+        target: Some(format!("127.0.0.1:{}", echo_port)),
         endpoint: EndpointConfig::Simple(format!("ws://{}/tunnel", server_listen)),
-        token: auth_token.to_string(),
+        token: Some(auth_token.to_string()),
         pool_size: None,
         failover: None,
         multiplex: None,
+        mappings: vec![],
+        retry: None,
     };
 
     let app_config = AppConfig::default();
@@ -165,8 +167,8 @@ async fn test_reverse_tunnel_ws_e2e() {
     let session_mgr = Arc::new(SessionManager::new());
 
     let server_config = ServerConfig {
-        listen: server_ws_listen.clone(),
-        token: auth_token.to_string(),
+        listen: vec![format!("ws://{}/tunnel", server_ws_listen)],
+        token: Some(auth_token.to_string()),
         default_target: None,
     };
     let server_runner = ServerRunner::new(
@@ -186,14 +188,16 @@ async fn test_reverse_tunnel_ws_e2e() {
     // 3. Setup client reverse tunnel
     let tunnel_config = TunnelConfig {
         tag: "test-reverse".to_string(),
-        mode: TunnelMode::Reverse,
-        listen: reverse_listen.clone(), // remote server will bind this
-        target: format!("127.0.0.1:{}", local_echo_port), // local target to forward to
+        mode: Some(TunnelMode::Reverse),
+        listen: Some(reverse_listen.clone()), // remote server will bind this
+        target: Some(format!("127.0.0.1:{}", local_echo_port)), // local target to forward to
         endpoint: EndpointConfig::Simple(format!("ws://{}/tunnel", server_ws_listen)),
-        token: auth_token.to_string(),
+        token: Some(auth_token.to_string()),
         pool_size: None,
         failover: None,
         multiplex: None,
+        mappings: vec![],
+        retry: None,
     };
 
     let app_config = AppConfig::default();
@@ -252,33 +256,37 @@ async fn test_supervisor_multi_tunnel_concurrency_e2e() {
     // 2. Configure AppConfig with Server + Forward Tunnel + Reverse Tunnel concurrently
     let mut app_config = AppConfig::default();
     app_config.server = Some(ServerConfig {
-        listen: format!("127.0.0.1:{}", server_ws_port),
-        token: auth_token.to_string(),
+        listen: vec![format!("ws://127.0.0.1:{}/ws", server_ws_port)],
+        token: Some(auth_token.to_string()),
         default_target: None,
     });
 
     app_config.tunnels.push(TunnelConfig {
         tag: "fwd-tunnel".to_string(),
-        mode: TunnelMode::Forward,
-        listen: format!("127.0.0.1:{}", fwd_listen_port),
-        target: format!("127.0.0.1:{}", echo_fwd_port),
+        mode: Some(TunnelMode::Forward),
+        listen: Some(format!("127.0.0.1:{}", fwd_listen_port)),
+        target: Some(format!("127.0.0.1:{}", echo_fwd_port)),
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/ws", server_ws_port)),
-        token: auth_token.to_string(),
+        token: Some(auth_token.to_string()),
         pool_size: None,
         failover: None,
         multiplex: None,
+        mappings: vec![],
+        retry: None,
     });
 
     app_config.tunnels.push(TunnelConfig {
         tag: "rev-tunnel".to_string(),
-        mode: TunnelMode::Reverse,
-        listen: format!("127.0.0.1:{}", rev_listen_port),
-        target: format!("127.0.0.1:{}", echo_rev_port),
+        mode: Some(TunnelMode::Reverse),
+        listen: Some(format!("127.0.0.1:{}", rev_listen_port)),
+        target: Some(format!("127.0.0.1:{}", echo_rev_port)),
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/ws", server_ws_port)),
-        token: auth_token.to_string(),
+        token: Some(auth_token.to_string()),
         pool_size: None,
         failover: None,
         multiplex: None,
+        mappings: vec![],
+        retry: None,
     });
 
     // 3. Launch supervisor

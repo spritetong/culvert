@@ -35,7 +35,8 @@ impl TransportDriver for H3TransportDriver {
     fn build_listener(
         &self,
         listen_addr: &str,
-        auth_token: &str,
+        auth_token: Option<&str>,
+        path: Option<&str>,
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
         // Generate an ephemeral self-signed certificate for zero-configuration startup
         let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
@@ -55,7 +56,7 @@ impl TransportDriver for H3TransportDriver {
             .with_single_cert(cert_chain, private_key)
             .map_err(|e| TunnelError::Tls(format!("Failed to build server TLS config: {}", e)))?;
 
-        let listener = H3Listener::bind(listen_addr, auth_token, server_rustls)?;
+        let listener = H3Listener::bind(listen_addr, auth_token, path, server_rustls)?;
         Ok(Box::new(listener))
     }
 }
