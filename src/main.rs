@@ -11,6 +11,11 @@ use micro_tunnel::config::ConfigLoader;
 use micro_tunnel::config::model::AppConfig;
 use micro_tunnel::supervisor::TunnelSupervisor;
 
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 /// High-performance lightweight HTTP/3 & WSS bidirectional TCP tunnel system.
 #[derive(Parser, Debug)]
 #[command(name = "micro-tunnel", version, about, long_about = None)]

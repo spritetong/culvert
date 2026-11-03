@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::constants::DEFAULT_FAILOVER_RING_BUFFER_CAPACITY;
+use crate::consts::DEFAULT_FAILOVER_RING_BUFFER_CAPACITY;
 use crate::core::stream::TunnelStream;
 
 /// Frame types for the Seamless Migration Protocol (SMP).

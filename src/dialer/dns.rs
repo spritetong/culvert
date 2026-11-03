@@ -14,7 +14,7 @@ use hickory_resolver::{Resolver, TokioResolver};
 use tracing::{debug, warn};
 
 use crate::config::model::{DnsConfig, DnsStrategy};
-use crate::constants::{DEFAULT_DNS_CACHE_CAPACITY, DEFAULT_DNS_CACHE_TTL};
+use crate::consts::{DEFAULT_DNS_CACHE_CAPACITY, DEFAULT_DNS_CACHE_TTL};
 use crate::core::error::TunnelError;
 use crate::core::stream::BoxFuture;
 

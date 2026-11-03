@@ -11,7 +11,7 @@ use tracing::{error, info, warn};
 use crate::common::net::SocketTuner;
 use crate::common::task::TaskTracker;
 use crate::config::model::TunnelConfig;
-use crate::constants::DEFAULT_HEARTBEAT_INTERVAL;
+use crate::consts::DEFAULT_HEARTBEAT_INTERVAL;
 use crate::control::stream::{ControlMessage, FramedControlStream};
 use crate::core::error::TunnelError;
 use crate::core::relay::RelayEngine;

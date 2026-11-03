@@ -5,7 +5,7 @@ use http::header::HeaderMap;
 use http::request::Builder as RequestBuilder;
 
 use crate::config::model::TunnelMode;
-use crate::constants::{
+use crate::consts::{
     HEADER_SESSION_ID, HEADER_TARGET_HOST, HEADER_TARGET_PORT, HEADER_TUNNEL_AUTH,
     HEADER_TUNNEL_MODE, TUNNEL_MODE_FORWARD, TUNNEL_MODE_REVERSE_CTRL, TUNNEL_MODE_REVERSE_DATA,
 };

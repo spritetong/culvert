@@ -8,7 +8,7 @@ use tokio::time::timeout;
 
 use crate::common::net::SocketTuner;
 use crate::config::model::DialerConfig;
-use crate::constants::DEFAULT_CONNECT_TIMEOUT;
+use crate::consts::DEFAULT_CONNECT_TIMEOUT;
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, TunnelStream};
 use crate::dialer::dns::DnsResolver;

@@ -7,7 +7,7 @@ use std::task::Poll;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::sync::CancellationToken;
 
-use crate::constants::RELAY_BUFFER_SIZE;
+use crate::consts::RELAY_BUFFER_SIZE;
 use crate::core::error::TunnelError;
 use crate::core::stream::TunnelStream;
 

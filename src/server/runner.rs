@@ -12,7 +12,7 @@ use tracing::{error, info, warn};
 use crate::common::net::SocketTuner;
 use crate::common::task::TaskTracker;
 use crate::config::model::{ServerConfig, TunnelMode};
-use crate::constants::DEFAULT_SESSION_PAIR_TIMEOUT;
+use crate::consts::DEFAULT_SESSION_PAIR_TIMEOUT;
 use crate::control::stream::{ControlMessage, FramedControlStream};
 use crate::core::error::TunnelError;
 use crate::core::relay::RelayEngine;

@@ -613,7 +613,7 @@ micro-tunnel/
 │   └── DESIGN.md               # 详细技术方案与规范 (本文档)
 └── src/
     ├── main.rs                 # 程序入口，解析 YAML 路径与信号捕获
-    ├── constants.rs            # 全局常量、配置默认值与魔数中心
+    ├── consts.rs               # 全局常量、配置默认值与魔数中心
     ├── common/                 # 公共辅助模块
     │   ├── mod.rs
     │   ├── net.rs              # Socket 选项微调与配置
