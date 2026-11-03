@@ -216,6 +216,7 @@ impl H3Connector {
             mode: self.mode,
             session_id: session_id.map(|s| s.to_string()),
             target: Some(target.clone()),
+            pool_idle: false,
         };
 
         let handshake_bytes = rmp_serde::to_vec_named(&handshake_meta)

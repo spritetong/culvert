@@ -81,6 +81,7 @@ pub async fn run_forward_tunnel(
                         let token_clone = config.token.clone();
                         let mode = config.mode;
 
+                        let pool_for_close = pool.clone();
                         conn_tracker.spawn_with_cancel(move |token| async move {
                             let remote_res = if let Some(ref p) = pool_clone {
                                 p.acquire().await
@@ -98,6 +99,9 @@ pub async fn run_forward_tunnel(
                                         remote_stream,
                                         token,
                                     ).await;
+                                    if let Some(ref p) = pool_for_close {
+                                        p.on_stream_closed();
+                                    }
                                 }
                                 Err(e) => {
                                     error!("Failed to open remote tunnel stream: {:?}", e);

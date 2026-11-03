@@ -5,9 +5,11 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+use crate::consts::ACTIVATE_STREAM_MAGIC;
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, TunnelStream};
 use crate::transport::{TargetAddr, TransportConnector};
@@ -137,11 +139,13 @@ impl ReplenishingStreamPool {
         let cancel_token = self.cancel_token.clone();
 
         tokio::spawn(async move {
+            let mut consecutive_failures = 0u32;
             while !cancel_token.is_cancelled() {
                 let current_len = idle_streams.lock().len();
                 if current_len < target_size {
-                    match connector.connect(&target, None).await {
+                    match connector.connect_pooled(&target).await {
                         Ok(stream) => {
+                            consecutive_failures = 0;
                             let idle_len = {
                                 let mut guard = idle_streams.lock();
                                 guard.push_back(stream);
@@ -152,10 +156,18 @@ impl ReplenishingStreamPool {
                             st.total_created += 1;
                         }
                         Err(e) => {
-                            tracing::warn!("Failed to pre-warm pool connection: {:?}", e);
+                            consecutive_failures += 1;
+                            let backoff_ms =
+                                (100u64 * (1u64 << consecutive_failures.min(5))).min(5000);
+                            tracing::warn!(
+                                failures = consecutive_failures,
+                                retry_in_ms = backoff_ms,
+                                "Failed to replenish pool connection: {:?}",
+                                e
+                            );
                             tokio::select! {
                                 _ = cancel_token.cancelled() => break,
-                                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                                _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
                             }
                         }
                     }
@@ -163,6 +175,7 @@ impl ReplenishingStreamPool {
                     tokio::select! {
                         _ = cancel_token.cancelled() => break,
                         _ = notify.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => {}
                     }
                 }
             }
@@ -170,30 +183,66 @@ impl ReplenishingStreamPool {
     }
 
     /// Acquires a pre-warmed connection in 0-RTT, or falls back to dialing on demand.
+    /// Performs non-blocking health check and discards stale/dead connections seamlessly.
     pub fn acquire<'a>(&'a self) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
         Box::pin(async move {
-            let (stream_opt, idle_len) = {
-                let mut guard = self.idle_streams.lock();
-                let stream = guard.pop_front();
-                let len = guard.len();
-                (stream, len)
-            };
+            loop {
+                let stream_opt = {
+                    let mut guard = self.idle_streams.lock();
+                    guard.pop_front()
+                };
 
-            self.notify.notify_one();
+                // Notify background worker to replenish the popped slot
+                self.notify.notify_one();
 
-            if let Some(stream) = stream_opt {
-                let mut st = self.stats.lock();
-                st.idle_count = idle_len;
-                st.active_count += 1;
-                Ok(stream)
-            } else {
-                let stream = self.connector.connect(&self.target, None).await?;
-                let mut st = self.stats.lock();
-                st.active_count += 1;
-                st.total_created += 1;
-                Ok(stream)
+                if let Some(mut stream) = stream_opt {
+                    // Activate the idle stream by writing the activation magic byte.
+                    // If the stream was disconnected while idle, writing/flushing fails immediately.
+                    let activate_res = tokio::time::timeout(Duration::from_millis(500), async {
+                        stream.write_all(&[ACTIVATE_STREAM_MAGIC]).await?;
+                        stream.flush().await?;
+                        Ok::<(), std::io::Error>(())
+                    })
+                    .await;
+
+                    match activate_res {
+                        Ok(Ok(())) => {
+                            let mut st = self.stats.lock();
+                            st.idle_count = self.idle_streams.lock().len();
+                            st.active_count += 1;
+                            return Ok(stream);
+                        }
+                        _ => {
+                            tracing::debug!(
+                                "Discarded stale/dead idle connection from pool, trying next..."
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    // Pool exhausted: fallback to on-demand direct connect and activate
+                    let mut stream = self.connector.connect_pooled(&self.target).await?;
+                    stream
+                        .write_all(&[ACTIVATE_STREAM_MAGIC])
+                        .await
+                        .map_err(TunnelError::Io)?;
+                    stream.flush().await.map_err(TunnelError::Io)?;
+
+                    let mut st = self.stats.lock();
+                    st.active_count += 1;
+                    st.total_created += 1;
+                    return Ok(stream);
+                }
             }
         })
+    }
+
+    /// Decrements the active connection count when a stream finishes relaying.
+    pub fn on_stream_closed(&self) {
+        let mut st = self.stats.lock();
+        if st.active_count > 0 {
+            st.active_count -= 1;
+        }
     }
 
     /// Pushes an idle stream back into the pool.

@@ -230,7 +230,7 @@ impl H3Listener {
                                         continue;
                                     }
 
-                                    let metadata = StreamMetadata { mode, session_id, target };
+                                    let metadata = StreamMetadata { mode, session_id, target, pool_idle: false };
                                     let tunnel_stream = Box::new(H3TunnelStream::from_server(stream)) as Box<dyn TunnelStream>;
 
                                     if tx_streams.send((tunnel_stream, metadata)).await.is_err() {

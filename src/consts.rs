@@ -50,3 +50,12 @@ pub const TUNNEL_MODE_REVERSE_CTRL: &str = "reverse-ctrl";
 
 /// Value for reverse data stream mode in header.
 pub const TUNNEL_MODE_REVERSE_DATA: &str = "reverse-data";
+
+/// HTTP Header key for indicating a pre-warmed idle pool connection.
+pub const HEADER_TUNNEL_POOL: &str = "x-tunnel-pool";
+
+/// Value for pre-warmed idle pool connection in header.
+pub const TUNNEL_POOL_IDLE: &str = "idle";
+
+/// Activation magic byte sent over pre-warmed pool streams to trigger target dialing.
+pub const ACTIVATE_STREAM_MAGIC: u8 = 0xA5;

@@ -38,6 +38,8 @@ pub struct StreamMetadata {
     pub mode: TunnelMode,
     pub session_id: Option<String>,
     pub target: Option<TargetAddr>,
+    #[serde(default)]
+    pub pool_idle: bool,
 }
 
 /// Dynamic trait object for establishing outbound tunnel streams.
@@ -48,6 +50,14 @@ pub trait TransportConnector: Send + Sync {
         target: &'a TargetAddr,
         session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>>;
+
+    /// Opens a pre-warmed pooled stream that remains idle on the server until activated.
+    fn connect_pooled<'a>(
+        &'a self,
+        target: &'a TargetAddr,
+    ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+        self.connect(target, None)
+    }
 
     /// Returns the protocol scheme implemented by this connector.
     fn protocol_scheme(&self) -> &'static str;

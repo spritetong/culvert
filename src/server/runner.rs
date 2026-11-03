@@ -4,6 +4,7 @@
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -12,7 +13,7 @@ use tracing::{error, info, warn};
 use crate::common::net::SocketTuner;
 use crate::common::task::TaskTracker;
 use crate::config::model::{ServerConfig, TunnelMode};
-use crate::consts::DEFAULT_SESSION_PAIR_TIMEOUT;
+use crate::consts::{ACTIVATE_STREAM_MAGIC, DEFAULT_SESSION_PAIR_TIMEOUT};
 use crate::control::stream::{ControlMessage, FramedControlStream};
 use crate::core::error::TunnelError;
 use crate::core::relay::RelayEngine;
@@ -106,6 +107,32 @@ impl ServerRunner {
                                                 return;
                                             }
                                         };
+
+                                        let mut stream = stream;
+
+                                        // If this stream was pre-warmed as an idle connection in client pool,
+                                        // wait for the client activation signal before touching the target service.
+                                        if metadata.pool_idle {
+                                            let mut magic = [0u8; 1];
+                                            tokio::select! {
+                                                _ = token.cancelled() => return,
+                                                res = stream.read_exact(&mut magic) => {
+                                                    match res {
+                                                        Ok(_) if magic[0] == ACTIVATE_STREAM_MAGIC => {
+                                                            // Activated! Proceed to dial target.
+                                                        }
+                                                        Ok(_) => {
+                                                            warn!("Received invalid activation magic from pool stream: {:02x}", magic[0]);
+                                                            return;
+                                                        }
+                                                        Err(_) => {
+                                                            // Stale or evicted stream closed by client pool without being used
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
 
                                         info!(target = %target, "Dialing forward target in local/internal network");
                                         let target_conn = match TcpStream::connect(target.to_string()).await {

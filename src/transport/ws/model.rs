@@ -7,7 +7,8 @@ use http::request::Builder as RequestBuilder;
 use crate::config::model::TunnelMode;
 use crate::consts::{
     HEADER_SESSION_ID, HEADER_TARGET_HOST, HEADER_TARGET_PORT, HEADER_TUNNEL_AUTH,
-    HEADER_TUNNEL_MODE, TUNNEL_MODE_FORWARD, TUNNEL_MODE_REVERSE_CTRL, TUNNEL_MODE_REVERSE_DATA,
+    HEADER_TUNNEL_MODE, HEADER_TUNNEL_POOL, TUNNEL_MODE_FORWARD, TUNNEL_MODE_REVERSE_CTRL,
+    TUNNEL_MODE_REVERSE_DATA, TUNNEL_POOL_IDLE,
 };
 use crate::core::error::TunnelError;
 use crate::transport::{StreamMetadata, TargetAddr};
@@ -20,6 +21,7 @@ pub struct WsHandshakeHeaders {
     pub session_id: Option<String>,
     pub target_host: Option<String>,
     pub target_port: Option<u16>,
+    pub pool_idle: bool,
 }
 
 impl WsHandshakeHeaders {
@@ -31,7 +33,14 @@ impl WsHandshakeHeaders {
             session_id: None,
             target_host: None,
             target_port: None,
+            pool_idle: false,
         }
+    }
+
+    /// Attaches whether this stream is a pre-warmed idle pool connection.
+    pub fn with_pool_idle(mut self, pool_idle: bool) -> Self {
+        self.pool_idle = pool_idle;
+        self
     }
 
     /// Attaches the session identifier.
@@ -101,12 +110,19 @@ impl WsHandshakeHeaders {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u16>().ok());
 
+        let pool_idle = headers
+            .get(HEADER_TUNNEL_POOL)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == TUNNEL_POOL_IDLE)
+            .unwrap_or(false);
+
         Ok(Self {
             auth_token,
             tunnel_mode,
             session_id,
             target_host,
             target_port,
+            pool_idle,
         })
     }
 
@@ -125,6 +141,10 @@ impl WsHandshakeHeaders {
             }
         };
         builder = builder.header(HEADER_TUNNEL_MODE, mode_str);
+
+        if self.pool_idle {
+            builder = builder.header(HEADER_TUNNEL_POOL, TUNNEL_POOL_IDLE);
+        }
 
         if let Some(ref sid) = self.session_id {
             builder = builder.header(HEADER_SESSION_ID, sid);
@@ -158,6 +178,7 @@ impl WsHandshakeHeaders {
             mode: self.tunnel_mode,
             session_id: self.session_id.clone(),
             target,
+            pool_idle: self.pool_idle,
         }
     }
 }

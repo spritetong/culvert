@@ -308,13 +308,120 @@ async fn test_pool_prewarm_and_reuse() {
     // Give pool time to pre-warm the 4 idle connections
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Send 6 sequential connections; all should acquire from pool in 0-RTT
-    for i in 0..6 {
+    // Send 10 sequential connections with disconnects; all should succeed and recover cleanly
+    for i in 0..10 {
         let mut stream = TcpStream::connect(&client_listen)
             .await
             .expect("Failed to connect client listen port");
 
         let msg = format!("Pooled connection request #{}", i);
+        stream.write_all(msg.as_bytes()).await.unwrap();
+
+        let mut buf = vec![0u8; msg.len()];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, msg.as_bytes());
+
+        // Explicitly close connection
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    cancel_token.cancel();
+    let _ = tokio::join!(echo_handle, server_handle, client_handle);
+}
+
+#[tokio::test]
+async fn test_pool_resilience_after_disconnect_and_high_churn() {
+    let cancel_token = CancellationToken::new();
+
+    let echo_port = get_available_port();
+    let server_ws_port = get_available_port();
+    let client_listen_port = get_available_port();
+
+    let echo_addr: SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
+    let server_ws_listen = format!("127.0.0.1:{}", server_ws_port);
+    let client_listen = format!("127.0.0.1:{}", client_listen_port);
+    let auth_token = "pool_churn_test_token";
+
+    let echo_handle = spawn_echo_server(echo_addr, cancel_token.clone());
+
+    let mut registry = TransportRegistry::new();
+    registry.register(WsTransportDriver);
+    let registry = Arc::new(registry);
+    let session_mgr = Arc::new(SessionManager::new());
+
+    let server_config = ServerConfig {
+        listen: server_ws_listen.clone(),
+        token: auth_token.to_string(),
+        default_target: None,
+    };
+    let server_runner = ServerRunner::new(
+        server_config,
+        Arc::clone(&registry),
+        Arc::clone(&session_mgr),
+    );
+    let s_cancel = cancel_token.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = server_runner.run(s_cancel).await;
+    });
+
+    // Configure tunnel with pool_size: 4
+    let tunnel_config = TunnelConfig {
+        tag: "test-pool-churn".to_string(),
+        mode: TunnelMode::Forward,
+        listen: client_listen.clone(),
+        target: format!("127.0.0.1:{}", echo_port),
+        token: auth_token.to_string(),
+        pool_size: Some(4),
+        failover: None,
+        multiplex: None,
+        endpoint: EndpointConfig::Simple(format!("ws://{}/ws", server_ws_listen)),
+    };
+
+    let app_config = AppConfig::default();
+    let endpoint_ctx = EndpointContext::build(&tunnel_config.endpoint, &app_config).unwrap();
+    let client_cancel = cancel_token.clone();
+    let client_registry = Arc::clone(&registry);
+    let client_handle = tokio::spawn(async move {
+        let _ =
+            run_forward_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Concurrently open 20 connections in parallel, exceeding pool capacity (4)
+    let mut handles = Vec::new();
+    for i in 0..20 {
+        let listen_addr = client_listen.clone();
+        handles.push(tokio::spawn(async move {
+            let mut stream = TcpStream::connect(&listen_addr)
+                .await
+                .expect("Failed to connect client listen port");
+
+            let msg = format!("Concurrent request #{}", i);
+            stream.write_all(msg.as_bytes()).await.unwrap();
+
+            let mut buf = vec![0u8; msg.len()];
+            stream.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, msg.as_bytes());
+            drop(stream);
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    // Wait a brief moment for pool replenishment after churn
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Subsequent connection after burst MUST succeed and be stable
+    for i in 0..5 {
+        let mut stream = TcpStream::connect(&client_listen)
+            .await
+            .expect("Failed to connect after high churn");
+
+        let msg = format!("Post churn request #{}", i);
         stream.write_all(msg.as_bytes()).await.unwrap();
 
         let mut buf = vec![0u8; msg.len()];

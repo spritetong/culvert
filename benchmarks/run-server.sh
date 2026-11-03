@@ -5,6 +5,8 @@
 
 set -euo pipefail
 
+export PATH="/root/.cargo/bin:${HOME}/.cargo/bin:${PATH}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BIN_PATH="${PROJECT_ROOT}/target/release/micro-tunnel"
