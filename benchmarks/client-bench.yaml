@@ -1,0 +1,54 @@
+# ==============================================================================
+# Micro-Tunnel Benchmark Client Configuration
+# Optimized for high-concurrency throughput and stream multiplexing tests
+# ==============================================================================
+
+log:
+  level: "warn" # Minimize logging overhead during stress tests
+  output: "stdout"
+  no_color: true
+
+worker_threads: 4
+
+dns:
+  strategy: "prefer_ipv4"
+  resolvers:
+    - "system://0.0.0.0"
+
+dialer:
+  connect_timeout: "3s"
+  tcp_keepalive: "15s"
+  tcp_nodelay: true
+
+tls:
+  enabled: true
+  insecure: true # Accept self-signed certificates during benchmarks
+  alpn: ["h3", "http/1.1"]
+
+tunnels:
+  # ----------------------------------------------------------------------------
+  # Forward Tunnel Benchmark:
+  # Local traffic to 127.0.0.1:15201 is tunneled to remote target 127.0.0.1:5201
+  # ----------------------------------------------------------------------------
+  - tag: "bench-forward-tunnel"
+    mode: "forward"
+    listen: "127.0.0.1:15201"
+    target: "127.0.0.1:5201"
+    token: "bench_secret_token_123456"
+
+    # Replace with server IP / domain:
+    #   - "ws://127.0.0.1:8080/tunnel"
+    #   - "wss://127.0.0.1:8443/tunnel"
+    #   - "h3://127.0.0.1:8443/tunnel"
+    #   - "quic://127.0.0.1:8443/raw"
+    endpoint: "wss://127.0.0.1:8443/tunnel"
+
+    # Pre-warmed connection pool for 0-RTT tunnel acquisition
+    pool_size: 16
+
+    # Lightweight frame multiplexing (sing-box style)
+    # Set to true to test single-connection multi-stream performance,
+    # or false to test raw zero-task stream pool performance.
+    multiplex:
+      enabled: false
+      max_streams: 256
