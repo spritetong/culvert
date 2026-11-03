@@ -299,3 +299,219 @@ async fn test_h3_stream_multiplexing_over_single_quic_connection() {
     let _ = tx_done.send(());
     server_task.await.unwrap();
 }
+
+#[tokio::test]
+async fn test_h3_tunnel_pool_prewarm_and_activation_end_to_end() {
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+
+    let echo_port = get_ephemeral_port();
+    let server_h3_port = get_ephemeral_port();
+    let client_listen_port = get_ephemeral_port();
+
+    let echo_addr: std::net::SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
+    let server_h3_listen = format!("127.0.0.1:{}", server_h3_port);
+    let client_listen = format!("127.0.0.1:{}", client_listen_port);
+
+    // 1. Spawn TCP echo service backend
+    let echo_cancel = cancel_token.clone();
+    let echo_handle = tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::bind(echo_addr).await.unwrap();
+        loop {
+            tokio::select! {
+                _ = echo_cancel.cancelled() => break,
+                res = listener.accept() => {
+                    let (mut socket, _) = match res {
+                        Ok(c) => c,
+                        Err(_) => break,
+                    };
+                    tokio::spawn(async move {
+                        let (mut rd, mut wr) = socket.split();
+                        let _ = tokio::io::copy(&mut rd, &mut wr).await;
+                    });
+                }
+            }
+        }
+    });
+
+    // 2. Setup server with H3 listener and self-signed cert, no token, path "/tunnel"
+    let mut server_registry = micro_tunnel::transport::TransportRegistry::new();
+    server_registry.register(micro_tunnel::transport::h3::H3TransportDriver);
+    let server_registry = Arc::new(server_registry);
+    let session_mgr = Arc::new(micro_tunnel::session::SessionManager::new());
+
+    let server_config = micro_tunnel::config::model::ServerConfig {
+        listen: vec![format!("h3://{}/tunnel", server_h3_listen)],
+        token: None, // Optional token / no token
+        default_target: Some(format!("127.0.0.1:{}", echo_port)),
+        ..Default::default()
+    };
+    let server_runner = micro_tunnel::server::ServerRunner::new(
+        server_config,
+        Arc::clone(&server_registry),
+        Arc::clone(&session_mgr),
+    );
+    let s_cancel = cancel_token.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = server_runner.run(s_cancel).await;
+    });
+
+    // Give server time to bind UDP port
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // 3. Setup client AppConfig with forward tunnel using pool_size: 4
+    let app_config = micro_tunnel::config::model::AppConfig {
+        tls: Some(TlsConfig {
+            enabled: true,
+            insecure: true,
+            server_name: Some("localhost".to_string()),
+            ..Default::default()
+        }),
+        tunnels: vec![micro_tunnel::config::model::TunnelConfig {
+            tag: "bench-h3-pool".to_string(),
+            mode: Some(TunnelMode::Forward),
+            listen: Some(client_listen.clone()),
+            target: Some(format!("127.0.0.1:{}", echo_port)),
+            token: None,
+            endpoint: EndpointConfig::Simple(format!("h3://{}/tunnel", server_h3_listen)),
+            pool_size: Some(4), // Pre-warm 4 connections in pool!
+            failover: None,
+            multiplex: None,
+            mappings: vec![],
+            retry: None,
+        }],
+        ..Default::default()
+    };
+
+    let c_cancel = cancel_token.clone();
+    let supervisor = micro_tunnel::supervisor::TunnelSupervisor::new(app_config, c_cancel);
+    let client_handle = tokio::spawn(async move {
+        let _ = supervisor.run().await;
+    });
+
+    // Wait for connection pool to pre-warm streams
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // 4. Connect 3 consecutive clients to client_listen port to consume pooled streams
+    for i in 1..=3 {
+        let mut client_tcp = tokio::net::TcpStream::connect(&client_listen)
+            .await
+            .expect("Failed to connect to local client tunnel port");
+
+        let test_message = format!("H3 POOL ECHO TEST PACKET {}", i);
+        client_tcp.write_all(test_message.as_bytes()).await.unwrap();
+
+        let mut read_buf = vec![0u8; test_message.len()];
+        client_tcp.read_exact(&mut read_buf).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&read_buf), test_message);
+    }
+
+    cancel_token.cancel();
+    let _ = tokio::join!(echo_handle, server_handle, client_handle);
+}
+
+#[tokio::test]
+async fn test_quic_raw_tunnel_pool_prewarm_and_activation_end_to_end() {
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+
+    let echo_port = get_ephemeral_port();
+    let server_quic_port = get_ephemeral_port();
+    let client_listen_port = get_ephemeral_port();
+
+    let echo_addr: std::net::SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
+    let server_quic_listen = format!("127.0.0.1:{}", server_quic_port);
+    let client_listen = format!("127.0.0.1:{}", client_listen_port);
+
+    // 1. Spawn TCP echo service backend
+    let echo_cancel = cancel_token.clone();
+    let echo_handle = tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::bind(echo_addr).await.unwrap();
+        loop {
+            tokio::select! {
+                _ = echo_cancel.cancelled() => break,
+                res = listener.accept() => {
+                    let (mut socket, _) = match res {
+                        Ok(c) => c,
+                        Err(_) => break,
+                    };
+                    tokio::spawn(async move {
+                        let (mut rd, mut wr) = socket.split();
+                        let _ = tokio::io::copy(&mut rd, &mut wr).await;
+                    });
+                }
+            }
+        }
+    });
+
+    // 2. Setup server with raw QUIC listener and self-signed cert
+    let mut server_registry = micro_tunnel::transport::TransportRegistry::new();
+    server_registry.register(micro_tunnel::transport::h3::H3TransportDriver);
+    let server_registry = Arc::new(server_registry);
+    let session_mgr = Arc::new(micro_tunnel::session::SessionManager::new());
+
+    let server_config = micro_tunnel::config::model::ServerConfig {
+        listen: vec![format!("quic://{}/raw", server_quic_listen)],
+        token: None,
+        default_target: Some(format!("127.0.0.1:{}", echo_port)),
+        ..Default::default()
+    };
+    let server_runner = micro_tunnel::server::ServerRunner::new(
+        server_config,
+        Arc::clone(&server_registry),
+        Arc::clone(&session_mgr),
+    );
+    let s_cancel = cancel_token.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = server_runner.run(s_cancel).await;
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // 3. Setup client AppConfig with forward tunnel using raw QUIC and pool_size: 4
+    let app_config = micro_tunnel::config::model::AppConfig {
+        tls: Some(TlsConfig {
+            enabled: true,
+            insecure: true,
+            server_name: Some("localhost".to_string()),
+            ..Default::default()
+        }),
+        tunnels: vec![micro_tunnel::config::model::TunnelConfig {
+            tag: "bench-quic-pool".to_string(),
+            mode: Some(TunnelMode::Forward),
+            listen: Some(client_listen.clone()),
+            target: Some(format!("127.0.0.1:{}", echo_port)),
+            token: None,
+            endpoint: EndpointConfig::Simple(format!("quic://{}/raw", server_quic_listen)),
+            pool_size: Some(4),
+            failover: None,
+            multiplex: None,
+            mappings: vec![],
+            retry: None,
+        }],
+        ..Default::default()
+    };
+
+    let c_cancel = cancel_token.clone();
+    let supervisor = micro_tunnel::supervisor::TunnelSupervisor::new(app_config, c_cancel);
+    let client_handle = tokio::spawn(async move {
+        let _ = supervisor.run().await;
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // 4. Connect 3 consecutive clients to client_listen port to consume pooled streams
+    for i in 1..=3 {
+        let mut client_tcp = tokio::net::TcpStream::connect(&client_listen)
+            .await
+            .expect("Failed to connect to local client tunnel port");
+
+        let test_message = format!("QUIC RAW POOL ECHO TEST PACKET {}", i);
+        client_tcp.write_all(test_message.as_bytes()).await.unwrap();
+
+        let mut read_buf = vec![0u8; test_message.len()];
+        client_tcp.read_exact(&mut read_buf).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&read_buf), test_message);
+    }
+
+    cancel_token.cancel();
+    let _ = tokio::join!(echo_handle, server_handle, client_handle);
+}

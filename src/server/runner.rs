@@ -144,7 +144,13 @@ impl ServerRunner {
                                                     }
                                                 }
 
-                                                let target_opt = dynamic_target.or(metadata.target).or_else(|| {
+                                                let is_dummy_target = match &metadata.target {
+                                                    Some(TargetAddr::Domain(host, _)) => host == "pool.idle",
+                                                    _ => false,
+                                                };
+                                                let valid_meta_target = if is_dummy_target { None } else { metadata.target };
+
+                                                let target_opt = dynamic_target.or(valid_meta_target).or_else(|| {
                                                     default_target.and_then(|dt| {
                                                         if let Ok(sa) = dt.parse() {
                                                             Some(TargetAddr::Ip(sa))

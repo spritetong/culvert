@@ -38,12 +38,11 @@ impl H3Connector {
         let is_quic_raw = scheme == "quic";
 
         let mut tls_config = endpoint.tls_config.clone().unwrap_or_default();
-        if tls_config.alpn.is_none() {
-            tls_config.alpn = Some(if is_quic_raw {
-                vec!["micro-tunnel-quic".to_string()]
-            } else {
-                vec!["h3".to_string()]
-            });
+        if is_quic_raw {
+            // For raw QUIC endpoints, force ALPN to micro-tunnel-quic regardless of generic global TLS settings
+            tls_config.alpn = Some(vec!["micro-tunnel-quic".to_string()]);
+        } else if tls_config.alpn.is_none() {
+            tls_config.alpn = Some(vec!["h3".to_string()]);
         }
 
         let rustls_client = TlsConfigBuilder::build_client_config(&tls_config)?;
@@ -57,6 +56,11 @@ impl H3Connector {
         transport_config
             .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
         transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+        transport_config.max_concurrent_bidi_streams(quinn::VarInt::from_u32(10_000));
+        transport_config.max_concurrent_uni_streams(quinn::VarInt::from_u32(10_000));
+        transport_config.stream_receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024).into());
+        transport_config.receive_window(quinn::VarInt::from_u32(32 * 1024 * 1024).into());
+        transport_config.send_window(32 * 1024 * 1024);
         client_config.transport_config(Arc::new(transport_config));
 
         let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
@@ -88,7 +92,10 @@ impl H3Connector {
             .dns_resolver
             .resolve(&self.endpoint.endpoint.host)
             .await?;
-        let resolved_addr = SocketAddr::new(ips[0], self.endpoint.endpoint.port);
+        let ip = ips.first().copied().ok_or_else(|| {
+            TunnelError::DnsNoAddresses(self.endpoint.endpoint.host.clone(), "any".to_string())
+        })?;
+        let resolved_addr = SocketAddr::new(ip, self.endpoint.endpoint.port);
         let sni = self
             .endpoint
             .tls_config
@@ -115,11 +122,22 @@ impl H3Connector {
         &self,
         target: &TargetAddr,
         session_id: Option<&str>,
+        pool_idle: bool,
     ) -> Result<Box<dyn TunnelStream>, TunnelError> {
         let mut sender_guard = self.cached_h3_sender.lock().await;
         let mut send_request = None;
 
-        if let Some(ref sender) = *sender_guard {
+        let quic_alive = {
+            let qguard = self.cached_quic_conn.lock().await;
+            qguard
+                .as_ref()
+                .map(|c| c.close_reason().is_none())
+                .unwrap_or(false)
+        };
+
+        if !quic_alive {
+            *sender_guard = None;
+        } else if let Some(ref sender) = *sender_guard {
             send_request = Some(sender.clone());
         }
 
@@ -155,33 +173,71 @@ impl H3Connector {
         let mut req_builder = Request::builder()
             .method("CONNECT")
             .uri(path)
-            .header("host", &authority)
-            .header("authorization", format!("Bearer {}", self.auth_token))
-            .header(
-                "x-tunnel-mode",
-                match self.mode {
-                    TunnelMode::Forward => "forward",
-                    TunnelMode::Reverse => "reverse",
-                },
-            )
-            .header("x-tunnel-target", target.to_string());
+            .header("host", &authority);
+
+        if !self.auth_token.is_empty() {
+            req_builder = req_builder
+                .header("authorization", format!("Bearer {}", self.auth_token))
+                .header(crate::consts::HEADER_TUNNEL_AUTH, &self.auth_token);
+        }
+
+        let mode_str = match self.mode {
+            TunnelMode::Forward => crate::consts::TUNNEL_MODE_FORWARD,
+            TunnelMode::Reverse => {
+                if session_id.is_some() {
+                    crate::consts::TUNNEL_MODE_REVERSE_DATA
+                } else {
+                    crate::consts::TUNNEL_MODE_REVERSE_CTRL
+                }
+            }
+        };
+        req_builder = req_builder.header(crate::consts::HEADER_TUNNEL_MODE, mode_str);
+
+        if pool_idle {
+            req_builder = req_builder.header(
+                crate::consts::HEADER_TUNNEL_POOL,
+                crate::consts::TUNNEL_POOL_IDLE,
+            );
+        }
+
+        req_builder = req_builder.header("x-tunnel-target", target.to_string());
 
         if let Some(sid) = session_id {
-            req_builder = req_builder.header("x-session-id", sid);
+            req_builder = req_builder.header(crate::consts::HEADER_SESSION_ID, sid);
         }
 
         let request = req_builder
             .body(())
             .map_err(|e| TunnelError::Config(format!("Invalid request headers: {:?}", e)))?;
 
-        debug!(path = %path, target = %target, "Sending HTTP/3 CONNECT tunnel request");
-        let mut stream = send_request.send_request(request).await.map_err(|e| {
-            TunnelError::ControlProtocol(format!("Failed to send H3 request: {:?}", e))
-        })?;
+        debug!(path = %path, target = %target, pool_idle, "Sending HTTP/3 CONNECT tunnel request");
+        let mut stream = match send_request.send_request(request).await {
+            Ok(s) => s,
+            Err(e) => {
+                let mut guard = self.cached_h3_sender.lock().await;
+                *guard = None;
+                let mut qguard = self.cached_quic_conn.lock().await;
+                *qguard = None;
+                return Err(TunnelError::ControlProtocol(format!(
+                    "Failed to send H3 request: {:?}",
+                    e
+                )));
+            }
+        };
 
-        let response = stream.recv_response().await.map_err(|e| {
-            TunnelError::ControlProtocol(format!("Failed to receive H3 response: {:?}", e))
-        })?;
+        let response = match stream.recv_response().await {
+            Ok(r) => r,
+            Err(e) => {
+                let mut guard = self.cached_h3_sender.lock().await;
+                *guard = None;
+                let mut qguard = self.cached_quic_conn.lock().await;
+                *qguard = None;
+                return Err(TunnelError::ControlProtocol(format!(
+                    "Failed to receive H3 response: {:?}",
+                    e
+                )));
+            }
+        };
 
         if response.status() == StatusCode::UNAUTHORIZED
             || response.status() == StatusCode::FORBIDDEN
@@ -204,19 +260,27 @@ impl H3Connector {
         &self,
         target: &TargetAddr,
         session_id: Option<&str>,
+        pool_idle: bool,
     ) -> Result<Box<dyn TunnelStream>, TunnelError> {
         let conn = self.get_or_connect().await?;
-        let (mut send, recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| TunnelError::Tls(format!("Failed to open QUIC bi-stream: {:?}", e)))?;
+        let (mut send, recv) = match conn.open_bi().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                let mut guard = self.cached_quic_conn.lock().await;
+                *guard = None;
+                return Err(TunnelError::Tls(format!(
+                    "Failed to open QUIC bi-stream: {:?}",
+                    e
+                )));
+            }
+        };
 
         // Send handshake control header over the raw QUIC stream
         let handshake_meta = crate::transport::StreamMetadata {
             mode: self.mode,
             session_id: session_id.map(|s| s.to_string()),
             target: Some(target.clone()),
-            pool_idle: false,
+            pool_idle,
         };
 
         let handshake_bytes = rmp_serde::to_vec_named(&handshake_meta)
@@ -230,9 +294,11 @@ impl H3Connector {
         header.extend_from_slice(&(handshake_bytes.len() as u32).to_be_bytes());
         header.extend_from_slice(&handshake_bytes);
 
-        tokio::io::AsyncWriteExt::write_all(&mut send, &header)
-            .await
-            .map_err(|e| TunnelError::Io(e))?;
+        if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut send, &header).await {
+            let mut guard = self.cached_quic_conn.lock().await;
+            *guard = None;
+            return Err(TunnelError::Io(e));
+        }
 
         Ok(Box::new(QuinnTunnelStream::new(send, recv)) as Box<dyn TunnelStream>)
     }
@@ -247,9 +313,23 @@ impl TransportConnector for H3Connector {
         Box::pin(async move {
             let scheme = self.endpoint.endpoint.scheme.as_str();
             if scheme == "quic" {
-                self.connect_quic_raw(target, session_id).await
+                self.connect_quic_raw(target, session_id, false).await
             } else {
-                self.connect_h3(target, session_id).await
+                self.connect_h3(target, session_id, false).await
+            }
+        })
+    }
+
+    fn connect_pooled<'a>(
+        &'a self,
+        target: &'a TargetAddr,
+    ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+        Box::pin(async move {
+            let scheme = self.endpoint.endpoint.scheme.as_str();
+            if scheme == "quic" {
+                self.connect_quic_raw(target, None, true).await
+            } else {
+                self.connect_h3(target, None, true).await
             }
         })
     }

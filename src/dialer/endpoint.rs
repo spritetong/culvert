@@ -32,7 +32,7 @@ impl Endpoint {
             .to_string();
 
         let port = parsed.port().unwrap_or_else(|| match scheme.as_str() {
-            "https" | "wss" | "h3" => 443,
+            "https" | "wss" | "h3" | "quic" => 443,
             "http" | "ws" => 80,
             _ => 0,
         });
@@ -125,8 +125,8 @@ impl EndpointContext {
         // Resolve effective TLS options
         let mut effective_tls = endpoint_tls.cloned().or_else(|| global_app.tls.clone());
 
-        // Automatically infer TLS if scheme is https/wss/h3 and not explicitly disabled
-        if matches!(endpoint.scheme.as_str(), "https" | "wss" | "h3") {
+        // Automatically infer TLS if scheme is https/wss/h3/quic and not explicitly disabled
+        if matches!(endpoint.scheme.as_str(), "https" | "wss" | "h3" | "quic") {
             let tls = effective_tls.get_or_insert_with(TlsConfig::default);
             tls.enabled = true;
             if tls.server_name.is_none() {
