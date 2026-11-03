@@ -9,15 +9,16 @@ Micro-Tunnel 专为与现代边缘网关（如 **Caddy**）协同工作设计。
 ```
 +---------------------------------------------------------------------------------------+
 |                       声明式多隧道配置与调度中心 (Config & Supervisor)                    |
-|   * YAML 声明式配置 (AppConfig: Global Defaults + Tunnels)                              |
-|   * TunnelSupervisor: 基于 JoinSet + CancellationToken 集中管理多隧道并发生命周期       |
+|   * YAML 声明式配置 (AppConfig: Server, Global Defaults + Tunnels + Mappings)           |
+|   * TunnelSupervisor: 集中纳管 Server Ingress 监听与多 Tunnel Cluster 并发生命周期       |
+|   * Self-Healing Retry: 端点初始化失败/网络断开自动延时自愈重试 (retry: delay/max_retries)|
 +---------------------------------------------------------------------------------------+
                                            │
                                            ▼
 +---------------------------------------------------------------------------------------+
 |                    端点上下文绑定与拨号层 (Endpoint Context & Dialer)                   |
 |   * EndpointContext: 每个 Endpoint 独立绑定其专属的 DNS、Dialer 与高级 TLS 配置          |
-|   * DnsResolver: 支持 prefer_ipv4 / prefer_ipv6 / ipv4_only / ipv6_only 与独立缓存     |
+|   * DnsResolver: wstunnel 兼容 scheme (system://, dns://, dns+https://, dns+tls://)    |
 |   * TlsConfig: 覆盖 SNI 伪装 (server_name), ALPN 协商, 自定义 CA, mTLS, TLS 版本约束   |
 |   * Unified Dialer: 单端点定制 connect_timeout, keepalive, nodelay 与 bind_interface  |
 +---------------------------------------------------------------------------------------+
@@ -28,16 +29,17 @@ Micro-Tunnel 专为与现代边缘网关（如 **Caddy**）协同工作设计。
 |   * TunnelStream: Box<dyn TunnelStream> (原生 AsyncRead + AsyncWrite)                 |
 |   * SessionManager: 逆向隧道内存路由表 (DashMap + oneshot 配对)                          |
 |   * Relay Engine: 64KB 大缓冲区零拷贝双工中继                                          |
-|   * Failover Wrapper: 动态底层物理 IO 无缝迁移（H3 <-> WSS）                            |
+|   * Multi-Mapping Cluster: 一个 Endpoint 承载多个双向 mappings 共享单个 Pool            |
 +---------------------------------------------------------------------------------------+
         │                                  │                                  │
         ▼                                  ▼                                  ▼
 +-----------------------+      +-----------------------+      +-------------------------+
 |  控制信道层 (Control)  |      |   连接池层 (Pool)      |      | 传输驱动层 (Transport)   |
-| * ControlMessage      |      | * StreamPool          |      | * TransportRegistry     |
-| * Box<dyn             |      | * 预热与保活心跳      |      | * H3 Driver (quinn+h3)  |
-|     ControlStream>    |      | * Draining 协议排空   |      | * WSS (fastwebsockets)  |
-| (原生 Stream + Sink)  |      | * Box<dyn StreamPool> |      | * P2P Driver (未来扩展) |
+| * ControlMessage      |      | * ReplenishingPool    |      | * TransportRegistry     |
+| * Box<dyn             |      | * 预热解耦保活        |      | * H3 Driver (quinn+h3)  |
+|     ControlStream>    |      | * [0xA5, len, target] |      | * WSS (fastwebsockets)  |
+| (原生 Stream + Sink)  |      |   动态按需激活        |      | * UDS Driver (IPC)      |
+|                       |      | * 死连接无感剔除还池  |      | * Path 匹配与 404 伪装   |
 +-----------------------+      +-----------------------+      +-------------------------+
 ```
 
@@ -77,8 +79,14 @@ pub struct EndpointContext {
 }
 ```
 
-### 2.2 灵活的 DNS Resolver 与策略路由 (`dialer::dns`)
-借鉴 sing-box 的 DNS 策略控制，解决跨国网络中的 IPv4/IPv6 路由劣化与 DNS 污染问题：
+### 2.2 灵活的 DNS Resolver 与协议支持 (`dialer::dns`)
+全面兼容 `wstunnel` 的 DNS Resolver 规范，支持多种协议前缀：
+* `dns://<IP>`：基于标准 UDP 端口 53 进行查询；
+* `dns+https://<IP>?sni=<domain>`：基于 DNS over HTTPS (DoH) 查询，支持指定 SNI 防伪造；
+* `dns+tls://<IP>?sni=<domain>`：基于 DNS over TLS (DoT) 查询；
+* `system://0.0.0.0`：走本地系统 libc `getaddrinfo` 解析。
+
+结合 sing-box 的 DNS 策略控制，解决跨国网络中的 IPv4/IPv6 路由劣化与 DNS 污染问题：
 
 ```rust
 use std::net::IpAddr;
@@ -98,12 +106,12 @@ pub enum DnsStrategy {
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct DnsConfig {
     pub strategy: Option<DnsStrategy>,
-    pub servers: Option<Vec<String>>,
+    pub resolvers: Option<Vec<String>>,
     pub cache_capacity: Option<usize>,
 }
 
 pub trait DnsResolver: Send + Sync {
-    /// 根据端点专属配置的 DnsStrategy 异步解析域名为有序的 IP 列表
+    /// 根据端点专属配置的 DnsStrategy 与 upstream resolvers 异步解析域名为有序的 IP 列表
     fn resolve<'a>(&'a self, host: &'a str) -> BoxFuture<'a, Result<Vec<IpAddr>, TunnelError>>;
 }
 ```
@@ -170,20 +178,26 @@ pub trait Dialer: Send + Sync {
 系统完全摒弃冗长脆弱的命令行 CLI 参数，采用规范化、分层清晰的 YAML 配置文件：
 
 ```yaml
-# ==========================================
-# Micro-Tunnel 声明式主配置文件 (config.yaml)
-# ==========================================
+# ==================================================
+# Micro-Tunnel 声明式主配置文件 (config-example.yaml)
+# ==================================================
 
 log:
   level: "info"         # trace | debug | info | warn | error
   output: "stdout"      # stdout | file path
+  no_color: false       # 禁用彩色输出 (适合容器日志采集)
 
-# 全局默认 DNS 基线配置 (可选)
+# Tokio 运行时 worker 线程数 (可选，默认核心数；1 为单线程运行时)
+worker_threads: 4
+
+# 全局默认 DNS 解析设置 (兼容 wstunnel 规范)
 dns:
   strategy: "prefer_ipv4"
-  servers:
-    - "system"
-    - "udp://1.1.1.1:53"
+  resolvers:
+    - "dns://1.1.1.1"
+    - "dns+https://1.1.1.1?sni=cloudflare-dns.com"
+    - "dns+tls://8.8.8.8?sni=dns.google"
+    - "system://0.0.0.0"
 
 # 全局默认套接字拨号参数
 dialer:
@@ -197,34 +211,45 @@ tls:
   insecure: false
   alpn: ["h3", "http/1.1"]
 
-# 并发并行运行的隧道列表
-tunnels:
-  # 隧道 1：反向穿透，定制专属 DNS 与 SNI 伪装
-  - tag: "vps-ssh-reverse"
-    mode: "reverse"
-    listen: "0.0.0.0:2222"
-    target: "127.0.0.1:22"
-    token: "SECURE_PSK_HEX"
-    endpoint:
-      url: "wss://198.51.100.1:443/ws"
-      # 端点专属 DNS：仅查 IPv4
-      dns:
-        strategy: "ipv4_only"
-        servers: ["udp://8.8.8.8:53"]
-      # 端点专属 TLS：覆盖 SNI 进行 Web 伪装与自签证书跳过
-      tls:
-        enabled: true
-        server_name: "custom-camouflage.example.com"
-        insecure: true
-      dialer:
-        connect_timeout: "3s"
+# 服务端 Ingress 配置 (支持与客户端 tunnels 共存)
+server:
+  # 必须使用显式协议 URL，支持 URI Path 路由与多个 Listeners
+  listen:
+    - "ws://0.0.0.0:8080/tunnel"
+    - "h3://0.0.0.0:8443/tunnel"
+  token: "SECURE_PRESHARED_TOKEN"   # 可选，省略或置空为免密
+  default_target: "127.0.0.1:5201"  # 可选
 
-  # 隧道 2：正向穿透，走海外节点，定制专属 IPv6 优先与 mTLS 双向认证
+# 隧道集群列表
+tunnels:
+  # 隧道 1：多端口映射集群，共享同一个 0-RTT 连接池与自愈重试
+  - tag: "corp-cluster"
+    endpoint: "ws://127.0.0.1:8080/tunnel"
+    token: "SECURE_PRESHARED_TOKEN"
+    pool_size: 8
+    retry:
+      delay: "3s"
+      max_retries: 10
+    mappings:
+      # 正向映射：本地 15201 -> 远端 5201
+      - mode: "forward"
+        listen: "127.0.0.1:15201"
+        target: "127.0.0.1:5201"
+      # 正向映射：本地 13306 -> 远端 3306
+      - mode: "forward"
+        listen: "127.0.0.1:13306"
+        target: "10.0.0.5:3306"
+      # 逆向映射：远端 2222 -> 本地 SSH 22
+      - mode: "reverse"
+        listen: "0.0.0.0:2222"
+        target: "127.0.0.1:22"
+
+  # 隧道 2：经典单映射正向穿透，定制专属 IPv6 优先与 mTLS 双向认证
   - tag: "cloud-db-forward"
     mode: "forward"
-    listen: "127.0.0.1:13306"
-    target: "10.0.0.5:3306"
-    token: "SECURE_PSK_HEX"
+    listen: "127.0.0.1:18080"
+    target: "10.0.0.8:8080"
+    token: "SECURE_PRESHARED_TOKEN"
     endpoint:
       url: "https://db-edge.example.com:443/tunnel"
       dns:
@@ -243,11 +268,58 @@ tunnels:
 
 ```rust
 use serde::Deserialize;
+use std::time::Duration;
 use crate::dialer::dns::DnsConfig;
 use crate::dialer::tls::TlsConfig;
 use crate::dialer::unified::DialerOptions;
 
+/// 解析就绪的 Server Listen 规格，显式拆解协议与 Path
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerListenSpec {
+    pub scheme: String,
+    pub bind_addr: String,
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ServerConfig {
+    #[serde(default, alias = "listens", deserialize_with = "deserialize_one_or_many")]
+    pub listen: Vec<String>,
+    pub token: Option<String>,
+    pub default_target: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct PortMappingConfig {
+    #[serde(default = "default_mapping_mode")]
+    pub mode: TunnelMode,
+    pub listen: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+pub struct TunnelRetryConfig {
+    pub delay: Option<Duration>,
+    pub max_retries: Option<usize>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
+pub struct TunnelConfig {
+    pub tag: String,
+    pub endpoint: EndpointConfig,
+    pub token: Option<String>,
+    pub pool_size: Option<usize>,
+    pub failover: Option<FailoverConfig>,
+    pub multiplex: Option<MultiplexConfig>,
+    pub retry: Option<TunnelRetryConfig>,
+    pub mappings: Vec<PortMappingConfig>,
+
+    // 向前兼容单映射字段
+    pub mode: Option<TunnelMode>,
+    pub listen: Option<String>,
+    pub target: Option<String>,
+}
+```
 pub struct AppConfig {
     #[serde(default)]
     pub log: LogConfig,
@@ -401,18 +473,20 @@ pub trait TransportListener: Send + Sync {
 }
 
 pub trait TransportDriver: Send + Sync + 'static {
-    fn scheme(&self) -> &'static str;
+    fn schemes(&self) -> &[&'static str];
 
     fn build_connector(
         &self,
         endpoint_ctx: &EndpointContext,
         auth_token: &str,
+        mode: TunnelMode,
     ) -> Result<Box<dyn TransportConnector>, TunnelError>;
 
     fn build_listener(
         &self,
         listen_addr: &str,
-        auth_token: &str,
+        auth_token: Option<&str>,
+        path: Option<&str>,
     ) -> Result<Box<dyn TransportListener>, TunnelError>;
 }
 
@@ -681,12 +755,29 @@ micro-tunnel/
 
 ## 10. 高性能现代架构优化演进
 
-### 10.1 控制信道二进制化：MessagePack (`to_vec_named`)
+### 10.1 目标解耦的 0-RTT 预热连接池与动态路由 (`ReplenishingStreamPool`)
+* **连接预热与目标解耦**：
+  * 在旧架构中，连接池在建连时即绑定特定后端端口（如 5201）。当连接池预热时，服务端立即向目标发起连接，容易在大量连接空闲时导致后端连接溢出或触发远端空闲超时（如 WSL iperf3 断联）。
+  * 新架构引入 `x-tunnel-pool: idle` 握手标识：客户端建立到服务端的预热空闲流，服务端仅保持传输层存活，**绝不提前触碰目标后端服务**。
+* **按需即时激活与动态多路转发**：
+  * 当客户端任意 mapping 端口接收到真实 TCP 流量时，以 0-RTT 从共享池取出空闲流，发送动态激活包：
+    `[0xA5 (ACTIVATE_STREAM_MAGIC), target_len: u16, target_str...]`
+  * 服务端接收到 0xA5 及目标地址后，即时拨号目标服务并进入双工中继。
+  * **集群效益**：单一 Tunnel Endpoint 下的数十个正向端口映射完全共享同一个预热容量，避免建立多套连接池的开销。
+* **陈旧死连接无感剔除**：
+  * 在出池激活写入 magic 字节阶段，结合短时超时（500ms）校验；若底层物理连接已被 NAT 或服务端切断，写入立即失败并自动丢弃，无缝尝试下一条空闲连接，业务端完全无感。
+
+### 10.2 Supervisor 错误重试与自愈控制 (`TunnelSupervisor`)
+* **网络震荡容灾**：当远端 Ingress 端点启动较慢、暂时不可达或 DNS 抖动时，Supervisor 不会使进程 Panic 或退出，而是启动 `run_tunnel_with_retry` 监控协程。
+* **重试策略可控**：支持通过 `retry: { delay: "3s", max_retries: 10 }` 控制间隔与上限；默认 `max_retries: None` 实现无限持久自愈。
+* **全生命周期信号对齐**：监听 `CancellationToken`，在收到 SIGINT/SIGTERM 时能够干净利落地阻断重试循环并优雅退出。
+
+### 10.3 控制信道二进制化：MessagePack (`to_vec_named`)
 * 全面废除文本型 JSON，采用极度紧凑高效的二进制 MessagePack (`rmp-serde`)。
 * 序列化统一使用 `rmp_serde::to_vec_named()`，在编码时输出带字段名的 Map 键值对，而非位置数组。
 * **协议演进兼容性**：即使服务端与客户端版本不一致、新版本增加可选字段或重排字段，旧版本反序列化时自动忽略未知字段，新版本处理旧消息自动填充 `#[serde(default)]` 默认值，完美实现跨版本前后兼容。
 
-### 10.2 WebSocket 传输流直驱：Zero-Task 纯状态机 (`WsTunnelStream`)
+### 10.4 WebSocket 传输流直驱：Zero-Task 纯状态机 (`WsTunnelStream`)
 * 废弃常规基于 `tokio::io::duplex` 内存桥接及为每个连接额外 `spawn` 两个读写 pump task 的做法。
 * 直接基于 `fastwebsockets::after_handshake_split` 取得底层的 `WebSocketRead` 与 `WebSocketWrite`。
 * 运用**所有权转移状态机模式（Ownership Transfer Pattern）**，在 `poll_read` 和 `poll_write` 触发异步读写时将流的所有权安全借出/收回，直接实现 `tokio::io::AsyncRead` 与 `AsyncWrite`。
@@ -695,7 +786,7 @@ micro-tunnel/
   - 彻底消灭中间 duplex 环形缓冲区的双重内存拷贝；
   - 保持 100% 安全 Rust（Safe Rust），无自引用结构体困扰。
 
-### 10.3 全链路 TCP Socket 底层性能调优 (`SocketTuner`)
+### 10.5 全链路 TCP Socket 底层性能调优 (`SocketTuner`)
 * 针对正向监听、反向访客入站、服务端代理回拨、本地目标回拨的所有 TCP Stream，在连接建立或 `accept()` 的第一时刻立即通过 `SocketTuner` 强制应用：
   - `set_nodelay(true)`：彻底禁用 Nagle 延迟缓冲算法，杜绝 40ms~200ms ACK 延迟；
   - `socket2::TcpKeepalive`：自动配置 15s 空闲保活与探测间隔，及时清理网络死连接并防范中间 NAT 超时掉线。

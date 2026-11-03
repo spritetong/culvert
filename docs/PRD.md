@@ -10,12 +10,15 @@
 ### 1.2 核心理念与减法哲学 (Philosophy & Non-Goals)
 相较于传统隧道工具（如 `wstunnel`、`frp`、`Xray`），Micro-Tunnel 遵循严格的减法哲学：
 * **零内嵌证书申请管理 (No ACME)**：服务端不管理任何 ACME 证书申请逻辑，不监听公网 80/443。外部流量全部由 Caddy 终结并由 Caddy 自动签发和续签合规证书，后端服务仅监听 Unix Domain Socket (UDS) 或受限本地回环。服务端崩溃或版本升级绝不影响公网域名接入点。
-* **彻底摒弃应用层多路复用 (No Yamux / No Smux)**：
+* **单配置全栈纳管 (Unified Server & Tunnel Coexistence)**：支持在同一配置文件中同时声明 `server` 入口与多条 `tunnels` 实例，节点可兼具 Ingress 汇聚与中继客户端双重角色。
+* **按需可选轻量鉴权 (Optional Token Authentication)**：支持高熵预共享密钥（PSK）校验，同时支持 token 省略或置空免密模式，便于与 Caddy / Nginx 等前置反代鉴权或受信内网环境无缝对接。
+* **彻底摒弃脆弱的多路复用分帧 (Native Streams & Decoupled 0-RTT Pool)**：
   * HTTP/3 下直接依托 QUIC 原生流隔离（Stream ID 隔离），单流丢包重传不阻塞其他流；
-  * WSS 下采用 1:1 双工流与预热连接池模型，消除私有应用层分帧带来的 CPU 二次打包开销与 TCP 队头阻塞。
+  * WSS 下采用 1:1 双工流与解耦预热连接池模型，消除私有应用层分帧带来的 CPU 二次打包开销与 TCP 队头阻塞。
+  * **集群多端口共享单连接池 (Multi-Mapping Cluster Sharing Pool)**：单一 Tunnel Endpoint 可声明多个双向端口映射（Forward / Reverse 混合），共享同一个 0-RTT 连接池，流量触发时按需动态激活目标，绝不提前占用下游端口。
 * **坚决不做 UDP 隧道与 DNS 代理 (No UDP / DNS Tunneling)**：不维护庞大且脆弱的 UDP 映射表与垃圾回收定时器。DNS 查询统一在客户端/服务端远端解析（Remote DNS），杜绝边缘 NAT 带来的内存泄漏隐患。
 * **剔除复合代理协议 (No SOCKS5 / HTTP Proxy)**：坚持 Unix 单一职责，只专注于稳定透明的底层双向 TCP 端口转发。如需 SOCKS5，通过标准端口映射外挂外部工具即可。
-* **极简鉴权**：摒弃复杂的 HTTP Basic/Digest 体系，采用高熵预共享密钥（PSK）头部校验。
+* **全生命周期自愈重试 (Self-Healing Retry Supervision)**：Supervisor 对隧道启动与运行失败进行自愈接管，支持配置重试延时与最大重试次数，默认持续重连直至远端恢复。
 
 ---
 
@@ -37,7 +40,15 @@
   3. VPS 客户端通过 WSS/HTTP3 发起隧道连接至云主机 Caddy；
   4. 云主机 Micro-Tunnel Server 解析目标并将流量转发至云内网 `10.0.0.5:3306`。
 
-### 2.3 场景三：异构多端点与多隧道并行 (Heterogeneous Multi-Endpoint & Multi-Tunnel)
+### 2.3 场景三：一个 Endpoint 多个双向映射共享连接池 (Multi-Mapping Sharing One Connection Pool)
+* **用户痛点**：客户端与服务端之间有多个端口需要转发（例如本地 15201 映射云端 iperf3 5201，本地 13306 映射云端 MySQL 3306，同时把云端 2222 逆向映射到本地 SSH 22）。传统做法需要建立多个独立的隧道，每个隧道独立握手与建立连接池，造成网络连接爆炸与连接维护开销剧增。
+* **业务链路**：
+  1. 客户端声明单一 Tunnel 配置，指向远端 Ingress URL（如 `wss://tunnel.example.com/tunnel`）；
+  2. 声明 `mappings: [...]` 包含多组 `forward` / `reverse` 规则；
+  3. 多个映射共享同一个预热连接池；连接处于 Idle 状态时不提前拨号目标后端；
+  4. 真实业务流量进入某映射端口时，发送带目标地址的单字节魔数激活报文，服务端在收到激活信号后才即时拨号目标服务，兼顾 0-RTT 与低资源占用。
+
+### 2.4 场景四：异构多端点与多隧道并行 (Heterogeneous Multi-Endpoint & Multi-Tunnel)
 * **用户痛点**：单台主机需要同时连接不同的远端基础设施（如既连国内 CDN 伪装的 VPS，又连海外直连 QUIC 节点），不同节点对 DNS 策略（国内要 `prefer_ipv4` 防污染，海外需要 `ipv6_only` 直连）、SNI 伪装域名、mTLS 双向认证证书以及超时控制完全不同。
 * **业务链路**：
   * 支持在单一配置文件内定义多个 Tunnel，**每个 Endpoint 均可独立绑定或覆写专属的 `dns`、`dialer` 与 `tls` 参数**。
@@ -58,62 +69,82 @@
 * **FR-1.3 IPC 极速互联 (UDS)**：
   * 服务端与 Caddy 之间严格走 Unix Domain Socket (`/run/tunnel.sock`)，免去内核网络协议栈封包、校验和计算与端口耗尽风险。
 
-### 3.2 统一 URL 解析与 Endpoint 专属绑定 (URL Parser & Per-Endpoint Binding)
-* **FR-2.1 标准化 URL 与复合 Endpoint 解析**：
+### 3.2 统一 URL 解析、Server 显式协议与 Endpoint 专属绑定
+* **FR-2.1 Server 显式协议 URL 与 Path 路由校验**：
+  * Server 的 `listen` 字段采用严格的 Full URL 格式（如 `ws://0.0.0.0:8080/tunnel`, `h3://0.0.0.0:8443/tunnel`, `uds:///run/tunnel.sock`），不再支持隐式无协议写法。
+  * 支持数组声明多个 Listen URLs，服务端自动启动对应的异构协议监听。
+  * **Path 路由伪装**：客户端发起请求的 URI Path 必须与服务端精确匹配；不匹配时直接以标准 **HTTP 404 Not Found** 响应，防范未授权扫描。
+* **FR-2.2 可选 Token 鉴权 (Optional Auth)**：
+  * Server 与 Tunnel 的 `token` 字段均为可选。未配置或置空时跳过鉴权，方便内网通信或前置由 Caddy/Nginx 执行鉴权。
+* **FR-2.3 标准化 URL 与复合 Endpoint 解析**：
   * 支持统一解析各种端点 URL：如 `wss://...`、`https://...`、`h3://...`、`uds://...`、`tcp://...`。
   * 支持将 `endpoint` 配置为简易 URL 字符串，或绑定独立上下文的高级对象结构。
-* **FR-2.2 Endpoint 专属 DNS 解析策略 (借鉴 sing-box)**：
-  * 支持为单个 Endpoint 独立配置 DNS 解析策略与上游服务器（系统、UDP DNS、DoH）。
+* **FR-2.4 丰富的主机名与 DNS 解析支持 (wstunnel 兼容规范)**：
+  * 支持多种主流 DNS 协议类型：
+    * `system://0.0.0.0`：系统 libc 本地解析；
+    * `dns://1.1.1.1`：标准 UDP DNS 解析；
+    * `dns+https://1.1.1.1?sni=cloudflare-dns.com`：DNS over HTTPS (DoH)；
+    * `dns+tls://8.8.8.8?sni=dns.google`：DNS over TLS (DoT)。
   * 支持独立策略：
     * `prefer_ipv4`（默认优先解析与连接 IPv4）
     * `prefer_ipv6`（优先 IPv6）
     * `ipv4_only`（仅解析连接 A 记录，彻底忽略 AAAA）
     * `ipv6_only`（仅解析连接 AAAA 记录）
-* **FR-2.3 Endpoint 专属细粒度 TLS 参数控制 (Rustls 原生高级覆盖)**：
+* **FR-2.5 Endpoint 专属细粒度 TLS 参数控制 (Rustls 原生高级覆盖)**：
   * `server_name`：独立覆盖 SNI 校验域名，支持 CDN 前置路由伪装与多租户分流。
   * `alpn`：独立指定应用层协议协商列表（如 `["h3"]` 或 `["http/1.1"]`）。
   * `insecure` / `skip_cert_verify`：针对特定端点开启自签证书跳过校验。
   * `ca_certificate`：独立加载端点专用的自定义 CA 根证书。
   * `client_certificate` & `client_key`：独立配置 mTLS 双向认证证书与私钥。
   * `min_version` / `max_version`：显式约束 TLS 最低与最高版本（如 `1.2`, `1.3`）。
-* **FR-2.4 Endpoint 专属底层 Socket 拨号微调**：
+* **FR-2.6 Endpoint 专属底层 Socket 拨号微调**：
   * `connect_timeout`：单端点定制建连超时。
   * `tcp_keepalive`：单端点 TCP Keepalive 周期探测。
   * `tcp_nodelay`：默认禁用 Nagle 算法。
   * `bind_interface`：单端点指定绑定的出站网卡（多网卡分流）。
 
-### 3.3 声明式 YAML 配置与多隧道并行 (Full Schematic YAML & Multi-Tunnel)
+### 3.3 声明式 YAML 配置、多端口映射与自愈重试 (Declarative YAML, Multi-Mapping & Retry)
 * **FR-3.1 规范化 YAML 分层声明**：
-  * 采用分层结构，全局定义 `log`、`dns`、`dialer`、`tls` 作为默认基线；
-  * `tunnels` 列表内定义并发隧道，各隧道可对 `endpoint` 内部的 `dns`、`dialer`、`tls` 进行细粒度覆写。
-* **FR-3.2 纳管多个并行运行的隧道 (Multi-Tunnel Execution)**：
-  * 在单一进程内，通过 `tunnels` 列表声明多个并行运行的 Tunnel（支持正向与反向混跑）。
-* **FR-3.3 集中式生命周期监控**：
-  * 主管协程（Supervisor）统一纳管所有 Tunnel 任务的生命周期，支持在收到退出信号时一键安全平滑退出。
+  * 采用分层结构，全局定义 `log`、`worker_threads`、`dns`、`dialer`、`tls` 作为默认基线；
+  * `log.no_color` 支持纯文本日志输出；`worker_threads` 精确指定 Tokio 运行时线程数（1 为单线程当前运行时）。
+* **FR-3.2 纳管集群多端口映射 (Cluster Multi-Port Mappings)**：
+  * 针对每个 Tunnel Endpoint，支持声明 `mappings: [...]` 数组，定义多个独立的端口转发（Forward / Reverse 混合）。
+  * 保持对经典单端口 `listen` / `target` / `mode` 的完整向前兼容。
+* **FR-3.3 集中式生命周期监控与失败重试 (Supervisor & Retry Loop)**：
+  * 主管协程（Supervisor）统一纳管 Server 与所有 Tunnel 任务的生命周期，支持在收到退出信号时一键安全平滑退出。
+  * **失败自愈与重试**：支持配置 `retry: { delay: "3s", max_retries: 10 }`。初始连接失败或网络临时中断不导致进程崩溃，而是按指数/固定延时自动恢复。默认无重试次数限制（持续重连）。
 
-### 3.4 连接池与动态热切 (Pool & Seamless Failover)
-* **FR-4.1 协议连接池 (Protocol Pool)**：
-  * 针对 WSS/TCP 模式维护空闲物理连接池，实现 **0-RTT** 即时出池激活。
-  * 上层 TCP 断开时执行 Draining 排空协议，清理残存脏数据后安全还池。
+### 3.4 动态目标解耦连接池 (Decoupled Stream Pool)
+* **FR-4.1 解耦连接池 (Decoupled 0-RTT Pool)**：
+  * 针对 WSS/TCP 模式维护空闲物理连接池，打上 `x-tunnel-pool: idle` 标识。
+  * 服务端仅维持空闲信道保活，绝不提前拨号后端服务。
+  * 客户端通过动态写入 `[0xA5, target_len: u16, target_str]` 动态激活流，实现多端口映射共享一个连接池的零等待与零无效拨号。
+  * 连接断开后自动平滑补充池容量，具备陈旧死连接静默剔除机制。
 * **FR-4.2 底层物理 IO 动态无缝热切 (Seamless Failover)**：
   * 支持单隧道配置主端点（H3）与备用端点（WSS）。
   * 基于 64 位单调流偏移量（Stream Offset）与端侧滑动环形重传缓冲（Ring Buffer），在 H3 受到网络 QoS 严重丢包或超时阻断时，在 $<30\text{ ms}$ 内动态切换至 WSS 物理信道，**上层应用 TCP 连接完全不中断、不丢包**。
 
 ---
 
-## 4. 完整配置规范示例 (`config.yaml`)
+## 4. 完整配置规范示例 (`config-example.yaml`)
 
 ```yaml
 log:
   level: "info"
   output: "stdout"
+  no_color: false
 
-# 全局默认 DNS 基线配置 (可选，未指定端点将继承此配置)
+# Tokio 运行时 worker 线程数 (可选，默认自动检测 CPU 核心数；设为 1 时为单线程运行时)
+worker_threads: 4
+
+# 全局默认 DNS 解析设置 (兼容 wstunnel 语法规范)
 dns:
   strategy: "prefer_ipv4"
-  servers:
-    - "system"
-    - "udp://1.1.1.1:53"
+  resolvers:
+    - "dns://1.1.1.1"
+    - "dns+https://1.1.1.1?sni=cloudflare-dns.com"
+    - "dns+tls://8.8.8.8?sni=dns.google"
+    - "system://0.0.0.0"
 
 # 全局默认套接字拨号参数
 dialer:
@@ -127,34 +158,45 @@ tls:
   insecure: false
   alpn: ["h3", "http/1.1"]
 
-# 并发运行的多隧道列表
-tunnels:
-  # 隧道 1：反向穿透，定制专属 DNS 与 SNI 伪装
-  - tag: "vps-ssh-reverse"
-    mode: "reverse"
-    listen: "0.0.0.0:2222"
-    target: "127.0.0.1:22"
-    token: "SECURE_PSK_HEX"
-    endpoint:
-      url: "wss://198.51.100.1:443/ws"
-      # 端点专属 DNS：仅查 IPv4
-      dns:
-        strategy: "ipv4_only"
-        servers: ["udp://8.8.8.8:53"]
-      # 端点专属 TLS：覆盖 SNI 进行 Web 伪装与自签证书跳过
-      tls:
-        enabled: true
-        server_name: "custom-camouflage.example.com"
-        insecure: true
-      dialer:
-        connect_timeout: "3s"
+# 服务端 Ingress 配置 (支持与客户端 tunnels 共存同一配置)
+server:
+  # 必须使用带显式协议的完整 URL，支持 URI Path 路由 (ws, wss, h3, quic, uds)
+  listen:
+    - "ws://0.0.0.0:8080/tunnel"
+    - "h3://0.0.0.0:8443/tunnel"
+  token: "SECURE_PRESHARED_TOKEN"   # 可选，省略或置空为免密模式
+  default_target: "127.0.0.1:5201"  # 可选，缺省目标地址
 
-  # 隧道 2：正向穿透，走海外节点，定制专属 IPv6 优先与 mTLS 双向认证
+# 隧道集群列表
+tunnels:
+  # 隧道 1：多端口映射集群，共享同一个 0-RTT 连接池与自愈重试
+  - tag: "corp-cluster"
+    endpoint: "ws://127.0.0.1:8080/tunnel"
+    token: "SECURE_PRESHARED_TOKEN"
+    pool_size: 8
+    retry:
+      delay: "3s"
+      max_retries: 10
+    mappings:
+      # 正向映射：本地 15201 -> 远端 5201
+      - mode: "forward"
+        listen: "127.0.0.1:15201"
+        target: "127.0.0.1:5201"
+      # 正向映射：本地 13306 -> 远端 3306
+      - mode: "forward"
+        listen: "127.0.0.1:13306"
+        target: "10.0.0.5:3306"
+      # 逆向映射：远端 2222 -> 本地 SSH 22
+      - mode: "reverse"
+        listen: "0.0.0.0:2222"
+        target: "127.0.0.1:22"
+
+  # 隧道 2：经典单映射正向穿透，定制专属 IPv6 优先与 mTLS 双向认证
   - tag: "cloud-db-forward"
     mode: "forward"
-    listen: "127.0.0.1:13306"
-    target: "10.0.0.5:3306"
-    token: "SECURE_PSK_HEX"
+    listen: "127.0.0.1:18080"
+    target: "10.0.0.8:8080"
+    token: "SECURE_PRESHARED_TOKEN"
     endpoint:
       url: "https://db-edge.example.com:443/tunnel"
       dns:
