@@ -65,6 +65,7 @@ async fn test_multi_mapping_shared_pool_and_path_matching_e2e() {
         listen: vec![format!("ws://127.0.0.1:{}/secret_path", server_ws_port)],
         token: None, // No-auth mode
         default_target: None,
+        ..Default::default()
     });
 
     app_config.tunnels.push(TunnelConfig {
@@ -142,6 +143,7 @@ async fn test_path_mismatch_rejection() {
         listen: vec![format!("ws://127.0.0.1:{}/valid_path", server_ws_port)],
         token: None,
         default_target: None,
+        ..Default::default()
     });
 
     // Client connects to the WRONG path: /wrong_path

@@ -215,10 +215,14 @@ tls:
 server:
   # 必须使用显式协议 URL，支持 URI Path 路由与多个 Listeners
   listen:
-    - "ws://0.0.0.0:8080/tunnel"
+    - "wss://0.0.0.0:8443/tunnel"
     - "h3://0.0.0.0:8443/tunnel"
+    - "ws://127.0.0.1:8080/tunnel"
   token: "SECURE_PRESHARED_TOKEN"   # 可选，省略或置空为免密
   default_target: "127.0.0.1:5201"  # 可选
+  # TLS 证书文件 (可选，未指定时 wss/h3/quic 自动生成内存自签名证书以实现开箱即用)
+  # certificate: "/path/to/server.crt"
+  # key: "/path/to/server.key"
 
 # 隧道集群列表
 tunnels:

@@ -37,24 +37,15 @@ impl TransportDriver for H3TransportDriver {
         listen_addr: &str,
         auth_token: Option<&str>,
         path: Option<&str>,
+        tls_cert: Option<&str>,
+        tls_key: Option<&str>,
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
-        // Generate an ephemeral self-signed certificate for zero-configuration startup
-        let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-        let cert_key = rcgen::generate_simple_self_signed(subject_alt_names)
-            .map_err(|e| TunnelError::Tls(format!("Failed to generate self-signed cert: {}", e)))?;
-
-        let cert_der = cert_key.cert.der().to_vec();
-        let key_der = cert_key.signing_key.serialize_der();
-
-        let cert_chain = vec![rustls::pki_types::CertificateDer::from(cert_der)];
-        let private_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
-            rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
-        );
-
-        let server_rustls = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(cert_chain, private_key)
-            .map_err(|e| TunnelError::Tls(format!("Failed to build server TLS config: {}", e)))?;
+        let alpn = vec![b"h3".to_vec(), b"micro-tunnel-quic".to_vec()];
+        let server_rustls = crate::dialer::tls::TlsConfigBuilder::build_server_config(
+            tls_cert,
+            tls_key,
+            Some(alpn),
+        )?;
 
         let listener = H3Listener::bind(listen_addr, auth_token, path, server_rustls)?;
         Ok(Box::new(listener))

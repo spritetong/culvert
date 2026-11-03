@@ -273,6 +273,7 @@ async fn test_wss_forward_tunnel_with_custom_ca_and_sni() {
         listen: vec![format!("ws://127.0.0.1:{}/tunnel", backend_server_port)],
         token: Some(auth_token.to_string()),
         default_target: None,
+        ..Default::default()
     };
     let server_runner = ServerRunner::new(
         server_config,
@@ -380,6 +381,7 @@ async fn test_wss_forward_tunnel_insecure_mode() {
         listen: vec![format!("ws://127.0.0.1:{}/tunnel", backend_server_port)],
         token: Some(auth_token.to_string()),
         default_target: None,
+        ..Default::default()
     };
     let server_runner = ServerRunner::new(
         server_config,
@@ -484,6 +486,7 @@ async fn test_wss_mtls_mutual_authentication() {
         listen: vec![format!("ws://127.0.0.1:{}/tunnel", backend_server_port)],
         token: Some(auth_token.to_string()),
         default_target: None,
+        ..Default::default()
     };
     let server_runner = ServerRunner::new(
         server_config,
@@ -591,6 +594,7 @@ async fn test_wss_reverse_tunnel_e2e() {
         listen: vec![format!("ws://127.0.0.1:{}/tunnel", backend_server_port)],
         token: Some(auth_token.to_string()),
         default_target: None,
+        ..Default::default()
     };
     let server_runner = ServerRunner::new(
         server_config,

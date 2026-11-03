@@ -128,9 +128,27 @@ pub struct ServerConfig {
 
     /// Default target to forward to when client doesn't specify one.
     pub default_target: Option<String>,
+
+    /// TLS certificate file path for direct TLS/WSS/H3 termination (optional, fallback to self-signed).
+    #[serde(default, alias = "cert")]
+    pub certificate: Option<String>,
+
+    /// TLS private key file path for direct TLS/WSS/H3 termination (optional, fallback to self-signed).
+    #[serde(default)]
+    pub key: Option<String>,
 }
 
 impl ServerConfig {
+    pub fn new(listen: Vec<String>, token: Option<String>, default_target: Option<String>) -> Self {
+        Self {
+            listen,
+            token,
+            default_target,
+            certificate: None,
+            key: None,
+        }
+    }
+
     pub fn parse_specs(&self) -> Result<Vec<ServerListenSpec>, crate::core::error::TunnelError> {
         let mut specs = Vec::new();
         for url in &self.listen {

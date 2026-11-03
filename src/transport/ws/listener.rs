@@ -10,6 +10,7 @@ use hyper_util::rt::TokioIo;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tokio_rustls::TlsAcceptor;
 
 use crate::common::net::SocketTuner;
 use crate::core::error::TunnelError;
@@ -26,6 +27,7 @@ pub struct WsListener {
     listen_addr: String,
     auth_token: Option<String>,
     path: Option<String>,
+    tls_acceptor: Option<TlsAcceptor>,
     incoming_rx: Option<mpsc::Receiver<AcceptedResult>>,
 }
 
@@ -35,23 +37,33 @@ impl WsListener {
         listen_addr: impl Into<String>,
         auth_token: Option<impl Into<String>>,
         path: Option<impl Into<String>>,
+        tls_acceptor: Option<TlsAcceptor>,
     ) -> Self {
         Self {
             listen_addr: listen_addr.into(),
             auth_token: auth_token.map(|t| t.into()),
             path: path.map(|p| p.into()),
+            tls_acceptor,
             incoming_rx: None,
         }
     }
 
     /// Spawns the background HTTP server accepting WebSocket upgrades.
     async fn start_server(&mut self) -> Result<(), TunnelError> {
-        let listener = TcpListener::bind(&self.listen_addr).await?;
+        let clean_addr = if let Some(idx) = self.listen_addr.find("://") {
+            let without_scheme = &self.listen_addr[idx + 3..];
+            without_scheme.split('/').next().unwrap_or(without_scheme)
+        } else {
+            &self.listen_addr
+        };
+
+        let listener = TcpListener::bind(clean_addr).await?;
         let (tx, rx) = mpsc::channel(32);
         self.incoming_rx = Some(rx);
 
         let auth_token = Arc::new(self.auth_token.clone());
         let expected_path = Arc::new(self.path.clone());
+        let tls_acceptor = self.tls_acceptor.clone();
 
         tokio::spawn(async move {
             loop {
@@ -66,9 +78,24 @@ impl WsListener {
                 let tx = tx.clone();
                 let token = Arc::clone(&auth_token);
                 let path = Arc::clone(&expected_path);
+                let acceptor = tls_acceptor.clone();
 
                 tokio::spawn(async move {
-                    let io = TokioIo::new(stream);
+                    // If TLS acceptor is configured (wss://), perform TLS handshake first
+                    let io: TokioIo<Box<dyn TunnelStream>> = if let Some(tls) = acceptor {
+                        match tls.accept(stream).await {
+                            Ok(tls_stream) => {
+                                TokioIo::new(Box::new(tls_stream) as Box<dyn TunnelStream>)
+                            }
+                            Err(e) => {
+                                tracing::debug!("WSS server TLS handshake failed: {:?}", e);
+                                return;
+                            }
+                        }
+                    } else {
+                        TokioIo::new(Box::new(stream) as Box<dyn TunnelStream>)
+                    };
+
                     let service = service_fn(move |mut req: Request<Incoming>| {
                         let tx = tx.clone();
                         let token = Arc::clone(&token);

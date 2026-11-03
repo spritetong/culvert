@@ -82,6 +82,7 @@ async fn test_forward_tunnel_ws_e2e() {
         listen: vec![format!("ws://{}/tunnel", server_listen)],
         token: Some(auth_token.to_string()),
         default_target: None,
+        ..Default::default()
     };
     let server_runner = ServerRunner::new(
         server_config,
@@ -170,6 +171,7 @@ async fn test_reverse_tunnel_ws_e2e() {
         listen: vec![format!("ws://{}/tunnel", server_ws_listen)],
         token: Some(auth_token.to_string()),
         default_target: None,
+        ..Default::default()
     };
     let server_runner = ServerRunner::new(
         server_config,
@@ -259,6 +261,7 @@ async fn test_supervisor_multi_tunnel_concurrency_e2e() {
         listen: vec![format!("ws://127.0.0.1:{}/ws", server_ws_port)],
         token: Some(auth_token.to_string()),
         default_target: None,
+        ..Default::default()
     });
 
     app_config.tunnels.push(TunnelConfig {

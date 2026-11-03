@@ -64,6 +64,8 @@ impl ServerRunner {
             let session_mgr = Arc::clone(&self.session_manager);
             let default_target = self.config.default_target.clone();
             let token_opt = self.config.token.clone();
+            let tls_cert = self.config.certificate.clone();
+            let tls_key = self.config.key.clone();
 
             tracker.spawn_with_cancel(move |token| async move {
                 let mut listener = registry.create_listener(
@@ -71,6 +73,8 @@ impl ServerRunner {
                     &spec_clone.bind_addr,
                     token_opt.as_deref(),
                     spec_clone.path.as_deref(),
+                    tls_cert.as_deref(),
+                    tls_key.as_deref(),
                 )?;
 
                 info!(

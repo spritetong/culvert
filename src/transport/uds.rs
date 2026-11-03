@@ -33,6 +33,8 @@ impl TransportDriver for UdsTransportDriver {
         socket_path: &str,
         auth_token: Option<&str>,
         _path: Option<&str>,
+        _tls_cert: Option<&str>,
+        _tls_key: Option<&str>,
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
         Ok(Box::new(UdsListener {
             socket_path: socket_path.to_string(),

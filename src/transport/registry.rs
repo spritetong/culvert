@@ -58,11 +58,20 @@ impl TransportRegistry {
         listen_addr: &str,
         auth_token: Option<&str>,
         path: Option<&str>,
+        tls_cert: Option<&str>,
+        tls_key: Option<&str>,
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
         let driver = self
             .get_driver(scheme)
             .ok_or_else(|| TunnelError::UnsupportedScheme(scheme.to_string()))?;
 
-        driver.build_listener(listen_addr, auth_token, path)
+        // Format a full URL for the driver if scheme is provided
+        let full_addr = if listen_addr.contains("://") {
+            listen_addr.to_string()
+        } else {
+            format!("{}://{}", scheme, listen_addr)
+        };
+
+        driver.build_listener(&full_addr, auth_token, path, tls_cert, tls_key)
     }
 }

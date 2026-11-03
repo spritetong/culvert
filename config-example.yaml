@@ -31,10 +31,14 @@ tls:
 server:
   # Explicit scheme URL(s) with path routing support: ws, wss, h3, quic, uds
   listen:
-    - "ws://0.0.0.0:8080/tunnel"
+    - "wss://0.0.0.0:8443/tunnel"
     - "h3://0.0.0.0:8443/tunnel"
+    - "ws://127.0.0.1:8080/tunnel"
   token: "SECURE_PRESHARED_TOKEN"   # Optional: omit or leave empty for no-auth mode
   default_target: "127.0.0.1:5201"  # Optional: fallback target
+  # TLS certificate & private key (Optional: wss/h3/quic auto-generate self-signed cert if omitted)
+  # certificate: "/path/to/server.crt"
+  # key: "/path/to/server.key"
 
 # Concurrent multi-tunnel definitions (single endpoint can carry multiple port mappings)
 tunnels:

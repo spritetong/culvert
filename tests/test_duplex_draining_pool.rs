@@ -76,6 +76,7 @@ async fn test_high_volume_duplex_stream_integrity() {
         listen: vec![format!("ws://{}/ws", server_ws_listen)],
         token: Some(auth_token.to_string()),
         default_target: None,
+        ..Default::default()
     };
     let server_runner = ServerRunner::new(
         server_config,
@@ -196,6 +197,7 @@ async fn test_stream_half_close_and_draining() {
         listen: vec![format!("ws://{}/ws", server_ws_listen)],
         token: Some(auth_token.to_string()),
         default_target: None,
+        ..Default::default()
     };
     let server_runner = ServerRunner::new(
         server_config,
@@ -276,6 +278,7 @@ async fn test_pool_prewarm_and_reuse() {
         listen: vec![format!("ws://{}/ws", server_ws_listen)],
         token: Some(auth_token.to_string()),
         default_target: None,
+        ..Default::default()
     };
     let server_runner = ServerRunner::new(
         server_config,
@@ -360,6 +363,7 @@ async fn test_pool_resilience_after_disconnect_and_high_churn() {
         listen: vec![format!("ws://{}/ws", server_ws_listen)],
         token: Some(auth_token.to_string()),
         default_target: None,
+        ..Default::default()
     };
     let server_runner = ServerRunner::new(
         server_config,
