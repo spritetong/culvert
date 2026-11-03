@@ -11,7 +11,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::core::stream::BoxFuture;
+use crate::core::stream::{BoxFuture, HeartbeatStatus, TunnelStream};
 
 type DynRead = Box<dyn AsyncRead + Send + Unpin>;
 type DynWrite = Box<dyn AsyncWrite + Send + Unpin>;
@@ -332,6 +332,116 @@ impl AsyncWrite for WsTunnelStream {
                         io::ErrorKind::BrokenPipe,
                         "WebSocket write half in failed state",
                     )));
+                }
+            }
+        }
+    }
+}
+
+impl TunnelStream for WsTunnelStream {
+    fn poll_send_ping(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            match std::mem::replace(&mut self.write_state, WriteState::Failed) {
+                WriteState::Idle(mut tx) => {
+                    let mut fut = Box::pin(async move {
+                        let res = tx.write_frame(Frame::new(true, OpCode::Ping, None, Payload::Borrowed(&[]))).await;
+                        (tx, res)
+                    });
+                    match fut.as_mut().poll(cx) {
+                        Poll::Ready((tx, Ok(()))) => {
+                            self.write_state = WriteState::Idle(tx);
+                            return Poll::Ready(Ok(()));
+                        }
+                        Poll::Ready((_tx, Err(e))) => {
+                            self.write_state = WriteState::Failed;
+                            return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
+                        }
+                        Poll::Pending => {
+                            self.write_state = WriteState::Writing(fut);
+                            return Poll::Pending;
+                        }
+                    }
+                }
+                WriteState::Writing(mut fut) => match fut.as_mut().poll(cx) {
+                    Poll::Pending => {
+                        self.write_state = WriteState::Writing(fut);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready((tx, Ok(()))) => {
+                        self.write_state = WriteState::Idle(tx);
+                        continue;
+                    }
+                    Poll::Ready((_tx, Err(e))) => {
+                        self.write_state = WriteState::Failed;
+                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
+                    }
+                },
+                WriteState::Closing(fut) => {
+                    self.write_state = WriteState::Closing(fut);
+                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closing")));
+                }
+                WriteState::Closed => {
+                    self.write_state = WriteState::Closed;
+                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")));
+                }
+                WriteState::Failed => {
+                    self.write_state = WriteState::Failed;
+                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "failed")));
+                }
+            }
+        }
+    }
+
+    fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+        match &mut self.read_state {
+            ReadState::Eof | ReadState::Failed => Poll::Ready(HeartbeatStatus::Dead),
+            ReadState::Buffered { .. } => Poll::Ready(HeartbeatStatus::Alive),
+            ReadState::Idle(_) => {
+                // Peek a read poll to check if underlying connection died or closed
+                let mut empty = [0u8; 0];
+                let mut buf = ReadBuf::new(&mut empty);
+                match Pin::new(&mut *self).poll_read(cx, &mut buf) {
+                    Poll::Ready(Err(_)) => Poll::Ready(HeartbeatStatus::Dead),
+                    Poll::Pending => {
+                        // Crucial: check what state poll_read transitioned into!
+                        if let ReadState::Reading(ref mut fut) = self.read_state {
+                            match fut.as_mut().poll(cx) {
+                                Poll::Ready((_rx, Ok((OpCode::Close, _)))) => {
+                                    self.read_state = ReadState::Eof;
+                                    Poll::Ready(HeartbeatStatus::Dead)
+                                }
+                                Poll::Ready((_rx, Err(_))) => {
+                                    self.read_state = ReadState::Failed;
+                                    Poll::Ready(HeartbeatStatus::Dead)
+                                }
+                                _ => Poll::Ready(HeartbeatStatus::Alive),
+                            }
+                        } else {
+                            Poll::Ready(HeartbeatStatus::Alive)
+                        }
+                    }
+                    _ => Poll::Ready(HeartbeatStatus::Alive),
+                }
+            }
+            ReadState::Reading(fut) => {
+                match fut.as_mut().poll(cx) {
+                    Poll::Ready((_rx, Ok((OpCode::Close, _)))) => {
+                        self.read_state = ReadState::Eof;
+                        Poll::Ready(HeartbeatStatus::Dead)
+                    }
+                    Poll::Ready((_rx, Err(_))) => {
+                        self.read_state = ReadState::Failed;
+                        Poll::Ready(HeartbeatStatus::Dead)
+                    }
+                    Poll::Ready((rx, Ok((_, payload)))) => {
+                        if payload.is_empty() {
+                            self.read_state = ReadState::Idle(rx);
+                        } else {
+                            self.read_state = ReadState::Buffered { rx, payload, cursor: 0 };
+                        }
+                        Poll::Ready(HeartbeatStatus::Alive)
+                    }
+                    Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
                 }
             }
         }

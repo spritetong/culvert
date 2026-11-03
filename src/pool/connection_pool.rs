@@ -4,14 +4,14 @@
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::consts::ACTIVATE_STREAM_MAGIC;
 use crate::core::error::TunnelError;
-use crate::core::stream::{BoxFuture, TunnelStream};
+use crate::core::stream::{BoxFuture, HeartbeatStatus, TunnelStream};
 use crate::transport::{TargetAddr, TransportConnector};
 
 /// Statistics for monitoring connection pool performance.
@@ -97,15 +97,23 @@ impl StreamPool for InMemoryStreamPool {
     }
 }
 
-/// Auto-replenishing stream pool that maintains pre-warmed idle streams for 0-RTT acquisition.
+/// Request sent to the pool actor to acquire a stream.
+struct AcquireRequest {
+    target: Option<TargetAddr>,
+    reply: oneshot::Sender<Result<Box<dyn TunnelStream>, TunnelError>>,
+}
+
+/// Control commands delivered to the pool actor.
+enum PoolCommand {
+    Acquire(AcquireRequest),
+    PushIdle(Box<dyn TunnelStream>),
+    StreamClosed,
+}
+
+/// Auto-replenishing stream pool managed by an actor loop with active heartbeat and self-healing.
 pub struct ReplenishingStreamPool {
-    connector: Arc<dyn TransportConnector>,
-    default_target: Option<TargetAddr>,
-    target_size: usize,
-    idle_streams: Arc<Mutex<VecDeque<Box<dyn TunnelStream>>>>,
+    tx_cmd: mpsc::Sender<PoolCommand>,
     stats: Arc<Mutex<PoolStats>>,
-    notify: Arc<Notify>,
-    cancel_token: CancellationToken,
 }
 
 impl ReplenishingStreamPool {
@@ -116,17 +124,7 @@ impl ReplenishingStreamPool {
         target_size: usize,
         cancel_token: CancellationToken,
     ) -> Self {
-        let pool = Self {
-            connector,
-            default_target: Some(target),
-            target_size,
-            idle_streams: Arc::new(Mutex::new(VecDeque::new())),
-            stats: Arc::new(Mutex::new(PoolStats::default())),
-            notify: Arc::new(Notify::new()),
-            cancel_token,
-        };
-        pool.spawn_replenish_worker();
-        pool
+        Self::spawn_actor(connector, Some(target), target_size, cancel_token)
     }
 
     /// Creates and immediately activates a shared `ReplenishingStreamPool` that connects idle streams
@@ -136,77 +134,140 @@ impl ReplenishingStreamPool {
         target_size: usize,
         cancel_token: CancellationToken,
     ) -> Self {
-        let pool = Self {
-            connector,
-            default_target: None,
-            target_size,
-            idle_streams: Arc::new(Mutex::new(VecDeque::new())),
-            stats: Arc::new(Mutex::new(PoolStats::default())),
-            notify: Arc::new(Notify::new()),
-            cancel_token,
-        };
-        pool.spawn_replenish_worker();
-        pool
+        Self::spawn_actor(connector, None, target_size, cancel_token)
     }
 
-    fn spawn_replenish_worker(&self) {
-        let connector = Arc::clone(&self.connector);
-        let default_target = self
-            .default_target
-            .clone()
-            .unwrap_or_else(|| TargetAddr::Domain("pool.idle".to_string(), 0));
-        let target_size = self.target_size;
-        let idle_streams = Arc::clone(&self.idle_streams);
-        let stats = Arc::clone(&self.stats);
-        let notify = Arc::clone(&self.notify);
-        let cancel_token = self.cancel_token.clone();
+    fn spawn_actor(
+        connector: Arc<dyn TransportConnector>,
+        default_target: Option<TargetAddr>,
+        target_size: usize,
+        cancel_token: CancellationToken,
+    ) -> Self {
+        let (tx_cmd, mut rx_cmd) = mpsc::channel::<PoolCommand>(1024);
+        let stats = Arc::new(Mutex::new(PoolStats::default()));
+        let stats_clone = Arc::clone(&stats);
 
         tokio::spawn(async move {
-            let mut consecutive_failures = 0u32;
-            while !cancel_token.is_cancelled() {
-                let current_len = idle_streams.lock().len();
-                if current_len < target_size {
-                    match connector.connect_pooled(&default_target).await {
-                        Ok(stream) => {
-                            consecutive_failures = 0;
-                            let idle_len = {
-                                let mut guard = idle_streams.lock();
-                                guard.push_back(stream);
-                                guard.len()
-                            };
-                            let mut st = stats.lock();
-                            st.idle_count = idle_len;
-                            st.total_created += 1;
-                        }
-                        Err(e) => {
-                            consecutive_failures += 1;
-                            let backoff_ms =
-                                (100u64 * (1u64 << consecutive_failures.min(5))).min(5000);
-                            tracing::warn!(
-                                failures = consecutive_failures,
-                                retry_in_ms = backoff_ms,
-                                "Failed to replenish pool connection: {:?}",
-                                e
-                            );
-                            tokio::select! {
-                                _ = cancel_token.cancelled() => break,
-                                _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+            let mut idle_streams: VecDeque<Box<dyn TunnelStream>> = VecDeque::new();
+            let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(5));
+            heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let dummy_target = default_target
+                .clone()
+                .unwrap_or_else(|| TargetAddr::Domain("pool.idle".to_string(), 0));
+
+            loop {
+                let need_replenish = idle_streams.len() < target_size;
+
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        break;
+                    }
+                    dial_res = connector.connect_pooled(&dummy_target), if need_replenish => {
+                        match dial_res {
+                            Ok(stream) => {
+                                idle_streams.push_back(stream);
+                                let mut st = stats_clone.lock();
+                                st.idle_count = idle_streams.len();
+                                st.total_created += 1;
+                            }
+                            Err(e) => {
+                                tracing::debug!("Failed to replenish idle pool stream: {:?}", e);
+                                tokio::time::sleep(Duration::from_millis(100)).await;
                             }
                         }
                     }
-                } else {
-                    tokio::select! {
-                        _ = cancel_token.cancelled() => break,
-                        _ = notify.notified() => {}
-                        _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                    _ = heartbeat_interval.tick() => {
+                        // Periodic heartbeat inspection across all idle streams
+                        let mut alive_streams = VecDeque::with_capacity(idle_streams.len());
+                        while let Some(mut stream) = idle_streams.pop_front() {
+                            let is_alive = std::future::poll_fn(|cx| {
+                                let _ = stream.poll_send_ping(cx);
+                                match stream.poll_check_alive(cx) {
+                                    Poll::Ready(HeartbeatStatus::Dead) => Poll::Ready(false),
+                                    _ => Poll::Ready(true),
+                                }
+                            }).await;
+
+                            if is_alive {
+                                alive_streams.push_back(stream);
+                            } else {
+                                tracing::debug!("Evicted dead stream during pool heartbeat sweep");
+                            }
+                        }
+                        idle_streams = alive_streams;
+                        stats_clone.lock().idle_count = idle_streams.len();
+                    }
+                    cmd_opt = rx_cmd.recv() => {
+                        match cmd_opt {
+                            Some(PoolCommand::Acquire(req)) => {
+                                let mut acquired_stream: Option<Box<dyn TunnelStream>> = None;
+
+                                while let Some(mut stream) = idle_streams.pop_front() {
+                                    let is_alive = std::future::poll_fn(|cx| {
+                                        match stream.poll_check_alive(cx) {
+                                            Poll::Ready(HeartbeatStatus::Dead) => Poll::Ready(false),
+                                            _ => Poll::Ready(true),
+                                        }
+                                    }).await;
+
+                                    if is_alive {
+                                        acquired_stream = Some(stream);
+                                        break;
+                                    } else {
+                                        tracing::debug!("Evicted dead stream during acquire check");
+                                    }
+                                }
+
+                                if let Some(stream) = acquired_stream {
+                                    let mut st = stats_clone.lock();
+                                    st.idle_count = idle_streams.len();
+                                    st.active_count += 1;
+                                    let _ = req.reply.send(Ok(stream));
+                                } else {
+                                    // Idle pool exhausted: dial on demand directly
+                                    let effective_target = req.target
+                                        .or_else(|| default_target.clone())
+                                        .unwrap_or_else(|| TargetAddr::Domain("pool.idle".to_string(), 0));
+
+                                    let dial_res = connector.connect_pooled(&effective_target).await;
+                                    match dial_res {
+                                        Ok(stream) => {
+                                            let mut st = stats_clone.lock();
+                                            st.active_count += 1;
+                                            st.total_created += 1;
+                                            let _ = req.reply.send(Ok(stream));
+                                        }
+                                        Err(e) => {
+                                            let _ = req.reply.send(Err(e));
+                                        }
+                                    }
+                                }
+                                stats_clone.lock().idle_count = idle_streams.len();
+                            }
+                            Some(PoolCommand::PushIdle(stream)) => {
+                                idle_streams.push_back(stream);
+                                let mut st = stats_clone.lock();
+                                st.idle_count = idle_streams.len();
+                                st.total_created += 1;
+                            }
+                            Some(PoolCommand::StreamClosed) => {
+                                let mut st = stats_clone.lock();
+                                if st.active_count > 0 {
+                                    st.active_count -= 1;
+                                }
+                            }
+                            None => break,
+                        }
                     }
                 }
             }
         });
+
+        Self { tx_cmd, stats }
     }
 
     /// Encodes target activation packet: [ACTIVATE_STREAM_MAGIC, len: u16, target_str]
-    fn encode_activation(target: Option<&TargetAddr>) -> Vec<u8> {
+    pub fn encode_activation(target: Option<&TargetAddr>) -> Vec<u8> {
         let mut pkt = Vec::new();
         pkt.push(ACTIVATE_STREAM_MAGIC);
         if let Some(t) = target {
@@ -219,67 +280,23 @@ impl ReplenishingStreamPool {
         pkt
     }
 
-    /// Acquires a pre-warmed connection in 0-RTT and activates it for the target, or falls back to dialing on demand.
+    /// Acquires a pre-warmed connection in 0-RTT, or falls back to dialing on demand.
     pub fn acquire<'a>(
         &'a self,
         target: Option<&'a TargetAddr>,
     ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+        let target_cloned = target.cloned();
         Box::pin(async move {
-            let effective_target = target
-                .or(self.default_target.as_ref())
-                .cloned()
-                .unwrap_or_else(|| TargetAddr::Domain("pool.idle".to_string(), 0));
-            let activation_pkt = Self::encode_activation(target.or(self.default_target.as_ref()));
+            let (reply, rx) = oneshot::channel();
+            self.tx_cmd
+                .send(PoolCommand::Acquire(AcquireRequest {
+                    target: target_cloned,
+                    reply,
+                }))
+                .await
+                .map_err(|_| TunnelError::PoolExhausted)?;
 
-            loop {
-                let stream_opt = {
-                    let mut guard = self.idle_streams.lock();
-                    guard.pop_front()
-                };
-
-                // Notify background worker to replenish the popped slot
-                self.notify.notify_one();
-
-                if let Some(mut stream) = stream_opt {
-                    // Activate the idle stream by writing the activation packet.
-                    // If the stream was disconnected while idle, writing/flushing fails immediately.
-                    let pkt = activation_pkt.clone();
-                    let activate_res = tokio::time::timeout(Duration::from_millis(500), async {
-                        stream.write_all(&pkt).await?;
-                        stream.flush().await?;
-                        Ok::<(), std::io::Error>(())
-                    })
-                    .await;
-
-                    match activate_res {
-                        Ok(Ok(())) => {
-                            let mut st = self.stats.lock();
-                            st.idle_count = self.idle_streams.lock().len();
-                            st.active_count += 1;
-                            return Ok(stream);
-                        }
-                        _ => {
-                            tracing::debug!(
-                                "Discarded stale/dead idle connection from pool, trying next..."
-                            );
-                            continue;
-                        }
-                    }
-                } else {
-                    // Pool exhausted: fallback to on-demand direct connect and activate
-                    let mut stream = self.connector.connect_pooled(&effective_target).await?;
-                    stream
-                        .write_all(&activation_pkt)
-                        .await
-                        .map_err(TunnelError::Io)?;
-                    stream.flush().await.map_err(TunnelError::Io)?;
-
-                    let mut st = self.stats.lock();
-                    st.active_count += 1;
-                    st.total_created += 1;
-                    return Ok(stream);
-                }
-            }
+            rx.await.map_err(|_| TunnelError::PoolExhausted)?
         })
     }
 
@@ -292,21 +309,12 @@ impl ReplenishingStreamPool {
 
     /// Decrements the active connection count when a stream finishes relaying.
     pub fn on_stream_closed(&self) {
-        let mut st = self.stats.lock();
-        if st.active_count > 0 {
-            st.active_count -= 1;
-        }
+        let _ = self.tx_cmd.try_send(PoolCommand::StreamClosed);
     }
 
     /// Pushes an idle stream back into the pool.
     pub fn push_idle(&self, stream: Box<dyn TunnelStream>) {
-        let idle_len = {
-            let mut guard = self.idle_streams.lock();
-            guard.push_back(stream);
-            guard.len()
-        };
-        let mut st = self.stats.lock();
-        st.idle_count = idle_len;
+        let _ = self.tx_cmd.try_send(PoolCommand::PushIdle(stream));
     }
 
     /// Returns pool statistics.

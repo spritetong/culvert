@@ -8,7 +8,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::consts::DEFAULT_FAILOVER_RING_BUFFER_CAPACITY;
-use crate::core::stream::TunnelStream;
+use crate::core::stream::{HeartbeatStatus, TunnelStream};
 
 /// Frame types for the Seamless Migration Protocol (SMP).
 #[repr(u8)]
@@ -75,5 +75,15 @@ impl AsyncWrite for FailoverTunnelStream {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.primary).poll_shutdown(cx)
+    }
+}
+
+impl TunnelStream for FailoverTunnelStream {
+    fn poll_send_ping(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.primary.poll_send_ping(cx)
+    }
+
+    fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+        self.primary.poll_check_alive(cx)
     }
 }

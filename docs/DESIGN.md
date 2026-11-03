@@ -577,35 +577,64 @@ impl<T> ControlStream for T where
 {}
 ```
 
-### 7.3 连接池与 0-RTT 状态机模块 (`pool`)
+### 7.3 基于 Actor 事件循环与主动心跳的 0-RTT 连接池 (`pool`)
 
-```rust
-use crate::core::stream::{BoxFuture, TunnelStream};
-use crate::core::error::TunnelError;
+#### 7.3.1 连接生命周期与架构设计原则
+系统针对连接生命周期确立了以下核心工程原则：
+1. **单次使用，用完即销毁（Stream-Level One-Shot Lifecycle）**：
+   * 业务 TCP 接入后，从连接池借出一条预热流用于代理。由于该业务连接关闭时（发送 FIN/RST），底层通道已被半关闭或写入了业务终止状态，将其重置并再次塞回连接池极易产生状态残留与数据污染。
+   * 因此，**流一旦被 `acquire` 出池即脱离 Pool 管辖，生命周期结束后直接 Drop 销毁**。连接池仅作为“流的预热与分发工厂”，负责感知流被借出或销毁，并在后台主动保持健康水位。
+2. **Actor 消息模型与直接数据结构访问解耦（Request-Response Pattern）**：
+   * 彻底摒弃共享内存锁（如 `Arc<Mutex<VecDeque>>`）配合调用方直接写入激活魔数进行“试探性建连”的脆弱模式；
+   * 连接池作为一个常驻运行的独立异步协程（**Pool Actor Loop**），外部调用方通过 `mpsc::Sender<AcquireRequest>` 发送请求，并通过随包附带的 `oneshot::Sender<Result<Box<dyn TunnelStream>, TunnelError>>` 异步等待交付；
+   * 获取流的流程透明统一：池中有健康空闲流则瞬间返回（0-RTT），若池空则由 Actor 在后台发起瞬时直连并交付，业务层完全不需要感知后端底层细节。
 
-pub trait StreamPool: Send + Sync {
-    fn acquire<'a>(&'a self) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>>;
-    fn release<'a>(&'a self, stream: Box<dyn TunnelStream>) -> BoxFuture<'a, ()>;
-    fn stats(&self) -> PoolStats;
-}
+```
+                    ┌────────────────────────────────────────────────────────┐
+Acquire Request ───►│                                                        │
+(via oneshot reply) │                 Pool Actor Loop                        │
+                    │                                                        │
+Heartbeat Timer ───►│  1. 维护空闲队列 (idle_pool: VecDeque<ManagedStream>)   │
+                    │  2. 定期心跳遍历所有空闲连接，淘汰 Dead 连接并立即重连     │
+Replenish Event ───►│  3. 收到 AcquireRequest：                              │
+                    │     - 若池中有 Healthy stream，直接 oneshot.send(stream) │
+                    │     - 若池空，启动快速异步直连并返回，或立即触发补充     │
+                    └────────────────────────────────────────────────────────┘
 ```
 
-#### 7.3.1 0-RTT 预热与后端建连解耦设计 (Decoupled Pre-warming & Lazy Target Dialing)
-传统隧道连接池若在预热时提前连接后端服务，会导致目标服务（如 `iperf3 -s`、MySQL、SSH）被大量空闲连接占满 backlog，最终引发后端超时重置并使整个连接池“状态机中毒（Poisoned）”。
+#### 7.3.2 主动心跳巡检与服务端重启即时自愈机制
+* **痛点根因**：传统静态池在服务端重启时，操作系统虽然收到了 TCP FIN/RST，但由于没有异步任务在对空闲流调用 `read()`，事件循环无法感知对端已死。只有在客户端用户发起 TCP 请求时，池才一个个弹出死连接并遭遇超时，导致“服务端重启后客户端需要卡顿很久才能恢复”。
+* **主动心跳与被动感知双轨制**：
+  * **协议解耦的心跳抽象接口**：在 `TunnelStream` 增加协议无关的心跳与存活检测契约：
+    ```rust
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum HeartbeatStatus {
+        Alive,
+        Dead,
+    }
 
-Micro-Tunnel 采用**通道预热与目标建连解耦**机制：
+    pub trait TunnelStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {
+        /// 轮询向对端发送协议级 Ping / 心跳帧（WS 发送 Ping Frame，H3/QUIC 发送轻量探测）
+        fn poll_send_ping(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        /// 轮询检查流活跃度：读到 EOF (0 字节)、ConnectionReset 或对端已关闭时返回 Dead
+        fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus>;
+    }
+    ```
+  * **常驻活跃度监听**：空闲流在池内停留期间，Pool Actor Loop 持续挂载其读就绪事件。服务端一旦发生重启或网络中断，底层流立即产生 EOF/Err，Actor 在微秒级即时捕获，**立即将所有坏死流从池中剔除并自动触发后台补充**。
+  * **定时心跳巡检**：定时器（如每 5s~10s）定期驱动池内空闲连接调用 `poll_send_ping` 与 `poll_check_alive`，确保穿透中间 NAT 保持通道保活，任何无响应流即刻注销重建。
+  * **结果**：服务端重启后，客户端在毫秒级内自动清理死流并完成重连注满，下一批客户端 TCP 接入时立即获得 100% 鲜活连接，无需经历任何试错延迟！
+
+#### 7.3.3 0-RTT 预热与后端建连解耦设计 (Decoupled Pre-warming & Lazy Target Dialing)
 1. **预热闲置通道（Idle Channel Pre-warming）**：
-   * Client 连接池在后台向 Server 建立 WebSocket 预热通道，握手头携带 `x-tunnel-pool: idle`。
+   * Client 连接池在后台向 Server 建立预热通道，握手头携带 `x-tunnel-pool: idle`。
    * Server 收到后进入挂起等待状态，**绝不触碰目标后端端口（Target Connection = 0）**。
-2. **0-RTT 激活信号（Activation Signaling）**：
-   * 当用户真实 TCP 流量接入 Client 入口时，Client 从池中取出空闲流，立即向通道写入单字节激活帧 `ACTIVATE_STREAM_MAGIC` (`0xA5`) 并 flush。
-   * Server 收到 `0xA5` 后，以微秒级时延（0.05ms）就近直连后端目标，随后立即接入 `RelayEngine` 双工转发。
-3. **坏死连接即时自愈（Stale Eviction & Direct Fallback）**：
-   * 出池时若写入激活帧失败或超时（说明该连接在池中驻留期间已遭 NAT 或对端断开），连接池立即自动丢弃该死连接并无缝尝试下一个；
-   * 若池内连接全部耗尽或失效，透明自动降级为直接向 Server 发起实时连接，保证业务流量 100% 不因空闲断连而丢包。
-4. **自适应指数退避与生命周期追踪**：
-   * 补充 Worker 遭遇网络中断时，应用 `100ms * 2^n`（上限 5s）指数退避，防止重试风暴；
-   * 提供 `on_stream_closed` 回调，确保 `active_count` 活跃指标精确闭环。
+2. **0-RTT 动态目标激活（Lazy Target Activation）**：
+   * 业务 IO Task 从池中成功取到流后，写入激活帧 `[0xA5, target_len: u16, target_str]`。
+   * Server 收到激活帧后就地拨号目标服务，随后立即接入中继。
+   * 废除此前在池管理内部强行做 `write_all + flush` 判断连接存活的临时补丁，心跳与活性全权归还 Pool Actor，业务流与健康检查彻底解耦。
 
 
 ### 7.4 会话配对路由模块 (`session`)
@@ -642,11 +671,60 @@ impl SessionManager {
 }
 ```
 
-### 7.5 中继转发引擎与 poll_fn 状态机 (`core::relay`)
+### 7.5 中继转发引擎与优雅双向半关闭排空状态机 (`core::relay`)
 在性能核心路径（高吞吐双向中继循环）中，不使用 `tokio::select!`（避免反复取消和重新实例化 Future，以及分支优先级偏置），而是采用 `std::future::poll_fn` 状态机直接驱动：
-* 在单个事件循环内并发驱动 **RX（A -> B）** 与 **TX（B -> A）**；
-* **无轮询纯事件驱动的退出监控**：在循环外利用 `std::pin::pin!(cancel_token.cancelled_owned())` 预先在栈上完成 Future Pin 绑定，循环内直接调用 `cancel_fut.as_mut().poll(cx)` 将当前任务的 `Waker` 注册到 Token 中。连接空闲挂起时一旦收到 Cancel 信号，立即可被精准唤醒执行安全挥手，杜绝盲目轮询与循环内重复创建 Future；
-* 维持 64KB 对称环形切片，实现真正的零中间协程、零额外 Task 分配与最高吞吐。
+
+#### 7.5.1 业务 IO Task 生命周期流转
+对于每一个接入的本地 TCP 连接，其生命周期自始至终由专属的异步 IO Task 自治管理，外部 Supervisor 仅持有 `CancellationToken` 进行全局停机介入：
+1. **TCP Inbound 接入**：Listener `accept()` 获得 `inbound_tcp`；
+2. **Spawn 专属 IO Task**：为该连接派生异步任务，受 TaskTracker/conn_tracker 纳管；
+3. **从 Pool 请求 Remote Transport**：
+   - 通过 MPSC Request / Oneshot Reply 向 Pool Actor 发送流借出请求；
+   - 若池中有健康连接，微秒级瞬间拿到；若池空，Actor 实时直连交付；若设置超时未交付，则报错并关闭本地连接；
+4. **0-RTT 目标声明**：将动态目标地址格式化写入通道；
+5. **进入 `RelayEngine::relay_with_cancel`**：驱动本地流与远程流的全双工双向排空中继；
+6. **双向排空完成**：连接自然终结，Stream 直接释放 Drop，通知 Pool 水位。
+
+#### 7.5.2 双向半关闭优雅排空状态机 (Bidirectional Half-Close Draining State Machine)
+在生产环境中（例如 HTTP/1.1 长连接、SSH、大量短连接 iperf3），一方发送完数据常会先关闭写端（发送 TCP FIN 或 QUIC STREAM FIN），此时反向通道仍有大量待读写数据。如果中继盲目直接退出，会导致残余数据丢失或触发 RST。
+
+`RelayEngine` 设计了确定性的单向传输状态机（`TransferState`）：
+
+```
+                    ┌─────────────────────────┐
+                    │    RelayState::Active   │
+                    │  (双向全双工高速转发)   │
+                    └────────────┬────────────┘
+                                 │
+           ┌─────────────────────┴─────────────────────┐
+           ▼                                           ▼
+┌───────────────────────┐                   ┌───────────────────────┐
+│ LocalTcpReadEof (FIN) │                   │ RemoteReadEof (FIN)   │
+│  - 关闭 Remote 写端   │                   │  - 关闭 Local TCP 写端│
+│  - 状态变为 HalfClosed │                   │  - 状态变为 HalfClosed│
+└──────────┬────────────┘                   └──────────┬────────────┘
+           │                                           │
+           │ (继续读取对端剩余字节并排空写入本地)      │ (继续读取本地剩余字节并排空写入对端)
+           └─────────────────────┬─────────────────────┘
+                                 │
+                                 ▼
+                    ┌─────────────────────────┐
+                    │  RelayState::Completed  │
+                    │   (两端均完成排空与关闭)│
+                    └────────────┬────────────┘
+                                 │
+                                 ▼
+                    [低配版: 释放/Drop stream]
+                    [通知 Pool 状态机水位]
+```
+
+* **状态机流转准则**：
+  * **RX (A -> B)** 与 **TX (B -> A)** 各自独立跟踪 `read_pos`, `write_pos`, `read_done`, `write_shutdown`；
+  * **Step 1 (Flush Write)**：将未写完的缓冲区内容优先全部推入 Writer；
+  * **Step 2 (Read Chunk)**：Writer 缓冲区排空后，从 Reader 继续读取下一批数据；
+  * **Step 3 (Half-Close Shutdown)**：当 Reader 返回 EOF (`Ok(0)`)，且缓冲区已全部 Flush 写入 Writer 后，对 Writer 调用 `poll_shutdown()` 发出半关闭信号；
+  * **Step 4 (Completion)**：只有当 **A -> B 与 B -> A 两个方向均达成 `read_done && write_shutdown`** 时，中继才判定为成功终止（`Ok((bytes_a_to_b, bytes_b_to_a))`）；
+  * **异常快速熔断**：任一方向遭遇 `ConnectionReset` 或致命 IO 错误时，立刻退出并返回 `Err`，不发生卡死挂起。
 
 ```rust
 pub struct RelayEngine;

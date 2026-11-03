@@ -11,6 +11,7 @@ use bytes::{Buf, Bytes};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 
+use crate::core::stream::{HeartbeatStatus, TunnelStream};
 use crate::mux::frame::{MAX_FRAME_PAYLOAD_SIZE, MuxFrame};
 
 /// A logical bi-directional multiplexed sub-stream.
@@ -146,6 +147,16 @@ impl AsyncWrite for MuxStream {
                 self.fin_sent = true;
                 Poll::Ready(Ok(()))
             }
+        }
+    }
+}
+
+impl TunnelStream for MuxStream {
+    fn poll_check_alive(&mut self, _cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+        if self.closed.load(Ordering::Relaxed) {
+            Poll::Ready(HeartbeatStatus::Dead)
+        } else {
+            Poll::Ready(HeartbeatStatus::Alive)
         }
     }
 }

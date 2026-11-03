@@ -114,13 +114,18 @@
   * 主管协程（Supervisor）统一纳管 Server 与所有 Tunnel 任务的生命周期，支持在收到退出信号时一键安全平滑退出。
   * **失败自愈与重试**：支持配置 `retry: { delay: "3s", max_retries: 10 }`。初始连接失败或网络临时中断不导致进程崩溃，而是按指数/固定延时自动恢复。默认无重试次数限制（持续重连）。
 
-### 3.4 动态目标解耦连接池 (Decoupled Stream Pool)
+### 3.4 动态目标解耦连接池与主动自愈 (Decoupled Stream Pool & Active Self-Healing)
 * **FR-4.1 解耦连接池 (Decoupled 0-RTT Pool)**：
-  * 针对 WSS/TCP 模式维护空闲物理连接池，打上 `x-tunnel-pool: idle` 标识。
+  * 针对 WS/WSS/QUIC/H3 模式维护空闲物理连接池，打上 `x-tunnel-pool: idle` 标识。
   * 服务端仅维持空闲信道保活，绝不提前拨号后端服务。
   * 客户端通过动态写入 `[0xA5, target_len: u16, target_str]` 动态激活流，实现多端口映射共享一个连接池的零等待与零无效拨号。
-  * 连接断开后自动平滑补充池容量，具备陈旧死连接静默剔除机制。
-* **FR-4.2 底层物理 IO 动态无缝热切 (Seamless Failover)**：
+  * **单次使用即销毁（Stream-Level One-Shot）**：出池流用于承载业务 TCP，结束后安全 Drop 释放并平滑补充新流，避免脏状态污染。
+* **FR-4.2 Actor 消息模型与主动心跳自愈 (Active Heartbeat & Fast Recovery)**：
+  * 连接池演进为独立的 Actor 事件循环任务，外部通过 Request/Response 通道异步索取流，移除直接读写内部数据的非安全模式。
+  * **服务端重启秒级自愈**：Pool Actor 常驻监听所有空闲流的读事件，结合定时心跳探测（`poll_send_ping` / `poll_check_alive`）。服务端发生重启时，底层断开事件在微秒级被捕获，池自动清空死连接并后台瞬时补齐，客户端新连接无需经历任何超时重试即可无缝接通。
+* **FR-4.3 全双工优雅半关闭排空 (Bidirectional Half-Close Draining)**：
+  * 业务 IO Task 在中继时，严格支持单向 FIN 半关闭与残余缓冲完全写出，直到双向达成 EOF 且正常 Shutdown，杜绝数据截断与 RST 异常。
+* **FR-4.4 底层物理 IO 动态无缝热切 (Seamless Failover)**：
   * 支持单隧道配置主端点（H3）与备用端点（WSS）。
   * 基于 64 位单调流偏移量（Stream Offset）与端侧滑动环形重传缓冲（Ring Buffer），在 H3 受到网络 QoS 严重丢包或超时阻断时，在 $<30\text{ ms}$ 内动态切换至 WSS 物理信道，**上层应用 TCP 连接完全不中断、不丢包**。
 

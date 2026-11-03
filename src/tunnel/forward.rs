@@ -2,6 +2,7 @@
 //! All comments and docstrings must be in English.
 
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -85,7 +86,25 @@ pub async fn run_forward_mapping(
                             };
 
                             match remote_res {
-                                Ok(remote_stream) => {
+                                Ok(mut remote_stream) => {
+                                    if pool_clone.is_some() {
+                                        let activation_pkt = ReplenishingStreamPool::encode_activation(Some(&target));
+                                        if let Err(e) = remote_stream.write_all(&activation_pkt).await {
+                                            error!("Failed to write stream activation packet: {:?}", e);
+                                            if let Some(ref p) = pool_for_close {
+                                                p.on_stream_closed();
+                                            }
+                                            return;
+                                        }
+                                        if let Err(e) = remote_stream.flush().await {
+                                            error!("Failed to flush stream activation packet: {:?}", e);
+                                            if let Some(ref p) = pool_for_close {
+                                                p.on_stream_closed();
+                                            }
+                                            return;
+                                        }
+                                    }
+
                                     let _ = RelayEngine::relay_with_cancel(
                                         Box::new(inbound_stream),
                                         remote_stream,

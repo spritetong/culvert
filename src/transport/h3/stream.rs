@@ -10,6 +10,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use tracing::debug;
 
+use crate::core::stream::{HeartbeatStatus, TunnelStream};
+
 /// Raw QUIC bidirectional stream adapter directly polling `quinn::SendStream` and `quinn::RecvStream`.
 pub struct QuinnTunnelStream {
     send: quinn::SendStream,
@@ -51,7 +53,16 @@ impl AsyncWrite for QuinnTunnelStream {
     }
 }
 
-// Blanket impl provides TunnelStream for QuinnTunnelStream
+impl TunnelStream for QuinnTunnelStream {
+    fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+        let mut empty = [0u8; 0];
+        let mut buf = ReadBuf::new(&mut empty);
+        match Pin::new(&mut self.recv).poll_read(cx, &mut buf) {
+            Poll::Ready(Err(_)) => Poll::Ready(HeartbeatStatus::Dead),
+            _ => Poll::Ready(HeartbeatStatus::Alive),
+        }
+    }
+}
 
 /// Bidirectional stream adapter for HTTP/3 request streams (`h3::client` or `h3::server`).
 pub struct H3TunnelStream {
@@ -231,7 +242,21 @@ impl AsyncWrite for H3TunnelStream {
     }
 }
 
-// Blanket impl provides TunnelStream for H3TunnelStream
+impl TunnelStream for H3TunnelStream {
+    fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+        if self.read_buf.is_some() {
+            return Poll::Ready(HeartbeatStatus::Alive);
+        }
+        match self.rx_inbound.poll_recv(cx) {
+            Poll::Ready(Some(bytes)) => {
+                self.read_buf = Some(bytes);
+                Poll::Ready(HeartbeatStatus::Alive)
+            }
+            Poll::Ready(None) => Poll::Ready(HeartbeatStatus::Dead),
+            Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
+        }
+    }
+}
 
 /// Trait unifying `h3::client::RequestStream` and `h3::server::RequestStream`.
 pub trait H3BidirectionalStream {
