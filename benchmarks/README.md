@@ -83,17 +83,24 @@ Open PowerShell Terminal 3:
 
 You can test different transport protocols and features by modifying `benchmarks/client-bench.yaml`:
 
-### Scenario A: Raw WebSocket (`ws://`)
+### Scenario A: Raw WebSocket (`ws://`) - Baseline High Throughput
 ```yaml
-endpoint: "ws://127.0.0.1:8080/tunnel"
+tls:
+  enabled: false
+...
+endpoint: "ws://127.0.0.1:8443/tunnel"
 ```
-*Evaluates baseline frame parsing and async proxy throughput without TLS encryption overhead.*
+*Evaluates baseline frame parsing and async proxy throughput without TLS encryption overhead (achieves ~5 Gbps on loopback).*
 
 ### Scenario B: Encrypted WebSocket (`wss://`)
 ```yaml
+tls:
+  enabled: true
+  insecure: true
+...
 endpoint: "wss://127.0.0.1:8443/tunnel"
 ```
-*Evaluates Rustls TLS 1.3 performance with ring/mimalloc.*
+*Evaluates Rustls TLS 1.3 performance with ring/mimalloc (requires TLS termination on server or reverse proxy).*
 
 ### Scenario C: HTTP/3 & QUIC (`h3://` or `quic://`)
 ```yaml

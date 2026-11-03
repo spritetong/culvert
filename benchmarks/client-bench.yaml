@@ -21,7 +21,7 @@ dialer:
   tcp_nodelay: true
 
 tls:
-  enabled: true
+  enabled: false # Set to true when using wss:// with a TLS server/proxy
   insecure: true # Accept self-signed certificates during benchmarks
   alpn: ["h3", "http/1.1"]
 
@@ -37,11 +37,11 @@ tunnels:
     token: "bench_secret_token_123456"
 
     # Replace with server IP / domain:
-    #   - "ws://127.0.0.1:8080/tunnel"
+    #   - "ws://127.0.0.1:8443/tunnel"
     #   - "wss://127.0.0.1:8443/tunnel"
     #   - "h3://127.0.0.1:8443/tunnel"
     #   - "quic://127.0.0.1:8443/raw"
-    endpoint: "wss://127.0.0.1:8443/tunnel"
+    endpoint: "ws://127.0.0.1:8443/tunnel"
 
     # Pre-warmed connection pool for 0-RTT tunnel acquisition
     pool_size: 16
