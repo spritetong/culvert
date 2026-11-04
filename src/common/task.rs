@@ -67,8 +67,10 @@ impl<T: 'static> TaskTracker<T> {
     /// Signals all tasks to stop via the cancellation token and awaits their orderly completion.
     /// If graceful shutdown exceeds the 5-second deadline, remaining tasks are aborted.
     pub async fn shutdown_and_wait(&mut self) {
-        self.shutdown_and_wait_until(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
-            .await;
+        self.shutdown_and_wait_until(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await;
     }
 
     /// Signals cancellation and awaits completion until a specified instant deadline.

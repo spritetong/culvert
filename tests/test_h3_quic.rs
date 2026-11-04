@@ -182,7 +182,9 @@ async fn test_h3_transport_handshake_and_bidirectional_transfer() {
 
     // Read echoed response
     let mut response = vec![0u8; 100 * 1024];
-    read_exact_timed(&mut client_stream, &mut response).await.unwrap();
+    read_exact_timed(&mut client_stream, &mut response)
+        .await
+        .unwrap();
 
     let mut expected = test_data.clone();
     expected.reverse();
@@ -284,7 +286,9 @@ async fn test_quic_raw_stream_bidirectional_transfer() {
     client_stream.shutdown().await.unwrap();
 
     let mut response = vec![0u8; 64 * 1024];
-    read_exact_timed(&mut client_stream, &mut response).await.unwrap();
+    read_exact_timed(&mut client_stream, &mut response)
+        .await
+        .unwrap();
 
     let mut expected = test_data.clone();
     expected.reverse();
@@ -458,17 +462,16 @@ async fn test_h3_tunnel_pool_prewarm_and_activation_end_to_end() {
     }
 
     cancel_token.cancel();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        async {
-            let (r1, r2, r3) = tokio::join!(echo_handle, server_handle, client_handle);
-            r1.expect("echo_handle panicked");
-            r2.expect("server_handle panicked");
-            r3.expect("client_handle panicked");
-        },
-    )
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let (r1, r2, r3) = tokio::join!(echo_handle, server_handle, client_handle);
+        r1.expect("echo_handle panicked");
+        r2.expect("server_handle panicked");
+        r3.expect("client_handle panicked");
+    })
     .await
-    .expect("Timeout waiting for tasks to exit after cancellation in test_h3_pool_prewarm_and_reuse");
+    .expect(
+        "Timeout waiting for tasks to exit after cancellation in test_h3_pool_prewarm_and_reuse",
+    );
 }
 
 #[tokio::test]
@@ -788,13 +791,10 @@ async fn test_h3_concurrent_forward_stress() {
             let mut received = 0;
             let mut buf = vec![0u8; CHUNK_SIZE];
             loop {
-                let n = tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    rd.read(&mut buf),
-                )
-                .await
-                .expect("read timed out in concurrent forward stress")
-                .unwrap();
+                let n = tokio::time::timeout(std::time::Duration::from_secs(10), rd.read(&mut buf))
+                    .await
+                    .expect("read timed out in concurrent forward stress")
+                    .unwrap();
                 if n == 0 {
                     break;
                 }
@@ -811,22 +811,14 @@ async fn test_h3_concurrent_forward_stress() {
     }
 
     cancel_token.cancel();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        async {
-            let (r1, r2, r3) = tokio::join!(echo_handle, server_handle, client_handle);
-            r1.expect("echo_handle panicked");
-            r2.expect("server_handle panicked");
-            r3.expect("client_handle panicked");
-        },
-    )
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let (r1, r2, r3) = tokio::join!(echo_handle, server_handle, client_handle);
+        r1.expect("echo_handle panicked");
+        r2.expect("server_handle panicked");
+        r3.expect("client_handle panicked");
+    })
     .await
-    .expect("Timeout waiting for tasks to exit after cancellation in test_h3_concurrent_forward_stress");
+    .expect(
+        "Timeout waiting for tasks to exit after cancellation in test_h3_concurrent_forward_stress",
+    );
 }
-
-
-
-
-
-
-

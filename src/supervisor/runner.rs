@@ -123,16 +123,17 @@ impl TunnelSupervisor {
                 Err(e) => {
                     attempts += 1;
                     if let Some(max) = max_retries
-                        && attempts >= max {
-                            error!(
-                                tag = %config.tag,
-                                attempts,
-                                max,
-                                "Tunnel exceeded maximum retry attempts, giving up: {:?}",
-                                e
-                            );
-                            return Err(e);
-                        }
+                        && attempts >= max
+                    {
+                        error!(
+                            tag = %config.tag,
+                            attempts,
+                            max,
+                            "Tunnel exceeded maximum retry attempts, giving up: {:?}",
+                            e
+                        );
+                        return Err(e);
+                    }
 
                     warn!(
                         tag = %config.tag,

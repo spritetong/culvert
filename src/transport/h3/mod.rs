@@ -40,7 +40,9 @@ impl TransportDriver for H3TransportDriver {
         tls: Option<&crate::config::model::TlsConfig>,
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
         let alpn = vec![b"h3".to_vec(), b"micro-tunnel-quic".to_vec()];
-        let cert_str = tls.and_then(|t| t.certificate.as_ref()).and_then(|p| p.to_str());
+        let cert_str = tls
+            .and_then(|t| t.certificate.as_ref())
+            .and_then(|p| p.to_str());
         let key_str = tls.and_then(|t| t.key.as_ref()).and_then(|p| p.to_str());
         let (min_v, max_v) = match tls {
             Some(t) => (t.min_version.as_deref(), t.max_version.as_deref()),

@@ -67,8 +67,7 @@ impl H3Connector {
         client_config.transport_config(Arc::new(transport_config));
 
         let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-        let mut quinn_endpoint =
-            quinn::Endpoint::client(bind_addr).map_err(TunnelError::Io)?;
+        let mut quinn_endpoint = quinn::Endpoint::client(bind_addr).map_err(TunnelError::Io)?;
         quinn_endpoint.set_default_client_config(client_config);
 
         Ok(Self {
@@ -88,22 +87,26 @@ impl H3Connector {
     async fn get_or_connect(&self) -> Result<quinn::Connection, TunnelError> {
         // Fast path: inspect under non-blocking read lock
         if let Some(ref conn) = *self.cached_quic_conn.read()
-            && conn.close_reason().is_none() {
-                return Ok(conn.clone());
-            }
+            && conn.close_reason().is_none()
+        {
+            return Ok(conn.clone());
+        }
 
         // Single-flight gate to serialize connection attempts without blocking readers
         let _gate = self.quic_establish_gate.lock().await;
 
         // Double-check after acquiring establishment gate
         if let Some(ref conn) = *self.cached_quic_conn.read()
-            && conn.close_reason().is_none() {
-                return Ok(conn.clone());
-            }
+            && conn.close_reason().is_none()
+        {
+            return Ok(conn.clone());
+        }
 
         let ips = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            self.endpoint.dns_resolver.resolve(&self.endpoint.endpoint.host),
+            self.endpoint
+                .dns_resolver
+                .resolve(&self.endpoint.endpoint.host),
         )
         .await
         .map_err(|_| TunnelError::ConnectTimeout(std::time::Duration::from_secs(10)))??;
@@ -174,9 +177,7 @@ impl H3Connector {
         )
         .await
         .map_err(|_| TunnelError::ConnectTimeout(std::time::Duration::from_secs(10)))?
-        .map_err(|e| {
-            TunnelError::ControlProtocol(format!("H3 handshake failed: {:?}", e))
-        })?;
+        .map_err(|e| TunnelError::ControlProtocol(format!("H3 handshake failed: {:?}", e)))?;
 
         tokio::spawn(async move {
             let _ = driver.wait_idle().await;
@@ -282,31 +283,33 @@ impl H3Connector {
             Err(_) => {
                 *self.cached_h3_sender.write() = None;
                 *self.cached_quic_conn.write() = None;
-                return Err(TunnelError::ConnectTimeout(std::time::Duration::from_secs(10)));
+                return Err(TunnelError::ConnectTimeout(std::time::Duration::from_secs(
+                    10,
+                )));
             }
         };
 
-        let response = match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            stream.recv_response(),
-        )
-        .await
-        {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                *self.cached_h3_sender.write() = None;
-                *self.cached_quic_conn.write() = None;
-                return Err(TunnelError::ControlProtocol(format!(
-                    "Failed to receive H3 response: {:?}",
-                    e
-                )));
-            }
-            Err(_) => {
-                *self.cached_h3_sender.write() = None;
-                *self.cached_quic_conn.write() = None;
-                return Err(TunnelError::ConnectTimeout(std::time::Duration::from_secs(10)));
-            }
-        };
+        let response =
+            match tokio::time::timeout(std::time::Duration::from_secs(10), stream.recv_response())
+                .await
+            {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    *self.cached_h3_sender.write() = None;
+                    *self.cached_quic_conn.write() = None;
+                    return Err(TunnelError::ControlProtocol(format!(
+                        "Failed to receive H3 response: {:?}",
+                        e
+                    )));
+                }
+                Err(_) => {
+                    *self.cached_h3_sender.write() = None;
+                    *self.cached_quic_conn.write() = None;
+                    return Err(TunnelError::ConnectTimeout(std::time::Duration::from_secs(
+                        10,
+                    )));
+                }
+            };
 
         if response.status() == StatusCode::UNAUTHORIZED
             || response.status() == StatusCode::FORBIDDEN
@@ -332,25 +335,23 @@ impl H3Connector {
         pool_idle: bool,
     ) -> Result<Box<dyn TunnelStream>, TunnelError> {
         let conn = self.get_or_connect().await?;
-        let (mut send, recv) = match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            conn.open_bi(),
-        )
-        .await
-        {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(e)) => {
-                *self.cached_quic_conn.write() = None;
-                return Err(TunnelError::Tls(format!(
-                    "Failed to open QUIC bi-stream: {:?}",
-                    e
-                )));
-            }
-            Err(_) => {
-                *self.cached_quic_conn.write() = None;
-                return Err(TunnelError::ConnectTimeout(std::time::Duration::from_secs(10)));
-            }
-        };
+        let (mut send, recv) =
+            match tokio::time::timeout(std::time::Duration::from_secs(10), conn.open_bi()).await {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => {
+                    *self.cached_quic_conn.write() = None;
+                    return Err(TunnelError::Tls(format!(
+                        "Failed to open QUIC bi-stream: {:?}",
+                        e
+                    )));
+                }
+                Err(_) => {
+                    *self.cached_quic_conn.write() = None;
+                    return Err(TunnelError::ConnectTimeout(std::time::Duration::from_secs(
+                        10,
+                    )));
+                }
+            };
 
         // Send handshake control header over the raw QUIC stream
         let handshake_meta = crate::transport::StreamMetadata {
@@ -385,11 +386,16 @@ impl H3Connector {
             }
             Err(_) => {
                 *self.cached_quic_conn.write() = None;
-                return Err(TunnelError::ConnectTimeout(std::time::Duration::from_secs(10)));
+                return Err(TunnelError::ConnectTimeout(std::time::Duration::from_secs(
+                    10,
+                )));
             }
         }
 
-        Ok(Box::new(QuinnTunnelStream::new(send, recv).with_connection(conn)) as Box<dyn TunnelStream>)
+        Ok(
+            Box::new(QuinnTunnelStream::new(send, recv).with_connection(conn))
+                as Box<dyn TunnelStream>,
+        )
     }
 }
 
@@ -445,7 +451,8 @@ mod tests {
         let app_cfg = AppConfig::default();
         let ep_cfg = EndpointConfig::Simple("h3://127.0.0.1:4433/tunnel".to_string());
         let ctx = EndpointContext::build(&ep_cfg, &app_cfg).unwrap();
-        let connector = Arc::new(H3Connector::new(&ctx, "test-token", TunnelMode::Forward).unwrap());
+        let connector =
+            Arc::new(H3Connector::new(&ctx, "test-token", TunnelMode::Forward).unwrap());
 
         // Cached sender starts empty
         assert!(connector.cached_h3_sender.read().is_none());

@@ -174,7 +174,11 @@ impl<S> TunnelStream for BufferedTlsStream<S>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    fn poll_write_bytes(&mut self, cx: &mut Context<'_>, buf: bytes::Bytes) -> Poll<io::Result<usize>> {
+    fn poll_write_bytes(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: bytes::Bytes,
+    ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.inner).poll_write(cx, &buf)
     }
 

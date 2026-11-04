@@ -2,8 +2,8 @@
 //! and connection pool pre-warming / reuse.
 //! All comments and docstrings must be in English.
 
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -37,9 +37,7 @@ fn get_available_port() -> u16 {
 }
 
 /// Spawns a full-duplex echo server using held-listener handoff to eliminate TOCTOU.
-fn spawn_echo_server(
-    cancel_token: CancellationToken,
-) -> (tokio::task::JoinHandle<()>, u16) {
+fn spawn_echo_server(cancel_token: CancellationToken) -> (tokio::task::JoinHandle<()>, u16) {
     let std_listener =
         std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind echo server");
     let port = std_listener.local_addr().unwrap().port();
@@ -153,10 +151,9 @@ async fn test_high_volume_duplex_stream_integrity() {
         recv_data
     });
 
-    let (writer_res, reader_res) = tokio::time::timeout(
-        Duration::from_secs(10),
-        async { tokio::join!(writer_handle, reader_handle) },
-    )
+    let (writer_res, reader_res) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(writer_handle, reader_handle)
+    })
     .await
     .expect("Timeout waiting for writer/reader handles");
     writer_res.expect("writer_handle panicked");
@@ -384,17 +381,16 @@ async fn test_pool_prewarm_and_reuse() {
     }
 
     cancel_token.cancel();
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        async {
-            let (r1, r2, r3) = tokio::join!(echo_handle, server_handle, client_handle);
-            r1.expect("echo_handle panicked");
-            r2.expect("server_handle panicked");
-            r3.expect("client_handle panicked");
-        },
-    )
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (r1, r2, r3) = tokio::join!(echo_handle, server_handle, client_handle);
+        r1.expect("echo_handle panicked");
+        r2.expect("server_handle panicked");
+        r3.expect("client_handle panicked");
+    })
     .await
-    .expect("Timeout waiting for handles to exit after cancellation in test_pool_prewarm_and_reuse");
+    .expect(
+        "Timeout waiting for handles to exit after cancellation in test_pool_prewarm_and_reuse",
+    );
 }
 
 #[tokio::test]

@@ -39,9 +39,12 @@ pub async fn run_reverse_mapping(
     let mut conn_tracker = TaskTracker::<()>::new(cancel_token.clone());
 
     // Share data connector across all incoming visitor sessions to maximize connection/0-RTT reuse
-    let data_connector: Arc<dyn TransportConnector> = Arc::from(
-        transport_registry.create_connector(&endpoint_ctx, token.as_deref(), TunnelMode::Reverse)?
-    );
+    let data_connector: Arc<dyn TransportConnector> =
+        Arc::from(transport_registry.create_connector(
+            &endpoint_ctx,
+            token.as_deref(),
+            TunnelMode::Reverse,
+        )?);
 
     let mut backoff = Duration::from_millis(500);
 

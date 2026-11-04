@@ -30,9 +30,7 @@ fn get_available_port() -> u16 {
     panic!("Failed to find an available port in Suite 4 partition [41000, 46500)");
 }
 
-fn spawn_echo_server(
-    cancel_token: CancellationToken,
-) -> (tokio::task::JoinHandle<()>, u16) {
+fn spawn_echo_server(cancel_token: CancellationToken) -> (tokio::task::JoinHandle<()>, u16) {
     let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = std_listener.local_addr().unwrap().port();
     std_listener.set_nonblocking(true).unwrap();
@@ -211,14 +209,13 @@ async fn test_path_mismatch_rejection() {
     assert_eq!(n, 0, "Server must close stream on path mismatch (404)");
 
     cancel_token.cancel();
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        async {
-            let (r1, r2) = tokio::join!(echo_handle, sup_handle);
-            r1.expect("echo handle panicked");
-            r2.expect("sup handle panicked");
-        },
-    )
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (r1, r2) = tokio::join!(echo_handle, sup_handle);
+        r1.expect("echo handle panicked");
+        r2.expect("sup handle panicked");
+    })
     .await
-    .expect("Timeout waiting for handles to exit after cancellation in test_path_mismatch_rejection");
+    .expect(
+        "Timeout waiting for handles to exit after cancellation in test_path_mismatch_rejection",
+    );
 }

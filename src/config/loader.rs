@@ -159,7 +159,11 @@ tunnels:
 "#;
         let res = ConfigLoader::from_yaml_str(yaml_bad_ver);
         assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("unsupported TLS version"));
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("unsupported TLS version")
+        );
 
         // Test contradictory range (min 1.3 > max 1.2)
         let yaml_contradictory = r#"
@@ -172,7 +176,11 @@ tunnels:
 "#;
         let res2 = ConfigLoader::from_yaml_str(yaml_contradictory);
         assert!(res2.is_err());
-        assert!(res2.unwrap_err().to_string().contains("invalid TLS version range"));
+        assert!(
+            res2.unwrap_err()
+                .to_string()
+                .contains("invalid TLS version range")
+        );
 
         // Test server.tls validation
         let yaml_server_bad_tls = r#"
@@ -183,7 +191,11 @@ server:
 "#;
         let res3 = ConfigLoader::from_yaml_str(yaml_server_bad_tls);
         assert!(res3.is_err());
-        assert!(res3.unwrap_err().to_string().contains("unsupported TLS version"));
+        assert!(
+            res3.unwrap_err()
+                .to_string()
+                .contains("unsupported TLS version")
+        );
 
         // Test previously rejected valid combinations (min=1.2, max=1.2) and (None, max=1.3)
         let yaml_valid_tls = r#"

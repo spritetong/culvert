@@ -265,13 +265,15 @@ mod humantime_serde_opt {
                 } else {
                     let s_trimmed = s.trim();
                     if let Some(stripped) = s_trimmed.strip_suffix('s')
-                        && let Ok(secs) = stripped.parse::<u64>() {
-                            return Ok(Some(Duration::from_secs(secs)));
-                        }
+                        && let Ok(secs) = stripped.parse::<u64>()
+                    {
+                        return Ok(Some(Duration::from_secs(secs)));
+                    }
                     if let Some(stripped) = s_trimmed.strip_suffix("ms")
-                        && let Ok(ms) = stripped.parse::<u64>() {
-                            return Ok(Some(Duration::from_millis(ms)));
-                        }
+                        && let Ok(ms) = stripped.parse::<u64>()
+                    {
+                        return Ok(Some(Duration::from_millis(ms)));
+                    }
                     Err(serde::de::Error::custom(format!("invalid duration: {}", s)))
                 }
             }

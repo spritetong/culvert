@@ -94,7 +94,7 @@ async fn async_main(app_config: AppConfig) -> Result<(), Box<dyn std::error::Err
     tokio::spawn(async move {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{signal, SignalKind};
+            use tokio::signal::unix::{SignalKind, signal};
             let mut sigterm = signal(SignalKind::terminate()).ok();
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {

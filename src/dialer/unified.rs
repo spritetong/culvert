@@ -1,10 +1,10 @@
 //! Unified dialer integrating DNS strategy, socket tuning, and connection timeouts.
 //! All comments and docstrings must be in English.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 

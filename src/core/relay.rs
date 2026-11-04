@@ -80,13 +80,16 @@ impl RelayEngine {
             if is_cancelled {
                 if drain_sleep.is_none() {
                     // Give at most 250ms bounded drain period to flush in-flight tails
-                    drain_sleep = Some(Box::pin(tokio::time::sleep(std::time::Duration::from_millis(250))));
+                    drain_sleep = Some(Box::pin(tokio::time::sleep(
+                        std::time::Duration::from_millis(250),
+                    )));
                 }
                 if let Some(sleep_fut) = drain_sleep.as_mut()
-                    && sleep_fut.as_mut().poll(cx).is_ready() {
-                        // Hard bounded deadline reached: terminate relay immediately without hanging
-                        return Poll::Ready(Ok((a_to_b.total_bytes, b_to_a.total_bytes)));
-                    }
+                    && sleep_fut.as_mut().poll(cx).is_ready()
+                {
+                    // Hard bounded deadline reached: terminate relay immediately without hanging
+                    return Poll::Ready(Ok((a_to_b.total_bytes, b_to_a.total_bytes)));
+                }
             }
 
             // Drive A -> B transfer (RX direction)
@@ -179,7 +182,8 @@ impl RelayEngine {
                         if n == 0 {
                             state.read_done = true;
                         } else {
-                            state.in_flight_chunk = Some(bytes::Bytes::copy_from_slice(&state.buffer[..n]));
+                            state.in_flight_chunk =
+                                Some(bytes::Bytes::copy_from_slice(&state.buffer[..n]));
                             state.chunk_pos = 0;
                         }
                         *progress = true;
@@ -191,7 +195,9 @@ impl RelayEngine {
         } else {
             // Path B: Standard byte streams (TCP, TLS, WS, H3, QUIC) - zero heap allocations in hot path
             while state.write_pos < state.read_pos {
-                match Pin::new(&mut **writer).poll_write(cx, &state.buffer[state.write_pos..state.read_pos]) {
+                match Pin::new(&mut **writer)
+                    .poll_write(cx, &state.buffer[state.write_pos..state.read_pos])
+                {
                     Poll::Ready(Ok(0)) => {
                         return Poll::Ready(Err(std::io::Error::new(
                             std::io::ErrorKind::WriteZero,
@@ -347,11 +353,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_relay_boxed_consumes_owned_write_delegation() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
-        use std::task::Context;
-        use std::io;
         use bytes::Bytes;
+        use std::io;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::Context;
 
         struct MockOwnedWriter {
             write_bytes_called: Arc<AtomicUsize>,
@@ -424,11 +430,13 @@ mod tests {
         );
 
         let (mut client_app, client_side) = duplex(65536);
-        let relay_handle = tokio::spawn(async move {
-            RelayEngine::relay(Box::new(client_side), boxed).await
-        });
+        let relay_handle =
+            tokio::spawn(async move { RelayEngine::relay(Box::new(client_side), boxed).await });
 
-        client_app.write_all(b"payload for owned writer").await.unwrap();
+        client_app
+            .write_all(b"payload for owned writer")
+            .await
+            .unwrap();
         client_app.shutdown().await.unwrap();
 
         relay_handle.await.unwrap().unwrap();

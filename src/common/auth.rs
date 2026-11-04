@@ -28,7 +28,9 @@ pub fn constant_time_token_eq(candidate: &[u8], expected: &[u8]) -> bool {
     let hash_exp = digest(&SHA256, &exp_buf);
     let overflow = (candidate.len() > TOKEN_MAX_LEN) | (expected.len() > TOKEN_MAX_LEN);
     bool::from(
-        hash_cand.as_ref().ct_eq(hash_exp.as_ref()) & eq_len & !subtle::Choice::from(overflow as u8),
+        hash_cand.as_ref().ct_eq(hash_exp.as_ref())
+            & eq_len
+            & !subtle::Choice::from(overflow as u8),
     )
 }
 
@@ -48,7 +50,10 @@ mod tests {
 
         // Different length (shorter / longer)
         assert!(!constant_time_token_eq(b"short", expected));
-        assert!(!constant_time_token_eq(b"my_secret_token_12345_extra_long_payload", expected));
+        assert!(!constant_time_token_eq(
+            b"my_secret_token_12345_extra_long_payload",
+            expected
+        ));
         assert!(!constant_time_token_eq(b"", expected));
 
         // Exactly TOKEN_MAX_LEN (256 bytes)

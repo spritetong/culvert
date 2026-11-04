@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::common::net::SocketTuner;
 use crate::core::error::TunnelError;
-use crate::core::stream::{BufferedTlsStream, BoxFuture, TunnelStream};
+use crate::core::stream::{BoxFuture, BufferedTlsStream, TunnelStream};
 use crate::transport::ws::model::WsHandshakeHeaders;
 use crate::transport::ws::stream::WsTunnelStream;
 use crate::transport::{StreamMetadata, TransportListener};

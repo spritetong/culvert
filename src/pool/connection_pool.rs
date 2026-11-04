@@ -237,9 +237,11 @@ impl ReplenishingStreamPool {
                     if now >= next_retry_at {
                         let c = Arc::clone(&connector);
                         let t = dummy_target.clone();
-                        connecting_futures.push(Box::pin(async move { c.connect_pooled(&t).await }));
+                        connecting_futures
+                            .push(Box::pin(async move { c.connect_pooled(&t).await }));
                     } else if in_flight == 0 && retry_timer.is_none() {
-                        retry_timer = Some(Box::pin(tokio::time::sleep_until(next_retry_at.into())));
+                        retry_timer =
+                            Some(Box::pin(tokio::time::sleep_until(next_retry_at.into())));
                     }
                 }
 
@@ -270,7 +272,9 @@ impl ReplenishingStreamPool {
                         let mut is_dead = false;
                         let managed = &mut idle_streams[i];
 
-                        if let Poll::Ready(HeartbeatStatus::Dead) = managed.stream.poll_check_alive(cx) {
+                        if let Poll::Ready(HeartbeatStatus::Dead) =
+                            managed.stream.poll_check_alive(cx)
+                        {
                             is_dead = true;
                         } else {
                             match managed.state {
@@ -284,7 +288,8 @@ impl ReplenishingStreamPool {
                                                 is_dead = true;
                                             }
                                             Poll::Pending => {
-                                                managed.state = HeartbeatState::SendingPing(sweep_now);
+                                                managed.state =
+                                                    HeartbeatState::SendingPing(sweep_now);
                                             }
                                         }
                                     }
@@ -342,12 +347,7 @@ impl ReplenishingStreamPool {
 
                 // 3. Dispatch and process pool events
                 match event {
-                    PoolEvent::Cancelled => {
-                        for (req, _) in pending_requests.drain(..) {
-                            let _ = req.reply.send(Err(TunnelError::PoolExhausted));
-                        }
-                        break;
-                    }
+                    PoolEvent::Cancelled => break,
                     PoolEvent::ConnectionResult(conn_res) => {
                         match conn_res {
                             Ok(stream) => {
@@ -389,7 +389,8 @@ impl ReplenishingStreamPool {
                                 tracing::debug!("Background connect_pooled failed: {:?}", e);
                                 next_retry_at = Instant::now() + backoff;
                                 backoff = (backoff * 2).min(BACKOFF_MAX);
-                                retry_timer = Some(Box::pin(tokio::time::sleep_until(next_retry_at.into())));
+                                retry_timer =
+                                    Some(Box::pin(tokio::time::sleep_until(next_retry_at.into())));
                             }
                         }
                     }
@@ -401,17 +402,22 @@ impl ReplenishingStreamPool {
                                 while let Some(mut managed) = idle_streams.pop_front() {
                                     let mut dead = false;
                                     let _ = std::future::poll_fn(|cx| {
-                                        if let Poll::Ready(HeartbeatStatus::Dead) = managed.stream.poll_check_alive(cx) {
+                                        if let Poll::Ready(HeartbeatStatus::Dead) =
+                                            managed.stream.poll_check_alive(cx)
+                                        {
                                             dead = true;
                                         }
                                         Poll::Ready(())
-                                    }).await;
+                                    })
+                                    .await;
 
                                     if !dead {
                                         acquired = Some(managed.stream);
                                         break;
                                     } else {
-                                        tracing::debug!("Evicted dead stream during acquire inspection");
+                                        tracing::debug!(
+                                            "Evicted dead stream during acquire inspection"
+                                        );
                                     }
                                 }
 
@@ -459,12 +465,7 @@ impl ReplenishingStreamPool {
                                     st.active_count -= 1;
                                 }
                             }
-                            None => {
-                                for (req, _) in pending_requests.drain(..) {
-                                    let _ = req.reply.send(Err(TunnelError::PoolExhausted));
-                                }
-                                break;
-                            }
+                            None => break,
                         }
                     }
                     PoolEvent::RetryTimerExpired => {
@@ -486,6 +487,10 @@ impl ReplenishingStreamPool {
                         stats_clone.lock().idle_count = idle_streams.len();
                     }
                 }
+            }
+
+            for (req, _) in pending_requests.drain(..) {
+                let _ = req.reply.send(Err(TunnelError::PoolExhausted));
             }
         });
 
@@ -675,9 +680,7 @@ mod tests {
 
         // Spawn a task waiting on acquire
         let pool_clone = pool.clone();
-        let acquire_task = tokio::spawn(async move {
-            pool_clone.acquire(None).await
-        });
+        let acquire_task = tokio::spawn(async move { pool_clone.acquire(None).await });
 
         // Give the task a moment to register into pending_requests
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -688,11 +691,21 @@ mod tests {
 
         // The waiting acquire task should immediately receive the stream via direct hand-off
         let acquired = tokio::time::timeout(Duration::from_secs(1), acquire_task).await;
-        assert!(acquired.is_ok(), "Acquire task should complete via hand-off");
-        assert!(acquired.unwrap().unwrap().is_ok(), "Stream acquisition should succeed");
+        assert!(
+            acquired.is_ok(),
+            "Acquire task should complete via hand-off"
+        );
+        assert!(
+            acquired.unwrap().unwrap().is_ok(),
+            "Stream acquisition should succeed"
+        );
 
         // Idle count should still be 0 because it bypassed idle_streams directly to the waiting request
-        assert_eq!(pool.stats().idle_count, 0, "Handed-off stream must bypass idle_streams");
+        assert_eq!(
+            pool.stats().idle_count,
+            0,
+            "Handed-off stream must bypass idle_streams"
+        );
 
         cancel_token.cancel();
     }

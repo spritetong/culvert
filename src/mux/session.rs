@@ -200,7 +200,11 @@ impl MuxSession {
                             "Multiplexer inbound stream backlog full; rejecting SYN with RST"
                         );
                         if let Err(e) = tx_frames.try_send(MuxFrame::rst(stream_id)) {
-                            warn!(stream_id, "Failed to enqueue RST frame on SYN reject (queue full/closed): {:?}", e);
+                            warn!(
+                                stream_id,
+                                "Failed to enqueue RST frame on SYN reject (queue full/closed): {:?}",
+                                e
+                            );
                         }
                         if let Some((_, (_, closed_flag))) = active_streams.remove(&stream_id) {
                             closed_streams.insert(stream_id, closed_flag);
@@ -237,7 +241,10 @@ impl MuxSession {
                                 "Multiplexer stream buffer full; resetting slow stream to prevent session HOL blocking"
                             );
                             if let Err(e) = tx_frames.try_send(MuxFrame::rst(stream_id)) {
-                                warn!(stream_id, "Failed to enqueue RST frame on slow stream reset: {:?}", e);
+                                warn!(
+                                    stream_id,
+                                    "Failed to enqueue RST frame on slow stream reset: {:?}", e
+                                );
                             }
                             if let Some((_, (_, closed_flag))) = active_streams.remove(&stream_id) {
                                 closed_flag.store(true, Ordering::Release);
@@ -318,12 +325,10 @@ impl MuxSession {
             )));
         }
 
-        Ok(MuxStream::new(
-            stream_id,
-            self.tx_frames.clone(),
-            data_rx,
-            closed_flag,
-        ).with_registry(Arc::clone(&self.active_streams)))
+        Ok(
+            MuxStream::new(stream_id, self.tx_frames.clone(), data_rx, closed_flag)
+                .with_registry(Arc::clone(&self.active_streams)),
+        )
     }
 
     /// Sends a raw frame directly to the session writer queue (useful for testing or injects).

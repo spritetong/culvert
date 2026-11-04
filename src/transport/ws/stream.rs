@@ -165,8 +165,15 @@ impl AsyncRead for WsTunnelStream {
                             let mut send_fn = |f: Frame<'_>| {
                                 let frame_to_queue = match f.opcode {
                                     OpCode::Pong => Frame::pong(Payload::Owned(f.payload.to_vec())),
-                                    OpCode::Close => Frame::close_raw(Payload::Owned(f.payload.to_vec())),
-                                    _ => Frame::new(f.fin, f.opcode, None, Payload::Owned(f.payload.to_vec())),
+                                    OpCode::Close => {
+                                        Frame::close_raw(Payload::Owned(f.payload.to_vec()))
+                                    }
+                                    _ => Frame::new(
+                                        f.fin,
+                                        f.opcode,
+                                        None,
+                                        Payload::Owned(f.payload.to_vec()),
+                                    ),
                                 };
                                 obligated.push(frame_to_queue);
                                 async { Ok::<(), io::Error>(()) }
@@ -326,12 +333,18 @@ impl AsyncWrite for WsTunnelStream {
                         Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)))
                     }
                     Poll::Pending => {
-                        self.write_state = WriteState::Writing { fut, written_len: len };
+                        self.write_state = WriteState::Writing {
+                            fut,
+                            written_len: len,
+                        };
                         Poll::Pending
                     }
                 }
             }
-            WriteState::Writing { mut fut, written_len } => match fut.as_mut().poll(cx) {
+            WriteState::Writing {
+                mut fut,
+                written_len,
+            } => match fut.as_mut().poll(cx) {
                 Poll::Pending => {
                     self.write_state = WriteState::Writing { fut, written_len };
                     Poll::Pending
@@ -368,7 +381,10 @@ impl AsyncWrite for WsTunnelStream {
                     self.write_state = WriteState::Idle(tx);
                     return Poll::Ready(Ok(()));
                 }
-                WriteState::Writing { mut fut, written_len } => match fut.as_mut().poll(cx) {
+                WriteState::Writing {
+                    mut fut,
+                    written_len,
+                } => match fut.as_mut().poll(cx) {
                     Poll::Pending => {
                         self.write_state = WriteState::Writing { fut, written_len };
                         return Poll::Pending;
@@ -413,14 +429,22 @@ impl AsyncWrite for WsTunnelStream {
                 WriteState::Idle(mut tx) => {
                     // Send 0-length binary frame as in-band logical FIN, supporting true half-close
                     let fut = Box::pin(async move {
-                        let res = tx.write_frame(Frame::binary(Payload::Owned(Vec::new()))).await;
+                        let res = tx
+                            .write_frame(Frame::binary(Payload::Owned(Vec::new())))
+                            .await;
                         (tx, res)
                     });
-                    self.write_state = WriteState::Writing { fut, written_len: 0 };
+                    self.write_state = WriteState::Writing {
+                        fut,
+                        written_len: 0,
+                    };
                     self.fin_queued = true;
                     continue;
                 }
-                WriteState::Writing { mut fut, written_len } => match fut.as_mut().poll(cx) {
+                WriteState::Writing {
+                    mut fut,
+                    written_len,
+                } => match fut.as_mut().poll(cx) {
                     Poll::Pending => {
                         self.write_state = WriteState::Writing { fut, written_len };
                         return Poll::Pending;
@@ -455,11 +479,7 @@ impl AsyncWrite for WsTunnelStream {
 }
 
 impl TunnelStream for WsTunnelStream {
-    fn poll_write_bytes(
-        &mut self,
-        cx: &mut Context<'_>,
-        buf: Bytes,
-    ) -> Poll<io::Result<usize>> {
+    fn poll_write_bytes(&mut self, cx: &mut Context<'_>, buf: Bytes) -> Poll<io::Result<usize>> {
         if self.peer_closed || self.close_sent {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -491,12 +511,18 @@ impl TunnelStream for WsTunnelStream {
                         Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)))
                     }
                     Poll::Pending => {
-                        self.write_state = WriteState::Writing { fut, written_len: len };
+                        self.write_state = WriteState::Writing {
+                            fut,
+                            written_len: len,
+                        };
                         Poll::Pending
                     }
                 }
             }
-            WriteState::Writing { mut fut, written_len } => match fut.as_mut().poll(cx) {
+            WriteState::Writing {
+                mut fut,
+                written_len,
+            } => match fut.as_mut().poll(cx) {
                 Poll::Pending => {
                     self.write_state = WriteState::Writing { fut, written_len };
                     Poll::Pending
@@ -534,7 +560,14 @@ impl TunnelStream for WsTunnelStream {
             match std::mem::replace(&mut self.write_state, WriteState::Failed) {
                 WriteState::Idle(mut tx) => {
                     let mut fut = Box::pin(async move {
-                        let res = tx.write_frame(Frame::new(true, OpCode::Ping, None, Payload::Borrowed(&[]))).await;
+                        let res = tx
+                            .write_frame(Frame::new(
+                                true,
+                                OpCode::Ping,
+                                None,
+                                Payload::Borrowed(&[]),
+                            ))
+                            .await;
                         (tx, res)
                     });
                     match fut.as_mut().poll(cx) {
@@ -552,7 +585,10 @@ impl TunnelStream for WsTunnelStream {
                         }
                     }
                 }
-                WriteState::Writing { mut fut, written_len } => match fut.as_mut().poll(cx) {
+                WriteState::Writing {
+                    mut fut,
+                    written_len,
+                } => match fut.as_mut().poll(cx) {
                     Poll::Pending => {
                         self.write_state = WriteState::Writing { fut, written_len };
                         return Poll::Pending;
@@ -640,49 +676,51 @@ impl TunnelStream for WsTunnelStream {
                     },
                 }
             }
-            ReadState::Reading(fut) => {
-                match fut.as_mut().poll(cx) {
-                    Poll::Ready((_rx, obligated, Ok((OpCode::Close, payload)))) => {
-                        if !obligated.is_empty() {
-                            self.control_queue.extend(obligated);
-                        }
-                        self.peer_closed = true;
-                        if !self.close_sent {
-                            let close_frame = if payload.is_empty() {
-                                Frame::close(1000, &[])
-                            } else {
-                                Frame::close_raw(Payload::Owned(payload.to_vec()))
-                            };
-                            self.control_queue.push_back(close_frame);
-                            self.close_sent = true;
-                        }
-                        let _ = self.poll_flush_control(cx);
-                        self.read_state = ReadState::Eof;
-                        Poll::Ready(HeartbeatStatus::Dead)
+            ReadState::Reading(fut) => match fut.as_mut().poll(cx) {
+                Poll::Ready((_rx, obligated, Ok((OpCode::Close, payload)))) => {
+                    if !obligated.is_empty() {
+                        self.control_queue.extend(obligated);
                     }
-                    Poll::Ready((_rx, obligated, Err(_))) => {
-                        if !obligated.is_empty() {
-                            self.control_queue.extend(obligated);
-                            let _ = self.poll_flush_control(cx);
-                        }
-                        self.read_state = ReadState::Failed;
-                        Poll::Ready(HeartbeatStatus::Dead)
-                    }
-                    Poll::Ready((rx, obligated, Ok((_, payload)))) => {
-                        if !obligated.is_empty() {
-                            self.control_queue.extend(obligated);
-                            let _ = self.poll_flush_control(cx);
-                        }
-                        if payload.is_empty() {
-                            self.read_state = ReadState::Idle(rx);
+                    self.peer_closed = true;
+                    if !self.close_sent {
+                        let close_frame = if payload.is_empty() {
+                            Frame::close(1000, &[])
                         } else {
-                            self.read_state = ReadState::Buffered { rx, payload, cursor: 0 };
-                        }
-                        Poll::Ready(HeartbeatStatus::Alive)
+                            Frame::close_raw(Payload::Owned(payload.to_vec()))
+                        };
+                        self.control_queue.push_back(close_frame);
+                        self.close_sent = true;
                     }
-                    Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
+                    let _ = self.poll_flush_control(cx);
+                    self.read_state = ReadState::Eof;
+                    Poll::Ready(HeartbeatStatus::Dead)
                 }
-            }
+                Poll::Ready((_rx, obligated, Err(_))) => {
+                    if !obligated.is_empty() {
+                        self.control_queue.extend(obligated);
+                        let _ = self.poll_flush_control(cx);
+                    }
+                    self.read_state = ReadState::Failed;
+                    Poll::Ready(HeartbeatStatus::Dead)
+                }
+                Poll::Ready((rx, obligated, Ok((_, payload)))) => {
+                    if !obligated.is_empty() {
+                        self.control_queue.extend(obligated);
+                        let _ = self.poll_flush_control(cx);
+                    }
+                    if payload.is_empty() {
+                        self.read_state = ReadState::Idle(rx);
+                    } else {
+                        self.read_state = ReadState::Buffered {
+                            rx,
+                            payload,
+                            cursor: 0,
+                        };
+                    }
+                    Poll::Ready(HeartbeatStatus::Alive)
+                }
+                Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
+            },
         }
     }
 }
@@ -738,7 +776,10 @@ mod tests {
         assert_eq!(n, 0, "Server must receive EOF after client half-close");
 
         // 3. Server can still write response back to client
-        server.write_all(b"response after client fin").await.unwrap();
+        server
+            .write_all(b"response after client fin")
+            .await
+            .unwrap();
         server.shutdown().await.unwrap();
 
         // 4. Client reads response then observes EOF
@@ -765,7 +806,9 @@ mod tests {
         let mut server = WsTunnelStream::new(raw_server, Role::Server);
 
         // Client sends RFC 6455 Close
-        tx.write_frame(Frame::close(1000, b"normal closure")).await.unwrap();
+        tx.write_frame(Frame::close(1000, b"normal closure"))
+            .await
+            .unwrap();
 
         // Server reads EOF
         let mut buf = [0u8; 10];
@@ -794,8 +837,9 @@ mod tests {
         {
             let fut = Box::pin(async move {
                 let _ = gate_rx.await;
-                let res =
-                    tx.write_frame(Frame::pong(Payload::Owned(b"pong_delayed".to_vec()))).await;
+                let res = tx
+                    .write_frame(Frame::pong(Payload::Owned(b"pong_delayed".to_vec())))
+                    .await;
                 (tx, res)
             });
             server.write_state = WriteState::WritingControl(fut);
@@ -842,7 +886,9 @@ mod tests {
 
         // Pre-fill server's control queue to MAX_CONTROL_QUEUE and simulate write side backpressure
         for _ in 0..MAX_CONTROL_QUEUE {
-            server.control_queue.push_back(Frame::pong(Payload::Owned(vec![])));
+            server
+                .control_queue
+                .push_back(Frame::pong(Payload::Owned(vec![])));
         }
         server.write_state = WriteState::Writing {
             fut: Box::pin(std::future::pending()),
@@ -851,9 +897,14 @@ mod tests {
 
         // Client sends a Ping frame (which triggers an obligated Pong frame on server)
         // followed by a data frame so server's read completes its loop.
-        tx.write_frame(Frame::new(true, OpCode::Ping, None, Payload::Owned(b"flood".to_vec())))
-            .await
-            .unwrap();
+        tx.write_frame(Frame::new(
+            true,
+            OpCode::Ping,
+            None,
+            Payload::Owned(b"flood".to_vec()),
+        ))
+        .await
+        .unwrap();
         tx.write_frame(Frame::binary(Payload::Owned(b"data".to_vec())))
             .await
             .unwrap();
@@ -861,7 +912,10 @@ mod tests {
         // Server reading next frame must reject with InvalidData due to control frame queue overflow under backpressure
         let mut buf = [0u8; 10];
         let res = server.read(&mut buf).await;
-        assert!(res.is_err(), "Server must reject control frame flood under backpressure");
+        assert!(
+            res.is_err(),
+            "Server must reject control frame flood under backpressure"
+        );
         assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
@@ -875,7 +929,9 @@ mod tests {
         let mut server = WsTunnelStream::new(raw_server, Role::Server);
 
         let test_payload = Bytes::from_static(b"zero copy bytes payload transfer");
-        let n = poll_fn(|cx| client.poll_write_bytes(cx, test_payload.clone())).await.unwrap();
+        let n = poll_fn(|cx| client.poll_write_bytes(cx, test_payload.clone()))
+            .await
+            .unwrap();
         assert_eq!(n, test_payload.len());
         client.flush().await.unwrap();
 
@@ -898,8 +954,8 @@ mod tests {
         // 1. Kick off write of 300KB into 64KB duplex pipe.
         // It must enter WriteState::Writing and return Poll::Pending due to pipe backpressure.
         let mut pending_write = false;
-        poll_fn(|cx| {
-            match Pin::new(&mut client).poll_write(cx, &large_payload) {
+        poll_fn(
+            |cx| match Pin::new(&mut client).poll_write(cx, &large_payload) {
                 Poll::Pending => {
                     pending_write = true;
                     Poll::Ready(())
@@ -907,25 +963,26 @@ mod tests {
                 Poll::Ready(_) => {
                     panic!("poll_write of 300KB into 64KB duplex must return Pending")
                 }
-            }
-        })
+            },
+        )
         .await;
-        assert!(pending_write, "Client must enter Writing state with in-flight data");
+        assert!(
+            pending_write,
+            "Client must enter Writing state with in-flight data"
+        );
 
         // 2. Poll shutdown immediately while in-flight write is pending. It must return Pending
         // without prematurely marking FIN as sent.
         let mut pending_shutdown = false;
-        poll_fn(|cx| {
-            match Pin::new(&mut client).poll_shutdown(cx) {
-                Poll::Pending => {
-                    pending_shutdown = true;
-                    Poll::Ready(())
-                }
-                Poll::Ready(res) => panic!(
-                    "poll_shutdown while write is in flight must return Pending, got {:?}",
-                    res
-                ),
+        poll_fn(|cx| match Pin::new(&mut client).poll_shutdown(cx) {
+            Poll::Pending => {
+                pending_shutdown = true;
+                Poll::Ready(())
             }
+            Poll::Ready(res) => panic!(
+                "poll_shutdown while write is in flight must return Pending, got {:?}",
+                res
+            ),
         })
         .await;
         assert!(
@@ -956,7 +1013,11 @@ mod tests {
             .expect("Server must observe EOF (FIN) within 15s");
 
         client_task.await.unwrap();
-        assert_eq!(received.len(), 300_000, "Server must receive all 300,000 bytes");
+        assert_eq!(
+            received.len(),
+            300_000,
+            "Server must receive all 300,000 bytes"
+        );
         assert_eq!(received, large_payload);
     }
 }

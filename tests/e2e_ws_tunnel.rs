@@ -1,8 +1,8 @@
 //! End-to-end integration tests for WebSocket tunnels.
 //! All comments and docstrings must be in English.
 
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -37,9 +37,7 @@ fn get_available_port() -> u16 {
 }
 
 /// Spawns a simple TCP echo server using held-listener handoff.
-fn spawn_echo_server(
-    cancel_token: CancellationToken,
-) -> (tokio::task::JoinHandle<()>, u16) {
+fn spawn_echo_server(cancel_token: CancellationToken) -> (tokio::task::JoinHandle<()>, u16) {
     let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = std_listener.local_addr().unwrap().port();
     std_listener.set_nonblocking(true).unwrap();
@@ -151,15 +149,12 @@ async fn test_forward_tunnel_ws_e2e() {
 
     // 5. Graceful shutdown
     cancel_token.cancel();
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        async {
-            let (r1, r2, r3) = tokio::join!(echo_handle, server_handle, client_handle);
-            r1.expect("echo handle panicked");
-            r2.expect("server handle panicked");
-            r3.expect("client handle panicked");
-        },
-    )
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (r1, r2, r3) = tokio::join!(echo_handle, server_handle, client_handle);
+        r1.expect("echo handle panicked");
+        r2.expect("server handle panicked");
+        r3.expect("client handle panicked");
+    })
     .await
     .expect("Timeout waiting for handles to exit after cancellation in test_forward_tunnel_ws_e2e");
 }
@@ -249,15 +244,12 @@ async fn test_reverse_tunnel_ws_e2e() {
 
     // 5. Graceful shutdown
     cancel_token.cancel();
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        async {
-            let (r1, r2, r3) = tokio::join!(echo_handle, server_handle, client_handle);
-            r1.expect("echo handle panicked");
-            r2.expect("server handle panicked");
-            r3.expect("client handle panicked");
-        },
-    )
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (r1, r2, r3) = tokio::join!(echo_handle, server_handle, client_handle);
+        r1.expect("echo handle panicked");
+        r2.expect("server handle panicked");
+        r3.expect("client handle panicked");
+    })
     .await
     .expect("Timeout waiting for handles to exit after cancellation in test_reverse_tunnel_ws_e2e");
 }
@@ -351,12 +343,9 @@ async fn test_supervisor_multi_tunnel_concurrency_e2e() {
         assert_eq!(&buf, payload);
     };
 
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        async {
-            tokio::try_join!(tokio::spawn(fwd_fut), tokio::spawn(rev_fut)).unwrap();
-        },
-    )
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::try_join!(tokio::spawn(fwd_fut), tokio::spawn(rev_fut)).unwrap();
+    })
     .await
     .expect("Timeout waiting for forward and reverse futures");
 

@@ -128,9 +128,10 @@ impl WsHandshakeHeaders {
     /// Injects these handshake headers into an outgoing HTTP request builder.
     pub fn apply_to_request_builder(&self, mut builder: RequestBuilder) -> RequestBuilder {
         if let Some(ref token) = self.auth_token
-            && !token.is_empty() {
-                builder = builder.header(HEADER_TUNNEL_AUTH, token);
-            }
+            && !token.is_empty()
+        {
+            builder = builder.header(HEADER_TUNNEL_AUTH, token);
+        }
 
         let mode_str = match self.tunnel_mode {
             TunnelMode::Forward => TUNNEL_MODE_FORWARD,

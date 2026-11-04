@@ -11,7 +11,7 @@ use std::future::Future;
 
 use crate::config::model::TunnelMode;
 use crate::core::error::TunnelError;
-use crate::core::stream::{BufferedTlsStream, BoxFuture, TunnelStream};
+use crate::core::stream::{BoxFuture, BufferedTlsStream, TunnelStream};
 use crate::dialer::endpoint::EndpointContext;
 use crate::dialer::tls::TlsConfigBuilder;
 use crate::transport::ws::model::WsHandshakeHeaders;

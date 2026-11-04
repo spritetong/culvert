@@ -29,9 +29,7 @@ fn get_available_port() -> u16 {
     panic!("Failed to find an available port in Suite 3 partition [34000, 39500)");
 }
 
-fn spawn_echo_server(
-    cancel_token: CancellationToken,
-) -> (tokio::task::JoinHandle<()>, u16) {
+fn spawn_echo_server(cancel_token: CancellationToken) -> (tokio::task::JoinHandle<()>, u16) {
     let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = std_listener.local_addr().unwrap().port();
     std_listener.set_nonblocking(true).unwrap();

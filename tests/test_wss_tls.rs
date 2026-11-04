@@ -237,9 +237,7 @@ fn spawn_tls_terminator(
 }
 
 /// Spawns a simple TCP echo server using held-listener handoff to eliminate TOCTOU.
-fn spawn_echo_server(
-    cancel_token: CancellationToken,
-) -> (tokio::task::JoinHandle<()>, u16) {
+fn spawn_echo_server(cancel_token: CancellationToken) -> (tokio::task::JoinHandle<()>, u16) {
     let std_listener =
         std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind echo server");
     let port = std_listener.local_addr().unwrap().port();
@@ -707,7 +705,8 @@ async fn test_wss_reverse_tunnel_e2e() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let mut visitor = visitor.expect("Failed to connect reverse listener port on server after retries");
+    let mut visitor =
+        visitor.expect("Failed to connect reverse listener port on server after retries");
 
     let payload = b"Reverse tunnel over encrypted TLS 1.3 WebSocket!";
     visitor.write_all(payload).await.unwrap();
@@ -720,16 +719,13 @@ async fn test_wss_reverse_tunnel_e2e() {
     assert_eq!(&buf, payload, "Echo mismatch on reverse WSS tunnel");
 
     cancel_token.cancel();
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        async {
-            let (r1, r2, r3, r4) = tokio::join!(echo_handle, server_handle, tls_handle, client_handle);
-            r1.expect("echo_handle panicked");
-            r2.expect("server_handle panicked");
-            r3.expect("tls_handle panicked");
-            r4.expect("client_handle panicked");
-        },
-    )
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (r1, r2, r3, r4) = tokio::join!(echo_handle, server_handle, tls_handle, client_handle);
+        r1.expect("echo_handle panicked");
+        r2.expect("server_handle panicked");
+        r3.expect("tls_handle panicked");
+        r4.expect("client_handle panicked");
+    })
     .await
     .expect("Timeout waiting for tasks to exit after cancellation in test_wss_reverse_tunnel_e2e");
 }
@@ -791,7 +787,10 @@ async fn test_wss_server_tls_version_enforcement() {
 
     let target = micro_tunnel::transport::TargetAddr::Domain("127.0.0.1".into(), 80);
     let connect_res_12 = connector_12.connect(&target, None).await;
-    assert!(connect_res_12.is_err(), "Server enforcing TLS 1.3 must reject client capped at TLS 1.2");
+    assert!(
+        connect_res_12.is_err(),
+        "Server enforcing TLS 1.3 must reject client capped at TLS 1.2"
+    );
 
     // 3. Client allowing TLS 1.3 must succeed
     let client_tls_13 = TlsConfig {
@@ -813,7 +812,10 @@ async fn test_wss_server_tls_version_enforcement() {
         .unwrap();
 
     let connect_res_13 = connector_13.connect(&target, None).await;
-    assert!(connect_res_13.is_ok(), "Client connecting with TLS 1.3 must succeed");
+    assert!(
+        connect_res_13.is_ok(),
+        "Client connecting with TLS 1.3 must succeed"
+    );
 
     cancel_token.cancel();
     tokio::time::timeout(

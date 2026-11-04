@@ -223,9 +223,10 @@ impl Drop for MuxStream {
     fn drop(&mut self) {
         let is_already_closed = self.closed.swap(true, Ordering::AcqRel);
         if let Some(ref registry) = self.registry
-            && let Some((_, (_, flag))) = registry.remove(&self.stream_id) {
-                flag.store(true, Ordering::Release);
-            }
+            && let Some((_, (_, flag))) = registry.remove(&self.stream_id)
+        {
+            flag.store(true, Ordering::Release);
+        }
         if !is_already_closed && !self.fin_sent {
             // Unclean drop without graceful shutdown: emit RST to immediately inform peer
             // and trigger silent dropping of any remaining in-flight frames.
