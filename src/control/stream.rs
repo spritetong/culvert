@@ -42,7 +42,6 @@ pub trait ControlStream:
     Stream<Item = Result<ControlMessage, TunnelError>>
     + Sink<ControlMessage, Error = TunnelError>
     + Send
-    + Sync
     + Unpin
     + 'static
 {
@@ -53,7 +52,6 @@ impl<T> ControlStream for T where
     T: Stream<Item = Result<ControlMessage, TunnelError>>
         + Sink<ControlMessage, Error = TunnelError>
         + Send
-        + Sync
         + Unpin
         + 'static
 {

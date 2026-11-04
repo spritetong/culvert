@@ -79,6 +79,14 @@ impl AsyncWrite for FailoverTunnelStream {
 }
 
 impl TunnelStream for FailoverTunnelStream {
+    fn poll_write_bytes(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: bytes::Bytes,
+    ) -> Poll<io::Result<usize>> {
+        self.primary.poll_write_bytes(cx, buf)
+    }
+
     fn supports_half_close(&self) -> bool {
         self.primary.supports_half_close()
     }

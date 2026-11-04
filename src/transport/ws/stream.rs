@@ -445,6 +445,72 @@ impl AsyncWrite for WsTunnelStream {
 }
 
 impl TunnelStream for WsTunnelStream {
+    fn poll_write_bytes(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: Bytes,
+    ) -> Poll<io::Result<usize>> {
+        if self.peer_closed || self.close_sent {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "WebSocket peer or write half closed",
+            )));
+        }
+
+        match self.poll_flush_control(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => {}
+        }
+
+        match std::mem::replace(&mut self.write_state, WriteState::Failed) {
+            WriteState::Idle(mut tx) => {
+                let len = buf.len();
+                let payload = bytes::BytesMut::from(buf.as_ref());
+                let mut fut = Box::pin(async move {
+                    let res = tx.write_frame(Frame::binary(Payload::Bytes(payload))).await;
+                    (tx, res)
+                });
+                match fut.as_mut().poll(cx) {
+                    Poll::Ready((tx, Ok(()))) => {
+                        self.write_state = WriteState::Idle(tx);
+                        Poll::Ready(Ok(len))
+                    }
+                    Poll::Ready((_tx, Err(e))) => {
+                        self.write_state = WriteState::Failed;
+                        Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)))
+                    }
+                    Poll::Pending => {
+                        self.write_state = WriteState::Writing { fut, written_len: len };
+                        Poll::Pending
+                    }
+                }
+            }
+            WriteState::Writing { mut fut, written_len } => match fut.as_mut().poll(cx) {
+                Poll::Pending => {
+                    self.write_state = WriteState::Writing { fut, written_len };
+                    Poll::Pending
+                }
+                Poll::Ready((tx, Ok(()))) => {
+                    self.write_state = WriteState::Idle(tx);
+                    Poll::Ready(Ok(written_len))
+                }
+                Poll::Ready((_tx, Err(e))) => {
+                    self.write_state = WriteState::Failed;
+                    Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)))
+                }
+            },
+            WriteState::WritingControl(fut) => {
+                self.write_state = WriteState::WritingControl(fut);
+                Poll::Pending
+            }
+            WriteState::Failed => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "WebSocket write half in failed state",
+            ))),
+        }
+    }
+
     fn supports_half_close(&self) -> bool {
         // Supported via in-band zero-length binary FIN frames without tearing down opposite stream
         true
@@ -755,5 +821,24 @@ mod tests {
         let res = server.read(&mut buf).await;
         assert!(res.is_err(), "Server must reject control frame flood under backpressure");
         assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn test_ws_poll_write_bytes_zero_copy() {
+        use std::future::poll_fn;
+
+        let (raw_client, raw_server) = duplex(65536);
+
+        let mut client = WsTunnelStream::new(raw_client, Role::Client);
+        let mut server = WsTunnelStream::new(raw_server, Role::Server);
+
+        let test_payload = Bytes::from_static(b"zero copy bytes payload transfer");
+        let n = poll_fn(|cx| client.poll_write_bytes(cx, test_payload.clone())).await.unwrap();
+        assert_eq!(n, test_payload.len());
+        client.flush().await.unwrap();
+
+        let mut buf = vec![0u8; test_payload.len()];
+        server.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, test_payload.as_ref());
     }
 }

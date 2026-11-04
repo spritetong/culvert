@@ -209,3 +209,32 @@ async fn test_mux_stream_drop_cleans_active_streams() {
 
     cancel.cancel();
 }
+
+#[tokio::test]
+async fn test_mux_poll_write_bytes_and_shutdown_flushes_pending() {
+    use std::future::poll_fn;
+    use crate::core::stream::TunnelStream;
+
+    let (pipe_client, pipe_server) = duplex(65536);
+    let cancel = CancellationToken::new();
+
+    let client_session = MuxSession::new(Box::new(pipe_client), true, cancel.clone());
+    let server_session = MuxSession::new(Box::new(pipe_server), false, cancel.clone());
+
+    let mut client_stream = client_session.open_stream().await.unwrap();
+    let mut server_stream = server_session.accept_stream().await.unwrap();
+
+    // Use zero-copy poll_write_bytes on client
+    let payload = Bytes::from_static(b"zero copy bytes over mux stream");
+    let n = poll_fn(|cx| client_stream.poll_write_bytes(cx, payload.clone())).await.unwrap();
+    assert_eq!(n, payload.len());
+
+    // Call shutdown which must drive poll_flush before emitting FIN
+    client_stream.shutdown().await.unwrap();
+
+    let mut recv_buf = Vec::new();
+    server_stream.read_to_end(&mut recv_buf).await.unwrap();
+    assert_eq!(recv_buf, payload.as_ref());
+
+    cancel.cancel();
+}

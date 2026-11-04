@@ -3,6 +3,8 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
@@ -86,26 +88,54 @@ impl Dialer for DefaultDialer {
                 return Ok(Box::new(stream) as Box<dyn TunnelStream>);
             }
 
-            // Multiple IPs: race connection attempts concurrently (Happy Eyeballs / RFC 8305)
-            let futs = ips.into_iter().map(|ip| {
-                let addr = SocketAddr::new(ip, port);
-                Box::pin(async move {
-                    match timeout(connect_timeout, TcpStream::connect(addr)).await {
-                        Ok(Ok(stream)) => Ok(stream),
-                        Ok(Err(e)) => Err(TunnelError::Io(e)),
-                        Err(_) => Err(TunnelError::ConnectTimeout(connect_timeout)),
-                    }
-                })
-            });
+            // Multiple IPs: race connection attempts with RFC 8305 250ms staggering and IPv6 priority
+            let mut ordered_ips = ips;
+            ordered_ips.sort_by_key(|ip| if ip.is_ipv6() { 0 } else { 1 });
 
-            match futures_util::future::select_ok(futs).await {
-                Ok((stream, _remaining)) => {
-                    SocketTuner::tune_tcp_stream(&stream, nodelay, tcp_keepalive)
-                        .map_err(TunnelError::Io)?;
-                    Ok(Box::new(stream) as Box<dyn TunnelStream>)
+            async fn try_connect(
+                addr: SocketAddr,
+                timeout_dur: std::time::Duration,
+            ) -> Result<TcpStream, TunnelError> {
+                match timeout(timeout_dur, TcpStream::connect(addr)).await {
+                    Ok(Ok(stream)) => Ok(stream),
+                    Ok(Err(e)) => Err(TunnelError::Io(e)),
+                    Err(_) => Err(TunnelError::ConnectTimeout(timeout_dur)),
                 }
-                Err(err) => Err(err),
             }
+
+            let mut futs = FuturesUnordered::new();
+            let first_addr = SocketAddr::new(ordered_ips[0], port);
+            futs.push(Box::pin(try_connect(first_addr, connect_timeout)));
+
+            let mut next_idx = 1;
+            let delay = tokio::time::sleep(std::time::Duration::from_millis(250));
+            tokio::pin!(delay);
+
+            let mut last_err = None;
+            while !futs.is_empty() || next_idx < ordered_ips.len() {
+                tokio::select! {
+                    Some(res) = futs.next(), if !futs.is_empty() => {
+                        match res {
+                            Ok(stream) => {
+                                SocketTuner::tune_tcp_stream(&stream, nodelay, tcp_keepalive)
+                                    .map_err(TunnelError::Io)?;
+                                return Ok(Box::new(stream) as Box<dyn TunnelStream>);
+                            }
+                            Err(e) => {
+                                last_err = Some(e);
+                            }
+                        }
+                    }
+                    _ = &mut delay, if next_idx < ordered_ips.len() => {
+                        let next_addr = SocketAddr::new(ordered_ips[next_idx], port);
+                        next_idx += 1;
+                        futs.push(Box::pin(try_connect(next_addr, connect_timeout)));
+                        delay.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_millis(250));
+                    }
+                }
+            }
+
+            Err(last_err.unwrap_or(TunnelError::ConnectTimeout(connect_timeout)))
         })
     }
 }

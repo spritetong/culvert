@@ -25,6 +25,16 @@ pub enum HeartbeatStatus {
 /// Implementations must be `Send + Unpin + 'static` to allow thread-safe dispatching
 /// and storage across Tokio task boundaries as `Box<dyn TunnelStream>`.
 pub trait TunnelStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {
+    /// Writes an owned byte slice without copying if supported by the transport.
+    /// Default implementation falls back to `poll_write`.
+    fn poll_write_bytes(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: bytes::Bytes,
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(self).poll_write(cx, &buf)
+    }
+
     /// Non-blocking hook to transmit a protocol-level ping/heartbeat frame.
     ///
     /// Transports without protocol-level ping (e.g. raw TCP) default to `Poll::Ready(Ok(()))`.
@@ -48,6 +58,14 @@ pub trait TunnelStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {
 
 // Implement TunnelStream for Box<dyn TunnelStream> to allow trait-object wrapping.
 impl TunnelStream for Box<dyn TunnelStream> {
+    fn poll_write_bytes(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: bytes::Bytes,
+    ) -> Poll<io::Result<usize>> {
+        (**self).poll_write_bytes(cx, buf)
+    }
+
     fn poll_send_ping(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         (**self).poll_send_ping(cx)
     }
@@ -145,6 +163,10 @@ impl<S> TunnelStream for BufferedTlsStream<S>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
+    fn poll_write_bytes(&mut self, cx: &mut Context<'_>, buf: bytes::Bytes) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, &buf)
+    }
+
     fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
         if self.pushback.is_some() {
             return Poll::Ready(HeartbeatStatus::Alive);

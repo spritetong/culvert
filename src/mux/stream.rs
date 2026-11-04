@@ -181,6 +181,13 @@ impl AsyncWrite for MuxStream {
             return Poll::Ready(Ok(()));
         }
 
+        // Ensure any pending payload is flushed into writer queue before sending FIN
+        match self.as_mut().poll_flush(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => {}
+        }
+
         let this = &mut *self;
         match this.outbound.poll_reserve(cx) {
             Poll::Ready(Ok(())) => {
@@ -199,6 +206,51 @@ impl AsyncWrite for MuxStream {
 }
 
 impl TunnelStream for MuxStream {
+    fn poll_write_bytes(&mut self, cx: &mut Context<'_>, buf: Bytes) -> Poll<io::Result<usize>> {
+        if self.closed.load(Ordering::Acquire) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Multiplexer stream is closed or reset",
+            )));
+        }
+
+        if self.pending_payload.is_some() {
+            match Pin::new(&mut *self).poll_flush(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => {}
+            }
+        }
+
+        let chunk_size = buf.len().min(MAX_FRAME_PAYLOAD_SIZE);
+        let payload = if chunk_size == buf.len() {
+            buf
+        } else {
+            buf.slice(..chunk_size)
+        };
+
+        match self.outbound.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => {
+                let frame = MuxFrame::data(self.stream_id, payload);
+                if self.outbound.send_item(frame).is_err() {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "Multiplexer session terminated",
+                    )));
+                }
+                Poll::Ready(Ok(chunk_size))
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "Multiplexer session terminated",
+            ))),
+            Poll::Pending => {
+                self.pending_payload = Some((payload, chunk_size));
+                Poll::Ready(Ok(chunk_size))
+            }
+        }
+    }
+
     fn poll_check_alive(&mut self, _cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
         if self.closed.load(Ordering::Acquire) {
             Poll::Ready(HeartbeatStatus::Dead)
