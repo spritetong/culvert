@@ -25,6 +25,13 @@ pub enum HeartbeatStatus {
 /// Implementations must be `Send + Unpin + 'static` to allow thread-safe dispatching
 /// and storage across Tokio task boundaries as `Box<dyn TunnelStream>`.
 pub trait TunnelStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {
+    /// Returns true if this transport stream benefits from owned `Bytes` buffers
+    /// and implements true zero-copy processing internally (e.g. MuxStream).
+    /// Defaults to false for standard byte-oriented streams (TCP, TLS, WS, QUIC, H3).
+    fn consumes_owned_write(&self) -> bool {
+        false
+    }
+
     /// Writes an owned byte slice without copying if supported by the transport.
     /// Default implementation falls back to `poll_write`.
     fn poll_write_bytes(

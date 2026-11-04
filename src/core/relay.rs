@@ -4,7 +4,7 @@
 use std::future::{Future, poll_fn};
 use std::pin::{Pin, pin};
 use std::task::Poll;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::ReadBuf;
 use tokio_util::sync::CancellationToken;
 
 use crate::consts::RELAY_BUFFER_SIZE;
@@ -13,7 +13,9 @@ use crate::core::stream::TunnelStream;
 
 /// Directional transfer state for one half of the duplex relay.
 struct TransferState {
-    raw_buf: Vec<u8>,
+    buffer: Vec<u8>,
+    read_pos: usize,
+    write_pos: usize,
     in_flight_chunk: Option<bytes::Bytes>,
     chunk_pos: usize,
     read_done: bool,
@@ -24,7 +26,9 @@ struct TransferState {
 impl TransferState {
     fn new(capacity: usize) -> Self {
         Self {
-            raw_buf: vec![0u8; capacity],
+            buffer: vec![0u8; capacity],
+            read_pos: 0,
+            write_pos: 0,
             in_flight_chunk: None,
             chunk_pos: 0,
             read_done: false,
@@ -34,7 +38,10 @@ impl TransferState {
     }
 
     fn is_finished(&self) -> bool {
-        self.read_done && self.in_flight_chunk.is_none() && self.write_shutdown
+        self.read_done
+            && self.write_pos == self.read_pos
+            && self.in_flight_chunk.is_none()
+            && self.write_shutdown
     }
 }
 
@@ -67,7 +74,6 @@ impl RelayEngine {
         // and achieve zero-allocation, purely event-driven cancellation without polling.
         let mut cancel_fut = pin!(cancel_token.cancelled_owned());
         let mut drain_sleep: Option<Pin<Box<tokio::time::Sleep>>> = None;
-        let mut spin_count: usize = 0;
 
         poll_fn(|cx| {
             let is_cancelled = cancel_fut.as_mut().poll(cx).is_ready();
@@ -116,16 +122,8 @@ impl RelayEngine {
             }
 
             if progress {
-                spin_count = spin_count.saturating_add(1);
-                // Bounded cooperative yield after consecutive busy spins to prevent worker starvation
-                if spin_count > 64 {
-                    spin_count = 0;
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
+                // Yield control to allow runtime cooperation
                 cx.waker().wake_by_ref();
-            } else {
-                spin_count = 0;
             }
 
             Poll::Pending
@@ -141,51 +139,95 @@ impl RelayEngine {
         force_stop: bool,
         progress: &mut bool,
     ) -> Poll<Result<(), std::io::Error>> {
-        // Step 1: Write pending buffer contents to writer using zero-copy ownership write API
-        while let Some(ref chunk) = state.in_flight_chunk {
-            let to_write = if state.chunk_pos == 0 {
-                chunk.clone()
-            } else {
-                chunk.slice(state.chunk_pos..)
-            };
+        let consumes_owned = writer.consumes_owned_write();
 
-            match writer.poll_write_bytes(cx, to_write) {
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        "writer returned zero bytes",
-                    )));
-                }
-                Poll::Ready(Ok(n)) => {
-                    state.chunk_pos += n;
-                    state.total_bytes += n as u64;
-                    *progress = true;
-                    if state.chunk_pos >= chunk.len() {
-                        state.in_flight_chunk = None;
-                        state.chunk_pos = 0;
+        if consumes_owned {
+            // Path A: Writer benefits from owned Bytes buffers (e.g. MuxStream)
+            while let Some(ref chunk) = state.in_flight_chunk {
+                let to_write = if state.chunk_pos == 0 {
+                    chunk.clone()
+                } else {
+                    chunk.slice(state.chunk_pos..)
+                };
+
+                match writer.poll_write_bytes(cx, to_write) {
+                    Poll::Ready(Ok(0)) => {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "writer returned zero bytes",
+                        )));
                     }
+                    Poll::Ready(Ok(n)) => {
+                        state.chunk_pos += n;
+                        state.total_bytes += n as u64;
+                        *progress = true;
+                        if state.chunk_pos >= chunk.len() {
+                            state.in_flight_chunk = None;
+                            state.chunk_pos = 0;
+                        }
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => break,
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => break,
             }
-        }
 
-        // Step 2: Read next data chunk from reader if in-flight chunk is empty
-        if !state.read_done && !force_stop && state.in_flight_chunk.is_none() {
-            let mut read_buf = ReadBuf::new(&mut state.raw_buf);
-            match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
-                Poll::Ready(Ok(())) => {
-                    let n = read_buf.filled().len();
-                    if n == 0 {
-                        state.read_done = true;
-                    } else {
-                        state.in_flight_chunk = Some(bytes::Bytes::copy_from_slice(&state.raw_buf[..n]));
-                        state.chunk_pos = 0;
+            if !state.read_done && !force_stop && state.in_flight_chunk.is_none() {
+                let mut read_buf = ReadBuf::new(&mut state.buffer);
+                match Pin::new(&mut **reader).poll_read(cx, &mut read_buf) {
+                    Poll::Ready(Ok(())) => {
+                        let n = read_buf.filled().len();
+                        if n == 0 {
+                            state.read_done = true;
+                        } else {
+                            state.in_flight_chunk = Some(bytes::Bytes::copy_from_slice(&state.buffer[..n]));
+                            state.chunk_pos = 0;
+                        }
+                        *progress = true;
                     }
-                    *progress = true;
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => {}
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {}
+            }
+        } else {
+            // Path B: Standard byte streams (TCP, TLS, WS, H3, QUIC) - zero heap allocations in hot path
+            while state.write_pos < state.read_pos {
+                match Pin::new(&mut **writer).poll_write(cx, &state.buffer[state.write_pos..state.read_pos]) {
+                    Poll::Ready(Ok(0)) => {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "writer returned zero bytes",
+                        )));
+                    }
+                    Poll::Ready(Ok(n)) => {
+                        state.write_pos += n;
+                        state.total_bytes += n as u64;
+                        *progress = true;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => break,
+                }
+            }
+
+            if state.write_pos == state.read_pos {
+                state.read_pos = 0;
+                state.write_pos = 0;
+            }
+
+            if !state.read_done && !force_stop && state.read_pos == 0 {
+                let mut read_buf = ReadBuf::new(&mut state.buffer);
+                match Pin::new(&mut **reader).poll_read(cx, &mut read_buf) {
+                    Poll::Ready(Ok(())) => {
+                        let n = read_buf.filled().len();
+                        if n == 0 {
+                            state.read_done = true;
+                        } else {
+                            state.read_pos = n;
+                        }
+                        *progress = true;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => {}
+                }
             }
         }
 
@@ -194,8 +236,14 @@ impl RelayEngine {
         }
 
         // Step 3: Flush and Shutdown writer if reader is done and all bytes written
-        if state.read_done && state.in_flight_chunk.is_none() && !state.write_shutdown {
-            match Pin::new(&mut *writer).poll_flush(cx) {
+        let all_written = if consumes_owned {
+            state.in_flight_chunk.is_none()
+        } else {
+            state.write_pos == state.read_pos
+        };
+
+        if state.read_done && all_written && !state.write_shutdown {
+            match Pin::new(&mut **writer).poll_flush(cx) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(e)) => {
                     tracing::debug!("Relay writer flush error during shutdown: {}", e);
@@ -204,7 +252,7 @@ impl RelayEngine {
             }
 
             if writer.supports_half_close() {
-                match Pin::new(&mut *writer).poll_shutdown(cx) {
+                match Pin::new(&mut **writer).poll_shutdown(cx) {
                     Poll::Ready(Ok(())) => {
                         state.write_shutdown = true;
                         *progress = true;
@@ -217,8 +265,6 @@ impl RelayEngine {
                     Poll::Pending => {}
                 }
             } else {
-                // For transports lacking half-close support, avoid shutting down the entire
-                // connection prematurely while opposite transfer direction is still in progress.
                 state.write_shutdown = true;
                 *progress = true;
             }

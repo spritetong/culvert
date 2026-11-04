@@ -79,6 +79,10 @@ impl AsyncWrite for FailoverTunnelStream {
 }
 
 impl TunnelStream for FailoverTunnelStream {
+    fn consumes_owned_write(&self) -> bool {
+        self.primary.consumes_owned_write()
+    }
+
     fn poll_write_bytes(
         &mut self,
         cx: &mut Context<'_>,

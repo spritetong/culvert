@@ -276,3 +276,91 @@ async fn test_mux_poll_write_and_poll_write_bytes_interleaving_no_data_loss() {
 
     cancel.cancel();
 }
+
+#[tokio::test]
+async fn test_mux_backpressure_retry_no_duplicate_frames() {
+    use std::future::poll_fn;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::task::Poll;
+    use tokio::io::AsyncWrite;
+    use tokio::sync::mpsc;
+    use crate::mux::stream::MuxStream;
+    use crate::mux::frame::MuxFrame;
+
+    let (tx_frames, mut rx_frames) = mpsc::channel::<MuxFrame>(1);
+    let (_tx_data, rx_data) = mpsc::channel(1);
+    let closed = Arc::new(AtomicBool::new(false));
+
+    let mut stream = MuxStream::new(1, tx_frames, rx_data, closed);
+
+    // 1. Fill outbound capacity (capacity = 1)
+    let first_payload = b"frame_1";
+    let n1 = poll_fn(|cx| Pin::new(&mut stream).poll_write(cx, first_payload)).await.unwrap();
+    assert_eq!(n1, 7);
+
+    // 2. Next write must return Poll::Pending without buffering or duplicate sending
+    let second_payload = b"frame_2_no_dup";
+    let pending_observed = poll_fn(|cx| {
+        match Pin::new(&mut stream).poll_write(cx, second_payload) {
+            Poll::Pending => Poll::Ready(true),
+            Poll::Ready(_) => panic!("Expected Poll::Pending when outbound is full"),
+        }
+    }).await;
+    assert!(pending_observed);
+
+    // 3. Drain first frame to open up capacity
+    let frame1 = rx_frames.recv().await.unwrap();
+    assert_eq!(frame1.payload.as_ref(), first_payload);
+
+    // 4. Retry write of second frame
+    let n2 = poll_fn(|cx| Pin::new(&mut stream).poll_write(cx, second_payload)).await.unwrap();
+    assert_eq!(n2, second_payload.len());
+
+    // 5. Read second frame and verify NO DUPLICATE frames exist
+    let frame2 = rx_frames.recv().await.unwrap();
+    assert_eq!(frame2.payload.as_ref(), second_payload);
+    assert!(rx_frames.try_recv().is_err(), "Must not send duplicate frames upon retry");
+}
+
+#[tokio::test]
+async fn test_mux_poll_write_bytes_backpressure_retry_no_duplicate_frames() {
+    use std::future::poll_fn;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::task::Poll;
+    use tokio::sync::mpsc;
+    use crate::mux::stream::MuxStream;
+    use crate::mux::frame::MuxFrame;
+    use crate::core::stream::TunnelStream;
+
+    let (tx_frames, mut rx_frames) = mpsc::channel::<MuxFrame>(1);
+    let (_tx_data, rx_data) = mpsc::channel(1);
+    let closed = Arc::new(AtomicBool::new(false));
+
+    let mut stream = MuxStream::new(1, tx_frames, rx_data, closed);
+
+    let first_payload = Bytes::from_static(b"bytes_1");
+    let n1 = poll_fn(|cx| stream.poll_write_bytes(cx, first_payload.clone())).await.unwrap();
+    assert_eq!(n1, 7);
+
+    let second_payload = Bytes::from_static(b"bytes_2_no_dup");
+    let pending_observed = poll_fn(|cx| {
+        match stream.poll_write_bytes(cx, second_payload.clone()) {
+            Poll::Pending => Poll::Ready(true),
+            Poll::Ready(_) => panic!("Expected Poll::Pending when outbound is full"),
+        }
+    }).await;
+    assert!(pending_observed);
+
+    let frame1 = rx_frames.recv().await.unwrap();
+    assert_eq!(frame1.payload.as_ref(), first_payload.as_ref());
+
+    let n2 = poll_fn(|cx| stream.poll_write_bytes(cx, second_payload.clone())).await.unwrap();
+    assert_eq!(n2, second_payload.len());
+
+    let frame2 = rx_frames.recv().await.unwrap();
+    assert_eq!(frame2.payload.as_ref(), second_payload.as_ref());
+    assert!(rx_frames.try_recv().is_err(), "poll_write_bytes must not send duplicate frames upon retry");
+}

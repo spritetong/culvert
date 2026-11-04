@@ -27,8 +27,6 @@ pub struct MuxStream {
     rx_data: mpsc::Receiver<Bytes>,
     /// Partially consumed incoming slice from a previous read poll.
     read_buf: Option<Bytes>,
-    /// In-flight pending payload waiting for outbound channel capacity.
-    pending_payload: Option<(Bytes, usize)>,
     /// Flag indicating if local write direction has sent FIN.
     fin_sent: bool,
     /// Flag indicating if stream is terminated/reset.
@@ -50,7 +48,6 @@ impl MuxStream {
             outbound: PollSender::new(tx_frames),
             rx_data,
             read_buf: None,
-            pending_payload: None,
             fin_sent: false,
             closed,
             registry: None,
@@ -124,20 +121,10 @@ impl AsyncWrite for MuxStream {
         }
 
         let this = &mut *self;
-        if this.pending_payload.is_some() {
-            match Pin::new(&mut *this).poll_flush(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(())) => {}
-            }
-        }
-        let chunk_size = std::cmp::min(buf.len(), MAX_FRAME_PAYLOAD_SIZE);
-        let payload = Bytes::copy_from_slice(&buf[..chunk_size]);
-        this.pending_payload = Some((payload, chunk_size));
-
         match this.outbound.poll_reserve(cx) {
             Poll::Ready(Ok(())) => {
-                let (payload, chunk_size) = this.pending_payload.take().unwrap();
+                let chunk_size = std::cmp::min(buf.len(), MAX_FRAME_PAYLOAD_SIZE);
+                let payload = Bytes::copy_from_slice(&buf[..chunk_size]);
                 let frame = MuxFrame::data(this.stream_id, payload);
                 if this.outbound.send_item(frame).is_err() {
                     return Poll::Ready(Err(io::Error::new(
@@ -155,42 +142,13 @@ impl AsyncWrite for MuxStream {
         }
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = &mut *self;
-        if this.pending_payload.is_some() {
-            match this.outbound.poll_reserve(cx) {
-                Poll::Ready(Ok(())) => {
-                    let (payload, _chunk_size) = this.pending_payload.take().unwrap();
-                    let frame = MuxFrame::data(this.stream_id, payload);
-                    if this.outbound.send_item(frame).is_err() {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::ConnectionReset,
-                            "Multiplexer session terminated",
-                        )));
-                    }
-                }
-                Poll::Ready(Err(_)) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::ConnectionReset,
-                        "Multiplexer session terminated",
-                    )));
-                }
-                Poll::Pending => return Poll::Pending,
-            }
-        }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.fin_sent {
             return Poll::Ready(Ok(()));
-        }
-
-        // Ensure any pending payload is flushed into writer queue before sending FIN
-        match self.as_mut().poll_flush(cx) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Ready(Ok(())) => {}
         }
 
         let this = &mut *self;
@@ -211,6 +169,10 @@ impl AsyncWrite for MuxStream {
 }
 
 impl TunnelStream for MuxStream {
+    fn consumes_owned_write(&self) -> bool {
+        true
+    }
+
     fn poll_write_bytes(&mut self, cx: &mut Context<'_>, buf: Bytes) -> Poll<io::Result<usize>> {
         if self.closed.load(Ordering::Acquire) {
             return Poll::Ready(Err(io::Error::new(
@@ -219,23 +181,18 @@ impl TunnelStream for MuxStream {
             )));
         }
 
-        if self.pending_payload.is_some() {
-            match Pin::new(&mut *self).poll_flush(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(())) => {}
-            }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
         }
-
-        let chunk_size = buf.len().min(MAX_FRAME_PAYLOAD_SIZE);
-        let payload = if chunk_size == buf.len() {
-            buf
-        } else {
-            buf.slice(..chunk_size)
-        };
 
         match self.outbound.poll_reserve(cx) {
             Poll::Ready(Ok(())) => {
+                let chunk_size = buf.len().min(MAX_FRAME_PAYLOAD_SIZE);
+                let payload = if chunk_size == buf.len() {
+                    buf
+                } else {
+                    buf.slice(..chunk_size)
+                };
                 let frame = MuxFrame::data(self.stream_id, payload);
                 if self.outbound.send_item(frame).is_err() {
                     return Poll::Ready(Err(io::Error::new(
@@ -249,10 +206,7 @@ impl TunnelStream for MuxStream {
                 io::ErrorKind::ConnectionReset,
                 "Multiplexer session terminated",
             ))),
-            Poll::Pending => {
-                self.pending_payload = Some((payload, chunk_size));
-                Poll::Pending
-            }
+            Poll::Pending => Poll::Pending,
         }
     }
 
