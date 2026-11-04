@@ -8,9 +8,11 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
+use tokio_util::sync::CancellationToken;
 
 use crate::common::net::SocketTuner;
 use crate::core::error::TunnelError;
@@ -29,6 +31,17 @@ pub struct WsListener {
     path: Option<String>,
     tls_acceptor: Option<TlsAcceptor>,
     incoming_rx: Option<mpsc::Receiver<AcceptedResult>>,
+    cancel_token: CancellationToken,
+    server_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for WsListener {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+        if let Some(task) = self.server_task.take() {
+            task.abort();
+        }
+    }
 }
 
 impl WsListener {
@@ -45,6 +58,8 @@ impl WsListener {
             path: path.map(|p| p.into()),
             tls_acceptor,
             incoming_rx: None,
+            cancel_token: CancellationToken::new(),
+            server_task: None,
         }
     }
 
@@ -64,15 +79,19 @@ impl WsListener {
         let auth_token = Arc::new(self.auth_token.clone());
         let expected_path = Arc::new(self.path.clone());
         let tls_acceptor = self.tls_acceptor.clone();
+        let cancel_token = self.cancel_token.clone();
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             loop {
-                let (stream, _) = match listener.accept().await {
-                    Ok((conn, addr)) => {
-                        let _ = SocketTuner::tune_tcp_stream(&conn, true, None);
-                        (conn, addr)
+                let stream = tokio::select! {
+                    _ = cancel_token.cancelled() => break,
+                    res = listener.accept() => match res {
+                        Ok((conn, _addr)) => {
+                            let _ = SocketTuner::tune_tcp_stream(&conn, true, None);
+                            conn
+                        }
+                        Err(_) => break,
                     }
-                    Err(_) => break,
                 };
 
                 let tx = tx.clone();
@@ -81,14 +100,18 @@ impl WsListener {
                 let acceptor = tls_acceptor.clone();
 
                 tokio::spawn(async move {
-                    // If TLS acceptor is configured (wss://), perform TLS handshake first
+                    // If TLS acceptor is configured (wss://), perform TLS handshake with 10s timeout
                     let io: TokioIo<Box<dyn TunnelStream>> = if let Some(tls) = acceptor {
-                        match tls.accept(stream).await {
-                            Ok(tls_stream) => {
+                        match tokio::time::timeout(Duration::from_secs(10), tls.accept(stream)).await {
+                            Ok(Ok(tls_stream)) => {
                                 TokioIo::new(Box::new(tls_stream) as Box<dyn TunnelStream>)
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 tracing::debug!("WSS server TLS handshake failed: {:?}", e);
+                                return;
+                            }
+                            Err(_) => {
+                                tracing::warn!("WSS server TLS handshake timed out (10s)");
                                 return;
                             }
                         }
@@ -150,7 +173,7 @@ impl WsListener {
                             match upgrade(&mut req) {
                                 Ok((response, fut)) => {
                                     tokio::spawn(async move {
-                                        if let Ok(ws) = fut.await {
+                                        if let Ok(Ok(ws)) = tokio::time::timeout(Duration::from_secs(10), fut).await {
                                             let stream =
                                                 WsTunnelStream::new(ws.into_inner(), Role::Server);
                                             let _ = tx
@@ -174,14 +197,18 @@ impl WsListener {
                         }
                     });
 
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, service)
-                        .with_upgrades()
-                        .await;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        hyper::server::conn::http1::Builder::new()
+                            .serve_connection(io, service)
+                            .with_upgrades(),
+                    )
+                    .await;
                 });
             }
         });
 
+        self.server_task = Some(task);
         Ok(())
     }
 }

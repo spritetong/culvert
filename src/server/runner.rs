@@ -112,11 +112,17 @@ impl ServerRunner {
                                                         res = stream.read_exact(&mut magic) => {
                                                             match res {
                                                                 Ok(_) if magic[0] == ACTIVATE_STREAM_MAGIC => {
-                                                                    // Activated! Check if dynamic target address is appended: [len: u16, target_str]
+                                                                    // Activated! Check if dynamic target address is appended: [len: u16, target_str] with 10s timeout
                                                                     let mut len_bytes = [0u8; 2];
                                                                     let read_len_res = tokio::select! {
                                                                         _ = conn_token.cancelled() => return,
-                                                                        res = stream.read_exact(&mut len_bytes) => res,
+                                                                        res = tokio::time::timeout(std::time::Duration::from_secs(10), stream.read_exact(&mut len_bytes)) => match res {
+                                                                            Ok(r) => r,
+                                                                            Err(_) => {
+                                                                                warn!("Timed out reading activation target length (10s)");
+                                                                                return;
+                                                                            }
+                                                                        },
                                                                     };
                                                                     if let Err(e) = read_len_res {
                                                                         warn!("Failed to read activation target length: {:?}", e);
@@ -131,7 +137,13 @@ impl ServerRunner {
                                                                         let mut target_bytes = vec![0u8; target_len];
                                                                         let read_target_res = tokio::select! {
                                                                             _ = conn_token.cancelled() => return,
-                                                                            res = stream.read_exact(&mut target_bytes) => res,
+                                                                            res = tokio::time::timeout(std::time::Duration::from_secs(10), stream.read_exact(&mut target_bytes)) => match res {
+                                                                                Ok(r) => r,
+                                                                                Err(_) => {
+                                                                                    warn!("Timed out reading activation target payload (10s)");
+                                                                                    return;
+                                                                                }
+                                                                            },
                                                                         };
                                                                         if let Err(e) = read_target_res {
                                                                             warn!("Failed to read activation target payload: {:?}", e);

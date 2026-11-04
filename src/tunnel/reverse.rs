@@ -16,7 +16,7 @@ use crate::control::stream::{ControlMessage, FramedControlStream};
 use crate::core::error::TunnelError;
 use crate::core::relay::RelayEngine;
 use crate::dialer::endpoint::EndpointContext;
-use crate::transport::{TargetAddr, TransportRegistry};
+use crate::transport::{TargetAddr, TransportConnector, TransportRegistry};
 
 /// Runs a single reverse mapping control loop.
 pub async fn run_reverse_mapping(
@@ -37,6 +37,11 @@ pub async fn run_reverse_mapping(
 
     let dummy_target = TargetAddr::Domain("control".to_string(), 0);
     let mut conn_tracker = TaskTracker::<()>::new(cancel_token.clone());
+
+    // Share data connector across all incoming visitor sessions to maximize connection/0-RTT reuse
+    let data_connector: Arc<dyn TransportConnector> = Arc::from(
+        transport_registry.create_connector(&endpoint_ctx, token.as_deref(), TunnelMode::Reverse)?
+    );
 
     while !cancel_token.is_cancelled() {
         let connector = transport_registry.create_connector(
@@ -124,13 +129,7 @@ pub async fn run_reverse_mapping(
                                     "New reverse connection arrival notification from server"
                                 );
 
-                                let connector = match transport_registry.create_connector(&endpoint_ctx, token.as_deref(), TunnelMode::Reverse) {
-                                    Ok(c) => c,
-                                    Err(e) => {
-                                        error!("Failed to create data connector: {:?}", e);
-                                        continue;
-                                    }
-                                };
+                                let connector = Arc::clone(&data_connector);
                                 let target_clone = target_addr.clone();
                                 let session_id_clone = session_id.clone();
                                 let dummy_target = dummy_target.clone();

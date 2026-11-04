@@ -57,6 +57,18 @@ pub async fn run_forward_mapping(
     let mut conn_tracker = TaskTracker::<()>::new(cancel_token.clone());
     let target = parse_target_addr(&target_str)?;
 
+    // Create shared transport connector at the mapping level so internal QUIC/H3 connection
+    // caches and zero-RTT handshakes are actually shared across multiple inbound visitor connections.
+    let shared_connector: Option<Arc<dyn TransportConnector>> = if pool.is_none() {
+        Some(Arc::from(transport_registry.create_connector(
+            &endpoint_ctx,
+            token.as_deref(),
+            TunnelMode::Forward,
+        )?))
+    } else {
+        None
+    };
+
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
@@ -71,20 +83,17 @@ pub async fn run_forward_mapping(
                         info!(tag = %tag, peer = %peer_addr, "Inbound connection accepted");
                         let target = target.clone();
                         let pool_clone = pool.clone();
-                        let registry_clone = Arc::clone(&transport_registry);
-                        let endpoint_clone = endpoint_ctx.clone();
-                        let token_clone = token.clone();
+                        let connector_clone = shared_connector.clone();
                         let pool_for_close = pool.clone();
 
                         conn_tracker.spawn_with_cancel(move |conn_token| async move {
                             let acquire_fut = async {
                                 if let Some(ref p) = pool_clone {
                                     p.acquire(Some(&target)).await
+                                } else if let Some(ref c) = connector_clone {
+                                    c.connect(&target, None).await
                                 } else {
-                                    match registry_clone.create_connector(&endpoint_clone, token_clone.as_deref(), TunnelMode::Forward) {
-                                        Ok(connector) => connector.connect(&target, None).await,
-                                        Err(e) => Err(e),
-                                    }
+                                    Err(TunnelError::Internal("Connector unavailable".into()))
                                 }
                             };
 

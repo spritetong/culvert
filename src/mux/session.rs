@@ -203,21 +203,13 @@ impl MuxSession {
                     return;
                 }
 
-                if let Some(entry) = active_streams.get(&stream_id) {
-                    let (data_tx, _) = entry.value();
-                    if let Err(e) = data_tx.try_send(frame.payload) {
-                        match e {
-                            mpsc::error::TrySendError::Full(_) => {
-                                warn!(
-                                    stream_id,
-                                    "Stream buffer full; dropping frame to avoid stall"
-                                );
-                            }
-                            mpsc::error::TrySendError::Closed(_) => {
-                                active_streams.remove(&stream_id);
-                                closed_streams.insert(stream_id, ());
-                            }
-                        }
+                // Propagate true backpressure to the underlying socket instead of silently dropping payloads.
+                // Clone the sender and immediately drop the DashMap read guard to avoid holding synchronization locks across .await.
+                let tx_opt = active_streams.get(&stream_id).map(|e| e.value().0.clone());
+                if let Some(data_tx) = tx_opt {
+                    if data_tx.send(frame.payload).await.is_err() {
+                        active_streams.remove(&stream_id);
+                        closed_streams.insert(stream_id, ());
                     }
                 }
             }

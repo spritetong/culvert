@@ -10,6 +10,7 @@ use std::task::{Context, Poll};
 use bytes::{Buf, Bytes};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
+use tokio_util::sync::PollSender;
 
 use crate::core::stream::{HeartbeatStatus, TunnelStream};
 use crate::mux::frame::{MAX_FRAME_PAYLOAD_SIZE, MuxFrame};
@@ -17,12 +18,14 @@ use crate::mux::frame::{MAX_FRAME_PAYLOAD_SIZE, MuxFrame};
 /// A logical bi-directional multiplexed sub-stream.
 pub struct MuxStream {
     stream_id: u32,
-    /// Channel for sending outgoing frames to the multiplexer writer task.
-    tx_frames: mpsc::Sender<MuxFrame>,
+    /// Channel for sending outgoing frames to the multiplexer writer task with waker registration.
+    outbound: PollSender<MuxFrame>,
     /// Channel for receiving inbound data slices from the multiplexer reader task.
     rx_data: mpsc::Receiver<Bytes>,
     /// Partially consumed incoming slice from a previous read poll.
     read_buf: Option<Bytes>,
+    /// In-flight pending payload waiting for outbound channel capacity.
+    pending_payload: Option<(Bytes, usize)>,
     /// Flag indicating if local write direction has sent FIN.
     fin_sent: bool,
     /// Flag indicating if stream is terminated/reset.
@@ -39,9 +42,10 @@ impl MuxStream {
     ) -> Self {
         Self {
             stream_id,
-            tx_frames,
+            outbound: PollSender::new(tx_frames),
             rx_data,
             read_buf: None,
+            pending_payload: None,
             fin_sent: false,
             closed,
         }
@@ -92,7 +96,7 @@ impl AsyncRead for MuxStream {
 
 impl AsyncWrite for MuxStream {
     fn poll_write(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
@@ -107,21 +111,30 @@ impl AsyncWrite for MuxStream {
             return Poll::Ready(Ok(0));
         }
 
-        let chunk_size = std::cmp::min(buf.len(), MAX_FRAME_PAYLOAD_SIZE);
-        let payload = Bytes::copy_from_slice(&buf[..chunk_size]);
-        match self
-            .tx_frames
-            .try_send(MuxFrame::data(self.stream_id, payload))
-        {
-            Ok(()) => Poll::Ready(Ok(chunk_size)),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
+        let this = &mut *self;
+        if this.pending_payload.is_none() {
+            let chunk_size = std::cmp::min(buf.len(), MAX_FRAME_PAYLOAD_SIZE);
+            let payload = Bytes::copy_from_slice(&buf[..chunk_size]);
+            this.pending_payload = Some((payload, chunk_size));
+        }
+
+        match this.outbound.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => {
+                let (payload, chunk_size) = this.pending_payload.take().unwrap();
+                let frame = MuxFrame::data(this.stream_id, payload);
+                if this.outbound.send_item(frame).is_err() {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "Multiplexer session terminated",
+                    )));
+                }
+                Poll::Ready(Ok(chunk_size))
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(io::Error::new(
+            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::ConnectionReset,
                 "Multiplexer session terminated",
             ))),
+            Poll::Pending => Poll::Pending,
         }
     }
 
@@ -134,26 +147,26 @@ impl AsyncWrite for MuxStream {
             return Poll::Ready(Ok(()));
         }
 
-        match self.tx_frames.try_send(MuxFrame::fin(self.stream_id)) {
-            Ok(()) => {
-                self.fin_sent = true;
+        let this = &mut *self;
+        match this.outbound.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => {
+                let frame = MuxFrame::fin(this.stream_id);
+                let _ = this.outbound.send_item(frame);
+                this.fin_sent = true;
                 Poll::Ready(Ok(()))
             }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.fin_sent = true;
+            Poll::Ready(Err(_)) => {
+                this.fin_sent = true;
                 Poll::Ready(Ok(()))
             }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 
 impl TunnelStream for MuxStream {
     fn poll_check_alive(&mut self, _cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
-        if self.closed.load(Ordering::Relaxed) {
+        if self.closed.load(Ordering::Acquire) {
             Poll::Ready(HeartbeatStatus::Dead)
         } else {
             Poll::Ready(HeartbeatStatus::Alive)
@@ -167,7 +180,9 @@ impl Drop for MuxStream {
         if !is_already_closed && !self.fin_sent {
             // Unclean drop without graceful shutdown: emit RST to immediately inform peer
             // and trigger silent dropping of any remaining in-flight frames.
-            let _ = self.tx_frames.try_send(MuxFrame::rst(self.stream_id));
+            if let Some(sender) = self.outbound.get_ref() {
+                let _ = sender.try_send(MuxFrame::rst(self.stream_id));
+            }
         }
     }
 }

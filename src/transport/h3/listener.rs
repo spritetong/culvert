@@ -364,45 +364,51 @@ impl H3Listener {
                             let tx_clone = tx_streams.clone();
 
                             tokio::spawn(async move {
-                                // Read auth length
-                                let mut len_buf = [0u8; 4];
-                                if recv.read_exact(&mut len_buf).await.is_err() {
-                                    return;
-                                }
-                                let auth_len = u32::from_be_bytes(len_buf) as usize;
-                                if auth_len > 1024 {
-                                    return;
-                                }
-                                let mut auth_buf = vec![0u8; auth_len];
-                                if recv.read_exact(&mut auth_buf).await.is_err() {
-                                    return;
-                                }
-                                if let Some(ref token) = *auth_clone {
-                                    if !token.is_empty() && auth_buf != token.as_bytes() {
-                                        warn!("Raw QUIC authentication failed");
-                                        return;
+                                let handshake_fut = async {
+                                    // Read auth length
+                                    let mut len_buf = [0u8; 4];
+                                    recv.read_exact(&mut len_buf).await.map_err(|_| ())?;
+                                    let auth_len = u32::from_be_bytes(len_buf) as usize;
+                                    if auth_len > 1024 {
+                                        return Err(());
                                     }
-                                }
+                                    let mut auth_buf = vec![0u8; auth_len];
+                                    recv.read_exact(&mut auth_buf).await.map_err(|_| ())?;
+                                    if let Some(ref token) = *auth_clone {
+                                        if !token.is_empty() && auth_buf != token.as_bytes() {
+                                            warn!("Raw QUIC authentication failed");
+                                            return Err(());
+                                        }
+                                    }
 
-                                // Read metadata
-                                if recv.read_exact(&mut len_buf).await.is_err() {
-                                    return;
-                                }
-                                let meta_len = u32::from_be_bytes(len_buf) as usize;
-                                if meta_len > 65536 {
-                                    return;
-                                }
-                                let mut meta_buf = vec![0u8; meta_len];
-                                if recv.read_exact(&mut meta_buf).await.is_err() {
-                                    return;
-                                }
-                                let metadata: StreamMetadata = match rmp_serde::from_slice(&meta_buf) {
-                                    Ok(m) => m,
-                                    Err(_) => return,
+                                    // Read metadata
+                                    recv.read_exact(&mut len_buf).await.map_err(|_| ())?;
+                                    let meta_len = u32::from_be_bytes(len_buf) as usize;
+                                    if meta_len > 65536 {
+                                        return Err(());
+                                    }
+                                    let mut meta_buf = vec![0u8; meta_len];
+                                    recv.read_exact(&mut meta_buf).await.map_err(|_| ())?;
+                                    let metadata: StreamMetadata = match rmp_serde::from_slice(&meta_buf) {
+                                        Ok(m) => m,
+                                        Err(_) => return Err(()),
+                                    };
+
+                                    Ok((send, recv, metadata))
                                 };
 
-                                let tunnel_stream = Box::new(QuinnTunnelStream::new(send, recv)) as Box<dyn TunnelStream>;
-                                let _ = tx_clone.send((tunnel_stream, metadata)).await;
+                                match tokio::time::timeout(std::time::Duration::from_secs(10), handshake_fut).await {
+                                    Ok(Ok((send, recv, metadata))) => {
+                                        let tunnel_stream = Box::new(QuinnTunnelStream::new(send, recv)) as Box<dyn TunnelStream>;
+                                        let _ = tx_clone.send((tunnel_stream, metadata)).await;
+                                    }
+                                    Ok(Err(())) => {
+                                        debug!("Raw QUIC handshake aborted due to protocol error");
+                                    }
+                                    Err(_) => {
+                                        warn!("Raw QUIC inbound handshake timed out (10s)");
+                                    }
+                                }
                             });
                         }
                         Err(_) => break,

@@ -80,7 +80,18 @@ impl H3Connector {
 
     /// Establishes or returns an active QUIC connection to the target server.
     async fn get_or_connect(&self) -> Result<quinn::Connection, TunnelError> {
+        // Fast path: inspect under short lock
+        {
+            let guard = self.cached_quic_conn.lock().await;
+            if let Some(ref conn) = *guard {
+                if conn.close_reason().is_none() {
+                    return Ok(conn.clone());
+                }
+            }
+        }
+
         let mut guard = self.cached_quic_conn.lock().await;
+        // Double-check after acquiring write lock
         if let Some(ref conn) = *guard {
             if conn.close_reason().is_none() {
                 return Ok(conn.clone());
@@ -117,6 +128,41 @@ impl H3Connector {
         Ok(conn)
     }
 
+    /// Establishes and caches the H3 client sender with double-checked locking,
+    /// keeping subsequent multi-stream creation outside the lock.
+    async fn establish_h3_sender(
+        &self,
+    ) -> Result<h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>, TunnelError> {
+        let mut sender_guard = self.cached_h3_sender.lock().await;
+        if let Some(ref sender) = *sender_guard {
+            let quic_alive = {
+                let qguard = self.cached_quic_conn.lock().await;
+                qguard
+                    .as_ref()
+                    .map(|c| c.close_reason().is_none())
+                    .unwrap_or(false)
+            };
+            if quic_alive {
+                return Ok(sender.clone());
+            }
+        }
+
+        let conn = self.get_or_connect().await?;
+        let (mut driver, sender) = h3::client::builder()
+            .build::<_, _, Bytes>(h3_quinn::Connection::new(conn))
+            .await
+            .map_err(|e| {
+                TunnelError::ControlProtocol(format!("H3 handshake failed: {:?}", e))
+            })?;
+
+        tokio::spawn(async move {
+            let _ = driver.wait_idle().await;
+        });
+
+        *sender_guard = Some(sender.clone());
+        Ok(sender)
+    }
+
     /// Connects via standard HTTP/3 request stream.
     async fn connect_h3(
         &self,
@@ -124,42 +170,30 @@ impl H3Connector {
         session_id: Option<&str>,
         pool_idle: bool,
     ) -> Result<Box<dyn TunnelStream>, TunnelError> {
-        let mut sender_guard = self.cached_h3_sender.lock().await;
-        let mut send_request = None;
-
-        let quic_alive = {
-            let qguard = self.cached_quic_conn.lock().await;
-            qguard
-                .as_ref()
-                .map(|c| c.close_reason().is_none())
-                .unwrap_or(false)
+        // Fast path: clone cached sender with short lock duration
+        let existing_sender = {
+            let guard = self.cached_h3_sender.lock().await;
+            guard.clone()
         };
 
-        if !quic_alive {
-            *sender_guard = None;
-        } else if let Some(ref sender) = *sender_guard {
-            send_request = Some(sender.clone());
-        }
+        let send_request = if let Some(sender) = existing_sender {
+            let quic_alive = {
+                let qguard = self.cached_quic_conn.lock().await;
+                qguard
+                    .as_ref()
+                    .map(|c| c.close_reason().is_none())
+                    .unwrap_or(false)
+            };
+            if quic_alive {
+                sender
+            } else {
+                self.establish_h3_sender().await?
+            }
+        } else {
+            self.establish_h3_sender().await?
+        };
 
-        if send_request.is_none() {
-            let conn = self.get_or_connect().await?;
-            let (mut driver, sender) = h3::client::builder()
-                .build::<_, _, Bytes>(h3_quinn::Connection::new(conn))
-                .await
-                .map_err(|e| {
-                    TunnelError::ControlProtocol(format!("H3 handshake failed: {:?}", e))
-                })?;
-
-            tokio::spawn(async move {
-                let _ = driver.wait_idle().await;
-            });
-
-            *sender_guard = Some(sender.clone());
-            send_request = Some(sender);
-        }
-        drop(sender_guard);
-
-        let mut send_request = send_request.unwrap();
+        let mut send_request = send_request;
         let path = if self.endpoint.endpoint.path.is_empty() {
             "/tunnel"
         } else {
