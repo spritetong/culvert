@@ -48,7 +48,9 @@ impl TransportDriver for WsTransportDriver {
         let is_wss = listen_addr.starts_with("wss://") || listen_addr.starts_with("https://");
         let tls_acceptor = if is_wss || tls_cert.is_some() || tls_key.is_some() {
             let server_rustls =
-                crate::dialer::tls::TlsConfigBuilder::build_server_config(tls_cert, tls_key, None)?;
+                crate::dialer::tls::TlsConfigBuilder::build_server_config(
+                    tls_cert, tls_key, None, None, None,
+                )?;
             Some(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(
                 server_rustls,
             )))

@@ -3,7 +3,6 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use subtle::ConstantTimeEq;
 
 use bytes::Bytes;
 use http::{Response, StatusCode};
@@ -103,9 +102,11 @@ impl H3Listener {
         let path = Arc::new(path);
 
         tokio::spawn(async move {
+            let mut conn_tasks = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     _ = cancel_token.cancelled() => break,
+                    Some(_) = conn_tasks.join_next(), if !conn_tasks.is_empty() => continue,
                     incoming = endpoint.accept() => {
                         match incoming {
                             Some(incoming) => {
@@ -116,29 +117,43 @@ impl H3Listener {
                                         let tx_clone = tx_streams.clone();
                                         let cancel_conn = cancel_token.clone();
 
-                                        tokio::spawn(async move {
-                                            let alpn = {
-                                                let handshake_res = connecting.handshake_data().await;
-                                                handshake_res
-                                                    .ok()
-                                                    .and_then(|h| h.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
-                                                    .and_then(|h| h.protocol)
-                                            };
-                                            match connecting.await {
-                                                Ok(conn) => {
-                                                    Self::handle_connection(
-                                                        conn,
-                                                        alpn,
-                                                        is_quic_listener,
-                                                        auth_clone,
-                                                        path_clone,
-                                                        tx_clone,
-                                                        cancel_conn,
-                                                    ).await;
-                                                }
-                                                Err(e) => {
-                                                    debug!("QUIC handshake error: {:?}", e);
-                                                }
+                                        conn_tasks.spawn(async move {
+                                            let cancel_for_handler = cancel_conn.clone();
+                                            tokio::select! {
+                                                _ = cancel_conn.cancelled() => {}
+                                                _ = async {
+                                                    let handshake = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                                                        let alpn = {
+                                                            let handshake_res = connecting.handshake_data().await;
+                                                            handshake_res
+                                                                .ok()
+                                                                .and_then(|h| h.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+                                                                .and_then(|h| h.protocol)
+                                                        };
+                                                        let conn = connecting.await.map_err(|e| format!("{:?}", e))?;
+                                                        Ok::<_, String>((conn, alpn))
+                                                    }).await;
+
+                                                    match handshake {
+                                                        Ok(Ok((conn, alpn))) => {
+                                                            Self::handle_connection(
+                                                                conn,
+                                                                alpn,
+                                                                is_quic_listener,
+                                                                auth_clone,
+                                                                path_clone,
+                                                                tx_clone,
+                                                                cancel_for_handler,
+                                                            ).await;
+                                                        }
+                                                        Ok(Err(e)) => {
+                                                            debug!("QUIC handshake error: {:?}", e);
+                                                        }
+                                                        Err(_) => {
+                                                            warn!("QUIC incoming connection handshake timed out (10s)");
+                                                        }
+                                                    }
+                                                } => {}
                                             }
                                         });
                                     }
@@ -152,6 +167,8 @@ impl H3Listener {
                     }
                 }
             }
+            conn_tasks.abort_all();
+            while conn_tasks.join_next().await.is_some() {}
         });
     }
 
@@ -241,8 +258,8 @@ impl H3Listener {
                                         let expected_bearer = format!("Bearer {}", token);
                                         let is_authed = auth_header
                                             .map(|h| {
-                                                bool::from(h.as_bytes().ct_eq(expected_bearer.as_bytes()))
-                                                    || bool::from(h.as_bytes().ct_eq(token.as_bytes()))
+                                                crate::common::constant_time_token_eq(h.as_bytes(), expected_bearer.as_bytes())
+                                                    || crate::common::constant_time_token_eq(h.as_bytes(), token.as_bytes())
                                             })
                                             .unwrap_or(false);
 
@@ -379,7 +396,7 @@ impl H3Listener {
                                     let mut auth_buf = vec![0u8; auth_len];
                                     recv.read_exact(&mut auth_buf).await.map_err(|_| ())?;
                                     if let Some(ref token) = *auth_clone
-                                        && !token.is_empty() && bool::from(!auth_buf.as_slice().ct_eq(token.as_bytes())) {
+                                        && !token.is_empty() && !crate::common::constant_time_token_eq(auth_buf.as_slice(), token.as_bytes()) {
                                             warn!("Raw QUIC authentication failed");
                                             return Err(());
                                         }

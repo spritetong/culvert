@@ -45,6 +45,8 @@ impl TransportDriver for H3TransportDriver {
             tls_cert,
             tls_key,
             Some(alpn),
+            None,
+            None,
         )?;
 
         let listener = H3Listener::bind(listen_addr, auth_token, path, server_rustls)?;

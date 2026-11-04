@@ -7,7 +7,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 /// Manages a set of async tasks to ensure full lifecycle supervision and safe shutdown.
-/// Calling `abort()` on task handles is strictly prohibited.
+/// Tasks should always observe cooperative cancellation. Calling `abort()` directly on
+/// individual task handles during normal lifecycle is prohibited; `abort_all()` is reserved
+/// strictly as an emergency last-resort fallback when graceful cancellation exceeds the deadline.
 pub struct TaskTracker<T: 'static> {
     join_set: JoinSet<T>,
     cancel_token: CancellationToken,
@@ -65,11 +67,18 @@ impl<T: 'static> TaskTracker<T> {
     /// Signals all tasks to stop via the cancellation token and awaits their orderly completion.
     /// If graceful shutdown exceeds the 5-second deadline, remaining tasks are aborted.
     pub async fn shutdown_and_wait(&mut self) {
+        self.shutdown_and_wait_until(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await;
+    }
+
+    /// Signals cancellation and awaits completion until a specified instant deadline.
+    /// This prevents nested trackers from compounding multiple 5s delays.
+    pub async fn shutdown_and_wait_until(&mut self, deadline: tokio::time::Instant) {
         info!("Initiating graceful task shutdown via cancellation token...");
         self.cancel_token.cancel();
 
-        let deadline = tokio::time::sleep(std::time::Duration::from_secs(5));
-        tokio::pin!(deadline);
+        let sleep = tokio::time::sleep_until(deadline);
+        tokio::pin!(sleep);
 
         loop {
             tokio::select! {
@@ -80,8 +89,8 @@ impl<T: 'static> TaskTracker<T> {
                     }
                     None => break,
                 },
-                _ = &mut deadline => {
-                    tracing::warn!("Graceful shutdown timeout (5s), aborting remaining tasks");
+                _ = &mut sleep => {
+                    tracing::warn!("Graceful shutdown deadline reached, aborting remaining tasks");
                     self.join_set.abort_all();
                     while self.join_set.join_next().await.is_some() {}
                     break;

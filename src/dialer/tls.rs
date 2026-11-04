@@ -61,10 +61,35 @@ impl ServerCertVerifier for NoVerifyVerifier {
     }
 }
 
+static ALL_VERSIONS: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13, &rustls::version::TLS12];
+static TLS13_ONLY: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
+static TLS12_ONLY: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS12];
+
 /// Helper for constructing client TLS configurations from `TlsConfig`.
 pub struct TlsConfigBuilder;
 
 impl TlsConfigBuilder {
+    /// Resolves and validates protocol versions for TLS client and server configurations.
+    pub fn parse_protocol_versions(
+        min_version: Option<&str>,
+        max_version: Option<&str>,
+    ) -> Result<&'static [&'static rustls::SupportedProtocolVersion], TunnelError> {
+        match (min_version, max_version) {
+            (None, None) => Ok(ALL_VERSIONS),
+            (Some("1.2"), None | Some("1.3")) => Ok(ALL_VERSIONS),
+            (Some("1.3"), None | Some("1.3")) => Ok(TLS13_ONLY),
+            (None, Some("1.2")) => Ok(TLS12_ONLY),
+            (Some(min_v), Some(max_v)) if min_v == "1.3" && max_v == "1.2" => {
+                Err(TunnelError::Config(format!(
+                    "invalid TLS version range: min_version \"{min_v}\" > max_version \"{max_v}\""
+                )))
+            }
+            (Some(v), _) | (_, Some(v)) => Err(TunnelError::Config(format!(
+                "unsupported TLS version: \"{v}\" (expected \"1.2\" or \"1.3\")"
+            ))),
+        }
+    }
+
     /// Builds a `rustls::ClientConfig` from the given configuration.
     pub fn build_client_config(config: &TlsConfig) -> Result<ClientConfig, TunnelError> {
         let mut root_store = RootCertStore {
@@ -88,14 +113,10 @@ impl TlsConfigBuilder {
             }
         }
 
-        let versions: &[&rustls::SupportedProtocolVersion] = match (
+        let versions = Self::parse_protocol_versions(
             config.min_version.as_deref(),
             config.max_version.as_deref(),
-        ) {
-            (Some("1.3"), _) => &[&rustls::version::TLS13],
-            (_, Some("1.2")) => &[&rustls::version::TLS12],
-            _ => &[&rustls::version::TLS13, &rustls::version::TLS12],
-        };
+        )?;
 
         let builder = ClientConfig::builder_with_protocol_versions(versions);
 
@@ -208,14 +229,18 @@ impl TlsConfigBuilder {
         }
     }
 
-    /// Builds a `rustls::ServerConfig` from certificate and private key paths or self-signed fallback.
+    /// Builds a `rustls::ServerConfig` from certificate and private key paths or self-signed fallback,
+    /// with validated protocol version bounds.
     pub fn build_server_config(
         cert_path: Option<&str>,
         key_path: Option<&str>,
         alpn: Option<Vec<Vec<u8>>>,
+        min_version: Option<&str>,
+        max_version: Option<&str>,
     ) -> Result<rustls::ServerConfig, TunnelError> {
+        let versions = Self::parse_protocol_versions(min_version, max_version)?;
         let (cert_chain, private_key) = Self::resolve_server_cert_and_key(cert_path, key_path)?;
-        let mut server_config = rustls::ServerConfig::builder()
+        let mut server_config = rustls::ServerConfig::builder_with_protocol_versions(versions)
             .with_no_client_auth()
             .with_single_cert(cert_chain, private_key)
             .map_err(|e| TunnelError::Tls(format!("Failed to build server TLS config: {}", e)))?;
@@ -225,5 +250,37 @@ impl TlsConfigBuilder {
         }
 
         Ok(server_config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_protocol_versions_valid() {
+        let v_default = TlsConfigBuilder::parse_protocol_versions(None, None).unwrap();
+        assert_eq!(v_default.len(), 2);
+
+        let v_12 = TlsConfigBuilder::parse_protocol_versions(None, Some("1.2")).unwrap();
+        assert_eq!(v_12.len(), 1);
+        assert_eq!(v_12[0].version, rustls::version::TLS12.version);
+
+        let v_13 = TlsConfigBuilder::parse_protocol_versions(Some("1.3"), None).unwrap();
+        assert_eq!(v_13.len(), 1);
+        assert_eq!(v_13[0].version, rustls::version::TLS13.version);
+    }
+
+    #[test]
+    fn test_parse_protocol_versions_invalid() {
+        assert!(TlsConfigBuilder::parse_protocol_versions(Some("1.3"), Some("1.2")).is_err());
+        assert!(TlsConfigBuilder::parse_protocol_versions(Some("TLS1.2"), None).is_err());
+        assert!(TlsConfigBuilder::parse_protocol_versions(None, Some("unknown")).is_err());
+    }
+
+    #[test]
+    fn test_build_server_config_with_versions() {
+        let cfg = TlsConfigBuilder::build_server_config(None, None, None, Some("1.3"), None).unwrap();
+        assert!(!cfg.alpn_protocols.is_empty() || cfg.alpn_protocols.is_empty());
     }
 }

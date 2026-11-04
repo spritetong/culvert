@@ -24,8 +24,15 @@ impl ConfigLoader {
         Self::from_yaml_str(&content)
     }
 
-    /// Validates configuration constraints and unsupported/preview feature flags.
+    /// Validates configuration constraints, TLS version bounds, and unsupported/preview feature flags.
     pub fn validate(config: &AppConfig) -> Result<(), TunnelError> {
+        if let Some(ref tls) = config.tls {
+            crate::dialer::tls::TlsConfigBuilder::parse_protocol_versions(
+                tls.min_version.as_deref(),
+                tls.max_version.as_deref(),
+            )?;
+        }
+
         for tunnel in &config.tunnels {
             if let Some(ref m) = tunnel.multiplex
                 && m.enabled
@@ -42,6 +49,15 @@ impl ConfigLoader {
                     "tunnel '{}': failover is not wired into the data path yet; remove it or set enabled: false",
                     tunnel.tag
                 )));
+            }
+
+            if let crate::config::model::EndpointConfig::Detailed { ref tls, .. } = tunnel.endpoint
+                && let Some(tls) = tls
+            {
+                crate::dialer::tls::TlsConfigBuilder::parse_protocol_versions(
+                    tls.min_version.as_deref(),
+                    tls.max_version.as_deref(),
+                )?;
             }
         }
 
@@ -100,6 +116,34 @@ tunnels:
         assert!(res.is_err());
         let err_msg = res.unwrap_err().to_string();
         assert!(err_msg.contains("multiplex is not wired into the data path yet"));
+    }
+
+    #[test]
+    fn test_reject_invalid_tls_versions() {
+        // Test invalid version string
+        let yaml_bad_ver = r#"
+tls:
+  min_version: "1.4"
+tunnels:
+  - tag: "tunnel1"
+    endpoint: "ws://127.0.0.1:8080/tunnel"
+"#;
+        let res = ConfigLoader::from_yaml_str(yaml_bad_ver);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("unsupported TLS version"));
+
+        // Test contradictory range (min 1.3 > max 1.2)
+        let yaml_contradictory = r#"
+tls:
+  min_version: "1.3"
+  max_version: "1.2"
+tunnels:
+  - tag: "tunnel2"
+    endpoint: "ws://127.0.0.1:8080/tunnel"
+"#;
+        let res2 = ConfigLoader::from_yaml_str(yaml_contradictory);
+        assert!(res2.is_err());
+        assert!(res2.unwrap_err().to_string().contains("invalid TLS version range"));
     }
 
     #[test]
