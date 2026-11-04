@@ -1,7 +1,6 @@
 //! Tests for multi-mapping tunnels, shared connection pools, path matching, optional tokens, and retry supervision.
 //! All comments and docstrings must be in English.
 
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -14,10 +13,10 @@ use micro_tunnel::config::model::{
 };
 use micro_tunnel::supervisor::TunnelSupervisor;
 
-/// Helper to get an available random ephemeral port with anti-collision PID offset.
+/// Helper to get an available random ephemeral port from Suite 4 partition [41000, 46500).
 fn get_available_port() -> u16 {
     static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
-    let base = 47000 + (std::process::id() as u16 % 500) * 30;
+    let base = 41000 + (std::process::id() as u16 % 100) * 50;
     for _ in 0..500 {
         let offset = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
         let port = base.wrapping_add(offset);
@@ -33,11 +32,13 @@ fn get_available_port() -> u16 {
 }
 
 fn spawn_echo_server(
-    addr: SocketAddr,
     cancel_token: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let listener = TcpListener::bind(addr).await.unwrap();
+) -> (tokio::task::JoinHandle<()>, u16) {
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = std_listener.local_addr().unwrap().port();
+    std_listener.set_nonblocking(true).unwrap();
+    let listener = TcpListener::from_std(std_listener).unwrap();
+    let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => break,
@@ -54,24 +55,19 @@ fn spawn_echo_server(
                 }
             }
         }
-    })
+    });
+    (handle, port)
 }
 
 #[tokio::test]
 async fn test_multi_mapping_shared_pool_and_path_matching_e2e() {
     let cancel_token = CancellationToken::new();
 
-    let echo_target1_port = get_available_port();
-    let echo_target2_port = get_available_port();
+    let (echo1_handle, echo_target1_port) = spawn_echo_server(cancel_token.clone());
+    let (echo2_handle, echo_target2_port) = spawn_echo_server(cancel_token.clone());
     let server_ws_port = get_available_port();
     let map1_listen_port = get_available_port();
     let map2_listen_port = get_available_port();
-
-    let echo1_addr: SocketAddr = format!("127.0.0.1:{}", echo_target1_port).parse().unwrap();
-    let echo2_addr: SocketAddr = format!("127.0.0.1:{}", echo_target2_port).parse().unwrap();
-
-    let echo1_handle = spawn_echo_server(echo1_addr, cancel_token.clone());
-    let echo2_handle = spawn_echo_server(echo2_addr, cancel_token.clone());
 
     // Single unified AppConfig with Server + Tunnel containing multiple mappings
     let mut app_config = AppConfig {
@@ -150,7 +146,10 @@ async fn test_multi_mapping_shared_pool_and_path_matching_e2e() {
     tokio::time::timeout(
         Duration::from_secs(10),
         async {
-            let _ = tokio::join!(echo1_handle, echo2_handle, sup_handle);
+            let (r1, r2, r3) = tokio::join!(echo1_handle, echo2_handle, sup_handle);
+            r1.expect("echo1 handle panicked");
+            r2.expect("echo2 handle panicked");
+            r3.expect("sup handle panicked");
         },
     )
     .await
@@ -160,12 +159,9 @@ async fn test_multi_mapping_shared_pool_and_path_matching_e2e() {
 #[tokio::test]
 async fn test_path_mismatch_rejection() {
     let cancel_token = CancellationToken::new();
+    let (echo_handle, echo_port) = spawn_echo_server(cancel_token.clone());
     let server_ws_port = get_available_port();
     let client_listen_port = get_available_port();
-    let echo_port = get_available_port();
-
-    let echo_addr: SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
-    let echo_handle = spawn_echo_server(echo_addr, cancel_token.clone());
 
     let mut app_config = AppConfig {
         server: Some(ServerConfig {
@@ -219,7 +215,9 @@ async fn test_path_mismatch_rejection() {
     tokio::time::timeout(
         Duration::from_secs(10),
         async {
-            let _ = tokio::join!(echo_handle, sup_handle);
+            let (r1, r2) = tokio::join!(echo_handle, sup_handle);
+            r1.expect("echo handle panicked");
+            r2.expect("sup handle panicked");
         },
     )
     .await

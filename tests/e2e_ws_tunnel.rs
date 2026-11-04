@@ -1,7 +1,6 @@
 //! End-to-end integration tests for WebSocket tunnels.
 //! All comments and docstrings must be in English.
 
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,10 +19,10 @@ use micro_tunnel::transport::TransportRegistry;
 use micro_tunnel::transport::ws::WsTransportDriver;
 use micro_tunnel::tunnel::{run_forward_tunnel, run_reverse_tunnel};
 
-/// Helper to get an available random ephemeral port with anti-collision PID offset.
+/// Helper to get an available random ephemeral port from Suite 5 partition [48000, 53500).
 fn get_available_port() -> u16 {
     static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
-    let base = 49000 + (std::process::id() as u16 % 500) * 30;
+    let base = 48000 + (std::process::id() as u16 % 100) * 50;
     for _ in 0..500 {
         let offset = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
         let port = base.wrapping_add(offset);
@@ -39,15 +38,15 @@ fn get_available_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
-/// Spawns a simple TCP echo server that echoes all received data back to the client.
+/// Spawns a simple TCP echo server using held-listener handoff.
 fn spawn_echo_server(
-    addr: SocketAddr,
     cancel_token: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let listener = TcpListener::bind(addr)
-            .await
-            .expect("Failed to bind echo server");
+) -> (tokio::task::JoinHandle<()>, u16) {
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = std_listener.local_addr().unwrap().port();
+    std_listener.set_nonblocking(true).unwrap();
+    let listener = TcpListener::from_std(std_listener).unwrap();
+    let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => break,
@@ -63,7 +62,8 @@ fn spawn_echo_server(
                 }
             }
         }
-    })
+    });
+    (handle, port)
 }
 
 #[tokio::test]
@@ -73,17 +73,15 @@ async fn test_forward_tunnel_ws_e2e() {
         .try_init();
     let cancel_token = CancellationToken::new();
 
-    let echo_port = get_available_port();
+    let (echo_handle, echo_port) = spawn_echo_server(cancel_token.clone());
     let server_port = get_available_port();
     let client_port = get_available_port();
 
-    let echo_addr: SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
     let server_listen = format!("127.0.0.1:{}", server_port);
     let client_listen = format!("127.0.0.1:{}", client_port);
     let auth_token = "ws_test_token_secret_123";
 
-    // 1. Start echo server
-    let echo_handle = spawn_echo_server(echo_addr, cancel_token.clone());
+    // 1. Start ServerRunner (echo server already started via handoff)
 
     // 2. Setup transport registry and start ServerRunner
     let mut registry = TransportRegistry::new();
@@ -158,7 +156,10 @@ async fn test_forward_tunnel_ws_e2e() {
     tokio::time::timeout(
         Duration::from_secs(10),
         async {
-            let _ = tokio::join!(echo_handle, server_handle, client_handle);
+            let (r1, r2, r3) = tokio::join!(echo_handle, server_handle, client_handle);
+            r1.expect("echo handle panicked");
+            r2.expect("server handle panicked");
+            r3.expect("client handle panicked");
         },
     )
     .await
@@ -169,19 +170,15 @@ async fn test_forward_tunnel_ws_e2e() {
 async fn test_reverse_tunnel_ws_e2e() {
     let cancel_token = CancellationToken::new();
 
-    let local_echo_port = get_available_port();
+    let (echo_handle, local_echo_port) = spawn_echo_server(cancel_token.clone());
     let server_ws_port = get_available_port();
     let reverse_listen_port = get_available_port();
 
-    let local_echo_addr: SocketAddr = format!("127.0.0.1:{}", local_echo_port).parse().unwrap();
     let server_ws_listen = format!("127.0.0.1:{}", server_ws_port);
     let reverse_listen = format!("127.0.0.1:{}", reverse_listen_port);
     let auth_token = "ws_reverse_test_token_456";
 
-    // 1. Start local echo server
-    let echo_handle = spawn_echo_server(local_echo_addr, cancel_token.clone());
-
-    // 2. Setup transport registry and start ServerRunner
+    // 1. Setup transport registry and start ServerRunner (echo server started via handoff)
     let mut registry = TransportRegistry::new();
     registry.register(WsTransportDriver);
     let registry = Arc::new(registry);
@@ -257,7 +254,10 @@ async fn test_reverse_tunnel_ws_e2e() {
     tokio::time::timeout(
         Duration::from_secs(10),
         async {
-            let _ = tokio::join!(echo_handle, server_handle, client_handle);
+            let (r1, r2, r3) = tokio::join!(echo_handle, server_handle, client_handle);
+            r1.expect("echo handle panicked");
+            r2.expect("server handle panicked");
+            r3.expect("client handle panicked");
         },
     )
     .await
@@ -268,21 +268,15 @@ async fn test_reverse_tunnel_ws_e2e() {
 async fn test_supervisor_multi_tunnel_concurrency_e2e() {
     let cancel_token = CancellationToken::new();
 
-    let echo_fwd_port = get_available_port();
-    let echo_rev_port = get_available_port();
+    let (echo_fwd_handle, echo_fwd_port) = spawn_echo_server(cancel_token.clone());
+    let (echo_rev_handle, echo_rev_port) = spawn_echo_server(cancel_token.clone());
     let server_ws_port = get_available_port();
     let fwd_listen_port = get_available_port();
     let rev_listen_port = get_available_port();
 
-    let echo_fwd_addr: SocketAddr = format!("127.0.0.1:{}", echo_fwd_port).parse().unwrap();
-    let echo_rev_addr: SocketAddr = format!("127.0.0.1:{}", echo_rev_port).parse().unwrap();
     let auth_token = "supervisor_multi_test_token";
 
-    // 1. Start echo servers
-    let echo_fwd_handle = spawn_echo_server(echo_fwd_addr, cancel_token.clone());
-    let echo_rev_handle = spawn_echo_server(echo_rev_addr, cancel_token.clone());
-
-    // 2. Configure AppConfig with Server + Forward Tunnel + Reverse Tunnel concurrently
+    // 1. Configure AppConfig with Server + Forward Tunnel + Reverse Tunnel concurrently
     let mut app_config = AppConfig {
         server: Some(ServerConfig {
             listen: vec![format!("ws://127.0.0.1:{}/ws", server_ws_port)],
@@ -373,7 +367,10 @@ async fn test_supervisor_multi_tunnel_concurrency_e2e() {
     tokio::time::timeout(
         Duration::from_secs(10),
         async {
-            let _ = tokio::join!(echo_fwd_handle, echo_rev_handle, sup_handle);
+            let (r1, r2, r3) = tokio::join!(echo_fwd_handle, echo_rev_handle, sup_handle);
+            r1.expect("echo_fwd handle panicked");
+            r2.expect("echo_rev handle panicked");
+            r3.expect("sup handle panicked");
         },
     )
     .await

@@ -14,9 +14,10 @@ use micro_tunnel::transport::{TargetAddr, TransportConnector, TransportListener}
 
 use std::sync::atomic::{AtomicU16, Ordering};
 
+/// Helper to get an available ephemeral port from Suite 6 partition [55000, 60500).
 fn get_ephemeral_port() -> u16 {
     static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
-    let base = 51000 + (std::process::id() as u16 % 500) * 25;
+    let base = 55000 + (std::process::id() as u16 % 100) * 50;
     for _ in 0..500 {
         let offset = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
         let port = base.wrapping_add(offset);
@@ -32,6 +33,34 @@ fn get_ephemeral_port() -> u16 {
     let listener =
         std::net::UdpSocket::bind("127.0.0.1:0").expect("Failed to bind UDP ephemeral port");
     listener.local_addr().unwrap().port()
+}
+
+/// Spawns a simple TCP echo server using held-listener handoff.
+fn spawn_echo_server(
+    cancel_token: tokio_util::sync::CancellationToken,
+) -> (tokio::task::JoinHandle<()>, u16) {
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = std_listener.local_addr().unwrap().port();
+    std_listener.set_nonblocking(true).unwrap();
+    let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => break,
+                res = listener.accept() => {
+                    let (mut socket, _) = match res {
+                        Ok(c) => c,
+                        Err(_) => break,
+                    };
+                    tokio::spawn(async move {
+                        let (mut rd, mut wr) = socket.split();
+                        let _ = tokio::io::copy(&mut rd, &mut wr).await;
+                    });
+                }
+            }
+        }
+    });
+    (handle, port)
 }
 
 async fn connect_with_retry(addr: &str) -> tokio::net::TcpStream {
@@ -347,36 +376,14 @@ async fn test_h3_stream_multiplexing_over_single_quic_connection() {
 async fn test_h3_tunnel_pool_prewarm_and_activation_end_to_end() {
     let cancel_token = tokio_util::sync::CancellationToken::new();
 
-    let echo_port = get_ephemeral_port();
+    let (echo_handle, echo_port) = spawn_echo_server(cancel_token.clone());
     let server_h3_port = get_ephemeral_port();
     let client_listen_port = get_ephemeral_port();
 
-    let echo_addr: std::net::SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
     let server_h3_listen = format!("127.0.0.1:{}", server_h3_port);
     let client_listen = format!("127.0.0.1:{}", client_listen_port);
 
-    // 1. Spawn TCP echo service backend
-    let echo_cancel = cancel_token.clone();
-    let echo_handle = tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind(echo_addr).await.unwrap();
-        loop {
-            tokio::select! {
-                _ = echo_cancel.cancelled() => break,
-                res = listener.accept() => {
-                    let (mut socket, _) = match res {
-                        Ok(c) => c,
-                        Err(_) => break,
-                    };
-                    tokio::spawn(async move {
-                        let (mut rd, mut wr) = socket.split();
-                        let _ = tokio::io::copy(&mut rd, &mut wr).await;
-                    });
-                }
-            }
-        }
-    });
-
-    // 2. Setup server with H3 listener and self-signed cert, no token, path "/tunnel"
+    // 1. Setup server with H3 listener and self-signed cert, no token, path "/tunnel" (echo server started via handoff)
     let mut server_registry = micro_tunnel::transport::TransportRegistry::new();
     server_registry.register(micro_tunnel::transport::h3::H3TransportDriver);
     let server_registry = Arc::new(server_registry);
@@ -456,7 +463,10 @@ async fn test_h3_tunnel_pool_prewarm_and_activation_end_to_end() {
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
         async {
-            let _ = tokio::join!(echo_handle, server_handle, client_handle);
+            let (r1, r2, r3) = tokio::join!(echo_handle, server_handle, client_handle);
+            r1.expect("echo_handle panicked");
+            r2.expect("server_handle panicked");
+            r3.expect("client_handle panicked");
         },
     )
     .await
@@ -467,36 +477,14 @@ async fn test_h3_tunnel_pool_prewarm_and_activation_end_to_end() {
 async fn test_quic_raw_tunnel_pool_prewarm_and_activation_end_to_end() {
     let cancel_token = tokio_util::sync::CancellationToken::new();
 
-    let echo_port = get_ephemeral_port();
+    let (echo_handle, echo_port) = spawn_echo_server(cancel_token.clone());
     let server_quic_port = get_ephemeral_port();
     let client_listen_port = get_ephemeral_port();
 
-    let echo_addr: std::net::SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
     let server_quic_listen = format!("127.0.0.1:{}", server_quic_port);
     let client_listen = format!("127.0.0.1:{}", client_listen_port);
 
-    // 1. Spawn TCP echo service backend
-    let echo_cancel = cancel_token.clone();
-    let echo_handle = tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind(echo_addr).await.unwrap();
-        loop {
-            tokio::select! {
-                _ = echo_cancel.cancelled() => break,
-                res = listener.accept() => {
-                    let (mut socket, _) = match res {
-                        Ok(c) => c,
-                        Err(_) => break,
-                    };
-                    tokio::spawn(async move {
-                        let (mut rd, mut wr) = socket.split();
-                        let _ = tokio::io::copy(&mut rd, &mut wr).await;
-                    });
-                }
-            }
-        }
-    });
-
-    // 2. Setup server with raw QUIC listener and self-signed cert
+    // 1. Setup server with raw QUIC listener and self-signed cert (echo server started via handoff)
     let mut server_registry = micro_tunnel::transport::TransportRegistry::new();
     server_registry.register(micro_tunnel::transport::h3::H3TransportDriver);
     let server_registry = Arc::new(server_registry);
@@ -574,7 +562,10 @@ async fn test_quic_raw_tunnel_pool_prewarm_and_activation_end_to_end() {
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
         async {
-            let _ = tokio::join!(echo_handle, server_handle, client_handle);
+            let (r1, r2, r3) = tokio::join!(echo_handle, server_handle, client_handle);
+            r1.expect("echo_handle panicked");
+            r2.expect("server_handle panicked");
+            r3.expect("client_handle panicked");
         },
     )
     .await
@@ -585,19 +576,20 @@ async fn test_quic_raw_tunnel_pool_prewarm_and_activation_end_to_end() {
 async fn test_quic_raw_forward_stress_throughput() {
     let cancel_token = tokio_util::sync::CancellationToken::new();
 
-    let sink_port = get_ephemeral_port();
     let server_quic_port = get_ephemeral_port();
     let client_listen_port = get_ephemeral_port();
 
-    let sink_addr: std::net::SocketAddr = format!("127.0.0.1:{}", sink_port).parse().unwrap();
     let server_quic_listen = format!("127.0.0.1:{}", server_quic_port);
     let client_listen = format!("127.0.0.1:{}", client_listen_port);
 
     // 1. Spawn TCP sink service backend (reads all bytes until EOF and counts)
     let sink_cancel = cancel_token.clone();
     let (tx_total, rx_total) = tokio::sync::oneshot::channel::<usize>();
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let sink_port = std_listener.local_addr().unwrap().port();
+    std_listener.set_nonblocking(true).unwrap();
+    let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
     let sink_handle = tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind(sink_addr).await.unwrap();
         tokio::select! {
             _ = sink_cancel.cancelled() => {}
             res = listener.accept() => {
@@ -697,7 +689,10 @@ async fn test_quic_raw_forward_stress_throughput() {
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
         async {
-            let _ = tokio::join!(sink_handle, server_handle, client_handle);
+            let (r1, r2, r3) = tokio::join!(sink_handle, server_handle, client_handle);
+            r1.expect("sink_handle panicked");
+            r2.expect("server_handle panicked");
+            r3.expect("client_handle panicked");
         },
     )
     .await
@@ -708,36 +703,14 @@ async fn test_quic_raw_forward_stress_throughput() {
 async fn test_h3_concurrent_forward_stress() {
     let cancel_token = tokio_util::sync::CancellationToken::new();
 
-    let echo_port = get_ephemeral_port();
+    let (echo_handle, echo_port) = spawn_echo_server(cancel_token.clone());
     let server_h3_port = get_ephemeral_port();
     let client_listen_port = get_ephemeral_port();
 
-    let echo_addr: std::net::SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
     let server_h3_listen = format!("127.0.0.1:{}", server_h3_port);
     let client_listen = format!("127.0.0.1:{}", client_listen_port);
 
-    // 1. Spawn TCP echo service backend
-    let echo_cancel = cancel_token.clone();
-    let echo_handle = tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind(echo_addr).await.unwrap();
-        loop {
-            tokio::select! {
-                _ = echo_cancel.cancelled() => break,
-                res = listener.accept() => {
-                    let (mut socket, _) = match res {
-                        Ok(c) => c,
-                        Err(_) => break,
-                    };
-                    tokio::spawn(async move {
-                        let (mut rd, mut wr) = socket.split();
-                        let _ = tokio::io::copy(&mut rd, &mut wr).await;
-                    });
-                }
-            }
-        }
-    });
-
-    // 2. Setup server with H3 listener
+    // 1. Setup server with H3 listener (echo server started via handoff)
     let mut server_registry = micro_tunnel::transport::TransportRegistry::new();
     server_registry.register(micro_tunnel::transport::h3::H3TransportDriver);
     let server_registry = Arc::new(server_registry);
@@ -843,7 +816,10 @@ async fn test_h3_concurrent_forward_stress() {
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
         async {
-            let _ = tokio::join!(echo_handle, server_handle, client_handle);
+            let (r1, r2, r3) = tokio::join!(echo_handle, server_handle, client_handle);
+            r1.expect("echo_handle panicked");
+            r2.expect("server_handle panicked");
+            r3.expect("client_handle panicked");
         },
     )
     .await

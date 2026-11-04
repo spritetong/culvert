@@ -1,7 +1,6 @@
 //! Test standalone direct WSS termination with self-signed certificate fallback.
 //! All comments and docstrings must be in English.
 
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -13,10 +12,10 @@ use micro_tunnel::config::model::{
 };
 use micro_tunnel::supervisor::TunnelSupervisor;
 
-/// Helper to get an available random ephemeral port with anti-collision PID offset.
+/// Helper to get an available random ephemeral port from Suite 3 partition [34000, 39500).
 fn get_available_port() -> u16 {
     static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
-    let base = 45000 + (std::process::id() as u16 % 500) * 30;
+    let base = 34000 + (std::process::id() as u16 % 100) * 50;
     for _ in 0..500 {
         let offset = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
         let port = base.wrapping_add(offset);
@@ -32,11 +31,13 @@ fn get_available_port() -> u16 {
 }
 
 fn spawn_echo_server(
-    addr: SocketAddr,
     cancel_token: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let listener = TcpListener::bind(addr).await.unwrap();
+) -> (tokio::task::JoinHandle<()>, u16) {
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = std_listener.local_addr().unwrap().port();
+    std_listener.set_nonblocking(true).unwrap();
+    let listener = TcpListener::from_std(std_listener).unwrap();
+    let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => break,
@@ -53,7 +54,8 @@ fn spawn_echo_server(
                 }
             }
         }
-    })
+    });
+    (handle, port)
 }
 
 #[tokio::test]
@@ -63,12 +65,10 @@ async fn test_standalone_wss_server_self_signed_direct_termination() {
         .try_init();
     let cancel_token = CancellationToken::new();
 
-    let echo_port = get_available_port();
     let server_wss_port = get_available_port();
     let client_listen_port = get_available_port();
 
-    let echo_addr: SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
-    let echo_handle = spawn_echo_server(echo_addr, cancel_token.clone());
+    let (echo_handle, echo_port) = spawn_echo_server(cancel_token.clone());
 
     // 1. Configure Server with standalone wss:// without providing cert/key files -> auto self-signed
     let mut app_config = AppConfig {
@@ -140,7 +140,9 @@ async fn test_standalone_wss_server_self_signed_direct_termination() {
     tokio::time::timeout(
         Duration::from_secs(10),
         async {
-            let _ = tokio::join!(echo_handle, sup_handle);
+            let (r1, r2) = tokio::join!(echo_handle, sup_handle);
+            r1.expect("echo_handle panicked");
+            r2.expect("sup_handle panicked");
         },
     )
     .await

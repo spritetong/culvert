@@ -29,10 +29,10 @@ use micro_tunnel::tunnel::{run_forward_tunnel, run_reverse_tunnel};
 
 use std::sync::atomic::{AtomicU16, Ordering};
 
-/// Helper to get an available random ephemeral port with anti-collision PID offset.
+/// Helper to get an available random ephemeral port from Suite 1 partition [20000, 25500).
 fn get_available_port() -> u16 {
     static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
-    let base = 41000 + (std::process::id() as u16 % 500) * 30;
+    let base = 20000 + (std::process::id() as u16 % 100) * 50;
     for _ in 0..500 {
         let offset = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
         let port = base.wrapping_add(offset);
@@ -183,18 +183,19 @@ fn generate_test_pki() -> TestPki {
 }
 
 /// Spawns a TLS-terminating server ingress proxy (simulating Caddy or direct TLS terminator)
-/// that decrypts TLS traffic and forwards plain TCP to the ServerRunner WsListener.
+/// using held-listener handoff to eliminate TOCTOU.
 fn spawn_tls_terminator(
-    tls_listen_addr: SocketAddr,
     backend_plain_addr: SocketAddr,
     tls_config: Arc<RustlsServerConfig>,
     cancel_token: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
+) -> (tokio::task::JoinHandle<()>, u16) {
     let acceptor = TlsAcceptor::from(tls_config);
-    tokio::spawn(async move {
-        let listener = TcpListener::bind(tls_listen_addr)
-            .await
-            .expect("Failed to bind TLS terminator");
+    let std_listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind TLS terminator");
+    let port = std_listener.local_addr().unwrap().port();
+    std_listener.set_nonblocking(true).unwrap();
+    let listener = TcpListener::from_std(std_listener).unwrap();
+    let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => break,
@@ -227,18 +228,20 @@ fn spawn_tls_terminator(
                 }
             }
         }
-    })
+    });
+    (handle, port)
 }
 
-/// Spawns a simple TCP echo server.
+/// Spawns a simple TCP echo server using held-listener handoff to eliminate TOCTOU.
 fn spawn_echo_server(
-    addr: SocketAddr,
     cancel_token: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let listener = TcpListener::bind(addr)
-            .await
-            .expect("Failed to bind echo server");
+) -> (tokio::task::JoinHandle<()>, u16) {
+    let std_listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind echo server");
+    let port = std_listener.local_addr().unwrap().port();
+    std_listener.set_nonblocking(true).unwrap();
+    let listener = TcpListener::from_std(std_listener).unwrap();
+    let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => break,
@@ -254,7 +257,8 @@ fn spawn_echo_server(
                 }
             }
         }
-    })
+    });
+    (handle, port)
 }
 
 #[tokio::test]
@@ -262,20 +266,16 @@ async fn test_wss_forward_tunnel_with_custom_ca_and_sni() {
     let cancel_token = CancellationToken::new();
     let pki = generate_test_pki();
 
-    let echo_port = get_available_port();
     let backend_server_port = get_available_port();
-    let tls_ingress_port = get_available_port();
     let client_listen_port = get_available_port();
 
-    let echo_addr: SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
     let backend_addr: SocketAddr = format!("127.0.0.1:{}", backend_server_port)
         .parse()
         .unwrap();
-    let tls_addr: SocketAddr = format!("127.0.0.1:{}", tls_ingress_port).parse().unwrap();
     let auth_token = "secure_wss_test_token";
 
-    // 1. Echo server
-    let echo_handle = spawn_echo_server(echo_addr, cancel_token.clone());
+    // 1. Echo server with held-listener handoff
+    let (echo_handle, echo_port) = spawn_echo_server(cancel_token.clone());
 
     // 2. Micro-tunnel ServerRunner (backend plain listener)
     let mut registry = TransportRegistry::new();
@@ -299,9 +299,8 @@ async fn test_wss_forward_tunnel_with_custom_ca_and_sni() {
         let _ = server_runner.run(s_cancel).await;
     });
 
-    // 3. TLS Terminator (Caddy simulator) terminating TLS with server.crt and forwarding to backend
-    let tls_handle = spawn_tls_terminator(
-        tls_addr,
+    // 3. TLS Terminator with held-listener handoff
+    let (tls_handle, tls_ingress_port) = spawn_tls_terminator(
         backend_addr,
         pki.server_rustls_config.clone(),
         cancel_token.clone(),
@@ -370,7 +369,11 @@ async fn test_wss_forward_tunnel_with_custom_ca_and_sni() {
     tokio::time::timeout(
         Duration::from_secs(10),
         async {
-            let _ = tokio::join!(echo_handle, server_handle, tls_handle, client_handle);
+            let (r1, r2, r3, r4) = tokio::join!(echo_handle, server_handle, tls_handle, client_handle);
+            r1.expect("echo_handle panicked");
+            r2.expect("server_handle panicked");
+            r3.expect("tls_handle panicked");
+            r4.expect("client_handle panicked");
         },
     )
     .await
@@ -382,19 +385,15 @@ async fn test_wss_forward_tunnel_insecure_mode() {
     let cancel_token = CancellationToken::new();
     let pki = generate_test_pki();
 
-    let echo_port = get_available_port();
     let backend_server_port = get_available_port();
-    let tls_ingress_port = get_available_port();
     let client_listen_port = get_available_port();
 
-    let echo_addr: SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
     let backend_addr: SocketAddr = format!("127.0.0.1:{}", backend_server_port)
         .parse()
         .unwrap();
-    let tls_addr: SocketAddr = format!("127.0.0.1:{}", tls_ingress_port).parse().unwrap();
     let auth_token = "insecure_wss_test_token";
 
-    let echo_handle = spawn_echo_server(echo_addr, cancel_token.clone());
+    let (echo_handle, echo_port) = spawn_echo_server(cancel_token.clone());
 
     let mut registry = TransportRegistry::new();
     registry.register(WsTransportDriver);
@@ -417,8 +416,7 @@ async fn test_wss_forward_tunnel_insecure_mode() {
         let _ = server_runner.run(s_cancel).await;
     });
 
-    let tls_handle = spawn_tls_terminator(
-        tls_addr,
+    let (tls_handle, tls_ingress_port) = spawn_tls_terminator(
         backend_addr,
         pki.server_rustls_config.clone(),
         cancel_token.clone(),
@@ -484,7 +482,11 @@ async fn test_wss_forward_tunnel_insecure_mode() {
     tokio::time::timeout(
         Duration::from_secs(10),
         async {
-            let _ = tokio::join!(echo_handle, server_handle, tls_handle, client_handle);
+            let (r1, r2, r3, r4) = tokio::join!(echo_handle, server_handle, tls_handle, client_handle);
+            r1.expect("echo_handle panicked");
+            r2.expect("server_handle panicked");
+            r3.expect("tls_handle panicked");
+            r4.expect("client_handle panicked");
         },
     )
     .await
@@ -496,19 +498,15 @@ async fn test_wss_mtls_mutual_authentication() {
     let cancel_token = CancellationToken::new();
     let pki = generate_test_pki();
 
-    let echo_port = get_available_port();
     let backend_server_port = get_available_port();
-    let tls_ingress_port = get_available_port();
     let client_listen_port = get_available_port();
 
-    let echo_addr: SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
     let backend_addr: SocketAddr = format!("127.0.0.1:{}", backend_server_port)
         .parse()
         .unwrap();
-    let tls_addr: SocketAddr = format!("127.0.0.1:{}", tls_ingress_port).parse().unwrap();
     let auth_token = "mtls_wss_test_token";
 
-    let echo_handle = spawn_echo_server(echo_addr, cancel_token.clone());
+    let (echo_handle, echo_port) = spawn_echo_server(cancel_token.clone());
 
     let mut registry = TransportRegistry::new();
     registry.register(WsTransportDriver);
@@ -532,8 +530,7 @@ async fn test_wss_mtls_mutual_authentication() {
     });
 
     // Server requires mTLS with Root CA validation
-    let tls_handle = spawn_tls_terminator(
-        tls_addr,
+    let (tls_handle, tls_ingress_port) = spawn_tls_terminator(
         backend_addr,
         pki.mtls_server_rustls_config.clone(),
         cancel_token.clone(),
@@ -602,7 +599,11 @@ async fn test_wss_mtls_mutual_authentication() {
     tokio::time::timeout(
         Duration::from_secs(10),
         async {
-            let _ = tokio::join!(echo_handle, server_handle, tls_handle, client_handle);
+            let (r1, r2, r3, r4) = tokio::join!(echo_handle, server_handle, tls_handle, client_handle);
+            r1.expect("echo_handle panicked");
+            r2.expect("server_handle panicked");
+            r3.expect("tls_handle panicked");
+            r4.expect("client_handle panicked");
         },
     )
     .await
@@ -614,20 +615,16 @@ async fn test_wss_reverse_tunnel_e2e() {
     let cancel_token = CancellationToken::new();
     let pki = generate_test_pki();
 
-    let local_echo_port = get_available_port();
     let backend_server_port = get_available_port();
-    let tls_ingress_port = get_available_port();
     let reverse_listen_port = get_available_port();
 
-    let local_echo_addr: SocketAddr = format!("127.0.0.1:{}", local_echo_port).parse().unwrap();
     let backend_addr: SocketAddr = format!("127.0.0.1:{}", backend_server_port)
         .parse()
         .unwrap();
-    let tls_addr: SocketAddr = format!("127.0.0.1:{}", tls_ingress_port).parse().unwrap();
     let auth_token = "wss_reverse_secret_token";
 
-    // 1. Local Echo Server
-    let echo_handle = spawn_echo_server(local_echo_addr, cancel_token.clone());
+    // 1. Local Echo Server with held-listener handoff
+    let (echo_handle, local_echo_port) = spawn_echo_server(cancel_token.clone());
 
     // 2. Micro-tunnel ServerRunner
     let mut registry = TransportRegistry::new();
@@ -651,9 +648,8 @@ async fn test_wss_reverse_tunnel_e2e() {
         let _ = server_runner.run(s_cancel).await;
     });
 
-    // 3. TLS Terminator
-    let tls_handle = spawn_tls_terminator(
-        tls_addr,
+    // 3. TLS Terminator with held-listener handoff
+    let (tls_handle, tls_ingress_port) = spawn_tls_terminator(
         backend_addr,
         pki.server_rustls_config.clone(),
         cancel_token.clone(),
@@ -723,7 +719,11 @@ async fn test_wss_reverse_tunnel_e2e() {
     tokio::time::timeout(
         Duration::from_secs(10),
         async {
-            let _ = tokio::join!(echo_handle, server_handle, tls_handle, client_handle);
+            let (r1, r2, r3, r4) = tokio::join!(echo_handle, server_handle, tls_handle, client_handle);
+            r1.expect("echo_handle panicked");
+            r2.expect("server_handle panicked");
+            r3.expect("tls_handle panicked");
+            r4.expect("client_handle panicked");
         },
     )
     .await
@@ -815,7 +815,8 @@ async fn test_wss_server_tls_version_enforcement() {
     tokio::time::timeout(
         Duration::from_secs(10),
         async {
-            let _ = tokio::join!(server_handle);
+            let (r,) = tokio::join!(server_handle);
+            r.expect("server_handle panicked");
         },
     )
     .await
@@ -916,7 +917,8 @@ async fn test_wss_server_inherits_global_tls_config() {
     tokio::time::timeout(
         Duration::from_secs(10),
         async {
-            let _ = tokio::join!(server_handle);
+            let (r,) = tokio::join!(server_handle);
+            r.expect("server_handle panicked");
         },
     )
     .await

@@ -278,7 +278,7 @@ impl ServerRunner {
     }
 
     /// Handles a reverse control channel: binds requested port on server and notifies client.
-    async fn handle_reverse_control(
+    pub(crate) async fn handle_reverse_control(
         stream: Box<dyn crate::core::stream::TunnelStream>,
         session_mgr: Arc<SessionManager>,
         cancel_token: CancellationToken,
@@ -424,5 +424,42 @@ impl ServerRunner {
 
         local_tracker.shutdown_and_wait().await;
         info!(addr = %listen_addr, "Reverse listener closed.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn test_server_reverse_control_cancellation_under_silent_client() {
+        let (client, server) = tokio::io::duplex(4096);
+        let _server_holder = tokio::spawn(async move {
+            let mut s = server;
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = tokio::io::AsyncReadExt::read(&mut s, &mut buf).await {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+
+        let session_mgr = Arc::new(SessionManager::new());
+        let cancel_token = CancellationToken::new();
+        let cancel_clone = cancel_token.clone();
+
+        let handle = tokio::spawn(async move {
+            ServerRunner::handle_reverse_control(Box::new(client), session_mgr, cancel_clone).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel_token.cancel();
+
+        let res = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(
+            res.is_ok(),
+            "handle_reverse_control hung on silent client despite cancellation token!"
+        );
     }
 }

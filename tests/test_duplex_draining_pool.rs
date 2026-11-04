@@ -2,7 +2,6 @@
 //! and connection pool pre-warming / reuse.
 //! All comments and docstrings must be in English.
 
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,10 +19,10 @@ use micro_tunnel::transport::TransportRegistry;
 use micro_tunnel::transport::ws::WsTransportDriver;
 use micro_tunnel::tunnel::run_forward_tunnel;
 
-/// Helper to get an available random ephemeral port with anti-collision PID offset.
+/// Helper to get an available random ephemeral port from Suite 2 partition [27000, 32500).
 fn get_available_port() -> u16 {
     static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
-    let base = 43000 + (std::process::id() as u16 % 500) * 30;
+    let base = 27000 + (std::process::id() as u16 % 100) * 50;
     for _ in 0..500 {
         let offset = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
         let port = base.wrapping_add(offset);
@@ -39,15 +38,16 @@ fn get_available_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
-/// Spawns a full-duplex echo server that echoes all received data back.
+/// Spawns a full-duplex echo server using held-listener handoff to eliminate TOCTOU.
 fn spawn_echo_server(
-    addr: SocketAddr,
     cancel_token: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let listener = TcpListener::bind(addr)
-            .await
-            .expect("Failed to bind echo server");
+) -> (tokio::task::JoinHandle<()>, u16) {
+    let std_listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind echo server");
+    let port = std_listener.local_addr().unwrap().port();
+    std_listener.set_nonblocking(true).unwrap();
+    let listener = TcpListener::from_std(std_listener).unwrap();
+    let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => break,
@@ -63,23 +63,22 @@ fn spawn_echo_server(
                 }
             }
         }
-    })
+    });
+    (handle, port)
 }
 
 #[tokio::test]
 async fn test_high_volume_duplex_stream_integrity() {
     let cancel_token = CancellationToken::new();
 
-    let echo_port = get_available_port();
     let server_ws_port = get_available_port();
     let client_listen_port = get_available_port();
 
-    let echo_addr: SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
     let server_ws_listen = format!("127.0.0.1:{}", server_ws_port);
     let client_listen = format!("127.0.0.1:{}", client_listen_port);
     let auth_token = "high_volume_test_token";
 
-    let echo_handle = spawn_echo_server(echo_addr, cancel_token.clone());
+    let (echo_handle, echo_port) = spawn_echo_server(cancel_token.clone());
 
     let mut registry = TransportRegistry::new();
     registry.register(WsTransportDriver);
@@ -175,7 +174,10 @@ async fn test_high_volume_duplex_stream_integrity() {
     tokio::time::timeout(
         Duration::from_secs(10),
         async {
-            let _ = tokio::join!(echo_handle, server_handle, client_handle);
+            let (r1, r2, r3) = tokio::join!(echo_handle, server_handle, client_handle);
+            r1.expect("echo_handle panicked");
+            r2.expect("server_handle panicked");
+            r3.expect("client_handle panicked");
         },
     )
     .await
@@ -186,13 +188,15 @@ async fn test_high_volume_duplex_stream_integrity() {
 async fn test_stream_half_close_and_draining() {
     let cancel_token = CancellationToken::new();
 
-    let backend_service_port = get_available_port();
+    let backend_listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind backend listener");
+    let backend_service_port = backend_listener.local_addr().unwrap().port();
+    backend_listener.set_nonblocking(true).unwrap();
+    let tokio_backend_listener = TcpListener::from_std(backend_listener).unwrap();
+
     let server_ws_port = get_available_port();
     let client_listen_port = get_available_port();
 
-    let backend_addr: SocketAddr = format!("127.0.0.1:{}", backend_service_port)
-        .parse()
-        .unwrap();
     let server_ws_listen = format!("127.0.0.1:{}", server_ws_port);
     let client_listen = format!("127.0.0.1:{}", client_listen_port);
     let auth_token = "draining_test_token";
@@ -200,14 +204,16 @@ async fn test_stream_half_close_and_draining() {
     // Backend service that reads until EOF (half-close draining), then responds
     let service_cancel = cancel_token.clone();
     let backend_handle = tokio::spawn(async move {
-        let listener = TcpListener::bind(backend_addr).await.unwrap();
         tokio::select! {
             _ = service_cancel.cancelled() => {}
-            res = listener.accept() => {
+            res = tokio_backend_listener.accept() => {
                 let (mut socket, _) = res.unwrap();
                 let mut buf = Vec::new();
-                // Read all data until client sends FIN (half-close)
-                socket.read_to_end(&mut buf).await.unwrap();
+                // Read all data until client sends FIN (half-close) with bounded timeout
+                tokio::time::timeout(Duration::from_secs(10), socket.read_to_end(&mut buf))
+                    .await
+                    .expect("Timeout reading client FIN in draining backend")
+                    .unwrap();
 
                 // Respond with confirmation and received size
                 let reply = format!("DRAINED_TOTAL_{}", buf.len());
@@ -286,7 +292,10 @@ async fn test_stream_half_close_and_draining() {
     tokio::time::timeout(
         Duration::from_secs(10),
         async {
-            let _ = tokio::join!(backend_handle, server_handle, client_handle);
+            let (r1, r2, r3) = tokio::join!(backend_handle, server_handle, client_handle);
+            r1.expect("backend_handle panicked");
+            r2.expect("server_handle panicked");
+            r3.expect("client_handle panicked");
         },
     )
     .await
@@ -297,16 +306,14 @@ async fn test_stream_half_close_and_draining() {
 async fn test_pool_prewarm_and_reuse() {
     let cancel_token = CancellationToken::new();
 
-    let echo_port = get_available_port();
     let server_ws_port = get_available_port();
     let client_listen_port = get_available_port();
 
-    let echo_addr: SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
     let server_ws_listen = format!("127.0.0.1:{}", server_ws_port);
     let client_listen = format!("127.0.0.1:{}", client_listen_port);
     let auth_token = "pool_reuse_test_token";
 
-    let echo_handle = spawn_echo_server(echo_addr, cancel_token.clone());
+    let (echo_handle, echo_port) = spawn_echo_server(cancel_token.clone());
 
     let mut registry = TransportRegistry::new();
     registry.register(WsTransportDriver);
@@ -381,7 +388,10 @@ async fn test_pool_prewarm_and_reuse() {
     tokio::time::timeout(
         Duration::from_secs(10),
         async {
-            let _ = tokio::join!(echo_handle, server_handle, client_handle);
+            let (r1, r2, r3) = tokio::join!(echo_handle, server_handle, client_handle);
+            r1.expect("echo_handle panicked");
+            r2.expect("server_handle panicked");
+            r3.expect("client_handle panicked");
         },
     )
     .await
@@ -392,16 +402,14 @@ async fn test_pool_prewarm_and_reuse() {
 async fn test_pool_resilience_after_disconnect_and_high_churn() {
     let cancel_token = CancellationToken::new();
 
-    let echo_port = get_available_port();
     let server_ws_port = get_available_port();
     let client_listen_port = get_available_port();
 
-    let echo_addr: SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
     let server_ws_listen = format!("127.0.0.1:{}", server_ws_port);
     let client_listen = format!("127.0.0.1:{}", client_listen_port);
     let auth_token = "pool_churn_test_token";
 
-    let echo_handle = spawn_echo_server(echo_addr, cancel_token.clone());
+    let (echo_handle, echo_port) = spawn_echo_server(cancel_token.clone());
 
     let mut registry = TransportRegistry::new();
     registry.register(WsTransportDriver);
@@ -500,7 +508,10 @@ async fn test_pool_resilience_after_disconnect_and_high_churn() {
     tokio::time::timeout(
         Duration::from_secs(10),
         async {
-            let _ = tokio::join!(echo_handle, server_handle, client_handle);
+            let (r1, r2, r3) = tokio::join!(echo_handle, server_handle, client_handle);
+            r1.expect("echo_handle panicked");
+            r2.expect("server_handle panicked");
+            r3.expect("client_handle panicked");
         },
     )
     .await
