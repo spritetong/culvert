@@ -1278,6 +1278,7 @@ dependencies = [
  "serde",
  "serde_yaml",
  "socket2",
+ "subtle",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",

@@ -18,6 +18,7 @@ use crate::core::stream::{HeartbeatStatus, TunnelStream};
 pub struct QuinnTunnelStream {
     send: quinn::SendStream,
     recv: quinn::RecvStream,
+    conn: Option<quinn::Connection>,
     shutdown_done: bool,
 }
 
@@ -27,8 +28,15 @@ impl QuinnTunnelStream {
         Self {
             send,
             recv,
+            conn: None,
             shutdown_done: false,
         }
+    }
+
+    /// Associates the underlying Quinn connection for accurate liveness detection.
+    pub fn with_connection(mut self, conn: quinn::Connection) -> Self {
+        self.conn = Some(conn);
+        self
     }
 }
 
@@ -75,6 +83,11 @@ impl AsyncWrite for QuinnTunnelStream {
 
 impl TunnelStream for QuinnTunnelStream {
     fn poll_check_alive(&mut self, _cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+        if let Some(ref conn) = self.conn {
+            if conn.close_reason().is_some() {
+                return Poll::Ready(HeartbeatStatus::Dead);
+            }
+        }
         Poll::Ready(HeartbeatStatus::Alive)
     }
 }

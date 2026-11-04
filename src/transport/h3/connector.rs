@@ -334,7 +334,7 @@ impl H3Connector {
             return Err(TunnelError::Io(e));
         }
 
-        Ok(Box::new(QuinnTunnelStream::new(send, recv)) as Box<dyn TunnelStream>)
+        Ok(Box::new(QuinnTunnelStream::new(send, recv).with_connection(conn)) as Box<dyn TunnelStream>)
     }
 }
 

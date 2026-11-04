@@ -35,7 +35,7 @@ pub struct MuxSession {
     /// Map of active stream IDs to their inbound data sender and termination flag.
     active_streams: Arc<DashMap<u32, (mpsc::Sender<Bytes>, Arc<AtomicBool>)>>,
     /// Set of closed / reset stream IDs whose trailing in-flight frames are silently dropped.
-    closed_streams: Arc<DashMap<u32, ()>>,
+    closed_streams: Arc<DashMap<u32, Arc<AtomicBool>>>,
     /// Session cancellation token.
     cancel_token: CancellationToken,
 }
@@ -56,7 +56,7 @@ impl MuxSession {
         let next_stream_id = Arc::new(AtomicU32::new(initial_id));
         let active_streams: Arc<DashMap<u32, (mpsc::Sender<Bytes>, Arc<AtomicBool>)>> =
             Arc::new(DashMap::new());
-        let closed_streams: Arc<DashMap<u32, ()>> = Arc::new(DashMap::new());
+        let closed_streams: Arc<DashMap<u32, Arc<AtomicBool>>> = Arc::new(DashMap::new());
 
         let session = Self {
             tx_frames: tx_frames.clone(),
@@ -88,7 +88,7 @@ impl MuxSession {
         tx_frames: mpsc::Sender<MuxFrame>,
         tx_new_streams: mpsc::Sender<MuxStream>,
         active_streams: Arc<DashMap<u32, (mpsc::Sender<Bytes>, Arc<AtomicBool>)>>,
-        closed_streams: Arc<DashMap<u32, ()>>,
+        closed_streams: Arc<DashMap<u32, Arc<AtomicBool>>>,
         cancel_token: CancellationToken,
     ) {
         let (read_half, write_half) = split(underlying);
@@ -158,7 +158,7 @@ impl MuxSession {
         tx_frames: &mpsc::Sender<MuxFrame>,
         tx_new_streams: &mpsc::Sender<MuxStream>,
         active_streams: &Arc<DashMap<u32, (mpsc::Sender<Bytes>, Arc<AtomicBool>)>>,
-        closed_streams: &Arc<DashMap<u32, ()>>,
+        closed_streams: &Arc<DashMap<u32, Arc<AtomicBool>>>,
     ) {
         match frame.frame_type {
             FrameType::Syn => {
@@ -184,11 +184,14 @@ impl MuxSession {
                             "Multiplexer inbound stream backlog full; rejecting SYN with RST"
                         );
                         let _ = tx_frames.try_send(MuxFrame::rst(stream_id));
-                        active_streams.remove(&stream_id);
-                        closed_streams.insert(stream_id, ());
+                        if let Some((_, (_, closed_flag))) = active_streams.remove(&stream_id) {
+                            closed_streams.insert(stream_id, closed_flag);
+                        }
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
-                        active_streams.remove(&stream_id);
+                        if let Some((_, (_, closed_flag))) = active_streams.remove(&stream_id) {
+                            closed_streams.insert(stream_id, closed_flag);
+                        }
                     }
                 }
             }
@@ -208,23 +211,39 @@ impl MuxSession {
                 let tx_opt = active_streams.get(&stream_id).map(|e| e.value().0.clone());
                 if let Some(data_tx) = tx_opt {
                     if data_tx.send(frame.payload).await.is_err() {
-                        active_streams.remove(&stream_id);
-                        closed_streams.insert(stream_id, ());
+                        if let Some((_, (_, closed_flag))) = active_streams.remove(&stream_id) {
+                            closed_streams.insert(stream_id, closed_flag);
+                        }
                     }
                 }
             }
             FrameType::Fin => {
                 let stream_id = frame.stream_id;
-                // Dropping the data sender triggers EOF (0 bytes) on the reader side of MuxStream
-                active_streams.remove(&stream_id);
-                closed_streams.insert(stream_id, ());
+                // Dropping the data sender triggers EOF (0 bytes) on the reader side of MuxStream.
+                // Preserve closed_flag in closed_streams so trailing RST can still update local state.
+                if let Some((_, (_, closed_flag))) = active_streams.remove(&stream_id) {
+                    closed_streams.insert(stream_id, closed_flag);
+                }
+
+                // Bound memory of closed_streams map
+                if closed_streams.len() > 4096 {
+                    let min_id = stream_id.saturating_sub(2048);
+                    closed_streams.retain(|&id, _| id >= min_id);
+                }
             }
             FrameType::Rst => {
                 let stream_id = frame.stream_id;
                 if let Some((_, (_, closed_flag))) = active_streams.remove(&stream_id) {
                     closed_flag.store(true, Ordering::Release);
+                    closed_streams.insert(stream_id, closed_flag);
+                } else if let Some(entry) = closed_streams.get(&stream_id) {
+                    entry.value().store(true, Ordering::Release);
                 }
-                closed_streams.insert(stream_id, ());
+
+                if closed_streams.len() > 4096 {
+                    let min_id = stream_id.saturating_sub(2048);
+                    closed_streams.retain(|&id, _| id >= min_id);
+                }
             }
             FrameType::Ping => {
                 // Instantly reply with PONG

@@ -81,12 +81,12 @@ where
     S: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
 {
     fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
-        // Read into an empty buffer to check if EOF or error is immediately pending
-        let mut empty = [0u8; 0];
-        let mut buf = ReadBuf::new(&mut empty);
+        let mut b = [0u8; 1];
+        let mut buf = ReadBuf::new(&mut b);
         match Pin::new(self).poll_read(cx, &mut buf) {
-            Poll::Ready(Err(_)) => Poll::Ready(HeartbeatStatus::Dead),
+            Poll::Ready(Ok(())) if buf.filled().is_empty() => Poll::Ready(HeartbeatStatus::Dead),
             Poll::Ready(Ok(())) => Poll::Ready(HeartbeatStatus::Alive),
+            Poll::Ready(Err(_)) => Poll::Ready(HeartbeatStatus::Dead),
             Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
         }
     }
@@ -98,11 +98,12 @@ where
     S: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
 {
     fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
-        let mut empty = [0u8; 0];
-        let mut buf = ReadBuf::new(&mut empty);
+        let mut b = [0u8; 1];
+        let mut buf = ReadBuf::new(&mut b);
         match Pin::new(self).poll_read(cx, &mut buf) {
-            Poll::Ready(Err(_)) => Poll::Ready(HeartbeatStatus::Dead),
+            Poll::Ready(Ok(())) if buf.filled().is_empty() => Poll::Ready(HeartbeatStatus::Dead),
             Poll::Ready(Ok(())) => Poll::Ready(HeartbeatStatus::Alive),
+            Poll::Ready(Err(_)) => Poll::Ready(HeartbeatStatus::Dead),
             Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
         }
     }

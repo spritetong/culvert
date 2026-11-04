@@ -3,6 +3,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 
 use bytes::Bytes;
 use http::{Response, StatusCode};
@@ -239,8 +240,12 @@ impl H3Listener {
                                             .and_then(|v| v.to_str().ok());
 
                                         let expected_bearer = format!("Bearer {}", token);
-                                        let is_authed = auth_header == Some(&expected_bearer)
-                                            || auth_header == Some(token.as_str());
+                                        let is_authed = auth_header
+                                            .map(|h| {
+                                                bool::from(h.as_bytes().ct_eq(expected_bearer.as_bytes()))
+                                                    || bool::from(h.as_bytes().ct_eq(token.as_bytes()))
+                                            })
+                                            .unwrap_or(false);
 
                                         if !is_authed {
                                             warn!("H3 request authentication failed");
@@ -362,6 +367,7 @@ impl H3Listener {
                         Ok((send, mut recv)) => {
                             let auth_clone = Arc::clone(&auth_token);
                             let tx_clone = tx_streams.clone();
+                            let conn_clone = conn.clone();
 
                             tokio::spawn(async move {
                                 let handshake_fut = async {
@@ -375,7 +381,7 @@ impl H3Listener {
                                     let mut auth_buf = vec![0u8; auth_len];
                                     recv.read_exact(&mut auth_buf).await.map_err(|_| ())?;
                                     if let Some(ref token) = *auth_clone {
-                                        if !token.is_empty() && auth_buf != token.as_bytes() {
+                                        if !token.is_empty() && bool::from(!auth_buf.as_slice().ct_eq(token.as_bytes())) {
                                             warn!("Raw QUIC authentication failed");
                                             return Err(());
                                         }
@@ -399,7 +405,7 @@ impl H3Listener {
 
                                 match tokio::time::timeout(std::time::Duration::from_secs(10), handshake_fut).await {
                                     Ok(Ok((send, recv, metadata))) => {
-                                        let tunnel_stream = Box::new(QuinnTunnelStream::new(send, recv)) as Box<dyn TunnelStream>;
+                                        let tunnel_stream = Box::new(QuinnTunnelStream::new(send, recv).with_connection(conn_clone)) as Box<dyn TunnelStream>;
                                         let _ = tx_clone.send((tunnel_stream, metadata)).await;
                                     }
                                     Ok(Err(())) => {

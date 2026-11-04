@@ -9,6 +9,7 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::sync::Arc;
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
@@ -149,13 +150,13 @@ impl WsListener {
                                 }
                             };
 
-                            // Validate token if configured on listener
+                            // Validate token if configured on listener using constant-time equality
                             if let Some(ref expected) = *token {
                                 if !expected.is_empty() {
                                     let matches = headers
                                         .auth_token
-                                        .as_ref()
-                                        .map(|t| t == expected)
+                                        .as_deref()
+                                        .map(|t| bool::from(t.as_bytes().ct_eq(expected.as_bytes())))
                                         .unwrap_or(false);
                                     if !matches {
                                         let resp = Response::builder()

@@ -90,12 +90,34 @@ async fn async_main(app_config: AppConfig) -> Result<(), Box<dyn std::error::Err
     let cancel_token = CancellationToken::new();
     let shutdown_token = cancel_token.clone();
 
-    // Spawn signal listener for graceful shutdown (SIGINT / Ctrl+C)
+    // Spawn signal listener for graceful shutdown (SIGINT / Ctrl+C and Unix SIGTERM)
     tokio::spawn(async move {
-        if let Ok(()) = tokio::signal::ctrl_c().await {
-            info!("Received termination signal (Ctrl+C). Initiating shutdown...");
-            shutdown_token.cancel();
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).ok();
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Received termination signal (SIGINT/Ctrl+C). Initiating shutdown...");
+                }
+                _ = async {
+                    if let Some(ref mut sig) = sigterm {
+                        sig.recv().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    info!("Received termination signal (SIGTERM). Initiating shutdown...");
+                }
+            }
         }
+        #[cfg(not(unix))]
+        {
+            if let Ok(()) = tokio::signal::ctrl_c().await {
+                info!("Received termination signal (Ctrl+C). Initiating shutdown...");
+            }
+        }
+        shutdown_token.cancel();
     });
 
     let supervisor = TunnelSupervisor::new(app_config, cancel_token);

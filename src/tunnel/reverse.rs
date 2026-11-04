@@ -43,6 +43,8 @@ pub async fn run_reverse_mapping(
         transport_registry.create_connector(&endpoint_ctx, token.as_deref(), TunnelMode::Reverse)?
     );
 
+    let mut backoff = Duration::from_millis(500);
+
     while !cancel_token.is_cancelled() {
         let connector = transport_registry.create_connector(
             &endpoint_ctx,
@@ -54,10 +56,13 @@ pub async fn run_reverse_mapping(
         let raw_stream = match connector.connect(&dummy_target, None).await {
             Ok(s) => s,
             Err(e) => {
-                warn!(tag = %tag, "Failed to connect control channel: {:?}. Retrying in 3s...", e);
+                warn!(tag = %tag, "Failed to connect control channel: {:?}. Retrying in {:?}...", e, backoff);
                 tokio::select! {
                     _ = cancel_token.cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_secs(3)) => continue,
+                    _ = tokio::time::sleep(backoff) => {
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        continue;
+                    }
                 }
             }
         };
@@ -71,8 +76,14 @@ pub async fn run_reverse_mapping(
         };
 
         if let Err(e) = ctrl_stream.send(reg_msg).await {
-            warn!(tag = %tag, "Failed to send RegisterReverse: {:?}", e);
-            continue;
+            warn!(tag = %tag, "Failed to send RegisterReverse: {:?}. Retrying in {:?}...", e, backoff);
+            tokio::select! {
+                _ = cancel_token.cancelled() => break,
+                _ = tokio::time::sleep(backoff) => {
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    continue;
+                }
+            }
         }
 
         // Await RegisterAck from remote server
@@ -87,21 +98,31 @@ pub async fn run_reverse_mapping(
                         tag = %tag,
                         addr = %ack_addr,
                         err = ?error_msg,
-                        "Server rejected reverse listener registration"
+                        "Server rejected reverse listener registration. Retrying in {:?}...", backoff
                     );
                     tokio::select! {
                         _ = cancel_token.cancelled() => break,
-                        _ = tokio::time::sleep(Duration::from_secs(5)) => continue,
+                        _ = tokio::time::sleep(backoff) => {
+                            backoff = (backoff * 2).min(Duration::from_secs(30));
+                            continue;
+                        }
                     }
                 }
                 info!(tag = %tag, addr = %ack_addr, "Remote server bound reverse port successfully");
             }
             other => {
-                warn!(tag = %tag, "Unexpected response to RegisterReverse: {:?}", other);
-                continue;
+                warn!(tag = %tag, "Unexpected response to RegisterReverse: {:?}. Retrying in {:?}...", other, backoff);
+                tokio::select! {
+                    _ = cancel_token.cancelled() => break,
+                    _ = tokio::time::sleep(backoff) => {
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        continue;
+                    }
+                }
             }
         }
 
+        let loop_start = tokio::time::Instant::now();
         let mut heartbeat = interval(DEFAULT_HEARTBEAT_INTERVAL);
 
         // Main event loop handling incoming connection alerts from remote server
@@ -191,6 +212,17 @@ pub async fn run_reverse_mapping(
                     }
                 }
             }
+        }
+
+        if loop_start.elapsed() > Duration::from_secs(30) {
+            backoff = Duration::from_millis(500);
+        } else {
+            backoff = (backoff * 2).min(Duration::from_secs(30));
+        }
+
+        tokio::select! {
+            _ = cancel_token.cancelled() => break,
+            _ = tokio::time::sleep(backoff) => {}
         }
     }
 

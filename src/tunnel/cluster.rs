@@ -91,6 +91,7 @@ pub async fn run_tunnel_cluster(
         });
     }
 
+    let mut exit_err = None;
     tokio::select! {
         _ = cancel_token.cancelled() => {
             info!(tag = %config.tag, "Tunnel cluster received cancellation signal");
@@ -98,11 +99,14 @@ pub async fn run_tunnel_cluster(
         res = tracker.join_next() => {
             if let Some(Ok(Err(e))) = res {
                 error!(tag = %config.tag, "A port mapping in cluster failed: {:?}", e);
-                return Err(e);
+                exit_err = Some(e);
             }
         }
     }
 
     tracker.shutdown_and_wait().await;
+    if let Some(e) = exit_err {
+        return Err(e);
+    }
     Ok(())
 }

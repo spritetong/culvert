@@ -4,6 +4,7 @@
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 use futures_util::stream::FuturesUnordered;
@@ -140,6 +141,7 @@ enum PoolCommand {
 pub struct ReplenishingStreamPool {
     tx_cmd: mpsc::Sender<PoolCommand>,
     stats: Arc<Mutex<PoolStats>>,
+    active_count: Arc<AtomicUsize>,
 }
 
 impl ReplenishingStreamPool {
@@ -172,6 +174,9 @@ impl ReplenishingStreamPool {
         let (tx_cmd, mut rx_cmd) = mpsc::channel::<PoolCommand>(1024);
         let stats = Arc::new(Mutex::new(PoolStats::default()));
         let stats_clone = Arc::clone(&stats);
+        let active_count = Arc::new(AtomicUsize::new(0));
+
+        let dial_semaphore = Arc::new(tokio::sync::Semaphore::new(16));
 
         tokio::spawn(async move {
             let mut idle_streams: VecDeque<ManagedStream> = VecDeque::new();
@@ -306,20 +311,30 @@ impl ReplenishingStreamPool {
                                     st.active_count += 1;
                                     let _ = req.reply.send(Ok(stream));
                                 } else {
-                                    // Idle pool exhausted: dial on demand directly in a separate task
+                                    // Idle pool exhausted: dial on demand directly with bounded concurrency semaphore
                                     let effective_target = req.target
                                         .or_else(|| default_target.clone())
                                         .unwrap_or_else(|| TargetAddr::Domain("pool.idle".to_string(), 0));
                                     let c = Arc::clone(&connector);
                                     let stats_inner = Arc::clone(&stats_clone);
                                     let cancel_inner = cancel_token.clone();
+                                    let sem = Arc::clone(&dial_semaphore);
 
                                     tokio::spawn(async move {
+                                        let permit = match sem.acquire_owned().await {
+                                            Ok(p) => p,
+                                            Err(_) => {
+                                                let _ = req.reply.send(Err(TunnelError::PoolExhausted));
+                                                return;
+                                            }
+                                        };
+
                                         let connect_fut = c.connect_pooled(&effective_target);
                                         let res = tokio::select! {
                                             _ = cancel_inner.cancelled() => Err(TunnelError::PoolExhausted),
                                             r = connect_fut => r,
                                         };
+                                        drop(permit);
 
                                         match res {
                                             Ok(stream) => {
@@ -358,7 +373,7 @@ impl ReplenishingStreamPool {
             }
         });
 
-        Self { tx_cmd, stats }
+        Self { tx_cmd, stats, active_count }
     }
 
     /// Encodes target activation packet: [ACTIVATE_STREAM_MAGIC, len: u16, target_str]
@@ -393,7 +408,9 @@ impl ReplenishingStreamPool {
                 .await
                 .map_err(|_| TunnelError::PoolExhausted)?;
 
-            rx.await.map_err(|_| TunnelError::PoolExhausted)?
+            let stream = rx.await.map_err(|_| TunnelError::PoolExhausted)??;
+            self.active_count.fetch_add(1, Ordering::Relaxed);
+            Ok(stream)
         })
     }
 
@@ -406,6 +423,7 @@ impl ReplenishingStreamPool {
 
     /// Decrements the active connection count when a stream finishes relaying.
     pub fn on_stream_closed(&self) {
+        self.active_count.fetch_sub(1, Ordering::Relaxed);
         let _ = self.tx_cmd.try_send(PoolCommand::StreamClosed);
     }
 
@@ -416,6 +434,8 @@ impl ReplenishingStreamPool {
 
     /// Returns pool statistics.
     pub fn stats(&self) -> PoolStats {
-        *self.stats.lock()
+        let mut st = *self.stats.lock();
+        st.active_count = self.active_count.load(Ordering::Relaxed);
+        st
     }
 }
