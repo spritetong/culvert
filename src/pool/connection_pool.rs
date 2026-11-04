@@ -1,14 +1,14 @@
 //! Protocol-aware connection pool supporting 0-RTT acquisition and session draining.
 //! All comments and docstrings must be in English.
 
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
-use futures_util::stream::FuturesUnordered;
-use futures_util::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -180,8 +180,9 @@ impl ReplenishingStreamPool {
 
         tokio::spawn(async move {
             let mut idle_streams: VecDeque<ManagedStream> = VecDeque::new();
-            let mut connecting_futures: FuturesUnordered<BoxFuture<'static, Result<Box<dyn TunnelStream>, TunnelError>>> =
-                FuturesUnordered::new();
+            let mut connecting_futures: FuturesUnordered<
+                BoxFuture<'static, Result<Box<dyn TunnelStream>, TunnelError>>,
+            > = FuturesUnordered::new();
             let dummy_target = default_target
                 .clone()
                 .unwrap_or_else(|| TargetAddr::Domain("pool.idle".to_string(), 0));
@@ -200,74 +201,77 @@ impl ReplenishingStreamPool {
                 let now = Instant::now();
                 let in_flight = connecting_futures.len();
                 let current_total = idle_streams.len() + in_flight;
-                if current_total < target_size && in_flight < MAX_CONCURRENT_CONNECTS && now >= next_retry_at {
+                if current_total < target_size
+                    && in_flight < MAX_CONCURRENT_CONNECTS
+                    && now >= next_retry_at
+                {
                     let c = Arc::clone(&connector);
                     let t = dummy_target.clone();
-                    connecting_futures.push(Box::pin(async move {
-                        c.connect_pooled(&t).await
-                    }));
+                    connecting_futures.push(Box::pin(async move { c.connect_pooled(&t).await }));
                 }
 
                 // 2. Perform non-blocking, multi-stream heartbeat sweep in a single poll
-                let mut surviving = VecDeque::with_capacity(idle_streams.len());
+                std::future::poll_fn(|cx| {
+                    let mut i = 0;
+                    while i < idle_streams.len() {
+                        let mut is_dead = false;
+                        let managed = &mut idle_streams[i];
 
-                while let Some(mut managed) = idle_streams.pop_front() {
-                    let mut is_dead = false;
-
-                    // Non-blocking single poll to check stream status and advance ping
-                    let _ = std::future::poll_fn(|cx| {
                         // First: check liveness
-                        if let Poll::Ready(HeartbeatStatus::Dead) = managed.stream.poll_check_alive(cx) {
+                        if let Poll::Ready(HeartbeatStatus::Dead) =
+                            managed.stream.poll_check_alive(cx)
+                        {
                             is_dead = true;
-                            return Poll::Ready(());
-                        }
-
-                        // Second: advance heartbeat state machine
-                        match managed.state {
-                            HeartbeatState::Idle(last_check) => {
-                                if now.duration_since(last_check) >= HEARTBEAT_INTERVAL {
-                                    match managed.stream.poll_send_ping(cx) {
-                                        Poll::Ready(Ok(())) => {
-                                            managed.state = HeartbeatState::Idle(now);
+                        } else {
+                            // Second: advance heartbeat state machine
+                            match managed.state {
+                                HeartbeatState::Idle(last_check) => {
+                                    if now.duration_since(last_check) >= HEARTBEAT_INTERVAL {
+                                        match managed.stream.poll_send_ping(cx) {
+                                            Poll::Ready(Ok(())) => {
+                                                managed.state = HeartbeatState::Idle(now);
+                                            }
+                                            Poll::Ready(Err(_)) => {
+                                                is_dead = true;
+                                            }
+                                            Poll::Pending => {
+                                                managed.state = HeartbeatState::SendingPing(now);
+                                            }
                                         }
-                                        Poll::Ready(Err(_)) => {
-                                            is_dead = true;
-                                        }
-                                        Poll::Pending => {
-                                            managed.state = HeartbeatState::SendingPing(now);
+                                    }
+                                }
+                                HeartbeatState::SendingPing(started_at) => {
+                                    if now.duration_since(started_at) > HEARTBEAT_TIMEOUT {
+                                        // Ping call hung in lower layer; evict defensively!
+                                        is_dead = true;
+                                    } else {
+                                        match managed.stream.poll_send_ping(cx) {
+                                            Poll::Ready(Ok(())) => {
+                                                managed.state = HeartbeatState::Idle(now);
+                                            }
+                                            Poll::Ready(Err(_)) => {
+                                                is_dead = true;
+                                            }
+                                            Poll::Pending => {
+                                                // Still pending, continue waiting without blocking other streams
+                                            }
                                         }
                                     }
                                 }
                             }
-                            HeartbeatState::SendingPing(started_at) => {
-                                if now.duration_since(started_at) > HEARTBEAT_TIMEOUT {
-                                    // Ping call hung in lower layer; evict defensively!
-                                    is_dead = true;
-                                } else {
-                                    match managed.stream.poll_send_ping(cx) {
-                                        Poll::Ready(Ok(())) => {
-                                            managed.state = HeartbeatState::Idle(now);
-                                        }
-                                        Poll::Ready(Err(_)) => {
-                                            is_dead = true;
-                                        }
-                                        Poll::Pending => {
-                                            // Still pending, continue waiting without blocking other streams
-                                        }
-                                    }
-                                }
-                            }
                         }
-                        Poll::Ready(())
-                    }).await;
 
-                    if !is_dead {
-                        surviving.push_back(managed);
-                    } else {
-                        tracing::debug!("Evicted dead/hanging stream during non-blocking sweep");
+                        if is_dead {
+                            tracing::debug!("Evicted dead/hanging stream during non-blocking sweep");
+                            idle_streams.swap_remove_back(i);
+                        } else {
+                            i += 1;
+                        }
                     }
-                }
-                idle_streams = surviving;
+                    Poll::Ready(())
+                })
+                .await;
+
                 stats_clone.lock().idle_count = idle_streams.len();
 
                 // 3. Multi-branch non-blocking select
@@ -385,7 +389,11 @@ impl ReplenishingStreamPool {
             }
         });
 
-        Self { tx_cmd, stats, active_count }
+        Self {
+            tx_cmd,
+            stats,
+            active_count,
+        }
     }
 
     /// Encodes target activation packet: [ACTIVATE_STREAM_MAGIC, len: u16, target_str]
@@ -405,32 +413,24 @@ impl ReplenishingStreamPool {
     }
 
     /// Acquires a pre-warmed connection in 0-RTT, or falls back to dialing on demand.
-    pub fn acquire<'a>(
-        &'a self,
-        target: Option<&'a TargetAddr>,
-    ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+    pub async fn acquire(
+        &self,
+        target: Option<&TargetAddr>,
+    ) -> Result<Box<dyn TunnelStream>, TunnelError> {
         let target_cloned = target.cloned();
-        Box::pin(async move {
-            let (reply, rx) = oneshot::channel();
-            self.tx_cmd
-                .send(PoolCommand::Acquire(AcquireRequest {
-                    target: target_cloned,
-                    reply,
-                }))
-                .await
-                .map_err(|_| TunnelError::PoolExhausted)?;
 
-            let stream = rx.await.map_err(|_| TunnelError::PoolExhausted)??;
-            self.active_count.fetch_add(1, Ordering::Relaxed);
-            Ok(stream)
-        })
-    }
+        let (reply, rx) = oneshot::channel();
+        self.tx_cmd
+            .send(PoolCommand::Acquire(AcquireRequest {
+                target: target_cloned,
+                reply,
+            }))
+            .await
+            .map_err(|_| TunnelError::PoolExhausted)?;
 
-    /// Acquires using default target if configured.
-    pub fn acquire_default<'a>(
-        &'a self,
-    ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
-        self.acquire(None)
+        let stream = rx.await.map_err(|_| TunnelError::PoolExhausted)??;
+        self.active_count.fetch_add(1, Ordering::Relaxed);
+        Ok(stream)
     }
 
     /// Decrements the active connection count when a stream finishes relaying.
@@ -472,7 +472,12 @@ mod tests {
             _session_id: Option<&'a str>,
         ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Err(TunnelError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"))) })
+            Box::pin(async {
+                Err(TunnelError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "refused",
+                )))
+            })
         }
 
         fn connect_pooled<'a>(
@@ -480,7 +485,12 @@ mod tests {
             _target: &'a TargetAddr,
         ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Err(TunnelError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"))) })
+            Box::pin(async {
+                Err(TunnelError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "refused",
+                )))
+            })
         }
     }
 
@@ -492,11 +502,7 @@ mod tests {
         });
 
         let cancel_token = CancellationToken::new();
-        let _pool = ReplenishingStreamPool::new_shared(
-            connector,
-            4,
-            cancel_token.clone(),
-        );
+        let _pool = ReplenishingStreamPool::new_shared(connector, 4, cancel_token.clone());
 
         // Sleep 400ms. In the buggy implementation without backoff, 400ms with instant failures
         // resulted in >100,000 reconnect attempts. With 200ms base backoff, call count must be <= 3.
@@ -504,7 +510,13 @@ mod tests {
         cancel_token.cancel();
 
         let count = call_count.load(Ordering::SeqCst);
-        assert!(count <= 3, "Reconnect rate must be throttled by backoff gate, got {count}");
-        assert!(count >= 1, "At least one attempt should be performed, got {count}");
+        assert!(
+            count <= 3,
+            "Reconnect rate must be throttled by backoff gate, got {count}"
+        );
+        assert!(
+            count >= 1,
+            "At least one attempt should be performed, got {count}"
+        );
     }
 }
