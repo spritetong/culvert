@@ -2,7 +2,6 @@
 //! All comments and docstrings must be in English.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -13,12 +12,9 @@ use micro_tunnel::transport::h3::H3Connector;
 use micro_tunnel::transport::h3::listener::H3Listener;
 use micro_tunnel::transport::{TargetAddr, TransportConnector, TransportListener};
 
-static PORT_COUNTER: AtomicUsize = AtomicUsize::new(51200);
-
 fn get_ephemeral_port() -> u16 {
-    let pid = std::process::id() as u16;
-    let offset = PORT_COUNTER.fetch_add(1, Ordering::SeqCst) as u16;
-    40000 + ((pid ^ offset) % 15000)
+    let listener = std::net::UdpSocket::bind("127.0.0.1:0").expect("Failed to bind UDP ephemeral port");
+    listener.local_addr().unwrap().port()
 }
 
 /// Helper to generate a test PKI certificate and ServerConfig for QUIC.

@@ -174,7 +174,11 @@ impl ServerRunner {
                                                 };
 
                                                 info!(target = %target, "Dialing forward target in local/internal network");
-                                                let target_conn = match TcpStream::connect(target.to_string()).await {
+                                                let dial_target_fut = TcpStream::connect(target.to_string());
+                                                let target_conn = match tokio::select! {
+                                                    _ = conn_token.cancelled() => return,
+                                                    res = dial_target_fut => res,
+                                                } {
                                                     Ok(s) => {
                                                         let _ = SocketTuner::tune_tcp_stream(&s, true, None);
                                                         s

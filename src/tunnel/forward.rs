@@ -76,28 +76,42 @@ pub async fn run_forward_mapping(
                         let pool_for_close = pool.clone();
 
                         conn_tracker.spawn_with_cancel(move |conn_token| async move {
-                            let remote_res = if let Some(ref p) = pool_clone {
-                                p.acquire(Some(&target)).await
-                            } else {
-                                match registry_clone.create_connector(&endpoint_clone, token_clone.as_deref(), TunnelMode::Forward) {
-                                    Ok(connector) => connector.connect(&target, None).await,
-                                    Err(e) => Err(e),
+                            let acquire_fut = async {
+                                if let Some(ref p) = pool_clone {
+                                    p.acquire(Some(&target)).await
+                                } else {
+                                    match registry_clone.create_connector(&endpoint_clone, token_clone.as_deref(), TunnelMode::Forward) {
+                                        Ok(connector) => connector.connect(&target, None).await,
+                                        Err(e) => Err(e),
+                                    }
                                 }
+                            };
+
+                            let remote_res = tokio::select! {
+                                _ = conn_token.cancelled() => return,
+                                res = acquire_fut => res,
                             };
 
                             match remote_res {
                                 Ok(mut remote_stream) => {
                                     if pool_clone.is_some() {
                                         let activation_pkt = ReplenishingStreamPool::encode_activation(Some(&target));
-                                        if let Err(e) = remote_stream.write_all(&activation_pkt).await {
-                                            error!("Failed to write stream activation packet: {:?}", e);
-                                            if let Some(ref p) = pool_for_close {
-                                                p.on_stream_closed();
+                                        let write_act_res = tokio::select! {
+                                            _ = conn_token.cancelled() => {
+                                                if let Some(ref p) = pool_for_close {
+                                                    p.on_stream_closed();
+                                                }
+                                                return;
                                             }
-                                            return;
-                                        }
-                                        if let Err(e) = remote_stream.flush().await {
-                                            error!("Failed to flush stream activation packet: {:?}", e);
+                                            res = async {
+                                                remote_stream.write_all(&activation_pkt).await?;
+                                                remote_stream.flush().await?;
+                                                Ok::<(), std::io::Error>(())
+                                            } => res,
+                                        };
+
+                                        if let Err(e) = write_act_res {
+                                            error!("Failed to write stream activation packet: {:?}", e);
                                             if let Some(ref p) = pool_for_close {
                                                 p.on_stream_closed();
                                             }

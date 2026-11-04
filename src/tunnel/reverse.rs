@@ -136,7 +136,11 @@ pub async fn run_reverse_mapping(
 
                                 conn_tracker.spawn_with_cancel(move |token| async move {
                                     // 1. Dial local target service
-                                    let local_stream = match TcpStream::connect(&target_clone).await {
+                                    let dial_local_fut = TcpStream::connect(&target_clone);
+                                    let local_stream = match tokio::select! {
+                                        _ = token.cancelled() => return,
+                                        res = dial_local_fut => res,
+                                    } {
                                         Ok(s) => {
                                             let _ = SocketTuner::tune_tcp_stream(&s, true, None);
                                             s
@@ -148,7 +152,11 @@ pub async fn run_reverse_mapping(
                                     };
 
                                     // 2. Open reverse data stream to server matching session_id
-                                    let data_stream = match connector.connect(&dummy_target, Some(&session_id_clone)).await {
+                                    let dial_remote_fut = connector.connect(&dummy_target, Some(&session_id_clone));
+                                    let data_stream = match tokio::select! {
+                                        _ = token.cancelled() => return,
+                                        res = dial_remote_fut => res,
+                                    } {
                                         Ok(s) => s,
                                         Err(e) => {
                                             error!("Failed to connect reverse data stream for session {}: {:?}", session_id_clone, e);

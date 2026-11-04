@@ -312,9 +312,15 @@ impl ReplenishingStreamPool {
                                         .unwrap_or_else(|| TargetAddr::Domain("pool.idle".to_string(), 0));
                                     let c = Arc::clone(&connector);
                                     let stats_inner = Arc::clone(&stats_clone);
+                                    let cancel_inner = cancel_token.clone();
 
                                     tokio::spawn(async move {
-                                        let res = c.connect_pooled(&effective_target).await;
+                                        let connect_fut = c.connect_pooled(&effective_target);
+                                        let res = tokio::select! {
+                                            _ = cancel_inner.cancelled() => Err(TunnelError::PoolExhausted),
+                                            r = connect_fut => r,
+                                        };
+
                                         match res {
                                             Ok(stream) => {
                                                 let mut st = stats_inner.lock();
