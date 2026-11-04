@@ -2,6 +2,7 @@
 //! All comments and docstrings must be in English.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -13,7 +14,20 @@ use micro_tunnel::config::model::{
 };
 use micro_tunnel::supervisor::TunnelSupervisor;
 
+/// Helper to get an available random ephemeral port with anti-collision PID offset.
 fn get_available_port() -> u16 {
+    static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
+    let base = 47000 + (std::process::id() as u16 % 500) * 30;
+    for _ in 0..500 {
+        let offset = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let port = base.wrapping_add(offset);
+        if (1024..65535).contains(&port)
+            && let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port))
+        {
+            drop(listener);
+            return port;
+        }
+    }
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().port()
 }
@@ -113,7 +127,10 @@ async fn test_multi_mapping_shared_pool_and_path_matching_e2e() {
     let payload1 = b"Payload for target 1";
     client1.write_all(payload1).await.unwrap();
     let mut buf1 = vec![0u8; payload1.len()];
-    client1.read_exact(&mut buf1).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), client1.read_exact(&mut buf1))
+        .await
+        .expect("Timeout reading client1 response")
+        .unwrap();
     assert_eq!(&buf1, payload1);
 
     // Test Mapping 2 (Target 2)
@@ -123,11 +140,21 @@ async fn test_multi_mapping_shared_pool_and_path_matching_e2e() {
     let payload2 = b"Payload for target 2 via shared pool";
     client2.write_all(payload2).await.unwrap();
     let mut buf2 = vec![0u8; payload2.len()];
-    client2.read_exact(&mut buf2).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), client2.read_exact(&mut buf2))
+        .await
+        .expect("Timeout reading client2 response")
+        .unwrap();
     assert_eq!(&buf2, payload2);
 
     cancel_token.cancel();
-    let _ = tokio::join!(echo1_handle, echo2_handle, sup_handle);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        async {
+            let _ = tokio::join!(echo1_handle, echo2_handle, sup_handle);
+        },
+    )
+    .await
+    .expect("Timeout waiting for handles to exit after cancellation in test_multi_mapping_tunnel_shared_pool");
 }
 
 #[tokio::test]
@@ -189,5 +216,12 @@ async fn test_path_mismatch_rejection() {
     assert_eq!(n, 0, "Server must close stream on path mismatch (404)");
 
     cancel_token.cancel();
-    let _ = tokio::join!(echo_handle, sup_handle);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        async {
+            let _ = tokio::join!(echo_handle, sup_handle);
+        },
+    )
+    .await
+    .expect("Timeout waiting for handles to exit after cancellation in test_path_mismatch_rejection");
 }

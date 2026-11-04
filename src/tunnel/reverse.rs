@@ -53,7 +53,10 @@ pub async fn run_reverse_mapping(
         )?;
 
         info!(tag = %tag, "Connecting reverse control channel to remote server...");
-        let raw_stream = match connector.connect(&dummy_target, None).await {
+        let raw_stream = match tokio::select! {
+            _ = cancel_token.cancelled() => break,
+            res = connector.connect(&dummy_target, None) => res,
+        } {
             Ok(s) => s,
             Err(e) => {
                 warn!(tag = %tag, "Failed to connect control channel: {:?}. Retrying in {:?}...", e, backoff);
@@ -75,7 +78,11 @@ pub async fn run_reverse_mapping(
             target_addr: target_addr.clone(),
         };
 
-        if let Err(e) = ctrl_stream.send(reg_msg).await {
+        let send_res = tokio::select! {
+            _ = cancel_token.cancelled() => break,
+            res = ctrl_stream.send(reg_msg) => res,
+        };
+        if let Err(e) = send_res {
             warn!(tag = %tag, "Failed to send RegisterReverse: {:?}. Retrying in {:?}...", e, backoff);
             tokio::select! {
                 _ = cancel_token.cancelled() => break,
@@ -87,7 +94,11 @@ pub async fn run_reverse_mapping(
         }
 
         // Await RegisterAck from remote server
-        match ctrl_stream.next().await {
+        let ack_res = tokio::select! {
+            _ = cancel_token.cancelled() => break,
+            res = ctrl_stream.next() => res,
+        };
+        match ack_res {
             Some(Ok(ControlMessage::RegisterAck {
                 listen_addr: ack_addr,
                 success,
@@ -134,7 +145,11 @@ pub async fn run_reverse_mapping(
                 }
                 Some(_) = conn_tracker.join_next(), if !conn_tracker.is_empty() => {}
                 _ = heartbeat.tick() => {
-                    if let Err(e) = ctrl_stream.send(ControlMessage::Ping).await {
+                    let send_ping = tokio::select! {
+                        _ = cancel_token.cancelled() => break,
+                        res = ctrl_stream.send(ControlMessage::Ping) => res,
+                    };
+                    if let Err(e) = send_ping {
                         warn!(tag = %tag, "Failed to send heartbeat ping: {:?}", e);
                         break;
                     }
@@ -197,7 +212,10 @@ pub async fn run_reverse_mapping(
                                 tracing::trace!(tag = %tag, "Heartbeat pong received");
                             }
                             ControlMessage::Ping => {
-                                let _ = ctrl_stream.send(ControlMessage::Pong).await;
+                                let _ = tokio::select! {
+                                    _ = cancel_token.cancelled() => break,
+                                    res = ctrl_stream.send(ControlMessage::Pong) => res,
+                                };
                             }
                             _ => {}
                         },

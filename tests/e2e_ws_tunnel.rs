@@ -2,6 +2,7 @@
 //! All comments and docstrings must be in English.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,8 +20,20 @@ use micro_tunnel::transport::TransportRegistry;
 use micro_tunnel::transport::ws::WsTransportDriver;
 use micro_tunnel::tunnel::{run_forward_tunnel, run_reverse_tunnel};
 
-/// Helper to get an available random ephemeral port.
+/// Helper to get an available random ephemeral port with anti-collision PID offset.
 fn get_available_port() -> u16 {
+    static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
+    let base = 49000 + (std::process::id() as u16 % 500) * 30;
+    for _ in 0..500 {
+        let offset = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let port = base.wrapping_add(offset);
+        if (1024..65535).contains(&port)
+            && let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port))
+        {
+            drop(listener);
+            return port;
+        }
+    }
     let listener =
         std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral port");
     listener.local_addr().unwrap().port()
@@ -134,15 +147,22 @@ async fn test_forward_tunnel_ws_e2e() {
         .expect("Failed to write to client");
 
     let mut buf = vec![0u8; payload.len()];
-    stream
-        .read_exact(&mut buf)
+    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut buf))
         .await
+        .expect("Timeout reading response in forward tunnel")
         .expect("Failed to read response");
     assert_eq!(&buf, payload, "Echoed payload mismatch in forward tunnel");
 
     // 5. Graceful shutdown
     cancel_token.cancel();
-    let _ = tokio::join!(echo_handle, server_handle, client_handle);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        async {
+            let _ = tokio::join!(echo_handle, server_handle, client_handle);
+        },
+    )
+    .await
+    .expect("Timeout waiting for handles to exit after cancellation in test_forward_tunnel_ws_e2e");
 }
 
 #[tokio::test]
@@ -226,15 +246,22 @@ async fn test_reverse_tunnel_ws_e2e() {
         .expect("Failed to write to reverse port");
 
     let mut buf = vec![0u8; payload.len()];
-    visitor_stream
-        .read_exact(&mut buf)
+    tokio::time::timeout(Duration::from_secs(10), visitor_stream.read_exact(&mut buf))
         .await
+        .expect("Timeout reading response from reverse port")
         .expect("Failed to read response from reverse port");
     assert_eq!(&buf, payload, "Echoed payload mismatch in reverse tunnel");
 
     // 5. Graceful shutdown
     cancel_token.cancel();
-    let _ = tokio::join!(echo_handle, server_handle, client_handle);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        async {
+            let _ = tokio::join!(echo_handle, server_handle, client_handle);
+        },
+    )
+    .await
+    .expect("Timeout waiting for handles to exit after cancellation in test_reverse_tunnel_ws_e2e");
 }
 
 #[tokio::test]
@@ -310,7 +337,10 @@ async fn test_supervisor_multi_tunnel_concurrency_e2e() {
         let payload = b"Multi-Tunnel Concurrency Forward Check";
         fwd_stream.write_all(payload).await.unwrap();
         let mut buf = vec![0u8; payload.len()];
-        fwd_stream.read_exact(&mut buf).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), fwd_stream.read_exact(&mut buf))
+            .await
+            .expect("Timeout reading fwd_stream in concurrency test")
+            .unwrap();
         assert_eq!(&buf, payload);
     };
 
@@ -322,13 +352,30 @@ async fn test_supervisor_multi_tunnel_concurrency_e2e() {
         let payload = b"Multi-Tunnel Concurrency Reverse Check";
         rev_stream.write_all(payload).await.unwrap();
         let mut buf = vec![0u8; payload.len()];
-        rev_stream.read_exact(&mut buf).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), rev_stream.read_exact(&mut buf))
+            .await
+            .expect("Timeout reading rev_stream in concurrency test")
+            .unwrap();
         assert_eq!(&buf, payload);
     };
 
-    tokio::try_join!(tokio::spawn(fwd_fut), tokio::spawn(rev_fut)).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        async {
+            tokio::try_join!(tokio::spawn(fwd_fut), tokio::spawn(rev_fut)).unwrap();
+        },
+    )
+    .await
+    .expect("Timeout waiting for forward and reverse futures");
 
     // 6. Graceful shutdown
     cancel_token.cancel();
-    let _ = tokio::join!(echo_fwd_handle, echo_rev_handle, sup_handle);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        async {
+            let _ = tokio::join!(echo_fwd_handle, echo_rev_handle, sup_handle);
+        },
+    )
+    .await
+    .expect("Timeout waiting for handles to exit after cancellation in test_supervisor_multi_tunnel_concurrency_e2e");
 }

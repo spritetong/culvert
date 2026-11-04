@@ -2,6 +2,7 @@
 //! All comments and docstrings must be in English.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -12,7 +13,20 @@ use micro_tunnel::config::model::{
 };
 use micro_tunnel::supervisor::TunnelSupervisor;
 
+/// Helper to get an available random ephemeral port with anti-collision PID offset.
 fn get_available_port() -> u16 {
+    static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
+    let base = 45000 + (std::process::id() as u16 % 500) * 30;
+    for _ in 0..500 {
+        let offset = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let port = base.wrapping_add(offset);
+        if (1024..65535).contains(&port)
+            && let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port))
+        {
+            drop(listener);
+            return port;
+        }
+    }
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().port()
 }
@@ -115,10 +129,20 @@ async fn test_standalone_wss_server_self_signed_direct_termination() {
     stream.write_all(payload).await.unwrap();
 
     let mut buf = vec![0u8; payload.len()];
-    stream.read_exact(&mut buf).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut buf))
+        .await
+        .expect("Timeout reading standalone WSS echo")
+        .unwrap();
     assert_eq!(&buf, payload);
 
     // 5. Clean shutdown
     cancel_token.cancel();
-    let _ = tokio::join!(echo_handle, sup_handle);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        async {
+            let _ = tokio::join!(echo_handle, sup_handle);
+        },
+    )
+    .await
+    .expect("Timeout waiting for echo and supervisor handles to terminate in test_standalone_wss_server_self_signed_direct_termination");
 }

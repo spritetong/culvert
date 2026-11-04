@@ -27,8 +27,22 @@ use micro_tunnel::transport::TransportRegistry;
 use micro_tunnel::transport::ws::WsTransportDriver;
 use micro_tunnel::tunnel::{run_forward_tunnel, run_reverse_tunnel};
 
-/// Helper to get an available random ephemeral port.
+use std::sync::atomic::{AtomicU16, Ordering};
+
+/// Helper to get an available random ephemeral port with anti-collision PID offset.
 fn get_available_port() -> u16 {
+    static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
+    let base = 41000 + (std::process::id() as u16 % 500) * 30;
+    for _ in 0..500 {
+        let offset = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let port = base.wrapping_add(offset);
+        if (1024..65535).contains(&port)
+            && let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port))
+        {
+            drop(listener);
+            return port;
+        }
+    }
     let listener =
         std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral port");
     listener.local_addr().unwrap().port()
@@ -353,7 +367,14 @@ async fn test_wss_forward_tunnel_with_custom_ca_and_sni() {
 
     // Cleanup
     cancel_token.cancel();
-    let _ = tokio::join!(echo_handle, server_handle, tls_handle, client_handle);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        async {
+            let _ = tokio::join!(echo_handle, server_handle, tls_handle, client_handle);
+        },
+    )
+    .await
+    .expect("Timeout waiting for tasks to exit after cancellation in test_wss_forward_tunnel_with_custom_ca_and_sni");
 }
 
 #[tokio::test]
@@ -460,7 +481,14 @@ async fn test_wss_forward_tunnel_insecure_mode() {
     assert_eq!(&buf, payload);
 
     cancel_token.cancel();
-    let _ = tokio::join!(echo_handle, server_handle, tls_handle, client_handle);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        async {
+            let _ = tokio::join!(echo_handle, server_handle, tls_handle, client_handle);
+        },
+    )
+    .await
+    .expect("Timeout waiting for tasks to exit after cancellation in test_wss_forward_tunnel_insecure_mode");
 }
 
 #[tokio::test]
@@ -571,7 +599,14 @@ async fn test_wss_mtls_mutual_authentication() {
     assert_eq!(&buf, payload);
 
     cancel_token.cancel();
-    let _ = tokio::join!(echo_handle, server_handle, tls_handle, client_handle);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        async {
+            let _ = tokio::join!(echo_handle, server_handle, tls_handle, client_handle);
+        },
+    )
+    .await
+    .expect("Timeout waiting for tasks to exit after cancellation in test_wss_mtls_mutual_authentication");
 }
 
 #[tokio::test]
@@ -685,7 +720,14 @@ async fn test_wss_reverse_tunnel_e2e() {
     assert_eq!(&buf, payload, "Echo mismatch on reverse WSS tunnel");
 
     cancel_token.cancel();
-    let _ = tokio::join!(echo_handle, server_handle, tls_handle, client_handle);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        async {
+            let _ = tokio::join!(echo_handle, server_handle, tls_handle, client_handle);
+        },
+    )
+    .await
+    .expect("Timeout waiting for tasks to exit after cancellation in test_wss_reverse_tunnel_e2e");
 }
 
 #[tokio::test]
@@ -770,7 +812,14 @@ async fn test_wss_server_tls_version_enforcement() {
     assert!(connect_res_13.is_ok(), "Client connecting with TLS 1.3 must succeed");
 
     cancel_token.cancel();
-    let _ = tokio::join!(server_handle);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        async {
+            let _ = tokio::join!(server_handle);
+        },
+    )
+    .await
+    .expect("Timeout waiting for server handle to exit after cancellation in test_wss_server_tls_version_enforcement");
 }
 
 #[tokio::test]
@@ -864,5 +913,12 @@ async fn test_wss_server_inherits_global_tls_config() {
     );
 
     cancel_token.cancel();
-    let _ = tokio::join!(server_handle);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        async {
+            let _ = tokio::join!(server_handle);
+        },
+    )
+    .await
+    .expect("Timeout waiting for server handle to exit after cancellation in test_wss_server_inherits_global_tls_config");
 }

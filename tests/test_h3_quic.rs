@@ -16,11 +16,11 @@ use std::sync::atomic::{AtomicU16, Ordering};
 
 fn get_ephemeral_port() -> u16 {
     static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
-    let base = 48000 + (std::process::id() as u16 % 1000) * 15;
-    for _ in 0..200 {
+    let base = 51000 + (std::process::id() as u16 % 500) * 25;
+    for _ in 0..500 {
         let offset = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
         let port = base.wrapping_add(offset);
-        if port >= 1024
+        if (1024..65535).contains(&port)
             && let Ok(u) = std::net::UdpSocket::bind(("127.0.0.1", port))
             && let Ok(t) = std::net::TcpListener::bind(("127.0.0.1", port))
         {
@@ -453,7 +453,14 @@ async fn test_h3_tunnel_pool_prewarm_and_activation_end_to_end() {
     }
 
     cancel_token.cancel();
-    let _ = tokio::join!(echo_handle, server_handle, client_handle);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        async {
+            let _ = tokio::join!(echo_handle, server_handle, client_handle);
+        },
+    )
+    .await
+    .expect("Timeout waiting for tasks to exit after cancellation in test_h3_pool_prewarm_and_reuse");
 }
 
 #[tokio::test]
@@ -564,7 +571,14 @@ async fn test_quic_raw_tunnel_pool_prewarm_and_activation_end_to_end() {
     }
 
     cancel_token.cancel();
-    let _ = tokio::join!(echo_handle, server_handle, client_handle);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        async {
+            let _ = tokio::join!(echo_handle, server_handle, client_handle);
+        },
+    )
+    .await
+    .expect("Timeout waiting for tasks to exit after cancellation in test_quic_raw_tunnel_pool_prewarm_and_activation_end_to_end");
 }
 
 #[tokio::test]
@@ -673,11 +687,21 @@ async fn test_quic_raw_forward_stress_throughput() {
     }
     client_tcp.shutdown().await.unwrap();
 
-    let total_received = rx_total.await.unwrap();
+    let total_received = tokio::time::timeout(std::time::Duration::from_secs(10), rx_total)
+        .await
+        .expect("Timed out waiting for rx_total in stress throughput test")
+        .unwrap();
     assert_eq!(total_received, CHUNK_SIZE * CHUNKS);
 
     cancel_token.cancel();
-    let _ = tokio::join!(sink_handle, server_handle, client_handle);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        async {
+            let _ = tokio::join!(sink_handle, server_handle, client_handle);
+        },
+    )
+    .await
+    .expect("Timeout waiting for tasks to exit after cancellation in test_quic_raw_forward_stress_throughput");
 }
 
 #[tokio::test]
@@ -816,7 +840,14 @@ async fn test_h3_concurrent_forward_stress() {
     }
 
     cancel_token.cancel();
-    let _ = tokio::join!(echo_handle, server_handle, client_handle);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        async {
+            let _ = tokio::join!(echo_handle, server_handle, client_handle);
+        },
+    )
+    .await
+    .expect("Timeout waiting for tasks to exit after cancellation in test_h3_concurrent_forward_stress");
 }
 
 

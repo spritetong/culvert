@@ -286,7 +286,10 @@ impl ServerRunner {
         let mut ctrl_stream = FramedControlStream::new(stream);
 
         // Await RegisterReverse
-        let (listen_addr, target_addr) = match ctrl_stream.next().await {
+        let (listen_addr, target_addr) = match tokio::select! {
+            _ = cancel_token.cancelled() => return,
+            res = ctrl_stream.next() => res,
+        } {
             Some(Ok(ControlMessage::RegisterReverse {
                 listen_addr,
                 target_addr,
@@ -304,24 +307,26 @@ impl ServerRunner {
 
         let listener = match TcpListener::bind(&listen_addr).await {
             Ok(l) => {
-                let _ = ctrl_stream
-                    .send(ControlMessage::RegisterAck {
+                let _ = tokio::select! {
+                    _ = cancel_token.cancelled() => return,
+                    res = ctrl_stream.send(ControlMessage::RegisterAck {
                         listen_addr: listen_addr.clone(),
                         success: true,
                         error_msg: None,
-                    })
-                    .await;
+                    }) => res,
+                };
                 l
             }
             Err(e) => {
                 warn!(addr = %listen_addr, "Failed to bind reverse listener: {:?}", e);
-                let _ = ctrl_stream
-                    .send(ControlMessage::RegisterAck {
+                let _ = tokio::select! {
+                    _ = cancel_token.cancelled() => return,
+                    res = ctrl_stream.send(ControlMessage::RegisterAck {
                         listen_addr: listen_addr.clone(),
                         success: false,
                         error_msg: Some(e.to_string()),
-                    })
-                    .await;
+                    }) => res,
+                };
                 return;
             }
         };
@@ -358,7 +363,15 @@ impl ServerRunner {
                                 client_addr: visitor_addr.to_string(),
                             };
 
-                            if let Err(e) = ctrl_stream.send(notify_msg).await {
+                            let send_res = tokio::select! {
+                                _ = cancel_token.cancelled() => {
+                                    session_mgr.remove(&session_id);
+                                    break;
+                                }
+                                res = ctrl_stream.send(notify_msg) => res,
+                            };
+
+                            if let Err(e) = send_res {
                                 warn!(session = %session_id, "Failed to notify client over control channel: {:?}", e);
                                 session_mgr.remove(&session_id);
                                 continue;
@@ -394,7 +407,10 @@ impl ServerRunner {
                 msg_opt = ctrl_stream.next() => {
                     match msg_opt {
                         Some(Ok(ControlMessage::Ping)) => {
-                            let _ = ctrl_stream.send(ControlMessage::Pong).await;
+                            let _ = tokio::select! {
+                                _ = cancel_token.cancelled() => break,
+                                res = ctrl_stream.send(ControlMessage::Pong) => res,
+                            };
                         }
                         Some(Ok(ControlMessage::Pong)) => {}
                         _ => {

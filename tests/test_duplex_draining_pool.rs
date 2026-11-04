@@ -3,6 +3,7 @@
 //! All comments and docstrings must be in English.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,7 +20,20 @@ use micro_tunnel::transport::TransportRegistry;
 use micro_tunnel::transport::ws::WsTransportDriver;
 use micro_tunnel::tunnel::run_forward_tunnel;
 
+/// Helper to get an available random ephemeral port with anti-collision PID offset.
 fn get_available_port() -> u16 {
+    static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
+    let base = 43000 + (std::process::id() as u16 % 500) * 30;
+    for _ in 0..500 {
+        let offset = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let port = base.wrapping_add(offset);
+        if (1024..65535).contains(&port)
+            && let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port))
+        {
+            drop(listener);
+            return port;
+        }
+    }
     let listener =
         std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral port");
     listener.local_addr().unwrap().port()
@@ -135,11 +149,19 @@ async fn test_high_volume_duplex_stream_integrity() {
 
     let reader_handle = tokio::spawn(async move {
         let mut recv_data = vec![0u8; DATA_SIZE];
-        rd.read_exact(&mut recv_data).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), rd.read_exact(&mut recv_data))
+            .await
+            .expect("Timeout reading duplex data")
+            .unwrap();
         recv_data
     });
 
-    let (_, recv_data) = tokio::join!(writer_handle, reader_handle);
+    let (_, recv_data) = tokio::time::timeout(
+        Duration::from_secs(10),
+        async { tokio::join!(writer_handle, reader_handle) },
+    )
+    .await
+    .expect("Timeout waiting for writer/reader handles");
     let recv_data = recv_data.unwrap();
 
     assert_eq!(recv_data.len(), DATA_SIZE);
@@ -150,7 +172,14 @@ async fn test_high_volume_duplex_stream_integrity() {
     );
 
     cancel_token.cancel();
-    let _ = tokio::join!(echo_handle, server_handle, client_handle);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        async {
+            let _ = tokio::join!(echo_handle, server_handle, client_handle);
+        },
+    )
+    .await
+    .expect("Timeout waiting for handles to exit after cancellation in test_full_duplex_concurrent_traffic");
 }
 
 #[tokio::test]
@@ -247,11 +276,21 @@ async fn test_stream_half_close_and_draining() {
 
     // Read response from backend service
     let mut reply = String::new();
-    stream.read_to_string(&mut reply).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), stream.read_to_string(&mut reply))
+        .await
+        .expect("Timeout reading reply in test_stream_half_close_and_draining")
+        .unwrap();
     assert_eq!(reply, format!("DRAINED_TOTAL_{}", UPLOAD_SIZE));
 
     cancel_token.cancel();
-    let _ = tokio::join!(backend_handle, server_handle, client_handle);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        async {
+            let _ = tokio::join!(backend_handle, server_handle, client_handle);
+        },
+    )
+    .await
+    .expect("Timeout waiting for handles to exit after cancellation in test_stream_half_close_and_draining");
 }
 
 #[tokio::test]
@@ -327,7 +366,10 @@ async fn test_pool_prewarm_and_reuse() {
         stream.write_all(msg.as_bytes()).await.unwrap();
 
         let mut buf = vec![0u8; msg.len()];
-        stream.read_exact(&mut buf).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut buf))
+            .await
+            .expect("Timeout reading pooled connection reply")
+            .unwrap();
         assert_eq!(&buf, msg.as_bytes());
 
         // Explicitly close connection
@@ -336,7 +378,14 @@ async fn test_pool_prewarm_and_reuse() {
     }
 
     cancel_token.cancel();
-    let _ = tokio::join!(echo_handle, server_handle, client_handle);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        async {
+            let _ = tokio::join!(echo_handle, server_handle, client_handle);
+        },
+    )
+    .await
+    .expect("Timeout waiting for handles to exit after cancellation in test_pool_prewarm_and_reuse");
 }
 
 #[tokio::test]
@@ -414,7 +463,10 @@ async fn test_pool_resilience_after_disconnect_and_high_churn() {
             stream.write_all(msg.as_bytes()).await.unwrap();
 
             let mut buf = vec![0u8; msg.len()];
-            stream.read_exact(&mut buf).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut buf))
+                .await
+                .expect("Timeout reading concurrent churn reply")
+                .unwrap();
             assert_eq!(&buf, msg.as_bytes());
             drop(stream);
         }));
@@ -437,10 +489,20 @@ async fn test_pool_resilience_after_disconnect_and_high_churn() {
         stream.write_all(msg.as_bytes()).await.unwrap();
 
         let mut buf = vec![0u8; msg.len()];
-        stream.read_exact(&mut buf).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut buf))
+            .await
+            .expect("Timeout reading post-churn reply")
+            .unwrap();
         assert_eq!(&buf, msg.as_bytes());
     }
 
     cancel_token.cancel();
-    let _ = tokio::join!(echo_handle, server_handle, client_handle);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        async {
+            let _ = tokio::join!(echo_handle, server_handle, client_handle);
+        },
+    )
+    .await
+    .expect("Timeout waiting for handles to exit after cancellation in test_pool_resilience_after_disconnect_and_high_churn");
 }
