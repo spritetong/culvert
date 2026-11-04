@@ -5,7 +5,9 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use futures_util::stream::FuturesUnordered;
+use futures_util::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -97,6 +99,30 @@ impl StreamPool for InMemoryStreamPool {
     }
 }
 
+/// State of an idle stream's heartbeat lifecycle within the pool.
+#[derive(Debug, Clone, Copy)]
+enum HeartbeatState {
+    /// Waiting for the next scheduled heartbeat check.
+    Idle(Instant),
+    /// Attempting to send a ping frame (with start timestamp to detect hanging ping calls).
+    SendingPing(Instant),
+}
+
+/// A wrapper around an idle `TunnelStream` keeping track of its heartbeat timing.
+struct ManagedStream {
+    stream: Box<dyn TunnelStream>,
+    state: HeartbeatState,
+}
+
+impl ManagedStream {
+    fn new(stream: Box<dyn TunnelStream>) -> Self {
+        Self {
+            stream,
+            state: HeartbeatState::Idle(Instant::now()),
+        }
+    }
+}
+
 /// Request sent to the pool actor to acquire a stream.
 struct AcquireRequest {
     target: Option<TargetAddr>,
@@ -148,104 +174,164 @@ impl ReplenishingStreamPool {
         let stats_clone = Arc::clone(&stats);
 
         tokio::spawn(async move {
-            let mut idle_streams: VecDeque<Box<dyn TunnelStream>> = VecDeque::new();
-            let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(5));
-            heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut idle_streams: VecDeque<ManagedStream> = VecDeque::new();
+            let mut connecting_futures: FuturesUnordered<BoxFuture<'static, Result<Box<dyn TunnelStream>, TunnelError>>> =
+                FuturesUnordered::new();
             let dummy_target = default_target
                 .clone()
                 .unwrap_or_else(|| TargetAddr::Domain("pool.idle".to_string(), 0));
 
-            loop {
-                let need_replenish = idle_streams.len() < target_size;
+            const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+            const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(3);
+            const MAX_CONCURRENT_CONNECTS: usize = 4;
 
+            loop {
+                // 1. Replenish connecting futures if total (idle + in_flight) < target_size
+                let in_flight = connecting_futures.len();
+                let current_total = idle_streams.len() + in_flight;
+                if current_total < target_size && in_flight < MAX_CONCURRENT_CONNECTS {
+                    let c = Arc::clone(&connector);
+                    let t = dummy_target.clone();
+                    connecting_futures.push(Box::pin(async move {
+                        c.connect_pooled(&t).await
+                    }));
+                }
+
+                // 2. Perform non-blocking, multi-stream heartbeat sweep in a single poll
+                let mut surviving = VecDeque::with_capacity(idle_streams.len());
+                let now = Instant::now();
+
+                while let Some(mut managed) = idle_streams.pop_front() {
+                    let mut is_dead = false;
+
+                    // Non-blocking single poll to check stream status and advance ping
+                    let _ = std::future::poll_fn(|cx| {
+                        // First: check liveness
+                        if let Poll::Ready(HeartbeatStatus::Dead) = managed.stream.poll_check_alive(cx) {
+                            is_dead = true;
+                            return Poll::Ready(());
+                        }
+
+                        // Second: advance heartbeat state machine
+                        match managed.state {
+                            HeartbeatState::Idle(last_check) => {
+                                if now.duration_since(last_check) >= HEARTBEAT_INTERVAL {
+                                    match managed.stream.poll_send_ping(cx) {
+                                        Poll::Ready(Ok(())) => {
+                                            managed.state = HeartbeatState::Idle(now);
+                                        }
+                                        Poll::Ready(Err(_)) => {
+                                            is_dead = true;
+                                        }
+                                        Poll::Pending => {
+                                            managed.state = HeartbeatState::SendingPing(now);
+                                        }
+                                    }
+                                }
+                            }
+                            HeartbeatState::SendingPing(started_at) => {
+                                if now.duration_since(started_at) > HEARTBEAT_TIMEOUT {
+                                    // Ping call hung in lower layer; evict defensively!
+                                    is_dead = true;
+                                } else {
+                                    match managed.stream.poll_send_ping(cx) {
+                                        Poll::Ready(Ok(())) => {
+                                            managed.state = HeartbeatState::Idle(now);
+                                        }
+                                        Poll::Ready(Err(_)) => {
+                                            is_dead = true;
+                                        }
+                                        Poll::Pending => {
+                                            // Still pending, continue waiting without blocking other streams
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Poll::Ready(())
+                    }).await;
+
+                    if !is_dead {
+                        surviving.push_back(managed);
+                    } else {
+                        tracing::debug!("Evicted dead/hanging stream during non-blocking sweep");
+                    }
+                }
+                idle_streams = surviving;
+                stats_clone.lock().idle_count = idle_streams.len();
+
+                // 3. Multi-branch non-blocking select
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
                         break;
                     }
-                    dial_res = connector.connect_pooled(&dummy_target), if need_replenish => {
-                        match dial_res {
+                    Some(conn_res) = connecting_futures.next(), if !connecting_futures.is_empty() => {
+                        match conn_res {
                             Ok(stream) => {
-                                idle_streams.push_back(stream);
+                                idle_streams.push_back(ManagedStream::new(stream));
                                 let mut st = stats_clone.lock();
                                 st.idle_count = idle_streams.len();
                                 st.total_created += 1;
                             }
                             Err(e) => {
-                                tracing::debug!("Failed to replenish idle pool stream: {:?}", e);
-                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                tracing::debug!("Background connect_pooled failed: {:?}", e);
                             }
                         }
-                    }
-                    _ = heartbeat_interval.tick() => {
-                        // Periodic heartbeat inspection across all idle streams
-                        let mut alive_streams = VecDeque::with_capacity(idle_streams.len());
-                        while let Some(mut stream) = idle_streams.pop_front() {
-                            let is_alive = std::future::poll_fn(|cx| {
-                                let _ = stream.poll_send_ping(cx);
-                                match stream.poll_check_alive(cx) {
-                                    Poll::Ready(HeartbeatStatus::Dead) => Poll::Ready(false),
-                                    _ => Poll::Ready(true),
-                                }
-                            }).await;
-
-                            if is_alive {
-                                alive_streams.push_back(stream);
-                            } else {
-                                tracing::debug!("Evicted dead stream during pool heartbeat sweep");
-                            }
-                        }
-                        idle_streams = alive_streams;
-                        stats_clone.lock().idle_count = idle_streams.len();
                     }
                     cmd_opt = rx_cmd.recv() => {
                         match cmd_opt {
                             Some(PoolCommand::Acquire(req)) => {
-                                let mut acquired_stream: Option<Box<dyn TunnelStream>> = None;
+                                let mut acquired: Option<Box<dyn TunnelStream>> = None;
 
-                                while let Some(mut stream) = idle_streams.pop_front() {
-                                    let is_alive = std::future::poll_fn(|cx| {
-                                        match stream.poll_check_alive(cx) {
-                                            Poll::Ready(HeartbeatStatus::Dead) => Poll::Ready(false),
-                                            _ => Poll::Ready(true),
+                                while let Some(mut managed) = idle_streams.pop_front() {
+                                    let mut dead = false;
+                                    let _ = std::future::poll_fn(|cx| {
+                                        if let Poll::Ready(HeartbeatStatus::Dead) = managed.stream.poll_check_alive(cx) {
+                                            dead = true;
                                         }
+                                        Poll::Ready(())
                                     }).await;
 
-                                    if is_alive {
-                                        acquired_stream = Some(stream);
+                                    if !dead {
+                                        acquired = Some(managed.stream);
                                         break;
                                     } else {
-                                        tracing::debug!("Evicted dead stream during acquire check");
+                                        tracing::debug!("Evicted dead stream during acquire inspection");
                                     }
                                 }
 
-                                if let Some(stream) = acquired_stream {
+                                if let Some(stream) = acquired {
                                     let mut st = stats_clone.lock();
                                     st.idle_count = idle_streams.len();
                                     st.active_count += 1;
                                     let _ = req.reply.send(Ok(stream));
                                 } else {
-                                    // Idle pool exhausted: dial on demand directly
+                                    // Idle pool exhausted: dial on demand directly in a separate task
                                     let effective_target = req.target
                                         .or_else(|| default_target.clone())
                                         .unwrap_or_else(|| TargetAddr::Domain("pool.idle".to_string(), 0));
+                                    let c = Arc::clone(&connector);
+                                    let stats_inner = Arc::clone(&stats_clone);
 
-                                    let dial_res = connector.connect_pooled(&effective_target).await;
-                                    match dial_res {
-                                        Ok(stream) => {
-                                            let mut st = stats_clone.lock();
-                                            st.active_count += 1;
-                                            st.total_created += 1;
-                                            let _ = req.reply.send(Ok(stream));
+                                    tokio::spawn(async move {
+                                        let res = c.connect_pooled(&effective_target).await;
+                                        match res {
+                                            Ok(stream) => {
+                                                let mut st = stats_inner.lock();
+                                                st.active_count += 1;
+                                                st.total_created += 1;
+                                                let _ = req.reply.send(Ok(stream));
+                                            }
+                                            Err(e) => {
+                                                let _ = req.reply.send(Err(e));
+                                            }
                                         }
-                                        Err(e) => {
-                                            let _ = req.reply.send(Err(e));
-                                        }
-                                    }
+                                    });
                                 }
                                 stats_clone.lock().idle_count = idle_streams.len();
                             }
                             Some(PoolCommand::PushIdle(stream)) => {
-                                idle_streams.push_back(stream);
+                                idle_streams.push_back(ManagedStream::new(stream));
                                 let mut st = stats_clone.lock();
                                 st.idle_count = idle_streams.len();
                                 st.total_created += 1;
@@ -258,6 +344,9 @@ impl ReplenishingStreamPool {
                             }
                             None => break,
                         }
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                        // Periodic timer to wake up and drive heartbeat sweep even when idle
                     }
                 }
             }
