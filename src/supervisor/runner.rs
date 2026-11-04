@@ -49,8 +49,9 @@ impl TunnelSupervisor {
 
         // Spawn server runner if ingress server is configured
         if let Some(ref server_cfg) = self.config.server {
-            let server_runner = ServerRunner::new(
+            let server_runner = ServerRunner::with_global_tls(
                 server_cfg.clone(),
+                self.config.tls.clone(),
                 Arc::clone(&self.transport_registry),
                 Arc::clone(&self.session_manager),
             );

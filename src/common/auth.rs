@@ -4,38 +4,32 @@
 use ring::digest::{SHA256, digest};
 use subtle::ConstantTimeEq;
 
-const TOKEN_MAX_LEN: usize = 256;
-
-fn pad_to_fixed_len(input: &[u8]) -> Option<[u8; TOKEN_MAX_LEN]> {
-    if input.len() > TOKEN_MAX_LEN {
-        return None;
-    }
-    let mut buf = [0u8; TOKEN_MAX_LEN];
-    buf[..input.len()].copy_from_slice(input);
-    Some(buf)
-}
+/// Maximum supported token length in bytes for constant-time comparison.
+pub const TOKEN_MAX_LEN: usize = 256;
 
 /// Compares two token byte sequences in constant time without leaking length information.
 ///
 /// Standard slice `ConstantTimeEq` returns immediately if slice lengths differ,
-/// leaking token length through side channels. This function pads inputs up to 256 bytes
-/// to enforce constant SHA-256 block compression counts before constant-time comparison,
-/// preventing length-based timing side channels.
+/// leaking token length through side channels. This function copies up to 256 bytes
+/// into fixed-size buffers, enforcing constant SHA-256 block compression counts before
+/// constant-time comparison. Inputs exceeding 256 bytes are rejected in constant time
+/// without timing leakages.
 pub fn constant_time_token_eq(candidate: &[u8], expected: &[u8]) -> bool {
     let eq_len = candidate.len().ct_eq(&expected.len());
-    match (pad_to_fixed_len(candidate), pad_to_fixed_len(expected)) {
-        (Some(c), Some(e)) => {
-            let hash_cand = digest(&SHA256, &c);
-            let hash_exp = digest(&SHA256, &e);
-            bool::from(hash_cand.as_ref().ct_eq(hash_exp.as_ref()) & eq_len)
-        }
-        (None, None) => {
-            let hash_cand = digest(&SHA256, candidate);
-            let hash_exp = digest(&SHA256, expected);
-            bool::from(hash_cand.as_ref().ct_eq(hash_exp.as_ref()) & eq_len)
-        }
-        _ => false,
-    }
+    let mut cand_buf = [0u8; TOKEN_MAX_LEN];
+    let mut exp_buf = [0u8; TOKEN_MAX_LEN];
+
+    let cand_len = candidate.len().min(TOKEN_MAX_LEN);
+    let exp_len = expected.len().min(TOKEN_MAX_LEN);
+    cand_buf[..cand_len].copy_from_slice(&candidate[..cand_len]);
+    exp_buf[..exp_len].copy_from_slice(&expected[..exp_len]);
+
+    let hash_cand = digest(&SHA256, &cand_buf);
+    let hash_exp = digest(&SHA256, &exp_buf);
+    let overflow = (candidate.len() > TOKEN_MAX_LEN) | (expected.len() > TOKEN_MAX_LEN);
+    bool::from(
+        hash_cand.as_ref().ct_eq(hash_exp.as_ref()) & eq_len & !subtle::Choice::from(overflow as u8),
+    )
 }
 
 #[cfg(test)]

@@ -12,7 +12,7 @@ use tracing::{error, info, warn};
 
 use crate::common::net::SocketTuner;
 use crate::common::task::TaskTracker;
-use crate::config::model::{ServerConfig, TunnelMode};
+use crate::config::model::{ServerConfig, TlsConfig, TunnelMode};
 use crate::consts::{ACTIVATE_STREAM_MAGIC, DEFAULT_SESSION_PAIR_TIMEOUT};
 use crate::control::stream::{ControlMessage, FramedControlStream};
 use crate::core::error::TunnelError;
@@ -25,6 +25,7 @@ static REVERSE_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Ingress server runner that listens on an ingress endpoint (e.g. WSS/UDS) and dispatches tunnels.
 pub struct ServerRunner {
     config: ServerConfig,
+    global_tls: Option<TlsConfig>,
     transport_registry: Arc<TransportRegistry>,
     session_manager: Arc<SessionManager>,
 }
@@ -36,8 +37,19 @@ impl ServerRunner {
         transport_registry: Arc<TransportRegistry>,
         session_manager: Arc<SessionManager>,
     ) -> Self {
+        Self::with_global_tls(config, None, transport_registry, session_manager)
+    }
+
+    /// Creates a new `ServerRunner` with inherited global TLS configuration.
+    pub fn with_global_tls(
+        config: ServerConfig,
+        global_tls: Option<TlsConfig>,
+        transport_registry: Arc<TransportRegistry>,
+        session_manager: Arc<SessionManager>,
+    ) -> Self {
         Self {
             config,
+            global_tls,
             transport_registry,
             session_manager,
         }
@@ -64,7 +76,7 @@ impl ServerRunner {
             let session_mgr = Arc::clone(&self.session_manager);
             let default_target = self.config.default_target.clone();
             let token_opt = self.config.token.clone();
-            let server_tls = self.config.effective_tls(None);
+            let server_tls = self.config.effective_tls(self.global_tls.as_ref());
 
             tracker.spawn_with_cancel(move |token| async move {
                 let mut listener = registry.create_listener(

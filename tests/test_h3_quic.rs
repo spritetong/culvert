@@ -12,9 +12,35 @@ use micro_tunnel::transport::h3::H3Connector;
 use micro_tunnel::transport::h3::listener::H3Listener;
 use micro_tunnel::transport::{TargetAddr, TransportConnector, TransportListener};
 
+use std::sync::atomic::{AtomicU16, Ordering};
+
+static PORT_COUNTER: AtomicU16 = AtomicU16::new(53100);
+
 fn get_ephemeral_port() -> u16 {
+    for _ in 0..200 {
+        let port = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        if let Ok(u) = std::net::UdpSocket::bind(("127.0.0.1", port))
+            && let Ok(t) = std::net::TcpListener::bind(("127.0.0.1", port))
+        {
+            drop(u);
+            drop(t);
+            return port;
+        }
+    }
     let listener = std::net::UdpSocket::bind("127.0.0.1:0").expect("Failed to bind UDP ephemeral port");
     listener.local_addr().unwrap().port()
+}
+
+async fn connect_with_retry(addr: &str) -> tokio::net::TcpStream {
+    for _ in 0..100 {
+        if let Ok(s) = tokio::net::TcpStream::connect(addr).await {
+            return s;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("Failed to connect to local tunnel port after retries")
 }
 
 /// Helper to generate a test PKI certificate and ServerConfig for QUIC.
@@ -389,15 +415,19 @@ async fn test_h3_tunnel_pool_prewarm_and_activation_end_to_end() {
 
     // 4. Connect 3 consecutive clients to client_listen port to consume pooled streams
     for i in 1..=3 {
-        let mut client_tcp = tokio::net::TcpStream::connect(&client_listen)
-            .await
-            .expect("Failed to connect to local client tunnel port");
+        let mut client_tcp = connect_with_retry(&client_listen).await;
 
         let test_message = format!("H3 POOL ECHO TEST PACKET {}", i);
         client_tcp.write_all(test_message.as_bytes()).await.unwrap();
 
         let mut read_buf = vec![0u8; test_message.len()];
-        client_tcp.read_exact(&mut read_buf).await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client_tcp.read_exact(&mut read_buf),
+        )
+        .await
+        .expect("Timed out reading echo response in H3 pool test")
+        .unwrap();
         assert_eq!(String::from_utf8_lossy(&read_buf), test_message);
     }
 
@@ -496,15 +526,19 @@ async fn test_quic_raw_tunnel_pool_prewarm_and_activation_end_to_end() {
 
     // 4. Connect 3 consecutive clients to client_listen port to consume pooled streams
     for i in 1..=3 {
-        let mut client_tcp = tokio::net::TcpStream::connect(&client_listen)
-            .await
-            .expect("Failed to connect to local client tunnel port");
+        let mut client_tcp = connect_with_retry(&client_listen).await;
 
         let test_message = format!("QUIC RAW POOL ECHO TEST PACKET {}", i);
         client_tcp.write_all(test_message.as_bytes()).await.unwrap();
 
         let mut read_buf = vec![0u8; test_message.len()];
-        client_tcp.read_exact(&mut read_buf).await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client_tcp.read_exact(&mut read_buf),
+        )
+        .await
+        .expect("Timed out reading echo response in QUIC pool test")
+        .unwrap();
         assert_eq!(String::from_utf8_lossy(&read_buf), test_message);
     }
 
@@ -607,9 +641,7 @@ async fn test_quic_raw_forward_stress_throughput() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // 4. Connect client and blast 20MB of data
-    let mut client_tcp = tokio::net::TcpStream::connect(&client_listen)
-        .await
-        .expect("Failed to connect to local client tunnel port");
+    let mut client_tcp = connect_with_retry(&client_listen).await;
 
     const CHUNK_SIZE: usize = 64 * 1024;
     const CHUNKS: usize = 1600; // 100 MB
@@ -725,7 +757,7 @@ async fn test_h3_concurrent_forward_stress() {
     for id in 0..CONCURRENCY {
         let addr = client_listen.clone();
         handles.push(tokio::spawn(async move {
-            let client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+            let client = connect_with_retry(&addr).await;
             let (mut rd, mut wr) = client.into_split();
 
             let payload = vec![(id as u8).wrapping_add(1); CHUNK_SIZE];

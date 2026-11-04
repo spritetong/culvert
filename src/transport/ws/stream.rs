@@ -886,22 +886,71 @@ mod tests {
 
     #[tokio::test]
     async fn test_ws_shutdown_with_in_flight_data_sends_fin() {
+        use std::future::poll_fn;
+
         let (raw_client, raw_server) = duplex(65536);
 
         let mut client = WsTunnelStream::new(raw_client, Role::Client);
         let mut server = WsTunnelStream::new(raw_server, Role::Server);
 
-        // Client writes data and immediately calls shutdown without manual flush
-        client.write_all(b"payload before shutdown").await.unwrap();
-        client.shutdown().await.unwrap();
+        let large_payload = vec![0x42u8; 300_000];
 
-        // Server should read the payload first
-        let mut buf = vec![0u8; 23];
-        server.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"payload before shutdown");
+        // 1. Kick off write of 300KB into 64KB duplex pipe.
+        // It must enter WriteState::Writing and return Poll::Pending due to pipe backpressure.
+        let mut pending_write = false;
+        poll_fn(|cx| {
+            match Pin::new(&mut client).poll_write(cx, &large_payload) {
+                Poll::Pending => {
+                    pending_write = true;
+                    Poll::Ready(())
+                }
+                Poll::Ready(_) => {
+                    panic!("poll_write of 300KB into 64KB duplex must return Pending")
+                }
+            }
+        })
+        .await;
+        assert!(pending_write, "Client must enter Writing state with in-flight data");
 
-        // Server should now read 0 bytes (EOF due to FIN frame)
-        let n = server.read(&mut buf).await.unwrap();
-        assert_eq!(n, 0, "Server must receive EOF after client shutdown");
+        // 2. Poll shutdown immediately while in-flight write is pending. It must return Pending
+        // without prematurely marking FIN as sent.
+        let mut pending_shutdown = false;
+        poll_fn(|cx| {
+            match Pin::new(&mut client).poll_shutdown(cx) {
+                Poll::Pending => {
+                    pending_shutdown = true;
+                    Poll::Ready(())
+                }
+                Poll::Ready(res) => panic!(
+                    "poll_shutdown while write is in flight must return Pending, got {:?}",
+                    res
+                ),
+            }
+        })
+        .await;
+        assert!(
+            pending_shutdown,
+            "poll_shutdown must return Pending while in-flight data is pending"
+        );
+
+        // 3. Drive client shutdown in background task
+        let client_task = tokio::spawn(async move {
+            client.shutdown().await.unwrap();
+        });
+
+        // 4. Server drains all data; this unblocks the in-flight data frame and lets shutdown emit FIN
+        let mut received = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = server.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            received.extend_from_slice(&buf[..n]);
+        }
+
+        client_task.await.unwrap();
+        assert_eq!(received.len(), 300_000, "Server must receive all 300,000 bytes");
+        assert_eq!(received, large_payload);
     }
 }
