@@ -371,6 +371,8 @@ impl ReplenishingStreamPool {
             let len = b.len().min(u16::MAX as usize) as u16;
             pkt.extend_from_slice(&len.to_be_bytes());
             pkt.extend_from_slice(&b[..len as usize]);
+        } else {
+            pkt.extend_from_slice(&0u16.to_be_bytes());
         }
         pkt
     }

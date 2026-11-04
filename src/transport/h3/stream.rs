@@ -1,13 +1,15 @@
 //! HTTP/3 and QUIC tunnel stream adapters implementing `TunnelStream`.
 //! All comments and docstrings must be in English.
 
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::{Buf, Bytes};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::PollSender;
 use tracing::debug;
 
 use crate::core::stream::{HeartbeatStatus, TunnelStream};
@@ -16,12 +18,17 @@ use crate::core::stream::{HeartbeatStatus, TunnelStream};
 pub struct QuinnTunnelStream {
     send: quinn::SendStream,
     recv: quinn::RecvStream,
+    shutdown_done: bool,
 }
 
 impl QuinnTunnelStream {
     /// Creates a new `QuinnTunnelStream` from split Quinn send and receive halves.
     pub fn new(send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
-        Self { send, recv }
+        Self {
+            send,
+            recv,
+            shutdown_done: false,
+        }
     }
 }
 
@@ -49,26 +56,36 @@ impl AsyncWrite for QuinnTunnelStream {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        tokio::io::AsyncWrite::poll_shutdown(Pin::new(&mut self.send), cx)
+        if self.shutdown_done {
+            return Poll::Ready(Ok(()));
+        }
+        match tokio::io::AsyncWrite::poll_shutdown(Pin::new(&mut self.send), cx) {
+            Poll::Ready(Ok(())) => {
+                self.shutdown_done = true;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::NotConnected => {
+                self.shutdown_done = true;
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
     }
 }
 
 impl TunnelStream for QuinnTunnelStream {
-    fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
-        let mut empty = [0u8; 0];
-        let mut buf = ReadBuf::new(&mut empty);
-        match Pin::new(&mut self.recv).poll_read(cx, &mut buf) {
-            Poll::Ready(Err(_)) => Poll::Ready(HeartbeatStatus::Dead),
-            _ => Poll::Ready(HeartbeatStatus::Alive),
-        }
+    fn poll_check_alive(&mut self, _cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+        Poll::Ready(HeartbeatStatus::Alive)
     }
 }
 
 /// Bidirectional stream adapter for HTTP/3 request streams (`h3::client` or `h3::server`).
 pub struct H3TunnelStream {
-    tx_outbound: Option<mpsc::Sender<Bytes>>,
+    tx_outbound: Option<PollSender<Bytes>>,
     rx_inbound: mpsc::Receiver<Bytes>,
     read_buf: Option<Bytes>,
+    shutdown_rx: Option<oneshot::Receiver<io::Result<()>>>,
+    shutdown_done: bool,
     fin_sent: bool,
 }
 
@@ -77,81 +94,70 @@ impl H3TunnelStream {
     pub fn from_client(
         stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     ) -> Self {
-        Self::spawn_pump(stream)
+        let (send, recv) = stream.split();
+        Self::spawn_split_pump(send, recv)
     }
 
     /// Constructs an `H3TunnelStream` from a server-side HTTP/3 request stream.
     pub fn from_server(
         stream: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     ) -> Self {
-        Self::spawn_pump(stream)
+        let (send, recv) = stream.split();
+        Self::spawn_split_pump(send, recv)
     }
 
-    fn spawn_pump<S>(mut stream: S) -> Self
+    fn spawn_split_pump<S, R>(mut send_stream: S, mut recv_stream: R) -> Self
     where
-        S: H3BidirectionalStream + Send + 'static,
+        S: H3SendStream,
+        R: H3RecvStream,
     {
-        let (tx_outbound, mut rx_outbound) = mpsc::channel::<Bytes>(64);
-        let (tx_inbound, rx_inbound) = mpsc::channel::<Bytes>(64);
-        let mut tx_inbound_opt = Some(tx_inbound);
+        let (tx_outbound, mut rx_outbound) = mpsc::channel::<Bytes>(128);
+        let (tx_inbound, rx_inbound) = mpsc::channel::<Bytes>(128);
+        let (tx_shutdown, rx_shutdown) = oneshot::channel::<io::Result<()>>();
 
+        // Outbound send task: continuously drains outgoing chunks without being blocked by incoming reading
         tokio::spawn(async move {
-            let mut read_closed = false;
-            let mut write_closed = false;
+            let mut result = Ok(());
+            while let Some(chunk) = rx_outbound.recv().await {
+                if let Err(e) = send_stream.send_chunk(chunk).await {
+                    debug!("H3 send_chunk failed: {:?}", e);
+                    result = Err(e);
+                    break;
+                }
+            }
+            if result.is_ok() {
+                if let Err(e) = send_stream.finish_stream().await {
+                    debug!("H3 finish_stream failed: {:?}", e);
+                    result = Err(e);
+                }
+            }
+            let _ = tx_shutdown.send(result);
+        });
 
-            while !read_closed || !write_closed {
-                tokio::select! {
-                    biased;
-
-                    chunk_opt = rx_outbound.recv(), if !write_closed => {
-                        match chunk_opt {
-                            Some(chunk) => {
-                                if let Err(e) = stream.send_chunk(chunk).await {
-                                    debug!("H3 send_chunk failed: {:?}", e);
-                                    break;
-                                }
-                            }
-                            None => {
-                                write_closed = true;
-                                if let Err(e) = stream.finish_stream().await {
-                                    debug!("H3 finish_stream failed: {:?}", e);
-                                    break;
-                                }
-                            }
+        // Inbound receive task: continuously receives incoming chunks without being blocked by outgoing writes
+        tokio::spawn(async move {
+            loop {
+                match recv_stream.recv_chunk().await {
+                    Ok(Some(data)) => {
+                        if tx_inbound.send(data).await.is_err() {
+                            break;
                         }
                     }
-
-                    res = stream.recv_chunk(), if !read_closed => {
-                        match res {
-                            Ok(Some(data)) => {
-                                if let Some(ref tx) = tx_inbound_opt {
-                                    if tx.send(data).await.is_err() {
-                                        break;
-                                    }
-                                } else {
-                                    break;
-                                }
-                            }
-                            Ok(None) => {
-                                // Peer closed write direction (FIN), half-close read and signal EOF
-                                read_closed = true;
-                                tx_inbound_opt.take();
-                            }
-                            Err(e) => {
-                                debug!("H3 recv_chunk failed: {:?}", e);
-                                tx_inbound_opt.take();
-                                break;
-                            }
-                        }
+                    Ok(None) => break, // EOF reached cleanly
+                    Err(e) => {
+                        debug!("H3 recv_chunk failed: {:?}", e);
+                        break;
                     }
                 }
             }
         });
 
         Self {
-            tx_outbound: Some(tx_outbound),
+            tx_outbound: Some(PollSender::new(tx_outbound)),
             rx_inbound,
             read_buf: None,
+            shutdown_rx: Some(rx_shutdown),
+            shutdown_done: false,
             fin_sent: false,
         }
     }
@@ -202,7 +208,8 @@ impl AsyncWrite for H3TunnelStream {
             )));
         }
 
-        let tx = match self.tx_outbound.as_ref() {
+        let this = self.get_mut();
+        let tx = match this.tx_outbound.as_mut() {
             Some(t) => t,
             None => {
                 return Poll::Ready(Err(io::Error::new(
@@ -216,18 +223,19 @@ impl AsyncWrite for H3TunnelStream {
             return Poll::Ready(Ok(0));
         }
 
-        let chunk = Bytes::copy_from_slice(buf);
-        let len = chunk.len();
-        match tx.try_send(chunk) {
-            Ok(()) => Poll::Ready(Ok(len)),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
+        // Use poll_reserve to properly register async waker instead of spinning in wake_by_ref
+        match tx.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => {
+                let chunk = Bytes::copy_from_slice(buf);
+                let len = chunk.len();
+                let _ = tx.send_item(chunk);
+                Poll::Ready(Ok(len))
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(io::Error::new(
+            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::ConnectionReset,
                 "HTTP/3 background pump closed",
             ))),
+            Poll::Pending => Poll::Pending,
         }
     }
 
@@ -235,10 +243,30 @@ impl AsyncWrite for H3TunnelStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.fin_sent = true;
-        self.tx_outbound.take();
-        Poll::Ready(Ok(()))
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.shutdown_done {
+            return Poll::Ready(Ok(()));
+        }
+
+        if self.tx_outbound.is_some() {
+            self.fin_sent = true;
+            // Dropping tx_outbound allows rx_outbound to drain completely before yielding None
+            self.tx_outbound.take();
+        }
+
+        if let Some(ref mut rx) = self.shutdown_rx {
+            match Future::poll(Pin::new(rx), cx) {
+                Poll::Ready(_) => {
+                    self.shutdown_done = true;
+                    self.shutdown_rx.take();
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            self.shutdown_done = true;
+            Poll::Ready(Ok(()))
+        }
     }
 }
 
@@ -258,31 +286,29 @@ impl TunnelStream for H3TunnelStream {
     }
 }
 
-/// Trait unifying `h3::client::RequestStream` and `h3::server::RequestStream`.
-pub trait H3BidirectionalStream {
+/// Trait for the independent send half of an HTTP/3 request stream.
+pub trait H3SendStream: Send + 'static {
     fn send_chunk(
         &mut self,
         chunk: Bytes,
     ) -> impl std::future::Future<Output = Result<(), io::Error>> + Send;
+    fn finish_stream(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<(), io::Error>> + Send;
+}
+
+/// Trait for the independent receive half of an HTTP/3 request stream.
+pub trait H3RecvStream: Send + 'static {
     fn recv_chunk(
         &mut self,
     ) -> impl std::future::Future<Output = Result<Option<Bytes>, io::Error>> + Send;
-    fn finish_stream(&mut self) -> impl std::future::Future<Output = Result<(), io::Error>> + Send;
 }
 
-impl H3BidirectionalStream for h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes> {
+impl H3SendStream for h3::client::RequestStream<h3_quinn::SendStream<Bytes>, Bytes> {
     async fn send_chunk(&mut self, chunk: Bytes) -> Result<(), io::Error> {
         self.send_data(chunk)
             .await
             .map_err(|e| io::Error::other(e.to_string()))
-    }
-
-    async fn recv_chunk(&mut self) -> Result<Option<Bytes>, io::Error> {
-        match self.recv_data().await {
-            Ok(Some(mut buf)) => Ok(Some(buf.copy_to_bytes(buf.remaining()))),
-            Ok(None) => Ok(None),
-            Err(e) => Err(io::Error::other(e.to_string())),
-        }
     }
 
     async fn finish_stream(&mut self) -> Result<(), io::Error> {
@@ -292,13 +318,7 @@ impl H3BidirectionalStream for h3::client::RequestStream<h3_quinn::BidiStream<By
     }
 }
 
-impl H3BidirectionalStream for h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes> {
-    async fn send_chunk(&mut self, chunk: Bytes) -> Result<(), io::Error> {
-        self.send_data(chunk)
-            .await
-            .map_err(|e| io::Error::other(e.to_string()))
-    }
-
+impl H3RecvStream for h3::client::RequestStream<h3_quinn::RecvStream, Bytes> {
     async fn recv_chunk(&mut self) -> Result<Option<Bytes>, io::Error> {
         match self.recv_data().await {
             Ok(Some(mut buf)) => Ok(Some(buf.copy_to_bytes(buf.remaining()))),
@@ -306,10 +326,28 @@ impl H3BidirectionalStream for h3::server::RequestStream<h3_quinn::BidiStream<By
             Err(e) => Err(io::Error::other(e.to_string())),
         }
     }
+}
+
+impl H3SendStream for h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes> {
+    async fn send_chunk(&mut self, chunk: Bytes) -> Result<(), io::Error> {
+        self.send_data(chunk)
+            .await
+            .map_err(|e| io::Error::other(e.to_string()))
+    }
 
     async fn finish_stream(&mut self) -> Result<(), io::Error> {
         self.finish()
             .await
             .map_err(|e| io::Error::other(e.to_string()))
+    }
+}
+
+impl H3RecvStream for h3::server::RequestStream<h3_quinn::RecvStream, Bytes> {
+    async fn recv_chunk(&mut self) -> Result<Option<Bytes>, io::Error> {
+        match self.recv_data().await {
+            Ok(Some(mut buf)) => Ok(Some(buf.copy_to_bytes(buf.remaining()))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(io::Error::other(e.to_string())),
+        }
     }
 }

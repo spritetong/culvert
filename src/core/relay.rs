@@ -171,11 +171,10 @@ impl RelayEngine {
         // Step 3: Shutdown writer if reader is done and all bytes written
         if state.read_done && state.write_pos == state.read_pos && !state.write_shutdown {
             match Pin::new(&mut *writer).poll_shutdown(cx) {
-                Poll::Ready(Ok(())) => {
+                Poll::Ready(_) => {
                     state.write_shutdown = true;
                     *progress = true;
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => {}
             }
         }

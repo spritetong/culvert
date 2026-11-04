@@ -204,133 +204,137 @@ impl H3Listener {
                 resolver_opt = h3_conn.accept() => {
                     match resolver_opt {
                         Ok(Some(resolver)) => {
-                            match resolver.resolve_request().await {
-                                Ok((req, mut stream)) => {
-                                    // Validate URI path
-                                    if let Some(ref p) = *expected_path {
-                                        if req.uri().path() != p.as_str() {
+                            let auth_clone = Arc::clone(&auth_token);
+                            let path_clone = Arc::clone(&expected_path);
+                            let tx_clone = tx_streams.clone();
+
+                            tokio::spawn(async move {
+                                let (req, mut stream) = match resolver.resolve_request().await {
+                                    Ok(pair) => pair,
+                                    Err(e) => {
+                                        debug!("Failed to resolve H3 request: {:?}", e);
+                                        return;
+                                    }
+                                };
+
+                                // Validate URI path
+                                if let Some(ref p) = *path_clone {
+                                    if req.uri().path() != p.as_str() {
+                                        let resp = Response::builder()
+                                            .status(StatusCode::NOT_FOUND)
+                                            .body(())
+                                            .unwrap();
+                                        let _ = stream.send_response(resp).await;
+                                        return;
+                                    }
+                                }
+
+                                // Validate authorization token if configured
+                                if let Some(ref token) = *auth_clone {
+                                    if !token.is_empty() {
+                                        let auth_header = req
+                                            .headers()
+                                            .get("authorization")
+                                            .or_else(|| req.headers().get(crate::consts::HEADER_TUNNEL_AUTH))
+                                            .and_then(|v| v.to_str().ok());
+
+                                        let expected_bearer = format!("Bearer {}", token);
+                                        let is_authed = auth_header == Some(&expected_bearer)
+                                            || auth_header == Some(token.as_str());
+
+                                        if !is_authed {
+                                            warn!("H3 request authentication failed");
                                             let resp = Response::builder()
-                                                .status(StatusCode::NOT_FOUND)
+                                                .status(StatusCode::UNAUTHORIZED)
                                                 .body(())
                                                 .unwrap();
                                             let _ = stream.send_response(resp).await;
-                                            continue;
+                                            return;
                                         }
                                     }
+                                }
 
-                                    // Validate authorization token if configured
-                                    if let Some(ref token) = *auth_token {
-                                        if !token.is_empty() {
-                                            let auth_header = req
-                                                .headers()
-                                                .get("authorization")
-                                                .or_else(|| req.headers().get(crate::consts::HEADER_TUNNEL_AUTH))
-                                                .and_then(|v| v.to_str().ok());
+                                let mode = match req
+                                    .headers()
+                                    .get(crate::consts::HEADER_TUNNEL_MODE)
+                                    .and_then(|v| v.to_str().ok())
+                                {
+                                    Some(crate::consts::TUNNEL_MODE_REVERSE_CTRL)
+                                    | Some(crate::consts::TUNNEL_MODE_REVERSE_DATA)
+                                    | Some("reverse") => TunnelMode::Reverse,
+                                    _ => TunnelMode::Forward,
+                                };
 
-                                            let expected_bearer = format!("Bearer {}", token);
-                                            let is_authed = auth_header == Some(&expected_bearer)
-                                                || auth_header == Some(token.as_str());
-
-                                            if !is_authed {
-                                                warn!("H3 request authentication failed");
-                                                let resp = Response::builder()
-                                                    .status(StatusCode::UNAUTHORIZED)
-                                                    .body(())
-                                                    .unwrap();
-                                                let _ = stream.send_response(resp).await;
-                                                continue;
-                                            }
+                                let target = req
+                                    .headers()
+                                    .get("x-tunnel-target")
+                                    .and_then(|v| v.to_str().ok())
+                                    .and_then(|s| {
+                                        if let Ok(addr) = s.parse::<SocketAddr>() {
+                                            Some(TargetAddr::Ip(addr))
+                                        } else if let Some((h, p)) = s.split_once(':') {
+                                            p.parse::<u16>()
+                                                .ok()
+                                                .map(|port| TargetAddr::Domain(h.to_string(), port))
+                                        } else {
+                                            None
                                         }
-                                    }
-
-                                    let mode = match req
-                                        .headers()
-                                        .get(crate::consts::HEADER_TUNNEL_MODE)
-                                        .and_then(|v| v.to_str().ok())
-                                    {
-                                        Some(crate::consts::TUNNEL_MODE_REVERSE_CTRL)
-                                        | Some(crate::consts::TUNNEL_MODE_REVERSE_DATA)
-                                        | Some("reverse") => TunnelMode::Reverse,
-                                        _ => TunnelMode::Forward,
-                                    };
-
-                                    let target = req
-                                        .headers()
-                                        .get("x-tunnel-target")
-                                        .and_then(|v| v.to_str().ok())
-                                        .and_then(|s| {
-                                            if let Ok(addr) = s.parse::<SocketAddr>() {
-                                                Some(TargetAddr::Ip(addr))
-                                            } else if let Some((h, p)) = s.split_once(':') {
-                                                p.parse::<u16>()
-                                                    .ok()
-                                                    .map(|port| TargetAddr::Domain(h.to_string(), port))
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .or_else(|| {
-                                            let host = req
-                                                .headers()
-                                                .get(crate::consts::HEADER_TARGET_HOST)
-                                                .and_then(|v| v.to_str().ok());
-                                            let port = req
-                                                .headers()
-                                                .get(crate::consts::HEADER_TARGET_PORT)
-                                                .and_then(|v| v.to_str().ok())
-                                                .and_then(|p| p.parse::<u16>().ok());
-                                            match (host, port) {
-                                                (Some(h), Some(p)) => {
-                                                    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
-                                                        Some(TargetAddr::Ip(SocketAddr::new(ip, p)))
-                                                    } else {
-                                                        Some(TargetAddr::Domain(h.to_string(), p))
-                                                    }
+                                    })
+                                    .or_else(|| {
+                                        let host = req
+                                            .headers()
+                                            .get(crate::consts::HEADER_TARGET_HOST)
+                                            .and_then(|v| v.to_str().ok());
+                                        let port = req
+                                            .headers()
+                                            .get(crate::consts::HEADER_TARGET_PORT)
+                                            .and_then(|v| v.to_str().ok())
+                                            .and_then(|p| p.parse::<u16>().ok());
+                                        match (host, port) {
+                                            (Some(h), Some(p)) => {
+                                                if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+                                                    Some(TargetAddr::Ip(SocketAddr::new(ip, p)))
+                                                } else {
+                                                    Some(TargetAddr::Domain(h.to_string(), p))
                                                 }
-                                                _ => None,
                                             }
-                                        });
+                                            _ => None,
+                                        }
+                                    });
 
-                                    let session_id = req
-                                        .headers()
-                                        .get(crate::consts::HEADER_SESSION_ID)
-                                        .and_then(|v| v.to_str().ok())
-                                        .map(|s| s.to_string());
+                                let session_id = req
+                                    .headers()
+                                    .get(crate::consts::HEADER_SESSION_ID)
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(|s| s.to_string());
 
-                                    let pool_idle = req
-                                        .headers()
-                                        .get(crate::consts::HEADER_TUNNEL_POOL)
-                                        .and_then(|v| v.to_str().ok())
-                                        .map(|v| v == crate::consts::TUNNEL_POOL_IDLE)
-                                        .unwrap_or(false);
+                                let pool_idle = req
+                                    .headers()
+                                    .get(crate::consts::HEADER_TUNNEL_POOL)
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(|v| v == crate::consts::TUNNEL_POOL_IDLE)
+                                    .unwrap_or(false);
 
-                                    let resp = Response::builder()
-                                        .status(StatusCode::OK)
-                                        .body(())
-                                        .unwrap();
+                                let resp = Response::builder()
+                                    .status(StatusCode::OK)
+                                    .body(())
+                                    .unwrap();
 
-                                    if let Err(e) = stream.send_response(resp).await {
-                                        debug!("Failed to send H3 200 response: {:?}", e);
-                                        continue;
-                                    }
-
-                                    let metadata = StreamMetadata {
-                                        mode,
-                                        session_id,
-                                        target,
-                                        pool_idle,
-                                    };
-                                    let tunnel_stream = Box::new(H3TunnelStream::from_server(stream)) as Box<dyn TunnelStream>;
-
-                                    if tx_streams.send((tunnel_stream, metadata)).await.is_err() {
-                                        break;
-                                    }
+                                if let Err(e) = stream.send_response(resp).await {
+                                    debug!("Failed to send H3 200 response: {:?}", e);
+                                    return;
                                 }
-                                Err(e) => {
-                                    debug!("Failed to resolve H3 request: {:?}", e);
-                                    break;
-                                }
-                            }
+
+                                let metadata = StreamMetadata {
+                                    mode,
+                                    session_id,
+                                    target,
+                                    pool_idle,
+                                };
+                                let tunnel_stream = Box::new(H3TunnelStream::from_server(stream)) as Box<dyn TunnelStream>;
+
+                                let _ = tx_clone.send((tunnel_stream, metadata)).await;
+                            });
                         }
                         Ok(None) => break,
                         Err(e) => {

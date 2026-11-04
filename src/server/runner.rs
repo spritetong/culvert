@@ -113,19 +113,35 @@ impl ServerRunner {
                                                                 Ok(_) if magic[0] == ACTIVATE_STREAM_MAGIC => {
                                                                     // Activated! Check if dynamic target address is appended: [len: u16, target_str]
                                                                     let mut len_bytes = [0u8; 2];
-                                                                    if let Ok(Ok(_)) = tokio::time::timeout(std::time::Duration::from_millis(200), stream.read_exact(&mut len_bytes)).await {
-                                                                        let target_len = u16::from_be_bytes(len_bytes) as usize;
-                                                                        if target_len > 0 && target_len < 512 {
-                                                                            let mut target_bytes = vec![0u8; target_len];
-                                                                            if let Ok(Ok(_)) = tokio::time::timeout(std::time::Duration::from_millis(200), stream.read_exact(&mut target_bytes)).await {
-                                                                                if let Ok(t_str) = std::str::from_utf8(&target_bytes) {
-                                                                                    if let Ok(sa) = t_str.parse() {
-                                                                                        dynamic_target = Some(TargetAddr::Ip(sa));
-                                                                                    } else if let Some((h, p)) = t_str.rsplit_once(':') {
-                                                                                        if let Ok(port) = p.parse() {
-                                                                                            dynamic_target = Some(TargetAddr::Domain(h.to_string(), port));
-                                                                                        }
-                                                                                    }
+                                                                    let read_len_res = tokio::select! {
+                                                                        _ = conn_token.cancelled() => return,
+                                                                        res = stream.read_exact(&mut len_bytes) => res,
+                                                                    };
+                                                                    if let Err(e) = read_len_res {
+                                                                        warn!("Failed to read activation target length: {:?}", e);
+                                                                        return;
+                                                                    }
+                                                                    let target_len = u16::from_be_bytes(len_bytes) as usize;
+                                                                    if target_len >= 512 {
+                                                                        warn!("Activation target length too large: {}", target_len);
+                                                                        return;
+                                                                    }
+                                                                    if target_len > 0 {
+                                                                        let mut target_bytes = vec![0u8; target_len];
+                                                                        let read_target_res = tokio::select! {
+                                                                            _ = conn_token.cancelled() => return,
+                                                                            res = stream.read_exact(&mut target_bytes) => res,
+                                                                        };
+                                                                        if let Err(e) = read_target_res {
+                                                                            warn!("Failed to read activation target payload: {:?}", e);
+                                                                            return;
+                                                                        }
+                                                                        if let Ok(t_str) = std::str::from_utf8(&target_bytes) {
+                                                                            if let Ok(sa) = t_str.parse() {
+                                                                                dynamic_target = Some(TargetAddr::Ip(sa));
+                                                                            } else if let Some((h, p)) = t_str.rsplit_once(':') {
+                                                                                if let Ok(port) = p.parse() {
+                                                                                    dynamic_target = Some(TargetAddr::Domain(h.to_string(), port));
                                                                                 }
                                                                             }
                                                                         }
@@ -190,8 +206,8 @@ impl ServerRunner {
                                                 };
 
                                                 let _ = RelayEngine::relay_with_cancel(
-                                                    stream,
                                                     Box::new(target_conn),
+                                                    stream,
                                                     conn_token,
                                                 ).await;
                                             }

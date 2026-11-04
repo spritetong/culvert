@@ -34,7 +34,7 @@ tunnels:
     mode: "forward"
     listen: "127.0.0.1:15201"
     target: "127.0.0.1:5201"
-    #token: "bench_secret_token_123456"
+    token: "bench_secret_token_123456"
 
     # Replace with server IP / domain:
     #   - "ws://127.0.0.1:8443/tunnel"
