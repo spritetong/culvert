@@ -38,6 +38,9 @@ pub async fn run_reverse_mapping(
     let dummy_target = TargetAddr::Domain("control".to_string(), 0);
     let mut conn_tracker = TaskTracker::<()>::new(cancel_token.clone());
 
+    let cancel_fut = cancel_token.cancelled();
+    tokio::pin!(cancel_fut);
+
     // Share data connector across all incoming visitor sessions to maximize connection/0-RTT reuse
     let data_connector: Arc<dyn TransportConnector> =
         Arc::from(transport_registry.create_connector(
@@ -57,14 +60,16 @@ pub async fn run_reverse_mapping(
 
         info!(tag = %tag, "Connecting reverse control channel to remote server...");
         let raw_stream = match tokio::select! {
-            _ = cancel_token.cancelled() => break,
+            biased;
+            _ = &mut cancel_fut => break,
             res = connector.connect(&dummy_target, None) => res,
         } {
             Ok(s) => s,
             Err(e) => {
                 warn!(tag = %tag, "Failed to connect control channel: {:?}. Retrying in {:?}...", e, backoff);
                 tokio::select! {
-                    _ = cancel_token.cancelled() => break,
+                    biased;
+                    _ = &mut cancel_fut => break,
                     _ = tokio::time::sleep(backoff) => {
                         backoff = (backoff * 2).min(Duration::from_secs(30));
                         continue;
@@ -82,13 +87,15 @@ pub async fn run_reverse_mapping(
         };
 
         let send_res = tokio::select! {
-            _ = cancel_token.cancelled() => break,
+            biased;
+            _ = &mut cancel_fut => break,
             res = ctrl_stream.send(reg_msg) => res,
         };
         if let Err(e) = send_res {
             warn!(tag = %tag, "Failed to send RegisterReverse: {:?}. Retrying in {:?}...", e, backoff);
             tokio::select! {
-                _ = cancel_token.cancelled() => break,
+                biased;
+                _ = &mut cancel_fut => break,
                 _ = tokio::time::sleep(backoff) => {
                     backoff = (backoff * 2).min(Duration::from_secs(30));
                     continue;
@@ -98,7 +105,8 @@ pub async fn run_reverse_mapping(
 
         // Await RegisterAck from remote server
         let ack_res = tokio::select! {
-            _ = cancel_token.cancelled() => break,
+            biased;
+            _ = &mut cancel_fut => break,
             res = ctrl_stream.next() => res,
         };
         match ack_res {
@@ -115,7 +123,8 @@ pub async fn run_reverse_mapping(
                         "Server rejected reverse listener registration. Retrying in {:?}...", backoff
                     );
                     tokio::select! {
-                        _ = cancel_token.cancelled() => break,
+                        biased;
+                        _ = &mut cancel_fut => break,
                         _ = tokio::time::sleep(backoff) => {
                             backoff = (backoff * 2).min(Duration::from_secs(30));
                             continue;
@@ -127,7 +136,8 @@ pub async fn run_reverse_mapping(
             other => {
                 warn!(tag = %tag, "Unexpected response to RegisterReverse: {:?}. Retrying in {:?}...", other, backoff);
                 tokio::select! {
-                    _ = cancel_token.cancelled() => break,
+                    biased;
+                    _ = &mut cancel_fut => break,
                     _ = tokio::time::sleep(backoff) => {
                         backoff = (backoff * 2).min(Duration::from_secs(30));
                         continue;
@@ -142,14 +152,16 @@ pub async fn run_reverse_mapping(
         // Main event loop handling incoming connection alerts from remote server
         loop {
             tokio::select! {
-                _ = cancel_token.cancelled() => {
+                biased;
+                _ = &mut cancel_fut => {
                     info!(tag = %tag, "Reverse tunnel received cancellation signal");
                     break;
                 }
                 Some(_) = conn_tracker.join_next(), if !conn_tracker.is_empty() => {}
                 _ = heartbeat.tick() => {
                     let send_ping = tokio::select! {
-                        _ = cancel_token.cancelled() => break,
+                        biased;
+                        _ = &mut cancel_fut => break,
                         res = ctrl_stream.send(ControlMessage::Ping) => res,
                     };
                     if let Err(e) = send_ping {
@@ -216,7 +228,8 @@ pub async fn run_reverse_mapping(
                             }
                             ControlMessage::Ping => {
                                 let _ = tokio::select! {
-                                    _ = cancel_token.cancelled() => break,
+                                    biased;
+                                    _ = &mut cancel_fut => break,
                                     res = ctrl_stream.send(ControlMessage::Pong) => res,
                                 };
                             }
@@ -242,7 +255,8 @@ pub async fn run_reverse_mapping(
         }
 
         tokio::select! {
-            _ = cancel_token.cancelled() => break,
+            biased;
+            _ = &mut cancel_fut => break,
             _ = tokio::time::sleep(backoff) => {}
         }
     }

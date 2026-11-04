@@ -76,6 +76,7 @@ impl TunnelSupervisor {
 
         // Wait for cancellation signal
         tokio::select! {
+            biased;
             _ = self.cancel_token.cancelled() => {
                 info!("Supervisor received shutdown signal.");
             }
@@ -144,6 +145,7 @@ impl TunnelSupervisor {
                     );
 
                     tokio::select! {
+                        biased;
                         _ = token.cancelled() => break,
                         _ = tokio::time::sleep(retry_delay) => {}
                     }

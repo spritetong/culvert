@@ -58,6 +58,9 @@ pub async fn run_forward_mapping(
     let mut conn_tracker = TaskTracker::<()>::new(cancel_token.clone());
     let target = parse_target_addr(&target_str)?;
 
+    let cancel_fut = cancel_token.cancelled();
+    tokio::pin!(cancel_fut);
+
     // Create shared transport connector at the mapping level so internal QUIC/H3 connection
     // caches and zero-RTT handshakes are actually shared across multiple inbound visitor connections.
     let shared_connector: Option<Arc<dyn TransportConnector>> = if pool.is_none() {
@@ -72,7 +75,8 @@ pub async fn run_forward_mapping(
 
     loop {
         tokio::select! {
-            _ = cancel_token.cancelled() => {
+            biased;
+            _ = &mut cancel_fut => {
                 info!(tag = %tag, "Forward tunnel received cancellation signal");
                 break;
             }
@@ -99,6 +103,7 @@ pub async fn run_forward_mapping(
                             };
 
                             let remote_res = tokio::select! {
+                                biased;
                                 _ = conn_token.cancelled() => return,
                                 res = acquire_fut => res,
                             };
@@ -108,6 +113,7 @@ pub async fn run_forward_mapping(
                                     if pool_clone.is_some() {
                                         let activation_pkt = ReplenishingStreamPool::encode_activation(Some(&target));
                                         let write_act_res = tokio::select! {
+                                            biased;
                                             _ = conn_token.cancelled() => {
                                                 if let Some(ref p) = pool_for_close {
                                                     p.on_stream_closed();

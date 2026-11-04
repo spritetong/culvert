@@ -93,6 +93,7 @@ pub async fn run_tunnel_cluster(
 
     let mut exit_err = None;
     tokio::select! {
+        biased;
         _ = cancel_token.cancelled() => {
             info!(tag = %config.tag, "Tunnel cluster received cancellation signal");
         }
