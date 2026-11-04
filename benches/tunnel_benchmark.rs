@@ -238,7 +238,7 @@ fn bench_pool_acquisition(c: &mut Criterion) {
                 }
                 let start = std::time::Instant::now();
                 for _ in 0..iters {
-                    let stream = pool.acquire().await.unwrap();
+                    let stream = pool.acquire(None).await.unwrap();
                     black_box(stream);
                 }
                 start.elapsed()

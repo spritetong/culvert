@@ -63,13 +63,29 @@ impl<T: 'static> TaskTracker<T> {
     }
 
     /// Signals all tasks to stop via the cancellation token and awaits their orderly completion.
+    /// If graceful shutdown exceeds the 5-second deadline, remaining tasks are aborted.
     pub async fn shutdown_and_wait(&mut self) {
         info!("Initiating graceful task shutdown via cancellation token...");
         self.cancel_token.cancel();
 
-        while let Some(res) = self.join_set.join_next().await {
-            if let Err(e) = res {
-                error!("Task panicked during graceful shutdown: {:?}", e);
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(5));
+        tokio::pin!(deadline);
+
+        loop {
+            tokio::select! {
+                res = self.join_set.join_next() => match res {
+                    Some(Ok(_)) => {},
+                    Some(Err(e)) => {
+                        error!("Task panicked during graceful shutdown: {:?}", e);
+                    }
+                    None => break,
+                },
+                _ = &mut deadline => {
+                    tracing::warn!("Graceful shutdown timeout (5s), aborting remaining tasks");
+                    self.join_set.abort_all();
+                    while self.join_set.join_next().await.is_some() {}
+                    break;
+                }
             }
         }
         info!("All tracked tasks completed cleanly.");

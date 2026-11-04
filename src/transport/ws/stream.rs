@@ -23,6 +23,7 @@ enum ReadState {
             'static,
             (
                 WebSocketRead<DynRead>,
+                Vec<Frame<'static>>,
                 Result<(OpCode, Bytes), WebSocketError>,
             ),
         >,
@@ -38,7 +39,11 @@ enum ReadState {
 
 enum WriteState {
     Idle(WebSocketWrite<DynWrite>),
-    Writing(BoxFuture<'static, (WebSocketWrite<DynWrite>, Result<(), WebSocketError>)>),
+    Writing {
+        fut: BoxFuture<'static, (WebSocketWrite<DynWrite>, Result<(), WebSocketError>)>,
+        written_len: usize,
+    },
+    WritingControl(BoxFuture<'static, (WebSocketWrite<DynWrite>, Result<(), WebSocketError>)>),
     Closing(BoxFuture<'static, (WebSocketWrite<DynWrite>, Result<(), WebSocketError>)>),
     Closed,
     Failed,
@@ -51,6 +56,7 @@ enum WriteState {
 pub struct WsTunnelStream {
     read_state: ReadState,
     write_state: WriteState,
+    control_queue: std::collections::VecDeque<Frame<'static>>,
 }
 
 // Safety: WsTunnelStream exposes no methods taking `&self` that mutate state without
@@ -67,12 +73,52 @@ impl WsTunnelStream {
         let (mut rx, mut tx) =
             after_handshake_split(Box::new(r) as DynRead, Box::new(w) as DynWrite, role);
         rx.set_auto_pong(true);
-        rx.set_auto_close(true);
+        rx.set_auto_close(false);
         tx.set_writev(true);
 
         Self {
             read_state: ReadState::Idle(rx),
             write_state: WriteState::Idle(tx),
+            control_queue: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Drives pending obligated control frames (Pong/Close) out to the underlying writer.
+    fn poll_flush_control(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            match std::mem::replace(&mut self.write_state, WriteState::Failed) {
+                WriteState::Idle(mut tx) => {
+                    if let Some(frame) = self.control_queue.pop_front() {
+                        let fut = Box::pin(async move {
+                            let res = tx.write_frame(frame).await;
+                            (tx, res)
+                        });
+                        self.write_state = WriteState::WritingControl(fut);
+                        continue;
+                    } else {
+                        self.write_state = WriteState::Idle(tx);
+                        return Poll::Ready(Ok(()));
+                    }
+                }
+                WriteState::WritingControl(mut fut) => match fut.as_mut().poll(cx) {
+                    Poll::Ready((tx, Ok(()))) => {
+                        self.write_state = WriteState::Idle(tx);
+                        continue;
+                    }
+                    Poll::Ready((_tx, Err(e))) => {
+                        self.write_state = WriteState::Failed;
+                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
+                    }
+                    Poll::Pending => {
+                        self.write_state = WriteState::WritingControl(fut);
+                        return Poll::Pending;
+                    }
+                },
+                other => {
+                    self.write_state = other;
+                    return Poll::Ready(Ok(()));
+                }
+            }
         }
     }
 }
@@ -83,6 +129,9 @@ impl AsyncRead for WsTunnelStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // Opportunistically flush any pending control frames
+        let _ = self.poll_flush_control(cx);
+
         loop {
             match std::mem::replace(&mut self.read_state, ReadState::Failed) {
                 ReadState::Buffered {
@@ -107,20 +156,29 @@ impl AsyncRead for WsTunnelStream {
                 }
                 ReadState::Idle(mut rx) => {
                     let fut = Box::pin(async move {
+                        let mut obligated = Vec::new();
                         let res = loop {
-                            let frame = match rx
-                                .read_frame(&mut |_| async { Ok::<(), io::Error>(()) })
-                                .await
-                            {
+                            let mut send_fn = |f: Frame<'_>| {
+                                let frame_to_queue = match f.opcode {
+                                    OpCode::Pong => Frame::pong(Payload::Owned(f.payload.to_vec())),
+                                    OpCode::Close => Frame::close_raw(Payload::Owned(f.payload.to_vec())),
+                                    _ => Frame::new(f.fin, f.opcode, None, Payload::Owned(f.payload.to_vec())),
+                                };
+                                obligated.push(frame_to_queue);
+                                async { Ok::<(), io::Error>(()) }
+                            };
+                            let frame = match rx.read_frame(&mut send_fn).await {
                                 Ok(f) => f,
                                 Err(e) => break Err(e),
                             };
                             match frame.opcode {
                                 OpCode::Binary | OpCode::Text => {
-                                    break Ok((
-                                        frame.opcode,
-                                        Bytes::copy_from_slice(&frame.payload),
-                                    ));
+                                    let payload = match frame.payload {
+                                        Payload::Bytes(b) => b.freeze(),
+                                        Payload::Owned(v) => Bytes::from(v),
+                                        other => Bytes::copy_from_slice(&other),
+                                    };
+                                    break Ok((frame.opcode, payload));
                                 }
                                 OpCode::Close => {
                                     break Ok((OpCode::Close, Bytes::new()));
@@ -128,7 +186,7 @@ impl AsyncRead for WsTunnelStream {
                                 _ => {}
                             }
                         };
-                        (rx, res)
+                        (rx, obligated, res)
                     });
                     self.read_state = ReadState::Reading(fut);
                 }
@@ -137,11 +195,19 @@ impl AsyncRead for WsTunnelStream {
                         self.read_state = ReadState::Reading(fut);
                         return Poll::Pending;
                     }
-                    Poll::Ready((_rx, Ok((OpCode::Close, _)))) => {
+                    Poll::Ready((_rx, obligated, Ok((OpCode::Close, _)))) => {
+                        if !obligated.is_empty() {
+                            self.control_queue.extend(obligated);
+                            let _ = self.poll_flush_control(cx);
+                        }
                         self.read_state = ReadState::Eof;
                         return Poll::Ready(Ok(()));
                     }
-                    Poll::Ready((rx, Ok((_, payload)))) => {
+                    Poll::Ready((rx, obligated, Ok((_, payload)))) => {
+                        if !obligated.is_empty() {
+                            self.control_queue.extend(obligated);
+                            let _ = self.poll_flush_control(cx);
+                        }
                         if payload.is_empty() {
                             self.read_state = ReadState::Idle(rx);
                             continue;
@@ -153,7 +219,11 @@ impl AsyncRead for WsTunnelStream {
                         };
                         continue;
                     }
-                    Poll::Ready((_rx, Err(e))) => {
+                    Poll::Ready((_rx, obligated, Err(e))) => {
+                        if !obligated.is_empty() {
+                            self.control_queue.extend(obligated);
+                            let _ = self.poll_flush_control(cx);
+                        }
                         self.read_state = ReadState::Failed;
                         return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, e)));
                     }
@@ -179,6 +249,10 @@ impl AsyncWrite for WsTunnelStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if let Poll::Ready(Err(e)) = self.poll_flush_control(cx) {
+            return Poll::Ready(Err(e));
+        }
+
         loop {
             match std::mem::replace(&mut self.write_state, WriteState::Failed) {
                 WriteState::Idle(mut tx) => {
@@ -198,25 +272,32 @@ impl AsyncWrite for WsTunnelStream {
                             return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
                         }
                         Poll::Pending => {
-                            self.write_state = WriteState::Writing(fut);
-                            return Poll::Ready(Ok(len));
+                            self.write_state = WriteState::Writing { fut, written_len: len };
+                            return Poll::Pending;
                         }
                     }
                 }
-                WriteState::Writing(mut fut) => match fut.as_mut().poll(cx) {
+                WriteState::Writing { mut fut, written_len } => match fut.as_mut().poll(cx) {
                     Poll::Pending => {
-                        self.write_state = WriteState::Writing(fut);
+                        self.write_state = WriteState::Writing { fut, written_len };
                         return Poll::Pending;
                     }
                     Poll::Ready((tx, Ok(()))) => {
                         self.write_state = WriteState::Idle(tx);
-                        continue;
+                        return Poll::Ready(Ok(written_len));
                     }
                     Poll::Ready((_tx, Err(e))) => {
                         self.write_state = WriteState::Failed;
                         return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
                     }
                 },
+                WriteState::WritingControl(fut) => {
+                    self.write_state = WriteState::WritingControl(fut);
+                    if let Poll::Ready(Err(e)) = self.poll_flush_control(cx) {
+                        return Poll::Ready(Err(e));
+                    }
+                    return Poll::Pending;
+                }
                 WriteState::Closing(mut fut) => match fut.as_mut().poll(cx) {
                     Poll::Pending => {
                         self.write_state = WriteState::Closing(fut);
@@ -248,26 +329,36 @@ impl AsyncWrite for WsTunnelStream {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Poll::Ready(Err(e)) = self.poll_flush_control(cx) {
+            return Poll::Ready(Err(e));
+        }
         loop {
             match std::mem::replace(&mut self.write_state, WriteState::Failed) {
                 WriteState::Idle(tx) => {
                     self.write_state = WriteState::Idle(tx);
                     return Poll::Ready(Ok(()));
                 }
-                WriteState::Writing(mut fut) => match fut.as_mut().poll(cx) {
+                WriteState::Writing { mut fut, written_len } => match fut.as_mut().poll(cx) {
                     Poll::Pending => {
-                        self.write_state = WriteState::Writing(fut);
+                        self.write_state = WriteState::Writing { fut, written_len };
                         return Poll::Pending;
                     }
                     Poll::Ready((tx, Ok(()))) => {
                         self.write_state = WriteState::Idle(tx);
-                        return Poll::Ready(Ok(()));
+                        continue;
                     }
                     Poll::Ready((_tx, Err(e))) => {
                         self.write_state = WriteState::Failed;
                         return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
                     }
                 },
+                WriteState::WritingControl(fut) => {
+                    self.write_state = WriteState::WritingControl(fut);
+                    if let Poll::Ready(Err(e)) = self.poll_flush_control(cx) {
+                        return Poll::Ready(Err(e));
+                    }
+                    return Poll::Pending;
+                }
                 WriteState::Closing(mut fut) => match fut.as_mut().poll(cx) {
                     Poll::Pending => {
                         self.write_state = WriteState::Closing(fut);
@@ -293,6 +384,9 @@ impl AsyncWrite for WsTunnelStream {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Poll::Ready(Err(e)) = self.poll_flush_control(cx) {
+            return Poll::Ready(Err(e));
+        }
         loop {
             match std::mem::replace(&mut self.write_state, WriteState::Failed) {
                 WriteState::Idle(mut tx) => {
@@ -303,24 +397,39 @@ impl AsyncWrite for WsTunnelStream {
                     self.write_state = WriteState::Closing(fut);
                     continue;
                 }
-                WriteState::Writing(mut fut) => match fut.as_mut().poll(cx) {
+                WriteState::Writing { mut fut, written_len } => match fut.as_mut().poll(cx) {
                     Poll::Pending => {
-                        self.write_state = WriteState::Writing(fut);
+                        self.write_state = WriteState::Writing { fut, written_len };
                         return Poll::Pending;
                     }
-                    Poll::Ready((tx, _)) => {
+                    Poll::Ready((tx, Ok(()))) => {
                         self.write_state = WriteState::Idle(tx);
                         continue;
                     }
+                    Poll::Ready((_tx, Err(e))) => {
+                        self.write_state = WriteState::Failed;
+                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
+                    }
                 },
+                WriteState::WritingControl(fut) => {
+                    self.write_state = WriteState::WritingControl(fut);
+                    if let Poll::Ready(Err(e)) = self.poll_flush_control(cx) {
+                        return Poll::Ready(Err(e));
+                    }
+                    return Poll::Pending;
+                }
                 WriteState::Closing(mut fut) => match fut.as_mut().poll(cx) {
                     Poll::Pending => {
                         self.write_state = WriteState::Closing(fut);
                         return Poll::Pending;
                     }
-                    Poll::Ready((_tx, _)) => {
+                    Poll::Ready((_tx, Ok(()))) => {
                         self.write_state = WriteState::Closed;
                         return Poll::Ready(Ok(()));
+                    }
+                    Poll::Ready((_tx, Err(e))) => {
+                        self.write_state = WriteState::Failed;
+                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
                     }
                 },
                 WriteState::Closed => {
@@ -339,7 +448,15 @@ impl AsyncWrite for WsTunnelStream {
 }
 
 impl TunnelStream for WsTunnelStream {
+    fn supports_half_close(&self) -> bool {
+        // WebSocket RFC 6455 does not support half-close (closing one direction terminates session)
+        false
+    }
+
     fn poll_send_ping(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Poll::Ready(Err(e)) = self.poll_flush_control(cx) {
+            return Poll::Ready(Err(e));
+        }
         loop {
             match std::mem::replace(&mut self.write_state, WriteState::Failed) {
                 WriteState::Idle(mut tx) => {
@@ -357,14 +474,28 @@ impl TunnelStream for WsTunnelStream {
                             return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
                         }
                         Poll::Pending => {
-                            self.write_state = WriteState::Writing(fut);
+                            self.write_state = WriteState::WritingControl(fut);
                             return Poll::Pending;
                         }
                     }
                 }
-                WriteState::Writing(mut fut) => match fut.as_mut().poll(cx) {
+                WriteState::Writing { mut fut, written_len } => match fut.as_mut().poll(cx) {
                     Poll::Pending => {
-                        self.write_state = WriteState::Writing(fut);
+                        self.write_state = WriteState::Writing { fut, written_len };
+                        return Poll::Pending;
+                    }
+                    Poll::Ready((tx, Ok(()))) => {
+                        self.write_state = WriteState::Idle(tx);
+                        continue;
+                    }
+                    Poll::Ready((_tx, Err(e))) => {
+                        self.write_state = WriteState::Failed;
+                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
+                    }
+                },
+                WriteState::WritingControl(mut fut) => match fut.as_mut().poll(cx) {
+                    Poll::Pending => {
+                        self.write_state = WriteState::WritingControl(fut);
                         return Poll::Pending;
                     }
                     Poll::Ready((tx, Ok(()))) => {
@@ -403,14 +534,22 @@ impl TunnelStream for WsTunnelStream {
                 match Pin::new(&mut *self).poll_read(cx, &mut buf) {
                     Poll::Ready(Err(_)) => Poll::Ready(HeartbeatStatus::Dead),
                     Poll::Pending => {
-                        // Crucial: check what state poll_read transitioned into!
+                        // Check if poll_read transitioned into Reading and inspect completion
                         if let ReadState::Reading(ref mut fut) = self.read_state {
                             match fut.as_mut().poll(cx) {
-                                Poll::Ready((_rx, Ok((OpCode::Close, _)))) => {
+                                Poll::Ready((_rx, obligated, Ok((OpCode::Close, _)))) => {
+                                    if !obligated.is_empty() {
+                                        self.control_queue.extend(obligated);
+                                        let _ = self.poll_flush_control(cx);
+                                    }
                                     self.read_state = ReadState::Eof;
                                     Poll::Ready(HeartbeatStatus::Dead)
                                 }
-                                Poll::Ready((_rx, Err(_))) => {
+                                Poll::Ready((_rx, obligated, Err(_))) => {
+                                    if !obligated.is_empty() {
+                                        self.control_queue.extend(obligated);
+                                        let _ = self.poll_flush_control(cx);
+                                    }
                                     self.read_state = ReadState::Failed;
                                     Poll::Ready(HeartbeatStatus::Dead)
                                 }
@@ -425,15 +564,27 @@ impl TunnelStream for WsTunnelStream {
             }
             ReadState::Reading(fut) => {
                 match fut.as_mut().poll(cx) {
-                    Poll::Ready((_rx, Ok((OpCode::Close, _)))) => {
+                    Poll::Ready((_rx, obligated, Ok((OpCode::Close, _)))) => {
+                        if !obligated.is_empty() {
+                            self.control_queue.extend(obligated);
+                            let _ = self.poll_flush_control(cx);
+                        }
                         self.read_state = ReadState::Eof;
                         Poll::Ready(HeartbeatStatus::Dead)
                     }
-                    Poll::Ready((_rx, Err(_))) => {
+                    Poll::Ready((_rx, obligated, Err(_))) => {
+                        if !obligated.is_empty() {
+                            self.control_queue.extend(obligated);
+                            let _ = self.poll_flush_control(cx);
+                        }
                         self.read_state = ReadState::Failed;
                         Poll::Ready(HeartbeatStatus::Dead)
                     }
-                    Poll::Ready((rx, Ok((_, payload)))) => {
+                    Poll::Ready((rx, obligated, Ok((_, payload)))) => {
+                        if !obligated.is_empty() {
+                            self.control_queue.extend(obligated);
+                            let _ = self.poll_flush_control(cx);
+                        }
                         if payload.is_empty() {
                             self.read_state = ReadState::Idle(rx);
                         } else {

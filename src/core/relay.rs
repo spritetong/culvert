@@ -66,9 +66,22 @@ impl RelayEngine {
         // Pre-create the cancellation future once on the stack to register wakers
         // and achieve zero-allocation, purely event-driven cancellation without polling.
         let mut cancel_fut = pin!(cancel_token.cancelled_owned());
+        let mut drain_sleep: Option<Pin<Box<tokio::time::Sleep>>> = None;
 
         poll_fn(|cx| {
             let is_cancelled = cancel_fut.as_mut().poll(cx).is_ready();
+            if is_cancelled {
+                if drain_sleep.is_none() {
+                    // Give at most 250ms bounded drain period to flush in-flight tails
+                    drain_sleep = Some(Box::pin(tokio::time::sleep(std::time::Duration::from_millis(250))));
+                }
+                if let Some(sleep_fut) = drain_sleep.as_mut() {
+                    if sleep_fut.as_mut().poll(cx).is_ready() {
+                        // Hard bounded deadline reached: terminate relay immediately without hanging
+                        return Poll::Ready(Ok((a_to_b.total_bytes, b_to_a.total_bytes)));
+                    }
+                }
+            }
 
             // Drive A -> B transfer (RX direction)
             let mut progress = false;

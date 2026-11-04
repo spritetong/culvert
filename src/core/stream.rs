@@ -37,6 +37,13 @@ pub trait TunnelStream: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static {
     /// Returns `Poll::Ready(HeartbeatStatus::Dead)` if EOF, RST, or broken pipe is detected.
     /// Returns `Poll::Ready(HeartbeatStatus::Alive)` or `Poll::Pending` if still healthy.
     fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus>;
+
+    /// Indicates whether the transport stream supports true half-close (closing write direction
+    /// while keeping read direction open, e.g. TCP FIN or QUIC stream FIN).
+    /// Transports that do not support half-close (e.g. WebSocket RFC 6455) must return false.
+    fn supports_half_close(&self) -> bool {
+        true
+    }
 }
 
 // Implement TunnelStream for Box<dyn TunnelStream> to allow trait-object wrapping.
@@ -47,6 +54,10 @@ impl TunnelStream for Box<dyn TunnelStream> {
 
     fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
         (**self).poll_check_alive(cx)
+    }
+
+    fn supports_half_close(&self) -> bool {
+        (**self).supports_half_close()
     }
 }
 

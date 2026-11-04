@@ -63,6 +63,7 @@ pub async fn run_forward_mapping(
                 info!(tag = %tag, "Forward tunnel received cancellation signal");
                 break;
             }
+            Some(_) = conn_tracker.join_next(), if !conn_tracker.is_empty() => {}
             accept_res = listener.accept() => {
                 match accept_res {
                     Ok((inbound_stream, peer_addr)) => {

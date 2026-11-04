@@ -89,6 +89,7 @@ impl ServerRunner {
                 loop {
                     tokio::select! {
                         _ = token.cancelled() => break,
+                        Some(_) = conn_tracker.join_next(), if !conn_tracker.is_empty() => {}
                         accept_res = listener.accept() => {
                             match accept_res {
                                 Ok((stream, metadata)) => {
@@ -310,6 +311,7 @@ impl ServerRunner {
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => break,
+                Some(_) = local_tracker.join_next(), if !local_tracker.is_empty() => {}
                 accept_res = listener.accept() => {
                     match accept_res {
                         Ok((visitor_stream, visitor_addr)) => {

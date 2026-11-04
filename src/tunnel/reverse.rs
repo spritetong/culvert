@@ -106,6 +106,7 @@ pub async fn run_reverse_mapping(
                     info!(tag = %tag, "Reverse tunnel received cancellation signal");
                     break;
                 }
+                Some(_) = conn_tracker.join_next(), if !conn_tracker.is_empty() => {}
                 _ = heartbeat.tick() => {
                     if let Err(e) = ctrl_stream.send(ControlMessage::Ping).await {
                         warn!(tag = %tag, "Failed to send heartbeat ping: {:?}", e);
