@@ -16,7 +16,7 @@ use micro_tunnel::supervisor::TunnelSupervisor;
 fn get_available_port() -> u16 {
     static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
     let base = 34000 + (std::process::id() as u16 % 100) * 50;
-    for _ in 0..500 {
+    for _ in 0..200 {
         let offset = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
         let port = base.wrapping_add(offset);
         if (1024..65535).contains(&port)
@@ -26,8 +26,7 @@ fn get_available_port() -> u16 {
             return port;
         }
     }
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
+    panic!("Failed to find an available port in Suite 3 partition [34000, 39500)");
 }
 
 fn spawn_echo_server(

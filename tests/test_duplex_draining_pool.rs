@@ -23,7 +23,7 @@ use micro_tunnel::tunnel::run_forward_tunnel;
 fn get_available_port() -> u16 {
     static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
     let base = 27000 + (std::process::id() as u16 % 100) * 50;
-    for _ in 0..500 {
+    for _ in 0..200 {
         let offset = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
         let port = base.wrapping_add(offset);
         if (1024..65535).contains(&port)
@@ -33,9 +33,7 @@ fn get_available_port() -> u16 {
             return port;
         }
     }
-    let listener =
-        std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral port");
-    listener.local_addr().unwrap().port()
+    panic!("Failed to find an available port in Suite 2 partition [27000, 32500)");
 }
 
 /// Spawns a full-duplex echo server using held-listener handoff to eliminate TOCTOU.
@@ -155,13 +153,14 @@ async fn test_high_volume_duplex_stream_integrity() {
         recv_data
     });
 
-    let (_, recv_data) = tokio::time::timeout(
+    let (writer_res, reader_res) = tokio::time::timeout(
         Duration::from_secs(10),
         async { tokio::join!(writer_handle, reader_handle) },
     )
     .await
     .expect("Timeout waiting for writer/reader handles");
-    let recv_data = recv_data.unwrap();
+    writer_res.expect("writer_handle panicked");
+    let recv_data = reader_res.expect("reader_handle panicked");
 
     assert_eq!(recv_data.len(), DATA_SIZE);
     assert_eq!(

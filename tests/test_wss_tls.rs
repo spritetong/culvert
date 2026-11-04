@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicU16, Ordering};
 fn get_available_port() -> u16 {
     static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
     let base = 20000 + (std::process::id() as u16 % 100) * 50;
-    for _ in 0..500 {
+    for _ in 0..200 {
         let offset = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
         let port = base.wrapping_add(offset);
         if (1024..65535).contains(&port)
@@ -43,9 +43,7 @@ fn get_available_port() -> u16 {
             return port;
         }
     }
-    let listener =
-        std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral port");
-    listener.local_addr().unwrap().port()
+    panic!("Failed to find an available port in Suite 1 partition [20000, 25500)");
 }
 
 /// In-memory or temporary PKI credentials bundle generated via rcgen.
@@ -220,10 +218,16 @@ fn spawn_tls_terminator(
                         };
                         let (mut tls_rd, mut tls_wr) = tokio::io::split(tls_stream);
                         let (mut be_rd, mut be_wr) = backend_conn.into_split();
-                        let _ = tokio::join!(
+                        let (res1, res2) = tokio::join!(
                             tokio::io::copy(&mut tls_rd, &mut be_wr),
                             tokio::io::copy(&mut be_rd, &mut tls_wr)
                         );
+                        if let Err(e) = res1 {
+                            tracing::debug!("TLS terminator to backend copy finished: {:?}", e);
+                        }
+                        if let Err(e) = res2 {
+                            tracing::debug!("Backend to TLS terminator copy finished: {:?}", e);
+                        }
                     });
                 }
             }
