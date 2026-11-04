@@ -124,11 +124,16 @@ impl AsyncWrite for MuxStream {
         }
 
         let this = &mut *self;
-        if this.pending_payload.is_none() {
-            let chunk_size = std::cmp::min(buf.len(), MAX_FRAME_PAYLOAD_SIZE);
-            let payload = Bytes::copy_from_slice(&buf[..chunk_size]);
-            this.pending_payload = Some((payload, chunk_size));
+        if this.pending_payload.is_some() {
+            match Pin::new(&mut *this).poll_flush(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => {}
+            }
         }
+        let chunk_size = std::cmp::min(buf.len(), MAX_FRAME_PAYLOAD_SIZE);
+        let payload = Bytes::copy_from_slice(&buf[..chunk_size]);
+        this.pending_payload = Some((payload, chunk_size));
 
         match this.outbound.poll_reserve(cx) {
             Poll::Ready(Ok(())) => {
@@ -246,7 +251,7 @@ impl TunnelStream for MuxStream {
             ))),
             Poll::Pending => {
                 self.pending_payload = Some((payload, chunk_size));
-                Poll::Ready(Ok(chunk_size))
+                Poll::Pending
             }
         }
     }

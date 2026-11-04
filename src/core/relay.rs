@@ -13,9 +13,9 @@ use crate::core::stream::TunnelStream;
 
 /// Directional transfer state for one half of the duplex relay.
 struct TransferState {
-    buffer: Vec<u8>,
-    read_pos: usize,
-    write_pos: usize,
+    raw_buf: Vec<u8>,
+    in_flight_chunk: Option<bytes::Bytes>,
+    chunk_pos: usize,
     read_done: bool,
     write_shutdown: bool,
     total_bytes: u64,
@@ -24,9 +24,9 @@ struct TransferState {
 impl TransferState {
     fn new(capacity: usize) -> Self {
         Self {
-            buffer: vec![0u8; capacity],
-            read_pos: 0,
-            write_pos: 0,
+            raw_buf: vec![0u8; capacity],
+            in_flight_chunk: None,
+            chunk_pos: 0,
             read_done: false,
             write_shutdown: false,
             total_bytes: 0,
@@ -34,7 +34,7 @@ impl TransferState {
     }
 
     fn is_finished(&self) -> bool {
-        self.read_done && self.write_pos == self.read_pos && self.write_shutdown
+        self.read_done && self.in_flight_chunk.is_none() && self.write_shutdown
     }
 }
 
@@ -132,10 +132,15 @@ impl RelayEngine {
         force_stop: bool,
         progress: &mut bool,
     ) -> Poll<Result<(), std::io::Error>> {
-        // Step 1: Write pending buffer contents to writer
-        while state.write_pos < state.read_pos {
-            let slice = &state.buffer[state.write_pos..state.read_pos];
-            match Pin::new(&mut *writer).poll_write(cx, slice) {
+        // Step 1: Write pending buffer contents to writer using zero-copy ownership write API
+        while let Some(ref chunk) = state.in_flight_chunk {
+            let to_write = if state.chunk_pos == 0 {
+                chunk.clone()
+            } else {
+                chunk.slice(state.chunk_pos..)
+            };
+
+            match writer.poll_write_bytes(cx, to_write) {
                 Poll::Ready(Ok(0)) => {
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::WriteZero,
@@ -143,31 +148,30 @@ impl RelayEngine {
                     )));
                 }
                 Poll::Ready(Ok(n)) => {
-                    state.write_pos += n;
+                    state.chunk_pos += n;
                     state.total_bytes += n as u64;
                     *progress = true;
+                    if state.chunk_pos >= chunk.len() {
+                        state.in_flight_chunk = None;
+                        state.chunk_pos = 0;
+                    }
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => break,
             }
         }
 
-        // Reset buffer pointers when all buffered data has been written
-        if state.write_pos == state.read_pos {
-            state.read_pos = 0;
-            state.write_pos = 0;
-        }
-
-        // Step 2: Read next data chunk from reader if buffer is empty
-        if !state.read_done && !force_stop && state.read_pos == 0 {
-            let mut read_buf = ReadBuf::new(&mut state.buffer);
+        // Step 2: Read next data chunk from reader if in-flight chunk is empty
+        if !state.read_done && !force_stop && state.in_flight_chunk.is_none() {
+            let mut read_buf = ReadBuf::new(&mut state.raw_buf);
             match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
                 Poll::Ready(Ok(())) => {
                     let n = read_buf.filled().len();
                     if n == 0 {
                         state.read_done = true;
                     } else {
-                        state.read_pos = n;
+                        state.in_flight_chunk = Some(bytes::Bytes::copy_from_slice(&state.raw_buf[..n]));
+                        state.chunk_pos = 0;
                     }
                     *progress = true;
                 }
@@ -181,7 +185,7 @@ impl RelayEngine {
         }
 
         // Step 3: Flush and Shutdown writer if reader is done and all bytes written
-        if state.read_done && state.write_pos == state.read_pos && !state.write_shutdown {
+        if state.read_done && state.in_flight_chunk.is_none() && !state.write_shutdown {
             match Pin::new(&mut *writer).poll_flush(cx) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(e)) => {

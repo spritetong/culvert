@@ -238,3 +238,41 @@ async fn test_mux_poll_write_bytes_and_shutdown_flushes_pending() {
 
     cancel.cancel();
 }
+
+#[tokio::test]
+async fn test_mux_poll_write_and_poll_write_bytes_interleaving_no_data_loss() {
+    use std::future::poll_fn;
+    use tokio::io::AsyncWrite;
+    use crate::core::stream::TunnelStream;
+
+    let (pipe_client, pipe_server) = duplex(65536);
+    let cancel = CancellationToken::new();
+
+    let client_session = MuxSession::new(Box::new(pipe_client), true, cancel.clone());
+    let server_session = MuxSession::new(Box::new(pipe_server), false, cancel.clone());
+
+    let mut client_stream = client_session.open_stream().await.unwrap();
+    let mut server_stream = server_session.accept_stream().await.unwrap();
+
+    // 1. First write via poll_write_bytes
+    let chunk_a = Bytes::from_static(b"chunk_aaa_");
+    let n_a = poll_fn(|cx| client_stream.poll_write_bytes(cx, chunk_a.clone())).await.unwrap();
+    assert_eq!(n_a, chunk_a.len());
+
+    // 2. Immediate interleaved write via standard AsyncWrite poll_write
+    let chunk_b = b"chunk_bbb_end";
+    let n_b = poll_fn(|cx| std::pin::Pin::new(&mut client_stream).poll_write(cx, chunk_b)).await.unwrap();
+    assert_eq!(n_b, chunk_b.len());
+
+    client_stream.shutdown().await.unwrap();
+
+    let mut recv_buf = Vec::new();
+    server_stream.read_to_end(&mut recv_buf).await.unwrap();
+
+    let mut expected = Vec::new();
+    expected.extend_from_slice(b"chunk_aaa_");
+    expected.extend_from_slice(b"chunk_bbb_end");
+    assert_eq!(recv_buf, expected, "Interleaving poll_write_bytes and poll_write must preserve both chunks in exact sequence without data corruption");
+
+    cancel.cancel();
+}
