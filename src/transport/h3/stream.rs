@@ -19,6 +19,7 @@ pub struct QuinnTunnelStream {
     send: quinn::SendStream,
     recv: quinn::RecvStream,
     conn: Option<quinn::Connection>,
+    liveness: Option<QuicLivenessTracker>,
     shutdown_done: bool,
 }
 
@@ -29,12 +30,14 @@ impl QuinnTunnelStream {
             send,
             recv,
             conn: None,
+            liveness: None,
             shutdown_done: false,
         }
     }
 
     /// Associates the underlying Quinn connection for accurate liveness detection.
     pub fn with_connection(mut self, conn: quinn::Connection) -> Self {
+        self.liveness = Some(QuicLivenessTracker::new(&conn));
         self.conn = Some(conn);
         self
     }
@@ -81,24 +84,85 @@ impl AsyncWrite for QuinnTunnelStream {
     }
 }
 
+#[derive(Debug, Clone)]
+struct QuicLivenessTracker {
+    last_rx_dgrams: u64,
+    last_tx_dgrams: u64,
+    last_progress_at: std::time::Instant,
+}
+
+impl QuicLivenessTracker {
+    fn new(conn: &quinn::Connection) -> Self {
+        let stats = conn.stats();
+        Self {
+            last_rx_dgrams: stats.udp_rx.datagrams,
+            last_tx_dgrams: stats.udp_tx.datagrams,
+            last_progress_at: std::time::Instant::now(),
+        }
+    }
+
+    /// Evaluates connection responsiveness based on UDP datagram progression.
+    /// If UDP packets are being sent (e.g. keep-alive pings) but zero UDP packets are received
+    /// for longer than unresponsive_threshold, the connection is deemed dead.
+    fn check_liveness(
+        &mut self,
+        conn: &quinn::Connection,
+        unresponsive_threshold: std::time::Duration,
+    ) -> bool {
+        let stats = conn.stats();
+        let cur_rx = stats.udp_rx.datagrams;
+        let cur_tx = stats.udp_tx.datagrams;
+
+        if cur_rx > self.last_rx_dgrams {
+            self.last_rx_dgrams = cur_rx;
+            self.last_tx_dgrams = cur_tx;
+            self.last_progress_at = std::time::Instant::now();
+            return true;
+        }
+
+        // Transmitting packets while zero packets received for longer than threshold -> zombie!
+        if cur_tx > self.last_tx_dgrams && self.last_progress_at.elapsed() >= unresponsive_threshold
+        {
+            return false;
+        }
+
+        true
+    }
+}
+
 impl TunnelStream for QuinnTunnelStream {
     fn poll_send_ping(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if let Some(ref conn) = self.conn
-            && let Some(reason) = conn.close_reason()
-        {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                format!("Underlying QUIC connection closed: {:?}", reason),
-            )));
+        if let Some(ref conn) = self.conn {
+            if let Some(reason) = conn.close_reason() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    format!("Underlying QUIC connection closed: {:?}", reason),
+                )));
+            }
+            if let Some(ref mut tracker) = self.liveness
+                && !tracker.check_liveness(conn, std::time::Duration::from_secs(4))
+            {
+                conn.close(quinn::VarInt::from_u32(0), b"liveness ping timeout");
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Underlying QUIC connection unresponsive to pings",
+                )));
+            }
         }
         Poll::Ready(Ok(()))
     }
 
     fn poll_check_alive(&mut self, _cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
-        if let Some(ref conn) = self.conn
-            && conn.close_reason().is_some()
-        {
-            return Poll::Ready(HeartbeatStatus::Dead);
+        if let Some(ref conn) = self.conn {
+            if conn.close_reason().is_some() {
+                return Poll::Ready(HeartbeatStatus::Dead);
+            }
+            if let Some(ref mut tracker) = self.liveness
+                && !tracker.check_liveness(conn, std::time::Duration::from_secs(4))
+            {
+                conn.close(quinn::VarInt::from_u32(0), b"liveness check timeout");
+                return Poll::Ready(HeartbeatStatus::Dead);
+            }
         }
         Poll::Ready(HeartbeatStatus::Alive)
     }
@@ -111,6 +175,7 @@ pub struct H3TunnelStream {
     read_buf: Option<Bytes>,
     shutdown_rx: Option<oneshot::Receiver<io::Result<()>>>,
     conn: Option<quinn::Connection>,
+    liveness: Option<QuicLivenessTracker>,
     shutdown_done: bool,
     fin_sent: bool,
 }
@@ -134,6 +199,7 @@ impl H3TunnelStream {
 
     /// Associates the underlying Quinn connection for accurate liveness detection.
     pub fn with_connection(mut self, conn: quinn::Connection) -> Self {
+        self.liveness = Some(QuicLivenessTracker::new(&conn));
         self.conn = Some(conn);
         self
     }
@@ -191,6 +257,7 @@ impl H3TunnelStream {
             read_buf: None,
             shutdown_rx: Some(rx_shutdown),
             conn: None,
+            liveness: None,
             shutdown_done: false,
             fin_sent: false,
         }
@@ -320,13 +387,22 @@ impl AsyncWrite for H3TunnelStream {
 
 impl TunnelStream for H3TunnelStream {
     fn poll_send_ping(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if let Some(ref conn) = self.conn
-            && let Some(reason) = conn.close_reason()
-        {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                format!("Underlying QUIC connection closed: {:?}", reason),
-            )));
+        if let Some(ref conn) = self.conn {
+            if let Some(reason) = conn.close_reason() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    format!("Underlying QUIC connection closed: {:?}", reason),
+                )));
+            }
+            if let Some(ref mut tracker) = self.liveness
+                && !tracker.check_liveness(conn, std::time::Duration::from_secs(4))
+            {
+                conn.close(quinn::VarInt::from_u32(0), b"liveness ping timeout");
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Underlying QUIC connection unresponsive to pings",
+                )));
+            }
         }
         if let Poll::Ready(HeartbeatStatus::Dead) = self.poll_check_alive(cx) {
             return Poll::Ready(Err(io::Error::new(
@@ -338,10 +414,16 @@ impl TunnelStream for H3TunnelStream {
     }
 
     fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
-        if let Some(ref conn) = self.conn
-            && conn.close_reason().is_some()
-        {
-            return Poll::Ready(HeartbeatStatus::Dead);
+        if let Some(ref conn) = self.conn {
+            if conn.close_reason().is_some() {
+                return Poll::Ready(HeartbeatStatus::Dead);
+            }
+            if let Some(ref mut tracker) = self.liveness
+                && !tracker.check_liveness(conn, std::time::Duration::from_secs(4))
+            {
+                conn.close(quinn::VarInt::from_u32(0), b"liveness check timeout");
+                return Poll::Ready(HeartbeatStatus::Dead);
+            }
         }
         if self.read_buf.is_some() {
             return Poll::Ready(HeartbeatStatus::Alive);

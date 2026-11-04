@@ -962,3 +962,132 @@ async fn test_h3_stream_liveness_detects_closed_connection() {
         std::task::Poll::Ready(micro_tunnel::core::stream::HeartbeatStatus::Dead)
     );
 }
+
+#[tokio::test]
+async fn test_h3_connector_recovers_after_server_restart() {
+    let port = get_ephemeral_port();
+    let listen_addr = format!("127.0.0.1:{}", port);
+    let auth_token = "restart_test_token";
+
+    // 1. Start Server 1
+    let (server_rustls_1, _) = generate_test_quic_pki();
+    let mut listener_1 =
+        H3Listener::bind(&listen_addr, Some(auth_token), None, server_rustls_1).unwrap();
+
+    let server_1_cancel = tokio_util::sync::CancellationToken::new();
+    let s1_cancel = server_1_cancel.clone();
+    let server_1_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = s1_cancel.cancelled() => break,
+                res = listener_1.accept() => {
+                    let (mut stream, _) = match res {
+                        Ok(pair) => pair,
+                        Err(_) => break,
+                    };
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 1024];
+                        if let Ok(n) = stream.read(&mut buf).await {
+                            let _ = stream.write_all(&buf[..n]).await;
+                            let _ = stream.shutdown().await;
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    let endpoint_cfg = EndpointConfig::Detailed {
+        url: format!("h3://{}/tunnel", listen_addr),
+        dns: None,
+        dialer: None,
+        tls: Some(TlsConfig {
+            enabled: true,
+            insecure: true,
+            server_name: Some("localhost".to_string()),
+            ..Default::default()
+        }),
+    };
+
+    let app_cfg = AppConfig::default();
+    let endpoint_ctx = EndpointContext::build(&endpoint_cfg, &app_cfg).unwrap();
+    let connector =
+        Arc::new(H3Connector::new(&endpoint_ctx, auth_token, TunnelMode::Forward).unwrap());
+
+    let target = TargetAddr::Domain("backend.local".to_string(), 80);
+
+    // 2. Connect to Server 1 and verify data transfer
+    let mut stream1 = connector.connect(&target, None).await.unwrap();
+    stream1.write_all(b"hello_server_1").await.unwrap();
+    stream1.shutdown().await.unwrap();
+    let mut resp1 = Vec::new();
+    read_to_end_timed(&mut stream1, &mut resp1).await.unwrap();
+    assert_eq!(resp1, b"hello_server_1");
+
+    // 3. Drop Server 1 (simulating process restart)
+    server_1_cancel.cancel();
+    let _ = server_1_task.await;
+    // Allow UDP socket to release
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // 4. Start Server 2 on the exact same port with fresh TLS config
+    let (server_rustls_2, _) = generate_test_quic_pki();
+    let mut listener_2 =
+        H3Listener::bind(&listen_addr, Some(auth_token), None, server_rustls_2).unwrap();
+
+    let server_2_cancel = tokio_util::sync::CancellationToken::new();
+    let s2_cancel = server_2_cancel.clone();
+    let server_2_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = s2_cancel.cancelled() => break,
+                res = listener_2.accept() => {
+                    let (mut stream, _) = match res {
+                        Ok(pair) => pair,
+                        Err(_) => break,
+                    };
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 1024];
+                        if let Ok(n) = stream.read(&mut buf).await {
+                            let _ = stream.write_all(&buf[..n]).await;
+                            let _ = stream.shutdown().await;
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    // 5. Connect again. When the first attempt detects or times out against the dead session,
+    // the zombie session is invalidated and subsequent reconnect dials Server 2.
+    let start = std::time::Instant::now();
+    let mut stream2 = None;
+    for _ in 0..5 {
+        match connector.connect(&target, None).await {
+            Ok(s) => {
+                stream2 = Some(s);
+                break;
+            }
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+
+    let mut stream2 = stream2.expect("Client should successfully reconnect to Server 2");
+    stream2.write_all(b"hello_server_2").await.unwrap();
+    stream2.shutdown().await.unwrap();
+    let mut resp2 = Vec::new();
+    read_to_end_timed(&mut stream2, &mut resp2).await.unwrap();
+    assert_eq!(resp2, b"hello_server_2");
+
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "Recovery must complete well within ACQUIRE_TIMEOUT (15s), took {:?}",
+        elapsed
+    );
+
+    server_2_cancel.cancel();
+    let _ = server_2_task.await;
+}

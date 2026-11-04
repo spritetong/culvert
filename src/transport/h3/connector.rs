@@ -53,6 +53,8 @@ pub struct H3Connector {
     quinn_endpoint: quinn::Endpoint,
     cached_h3_session: Arc<RwLock<Option<Arc<H3Session>>>>,
     cached_quic_session: Arc<RwLock<Option<Arc<RawQuicSession>>>>,
+    last_h3_failure: Arc<RwLock<Option<(std::time::Instant, String)>>>,
+    last_quic_failure: Arc<RwLock<Option<(std::time::Instant, String)>>>,
     h3_establish_gate: Arc<Mutex<()>>,
     quic_establish_gate: Arc<Mutex<()>>,
 }
@@ -84,8 +86,8 @@ impl H3Connector {
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
         let mut transport_config = quinn::TransportConfig::default();
         transport_config
-            .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
-        transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+            .max_idle_timeout(Some(std::time::Duration::from_secs(8).try_into().unwrap()));
+        transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(2)));
         transport_config.max_concurrent_bidi_streams(quinn::VarInt::from_u32(10_000));
         transport_config.max_concurrent_uni_streams(quinn::VarInt::from_u32(10_000));
         transport_config.stream_receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
@@ -104,6 +106,8 @@ impl H3Connector {
             quinn_endpoint,
             cached_h3_session: Arc::new(RwLock::new(None)),
             cached_quic_session: Arc::new(RwLock::new(None)),
+            last_h3_failure: Arc::new(RwLock::new(None)),
+            last_quic_failure: Arc::new(RwLock::new(None)),
             h3_establish_gate: Arc::new(Mutex::new(())),
             quic_establish_gate: Arc::new(Mutex::new(())),
         })
@@ -148,20 +152,30 @@ impl H3Connector {
     /// Never reuses a QUIC connection for a second H3 session, eliminating H3_STREAM_CREATION_ERROR.
     async fn get_or_establish_h3_session(&self) -> Result<Arc<H3Session>, TunnelError> {
         // Fast path: inspect cache under read lock
-        if let Some(ref session) = *self.cached_h3_session.read() {
-            if session.is_alive() {
-                return Ok(Arc::clone(session));
-            }
+        if let Some(ref session) = *self.cached_h3_session.read()
+            && session.is_alive()
+        {
+            return Ok(Arc::clone(session));
         }
 
         // Single-flight gate
         let _gate = self.h3_establish_gate.lock().await;
 
         // Double check
-        if let Some(ref session) = *self.cached_h3_session.read() {
-            if session.is_alive() {
-                return Ok(Arc::clone(session));
-            }
+        if let Some(ref session) = *self.cached_h3_session.read()
+            && session.is_alive()
+        {
+            return Ok(Arc::clone(session));
+        }
+
+        // Fail fast if an establishment attempt failed within the last 500ms to avoid serial cascading 5s timeouts
+        if let Some((failed_at, ref err_msg)) = *self.last_h3_failure.read()
+            && failed_at.elapsed() < std::time::Duration::from_millis(500)
+        {
+            return Err(TunnelError::ControlProtocol(format!(
+                "H3 establishment failed recently: {}",
+                err_msg
+            )));
         }
 
         // If there is an existing dead session, close its QUIC connection explicitly
@@ -172,7 +186,13 @@ impl H3Connector {
         }
 
         // Always dial a fresh QUIC connection dedicated to this H3 session
-        let conn = self.dial_quic_connection().await?;
+        let conn = match self.dial_quic_connection().await {
+            Ok(c) => c,
+            Err(e) => {
+                *self.last_h3_failure.write() = Some((std::time::Instant::now(), e.to_string()));
+                return Err(e);
+            }
+        };
         let id = conn.stable_id();
 
         let build_res = tokio::time::timeout(
@@ -184,13 +204,14 @@ impl H3Connector {
         let (mut driver, sender) = match build_res {
             Ok(Ok(pair)) => pair,
             Ok(Err(e)) => {
+                let err_str = format!("H3 handshake failed: {:?}", e);
+                *self.last_h3_failure.write() = Some((std::time::Instant::now(), err_str.clone()));
                 conn.close(quinn::VarInt::from_u32(0), b"H3 build failed");
-                return Err(TunnelError::ControlProtocol(format!(
-                    "H3 handshake failed: {:?}",
-                    e
-                )));
+                return Err(TunnelError::ControlProtocol(err_str));
             }
             Err(_) => {
+                *self.last_h3_failure.write() =
+                    Some((std::time::Instant::now(), "H3 build timeout".to_string()));
                 conn.close(quinn::VarInt::from_u32(0), b"H3 build timeout");
                 return Err(TunnelError::ConnectTimeout(std::time::Duration::from_secs(
                     5,
@@ -213,6 +234,7 @@ impl H3Connector {
             driver_alive,
         });
 
+        *self.last_h3_failure.write() = None;
         *self.cached_h3_session.write() = Some(Arc::clone(&new_session));
         Ok(new_session)
     }
@@ -221,31 +243,41 @@ impl H3Connector {
     /// preventing lost updates from wiping out newer healthy connections.
     fn invalidate_h3_session_if_same(&self, session_id: usize) {
         let mut guard = self.cached_h3_session.write();
-        if let Some(ref current) = *guard {
-            if current.id == session_id {
-                debug!(session_id, "Invalidating and closing broken H3 session");
-                current
-                    .conn
-                    .close(quinn::VarInt::from_u32(0), b"session invalidated");
-                *guard = None;
-            }
+        if let Some(ref current) = *guard
+            && current.id == session_id
+        {
+            debug!(session_id, "Invalidating and closing broken H3 session");
+            current
+                .conn
+                .close(quinn::VarInt::from_u32(0), b"session invalidated");
+            *guard = None;
         }
     }
 
     /// Establishes or returns an active raw QUIC session.
     async fn get_or_connect_quic_raw(&self) -> Result<Arc<RawQuicSession>, TunnelError> {
-        if let Some(ref session) = *self.cached_quic_session.read() {
-            if session.is_alive() {
-                return Ok(Arc::clone(session));
-            }
+        if let Some(ref session) = *self.cached_quic_session.read()
+            && session.is_alive()
+        {
+            return Ok(Arc::clone(session));
         }
 
         let _gate = self.quic_establish_gate.lock().await;
 
-        if let Some(ref session) = *self.cached_quic_session.read() {
-            if session.is_alive() {
-                return Ok(Arc::clone(session));
-            }
+        if let Some(ref session) = *self.cached_quic_session.read()
+            && session.is_alive()
+        {
+            return Ok(Arc::clone(session));
+        }
+
+        // Fail fast if raw QUIC dial failed within the last 500ms
+        if let Some((failed_at, ref err_msg)) = *self.last_quic_failure.read()
+            && failed_at.elapsed() < std::time::Duration::from_millis(500)
+        {
+            return Err(TunnelError::ControlProtocol(format!(
+                "Raw QUIC establishment failed recently: {}",
+                err_msg
+            )));
         }
 
         if let Some(old_session) = self.cached_quic_session.write().take() {
@@ -255,12 +287,19 @@ impl H3Connector {
             );
         }
 
-        let conn = self.dial_quic_connection().await?;
+        let conn = match self.dial_quic_connection().await {
+            Ok(c) => c,
+            Err(e) => {
+                *self.last_quic_failure.write() = Some((std::time::Instant::now(), e.to_string()));
+                return Err(e);
+            }
+        };
         let session = Arc::new(RawQuicSession {
             id: conn.stable_id(),
             conn,
         });
 
+        *self.last_quic_failure.write() = None;
         *self.cached_quic_session.write() = Some(Arc::clone(&session));
         Ok(session)
     }
@@ -268,17 +307,17 @@ impl H3Connector {
     /// Atomically clears the cached raw QUIC session only if it matches the specified session ID.
     fn invalidate_quic_session_if_same(&self, session_id: usize) {
         let mut guard = self.cached_quic_session.write();
-        if let Some(ref current) = *guard {
-            if current.id == session_id {
-                debug!(
-                    session_id,
-                    "Invalidating and closing broken raw QUIC session"
-                );
-                current
-                    .conn
-                    .close(quinn::VarInt::from_u32(0), b"raw session invalidated");
-                *guard = None;
-            }
+        if let Some(ref current) = *guard
+            && current.id == session_id
+        {
+            debug!(
+                session_id,
+                "Invalidating and closing broken raw QUIC session"
+            );
+            current
+                .conn
+                .close(quinn::VarInt::from_u32(0), b"raw session invalidated");
+            *guard = None;
         }
     }
 
@@ -346,51 +385,43 @@ impl H3Connector {
 
         debug!(path = %path, target = %target, pool_idle, "Sending HTTP/3 CONNECT tunnel request");
         let mut stream = match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(10),
             send_request.send_request(request),
         )
         .await
         {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                if !session.is_alive() {
-                    self.invalidate_h3_session_if_same(session_id_val);
-                }
+                self.invalidate_h3_session_if_same(session_id_val);
                 return Err(TunnelError::ControlProtocol(format!(
                     "Failed to send H3 request: {:?}",
                     e
                 )));
             }
             Err(_) => {
-                if !session.is_alive() {
-                    self.invalidate_h3_session_if_same(session_id_val);
-                }
+                self.invalidate_h3_session_if_same(session_id_val);
                 return Err(TunnelError::ConnectTimeout(std::time::Duration::from_secs(
-                    5,
+                    10,
                 )));
             }
         };
 
         let response =
-            match tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv_response())
+            match tokio::time::timeout(std::time::Duration::from_secs(10), stream.recv_response())
                 .await
             {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
-                    if !session.is_alive() {
-                        self.invalidate_h3_session_if_same(session_id_val);
-                    }
+                    self.invalidate_h3_session_if_same(session_id_val);
                     return Err(TunnelError::ControlProtocol(format!(
                         "Failed to receive H3 response: {:?}",
                         e
                     )));
                 }
                 Err(_) => {
-                    if !session.is_alive() {
-                        self.invalidate_h3_session_if_same(session_id_val);
-                    }
+                    self.invalidate_h3_session_if_same(session_id_val);
                     return Err(TunnelError::ConnectTimeout(std::time::Duration::from_secs(
-                        5,
+                        10,
                     )));
                 }
             };
@@ -429,18 +460,14 @@ impl H3Connector {
             match tokio::time::timeout(std::time::Duration::from_secs(5), conn.open_bi()).await {
                 Ok(Ok(pair)) => pair,
                 Ok(Err(e)) => {
-                    if !session.is_alive() {
-                        self.invalidate_quic_session_if_same(session_id_val);
-                    }
+                    self.invalidate_quic_session_if_same(session_id_val);
                     return Err(TunnelError::Tls(format!(
                         "Failed to open QUIC bi-stream: {:?}",
                         e
                     )));
                 }
                 Err(_) => {
-                    if !session.is_alive() {
-                        self.invalidate_quic_session_if_same(session_id_val);
-                    }
+                    self.invalidate_quic_session_if_same(session_id_val);
                     return Err(TunnelError::ConnectTimeout(std::time::Duration::from_secs(
                         5,
                     )));
@@ -475,15 +502,11 @@ impl H3Connector {
         match write_res {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                if !session.is_alive() {
-                    self.invalidate_quic_session_if_same(session_id_val);
-                }
+                self.invalidate_quic_session_if_same(session_id_val);
                 return Err(TunnelError::Io(e));
             }
             Err(_) => {
-                if !session.is_alive() {
-                    self.invalidate_quic_session_if_same(session_id_val);
-                }
+                self.invalidate_quic_session_if_same(session_id_val);
                 return Err(TunnelError::ConnectTimeout(std::time::Duration::from_secs(
                     5,
                 )));
@@ -532,6 +555,17 @@ impl TransportConnector for H3Connector {
             "quic"
         } else {
             "h3"
+        }
+    }
+
+    fn invalidate_broken_sessions(&self) {
+        if let Some(s) = self.cached_h3_session.write().take() {
+            s.conn
+                .close(quinn::VarInt::from_u32(0), b"pool evicted dead streams");
+        }
+        if let Some(s) = self.cached_quic_session.write().take() {
+            s.conn
+                .close(quinn::VarInt::from_u32(0), b"pool evicted dead streams");
         }
     }
 }

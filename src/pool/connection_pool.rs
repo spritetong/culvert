@@ -146,6 +146,7 @@ enum PoolEvent {
     Command(Option<PoolCommand>),
     RetryTimerExpired,
     HeartbeatTick,
+    StreamsEvicted,
 }
 
 /// Auto-replenishing stream pool managed by an actor loop with active heartbeat and self-healing.
@@ -234,10 +235,12 @@ impl ReplenishingStreamPool {
                 let capacity_available =
                     total_allocated < MAX_POOL_CAPACITY && in_flight < MAX_CONCURRENT_CONNECTS;
 
-                if needed && capacity_available {
-                    // Active callers waiting in pending_requests bypass idle replenishment backoff timer
-                    // to facilitate immediate connection establishment upon demand.
-                    if has_waiters || now >= next_retry_at {
+                // When recovering from failures (backoff > BACKOFF_BASE), limit in_flight to 1 probe
+                // to avoid slamming or serializing gate locks until a connection succeeds.
+                let throttled_by_failure = backoff > BACKOFF_BASE && in_flight >= 1;
+
+                if needed && capacity_available && !throttled_by_failure {
+                    if now >= next_retry_at {
                         let c = Arc::clone(&connector);
                         let t = dummy_target.clone();
                         connecting_futures
@@ -261,10 +264,10 @@ impl ReplenishingStreamPool {
                     }
 
                     // Branch C: background connecting futures completion
-                    if !connecting_futures.is_empty() {
-                        if let Poll::Ready(Some(res)) = connecting_futures.poll_next_unpin(cx) {
-                            return Poll::Ready(PoolEvent::ConnectionResult(res));
-                        }
+                    if !connecting_futures.is_empty()
+                        && let Poll::Ready(Some(res)) = connecting_futures.poll_next_unpin(cx)
+                    {
+                        return Poll::Ready(PoolEvent::ConnectionResult(res));
                     }
 
                     // Branch D: drive idle stream liveness and in-flight heartbeat ping progress
@@ -327,14 +330,14 @@ impl ReplenishingStreamPool {
                     }
 
                     if evicted_any {
-                        return Poll::Ready(PoolEvent::HeartbeatTick);
+                        return Poll::Ready(PoolEvent::StreamsEvicted);
                     }
 
                     // Branch E: retry backoff timer
-                    if let Some(timer) = retry_timer.as_mut() {
-                        if timer.as_mut().poll(cx).is_ready() {
-                            return Poll::Ready(PoolEvent::RetryTimerExpired);
-                        }
+                    if let Some(timer) = retry_timer.as_mut()
+                        && timer.as_mut().poll(cx).is_ready()
+                    {
+                        return Poll::Ready(PoolEvent::RetryTimerExpired);
                     }
 
                     // Branch F: periodic heartbeat ticker
@@ -390,8 +393,13 @@ impl ReplenishingStreamPool {
                             }
                             Err(e) => {
                                 tracing::debug!("Background connect_pooled failed: {:?}", e);
+                                let max_backoff = if !pending_requests.is_empty() {
+                                    Duration::from_secs(1)
+                                } else {
+                                    BACKOFF_MAX
+                                };
                                 next_retry_at = Instant::now() + backoff;
-                                backoff = (backoff * 2).min(BACKOFF_MAX);
+                                backoff = (backoff * 2).min(max_backoff);
                                 retry_timer =
                                     Some(Box::pin(tokio::time::sleep_until(next_retry_at.into())));
                             }
@@ -421,6 +429,7 @@ impl ReplenishingStreamPool {
                                         tracing::debug!(
                                             "Evicted dead stream during acquire inspection"
                                         );
+                                        connector.invalidate_broken_sessions();
                                     }
                                 }
 
@@ -430,6 +439,15 @@ impl ReplenishingStreamPool {
                                     st.active_count += 1;
                                     let _ = req.reply.send(Ok(stream));
                                 } else {
+                                    // If pool has no idle streams and no connects currently in-flight,
+                                    // reset backoff timer so this incoming demand is attempted promptly
+                                    // rather than waiting for an idle replenishment backoff timer.
+                                    if pending_requests.is_empty() && connecting_futures.is_empty()
+                                    {
+                                        next_retry_at = Instant::now();
+                                        backoff = BACKOFF_BASE;
+                                        retry_timer = None;
+                                    }
                                     // Idle pool exhausted: enqueue into pending requests for hand-off
                                     pending_requests.push_back((req, Instant::now()));
                                 }
@@ -473,6 +491,10 @@ impl ReplenishingStreamPool {
                     }
                     PoolEvent::RetryTimerExpired => {
                         retry_timer = None;
+                    }
+                    PoolEvent::StreamsEvicted => {
+                        connector.invalidate_broken_sessions();
+                        stats_clone.lock().idle_count = idle_streams.len();
                     }
                     PoolEvent::HeartbeatTick => {
                         let now = Instant::now();

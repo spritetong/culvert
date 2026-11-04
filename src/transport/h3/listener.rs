@@ -57,8 +57,8 @@ impl H3Listener {
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_crypto));
         let mut transport_config = quinn::TransportConfig::default();
         transport_config
-            .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
-        transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+            .max_idle_timeout(Some(std::time::Duration::from_secs(8).try_into().unwrap()));
+        transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(2)));
         transport_config.max_concurrent_bidi_streams(quinn::VarInt::from_u32(10_000));
         transport_config.max_concurrent_uni_streams(quinn::VarInt::from_u32(10_000));
         transport_config.stream_receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
@@ -229,6 +229,7 @@ impl H3Listener {
                             let path_clone = Arc::clone(&expected_path);
                             let tx_clone = tx_streams.clone();
                             let conn_clone = conn.clone();
+                            let cancel_task = cancel_token.clone();
 
                             request_tasks.spawn(async move {
                                 let (req, mut stream) = match resolver.resolve_request().await {
@@ -360,7 +361,12 @@ impl H3Listener {
                                         .with_connection(conn_clone),
                                 ) as Box<dyn TunnelStream>;
 
-                                let _ = tx_clone.send((tunnel_stream, metadata)).await;
+                                tokio::select! {
+                                    _ = cancel_task.cancelled() => {}
+                                    res = tx_clone.send((tunnel_stream, metadata)) => {
+                                        let _ = res;
+                                    }
+                                }
                             });
                         }
                         Ok(None) => break,
@@ -373,8 +379,19 @@ impl H3Listener {
             }
         }
 
-        // Allow in-flight request setup tasks to finish sending responses
-        while let Some(_) = request_tasks.join_next().await {}
+        // Allow in-flight request setup tasks to finish sending responses (bounded and cancellable)
+        let cancel_drain = cancel_token.clone();
+        tokio::select! {
+            _ = cancel_drain.cancelled() => {
+                request_tasks.abort_all();
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                request_tasks.abort_all();
+            }
+            _ = async {
+                while request_tasks.join_next().await.is_some() {}
+            } => {}
+        }
 
         // Keep h3_conn alive until connection is closed by peer or cancelled,
         // preventing premature QUIC teardown while accepted streams are still relaying.

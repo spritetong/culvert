@@ -61,6 +61,10 @@ pub trait TransportConnector: Send + Sync {
 
     /// Returns the protocol scheme implemented by this connector.
     fn protocol_scheme(&self) -> &'static str;
+
+    /// Hints to the connector that underlying streams have failed or become dead,
+    /// allowing multiplexed transports (such as HTTP/3) to invalidate broken cached sessions.
+    fn invalidate_broken_sessions(&self) {}
 }
 
 /// Dynamic trait object for accepting inbound tunnel streams from clients.
