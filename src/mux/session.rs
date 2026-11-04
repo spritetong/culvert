@@ -23,6 +23,10 @@ const STREAM_BUFFER_SIZE: usize = 128;
 /// Default outbound frame channel queue capacity.
 const SESSION_FRAME_QUEUE_SIZE: usize = 256;
 
+type ActiveStreamHandle = (mpsc::Sender<Bytes>, Arc<AtomicBool>);
+type ActiveStreamsMap = Arc<DashMap<u32, ActiveStreamHandle>>;
+type ClosedStreamsMap = Arc<DashMap<u32, Arc<AtomicBool>>>;
+
 /// Multiplex session driving multiple logical streams over a single underlying transport.
 #[derive(Clone)]
 pub struct MuxSession {
@@ -33,9 +37,9 @@ pub struct MuxSession {
     /// Next logical stream identifier counter.
     next_stream_id: Arc<AtomicU32>,
     /// Map of active stream IDs to their inbound data sender and termination flag.
-    active_streams: Arc<DashMap<u32, (mpsc::Sender<Bytes>, Arc<AtomicBool>)>>,
+    active_streams: ActiveStreamsMap,
     /// Set of closed / reset stream IDs whose trailing in-flight frames are silently dropped.
-    closed_streams: Arc<DashMap<u32, Arc<AtomicBool>>>,
+    closed_streams: ClosedStreamsMap,
     /// Session cancellation token.
     cancel_token: CancellationToken,
 }
@@ -54,9 +58,8 @@ impl MuxSession {
 
         let initial_id = if is_client { 1 } else { 2 };
         let next_stream_id = Arc::new(AtomicU32::new(initial_id));
-        let active_streams: Arc<DashMap<u32, (mpsc::Sender<Bytes>, Arc<AtomicBool>)>> =
-            Arc::new(DashMap::new());
-        let closed_streams: Arc<DashMap<u32, Arc<AtomicBool>>> = Arc::new(DashMap::new());
+        let active_streams: ActiveStreamsMap = Arc::new(DashMap::new());
+        let closed_streams: ClosedStreamsMap = Arc::new(DashMap::new());
 
         let session = Self {
             tx_frames: tx_frames.clone(),
@@ -87,8 +90,8 @@ impl MuxSession {
         mut rx_frames: mpsc::Receiver<MuxFrame>,
         tx_frames: mpsc::Sender<MuxFrame>,
         tx_new_streams: mpsc::Sender<MuxStream>,
-        active_streams: Arc<DashMap<u32, (mpsc::Sender<Bytes>, Arc<AtomicBool>)>>,
-        closed_streams: Arc<DashMap<u32, Arc<AtomicBool>>>,
+        active_streams: ActiveStreamsMap,
+        closed_streams: ClosedStreamsMap,
         cancel_token: CancellationToken,
     ) {
         let (read_half, write_half) = split(underlying);
@@ -157,8 +160,8 @@ impl MuxSession {
         frame: MuxFrame,
         tx_frames: &mpsc::Sender<MuxFrame>,
         tx_new_streams: &mpsc::Sender<MuxStream>,
-        active_streams: &Arc<DashMap<u32, (mpsc::Sender<Bytes>, Arc<AtomicBool>)>>,
-        closed_streams: &Arc<DashMap<u32, Arc<AtomicBool>>>,
+        active_streams: &ActiveStreamsMap,
+        closed_streams: &ClosedStreamsMap,
     ) {
         match frame.frame_type {
             FrameType::Syn => {
@@ -209,13 +212,11 @@ impl MuxSession {
                 // Propagate true backpressure to the underlying socket instead of silently dropping payloads.
                 // Clone the sender and immediately drop the DashMap read guard to avoid holding synchronization locks across .await.
                 let tx_opt = active_streams.get(&stream_id).map(|e| e.value().0.clone());
-                if let Some(data_tx) = tx_opt {
-                    if data_tx.send(frame.payload).await.is_err() {
-                        if let Some((_, (_, closed_flag))) = active_streams.remove(&stream_id) {
+                if let Some(data_tx) = tx_opt
+                    && data_tx.send(frame.payload).await.is_err()
+                        && let Some((_, (_, closed_flag))) = active_streams.remove(&stream_id) {
                             closed_streams.insert(stream_id, closed_flag);
                         }
-                    }
-                }
             }
             FrameType::Fin => {
                 let stream_id = frame.stream_id;

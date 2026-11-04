@@ -256,11 +256,10 @@ impl DnsResolver for CachedDnsResolver {
             // 2. Check in-memory cache
             {
                 let read_guard = self.cache.read();
-                if let Some((inserted_at, ips)) = read_guard.get(host) {
-                    if inserted_at.elapsed() < DEFAULT_DNS_CACHE_TTL {
+                if let Some((inserted_at, ips)) = read_guard.get(host)
+                    && inserted_at.elapsed() < DEFAULT_DNS_CACHE_TTL {
                         return Ok(ips.clone());
                     }
-                }
             }
 
             // 3. Resolve using Hickory (UDP / DoH / DoT) if configured
@@ -288,15 +287,14 @@ impl DnsResolver for CachedDnsResolver {
                 || self.hickory_resolver.is_none()
                 || (resolved_ips.is_empty() && hickory_failed);
 
-            if should_try_system {
-                if let Ok(addrs) = tokio::net::lookup_host(format!("{}:0", host)).await {
+            if should_try_system
+                && let Ok(addrs) = tokio::net::lookup_host(format!("{}:0", host)).await {
                     for sa in addrs {
                         if !resolved_ips.contains(&sa.ip()) {
                             resolved_ips.push(sa.ip());
                         }
                     }
                 }
-            }
 
             if resolved_ips.is_empty() {
                 return Err(TunnelError::DnsResolutionFailed(

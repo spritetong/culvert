@@ -36,6 +36,7 @@ pub fn parse_target_addr(target_str: &str) -> Result<TargetAddr, TunnelError> {
 }
 
 /// Runs a single forward mapping listener and forwards inbound connections to remote peer.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_forward_mapping(
     tag: String,
     listen: String,

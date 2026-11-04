@@ -46,39 +46,66 @@ impl Dialer for DefaultDialer {
         port: u16,
     ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
         Box::pin(async move {
+            if let Some(ref iface) = self.config.bind_interface {
+                #[cfg(not(target_os = "linux"))]
+                {
+                    return Err(TunnelError::Config(format!(
+                        "bind_interface '{}' is only supported on Linux (SO_BINDTODEVICE)",
+                        iface
+                    )));
+                }
+                #[cfg(target_os = "linux")]
+                let _ = iface;
+            }
+
             let ips = self.dns_resolver.resolve(host).await?;
+            if ips.is_empty() {
+                return Err(TunnelError::Internal(format!(
+                    "No IP addresses resolved for {}:{}",
+                    host, port
+                )));
+            }
+
             let connect_timeout = self
                 .config
                 .connect_timeout
                 .unwrap_or(DEFAULT_CONNECT_TIMEOUT);
 
-            let mut last_error = None;
-            for ip in ips {
-                let addr = SocketAddr::new(ip, port);
-                let connect_fut = TcpStream::connect(addr);
+            let nodelay = self.config.tcp_nodelay.unwrap_or(true);
+            let tcp_keepalive = self.config.tcp_keepalive;
 
-                match timeout(connect_timeout, connect_fut).await {
-                    Ok(Ok(stream)) => {
-                        let nodelay = self.config.tcp_nodelay.unwrap_or(true);
-                        SocketTuner::tune_tcp_stream(&stream, nodelay, self.config.tcp_keepalive)
-                            .map_err(TunnelError::Io)?;
-                        return Ok(Box::new(stream) as Box<dyn TunnelStream>);
-                    }
-                    Ok(Err(e)) => {
-                        last_error = Some(TunnelError::Io(e));
-                    }
-                    Err(_) => {
-                        last_error = Some(TunnelError::ConnectTimeout(connect_timeout));
-                    }
-                }
+            if ips.len() == 1 {
+                let addr = SocketAddr::new(ips[0], port);
+                let stream = match timeout(connect_timeout, TcpStream::connect(addr)).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => return Err(TunnelError::Io(e)),
+                    Err(_) => return Err(TunnelError::ConnectTimeout(connect_timeout)),
+                };
+                SocketTuner::tune_tcp_stream(&stream, nodelay, tcp_keepalive)
+                    .map_err(TunnelError::Io)?;
+                return Ok(Box::new(stream) as Box<dyn TunnelStream>);
             }
 
-            Err(last_error.unwrap_or_else(|| {
-                TunnelError::Internal(format!(
-                    "Failed to connect to any resolved IP for {}:{}",
-                    host, port
-                ))
-            }))
+            // Multiple IPs: race connection attempts concurrently (Happy Eyeballs / RFC 8305)
+            let futs = ips.into_iter().map(|ip| {
+                let addr = SocketAddr::new(ip, port);
+                Box::pin(async move {
+                    match timeout(connect_timeout, TcpStream::connect(addr)).await {
+                        Ok(Ok(stream)) => Ok(stream),
+                        Ok(Err(e)) => Err(TunnelError::Io(e)),
+                        Err(_) => Err(TunnelError::ConnectTimeout(connect_timeout)),
+                    }
+                })
+            });
+
+            match futures_util::future::select_ok(futs).await {
+                Ok((stream, _remaining)) => {
+                    SocketTuner::tune_tcp_stream(&stream, nodelay, tcp_keepalive)
+                        .map_err(TunnelError::Io)?;
+                    Ok(Box::new(stream) as Box<dyn TunnelStream>)
+                }
+                Err(err) => Err(err),
+            }
         })
     }
 }

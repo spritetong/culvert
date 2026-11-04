@@ -88,7 +88,16 @@ impl TlsConfigBuilder {
             }
         }
 
-        let builder = ClientConfig::builder();
+        let versions: &[&rustls::SupportedProtocolVersion] = match (
+            config.min_version.as_deref(),
+            config.max_version.as_deref(),
+        ) {
+            (Some("1.3"), _) => &[&rustls::version::TLS13],
+            (_, Some("1.2")) => &[&rustls::version::TLS12],
+            _ => &[&rustls::version::TLS13, &rustls::version::TLS12],
+        };
+
+        let builder = ClientConfig::builder_with_protocol_versions(versions);
 
         let builder = if config.insecure {
             builder

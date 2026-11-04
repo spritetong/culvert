@@ -60,13 +60,15 @@ async fn test_multi_mapping_shared_pool_and_path_matching_e2e() {
     let echo2_handle = spawn_echo_server(echo2_addr, cancel_token.clone());
 
     // Single unified AppConfig with Server + Tunnel containing multiple mappings
-    let mut app_config = AppConfig::default();
-    app_config.server = Some(ServerConfig {
-        listen: vec![format!("ws://127.0.0.1:{}/secret_path", server_ws_port)],
-        token: None, // No-auth mode
-        default_target: None,
+    let mut app_config = AppConfig {
+        server: Some(ServerConfig {
+            listen: vec![format!("ws://127.0.0.1:{}/secret_path", server_ws_port)],
+            token: None, // No-auth mode
+            default_target: None,
+            ..Default::default()
+        }),
         ..Default::default()
-    });
+    };
 
     app_config.tunnels.push(TunnelConfig {
         tag: "shared-pool-cluster".to_string(),
@@ -138,13 +140,15 @@ async fn test_path_mismatch_rejection() {
     let echo_addr: SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
     let echo_handle = spawn_echo_server(echo_addr, cancel_token.clone());
 
-    let mut app_config = AppConfig::default();
-    app_config.server = Some(ServerConfig {
-        listen: vec![format!("ws://127.0.0.1:{}/valid_path", server_ws_port)],
-        token: None,
-        default_target: None,
+    let mut app_config = AppConfig {
+        server: Some(ServerConfig {
+            listen: vec![format!("ws://127.0.0.1:{}/valid_path", server_ws_port)],
+            token: None,
+            default_target: None,
+            ..Default::default()
+        }),
         ..Default::default()
-    });
+    };
 
     // Client connects to the WRONG path: /wrong_path
     app_config.tunnels.push(TunnelConfig {

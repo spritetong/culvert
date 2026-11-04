@@ -75,12 +75,11 @@ impl RelayEngine {
                     // Give at most 250ms bounded drain period to flush in-flight tails
                     drain_sleep = Some(Box::pin(tokio::time::sleep(std::time::Duration::from_millis(250))));
                 }
-                if let Some(sleep_fut) = drain_sleep.as_mut() {
-                    if sleep_fut.as_mut().poll(cx).is_ready() {
+                if let Some(sleep_fut) = drain_sleep.as_mut()
+                    && sleep_fut.as_mut().poll(cx).is_ready() {
                         // Hard bounded deadline reached: terminate relay immediately without hanging
                         return Poll::Ready(Ok((a_to_b.total_bytes, b_to_a.total_bytes)));
                     }
-                }
             }
 
             // Drive A -> B transfer (RX direction)
@@ -181,10 +180,23 @@ impl RelayEngine {
             state.read_done = true;
         }
 
-        // Step 3: Shutdown writer if reader is done and all bytes written
+        // Step 3: Flush and Shutdown writer if reader is done and all bytes written
         if state.read_done && state.write_pos == state.read_pos && !state.write_shutdown {
+            match Pin::new(&mut *writer).poll_flush(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => {
+                    tracing::debug!("Relay writer flush error during shutdown: {}", e);
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+
             match Pin::new(&mut *writer).poll_shutdown(cx) {
-                Poll::Ready(_) => {
+                Poll::Ready(Ok(())) => {
+                    state.write_shutdown = true;
+                    *progress = true;
+                }
+                Poll::Ready(Err(e)) => {
+                    tracing::debug!("Relay writer shutdown error: {}", e);
                     state.write_shutdown = true;
                     *progress = true;
                 }

@@ -58,14 +58,14 @@ impl H3Connector {
         transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
         transport_config.max_concurrent_bidi_streams(quinn::VarInt::from_u32(10_000));
         transport_config.max_concurrent_uni_streams(quinn::VarInt::from_u32(10_000));
-        transport_config.stream_receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024).into());
-        transport_config.receive_window(quinn::VarInt::from_u32(32 * 1024 * 1024).into());
+        transport_config.stream_receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
+        transport_config.receive_window(quinn::VarInt::from_u32(32 * 1024 * 1024));
         transport_config.send_window(32 * 1024 * 1024);
         client_config.transport_config(Arc::new(transport_config));
 
         let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
         let mut quinn_endpoint =
-            quinn::Endpoint::client(bind_addr).map_err(|e| TunnelError::Io(e))?;
+            quinn::Endpoint::client(bind_addr).map_err(TunnelError::Io)?;
         quinn_endpoint.set_default_client_config(client_config);
 
         Ok(Self {
@@ -83,20 +83,18 @@ impl H3Connector {
         // Fast path: inspect under short lock
         {
             let guard = self.cached_quic_conn.lock().await;
-            if let Some(ref conn) = *guard {
-                if conn.close_reason().is_none() {
+            if let Some(ref conn) = *guard
+                && conn.close_reason().is_none() {
                     return Ok(conn.clone());
                 }
-            }
         }
 
         let mut guard = self.cached_quic_conn.lock().await;
         // Double-check after acquiring write lock
-        if let Some(ref conn) = *guard {
-            if conn.close_reason().is_none() {
+        if let Some(ref conn) = *guard
+            && conn.close_reason().is_none() {
                 return Ok(conn.clone());
             }
-        }
 
         let ips = self
             .endpoint
@@ -112,7 +110,7 @@ impl H3Connector {
             .tls_config
             .as_ref()
             .and_then(|t| t.server_name.as_deref())
-            .unwrap_or_else(|| self.endpoint.endpoint.host.as_str());
+            .unwrap_or(self.endpoint.endpoint.host.as_str());
 
         info!(server = %resolved_addr, sni = %sni, "Dialing QUIC transport endpoint");
         let connecting = self

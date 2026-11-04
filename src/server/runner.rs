@@ -152,11 +152,10 @@ impl ServerRunner {
                                                                         if let Ok(t_str) = std::str::from_utf8(&target_bytes) {
                                                                             if let Ok(sa) = t_str.parse() {
                                                                                 dynamic_target = Some(TargetAddr::Ip(sa));
-                                                                            } else if let Some((h, p)) = t_str.rsplit_once(':') {
-                                                                                if let Ok(port) = p.parse() {
+                                                                            } else if let Some((h, p)) = t_str.rsplit_once(':')
+                                                                                && let Ok(port) = p.parse() {
                                                                                     dynamic_target = Some(TargetAddr::Domain(h.to_string(), port));
                                                                                 }
-                                                                            }
                                                                         }
                                                                     }
                                                                 }

@@ -138,7 +138,29 @@ impl AsyncWrite for MuxStream {
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        if this.pending_payload.is_some() {
+            match this.outbound.poll_reserve(cx) {
+                Poll::Ready(Ok(())) => {
+                    let (payload, _chunk_size) = this.pending_payload.take().unwrap();
+                    let frame = MuxFrame::data(this.stream_id, payload);
+                    if this.outbound.send_item(frame).is_err() {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::ConnectionReset,
+                            "Multiplexer session terminated",
+                        )));
+                    }
+                }
+                Poll::Ready(Err(_)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "Multiplexer session terminated",
+                    )));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
         Poll::Ready(Ok(()))
     }
 

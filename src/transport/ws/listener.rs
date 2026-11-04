@@ -127,15 +127,14 @@ impl WsListener {
 
                         async move {
                             // Validate URI path if configured on listener
-                            if let Some(ref p) = *path {
-                                if req.uri().path() != p.as_str() {
+                            if let Some(ref p) = *path
+                                && req.uri().path() != p.as_str() {
                                     let resp = Response::builder()
                                         .status(StatusCode::NOT_FOUND)
                                         .body(Empty::<Bytes>::new())
                                         .unwrap();
                                     return Ok::<_, hyper::Error>(resp);
                                 }
-                            }
 
                             // Validate custom handshake headers
                             let headers = match WsHandshakeHeaders::from_http_headers(req.headers())
@@ -151,8 +150,8 @@ impl WsListener {
                             };
 
                             // Validate token if configured on listener using constant-time equality
-                            if let Some(ref expected) = *token {
-                                if !expected.is_empty() {
+                            if let Some(ref expected) = *token
+                                && !expected.is_empty() {
                                     let matches = headers
                                         .auth_token
                                         .as_deref()
@@ -166,7 +165,6 @@ impl WsListener {
                                         return Ok::<_, hyper::Error>(resp);
                                     }
                                 }
-                            }
 
                             let metadata = headers.to_stream_metadata();
 

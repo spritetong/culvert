@@ -66,7 +66,7 @@ pub struct FramedControlStream<S> {
 
 impl<S> FramedControlStream<S>
 where
-    S: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     /// Creates a new `FramedControlStream` wrapping the provided stream.
     pub fn new(stream: S) -> Self {
@@ -78,7 +78,7 @@ where
 
 impl<S> Stream for FramedControlStream<S>
 where
-    S: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     type Item = Result<ControlMessage, TunnelError>;
 
@@ -97,7 +97,7 @@ where
 
 impl<S> Sink<ControlMessage> for FramedControlStream<S>
 where
-    S: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     type Error = TunnelError;
 

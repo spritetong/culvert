@@ -121,8 +121,8 @@ impl TunnelSupervisor {
                 }
                 Err(e) => {
                     attempts += 1;
-                    if let Some(max) = max_retries {
-                        if attempts >= max {
+                    if let Some(max) = max_retries
+                        && attempts >= max {
                             error!(
                                 tag = %config.tag,
                                 attempts,
@@ -132,7 +132,6 @@ impl TunnelSupervisor {
                             );
                             return Err(e);
                         }
-                    }
 
                     warn!(
                         tag = %config.tag,

@@ -22,9 +22,9 @@ pub enum HeartbeatStatus {
 /// Unified dynamic tunnel stream trait combining non-blocking asynchronous reading,
 /// writing, and protocol-level active liveness verification.
 ///
-/// Implementations must be `Send + Sync + Unpin + 'static` to allow thread-safe dispatching
+/// Implementations must be `Send + Unpin + 'static` to allow thread-safe dispatching
 /// and storage across Tokio task boundaries as `Box<dyn TunnelStream>`.
-pub trait TunnelStream: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static {
+pub trait TunnelStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {
     /// Non-blocking hook to transmit a protocol-level ping/heartbeat frame.
     ///
     /// Transports without protocol-level ping (e.g. raw TCP) default to `Poll::Ready(Ok(()))`.
@@ -78,7 +78,7 @@ impl TunnelStream for tokio::net::TcpStream {
 // Implement TunnelStream for tokio_rustls client TLS stream
 impl<S> TunnelStream for tokio_rustls::client::TlsStream<S>
 where
-    S: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
         let mut b = [0u8; 1];
@@ -95,7 +95,7 @@ where
 // Implement TunnelStream for tokio_rustls server TLS stream
 impl<S> TunnelStream for tokio_rustls::server::TlsStream<S>
 where
-    S: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
         let mut b = [0u8; 1];

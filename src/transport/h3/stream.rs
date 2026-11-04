@@ -83,11 +83,10 @@ impl AsyncWrite for QuinnTunnelStream {
 
 impl TunnelStream for QuinnTunnelStream {
     fn poll_check_alive(&mut self, _cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
-        if let Some(ref conn) = self.conn {
-            if conn.close_reason().is_some() {
+        if let Some(ref conn) = self.conn
+            && conn.close_reason().is_some() {
                 return Poll::Ready(HeartbeatStatus::Dead);
             }
-        }
         Poll::Ready(HeartbeatStatus::Alive)
     }
 }
@@ -138,12 +137,11 @@ impl H3TunnelStream {
                     break;
                 }
             }
-            if result.is_ok() {
-                if let Err(e) = send_stream.finish_stream().await {
+            if result.is_ok()
+                && let Err(e) = send_stream.finish_stream().await {
                     debug!("H3 finish_stream failed: {:?}", e);
                     result = Err(e);
                 }
-            }
             let _ = tx_shutdown.send(result);
         });
 

@@ -62,13 +62,13 @@ impl H3Listener {
         transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
         transport_config.max_concurrent_bidi_streams(quinn::VarInt::from_u32(10_000));
         transport_config.max_concurrent_uni_streams(quinn::VarInt::from_u32(10_000));
-        transport_config.stream_receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024).into());
-        transport_config.receive_window(quinn::VarInt::from_u32(32 * 1024 * 1024).into());
+        transport_config.stream_receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
+        transport_config.receive_window(quinn::VarInt::from_u32(32 * 1024 * 1024));
         transport_config.send_window(32 * 1024 * 1024);
         server_config.transport_config(Arc::new(transport_config));
 
         let quinn_endpoint =
-            quinn::Endpoint::server(server_config, addr).map_err(|e| TunnelError::Io(e))?;
+            quinn::Endpoint::server(server_config, addr).map_err(TunnelError::Io)?;
 
         info!(addr = %addr, is_quic_listener, "Bound HTTP/3 & QUIC listener on UDP socket");
 
@@ -219,8 +219,8 @@ impl H3Listener {
                                 };
 
                                 // Validate URI path
-                                if let Some(ref p) = *path_clone {
-                                    if req.uri().path() != p.as_str() {
+                                if let Some(ref p) = *path_clone
+                                    && req.uri().path() != p.as_str() {
                                         let resp = Response::builder()
                                             .status(StatusCode::NOT_FOUND)
                                             .body(())
@@ -228,11 +228,10 @@ impl H3Listener {
                                         let _ = stream.send_response(resp).await;
                                         return;
                                     }
-                                }
 
                                 // Validate authorization token if configured
-                                if let Some(ref token) = *auth_clone {
-                                    if !token.is_empty() {
+                                if let Some(ref token) = *auth_clone
+                                    && !token.is_empty() {
                                         let auth_header = req
                                             .headers()
                                             .get("authorization")
@@ -257,7 +256,6 @@ impl H3Listener {
                                             return;
                                         }
                                     }
-                                }
 
                                 let mode = match req
                                     .headers()
@@ -380,12 +378,11 @@ impl H3Listener {
                                     }
                                     let mut auth_buf = vec![0u8; auth_len];
                                     recv.read_exact(&mut auth_buf).await.map_err(|_| ())?;
-                                    if let Some(ref token) = *auth_clone {
-                                        if !token.is_empty() && bool::from(!auth_buf.as_slice().ct_eq(token.as_bytes())) {
+                                    if let Some(ref token) = *auth_clone
+                                        && !token.is_empty() && bool::from(!auth_buf.as_slice().ct_eq(token.as_bytes())) {
                                             warn!("Raw QUIC authentication failed");
                                             return Err(());
                                         }
-                                    }
 
                                     // Read metadata
                                     recv.read_exact(&mut len_buf).await.map_err(|_| ())?;

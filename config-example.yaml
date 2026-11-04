@@ -72,5 +72,5 @@ tunnels:
     token: "SECURE_PRESHARED_TOKEN"
     endpoint: "https://tunnel.example.com/tunnel"
     multiplex:
-      enabled: true
+      enabled: false  # Note: MUX engine is in preview and not yet wired into the production path
       max_streams: 128

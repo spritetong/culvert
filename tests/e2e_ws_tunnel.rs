@@ -256,13 +256,15 @@ async fn test_supervisor_multi_tunnel_concurrency_e2e() {
     let echo_rev_handle = spawn_echo_server(echo_rev_addr, cancel_token.clone());
 
     // 2. Configure AppConfig with Server + Forward Tunnel + Reverse Tunnel concurrently
-    let mut app_config = AppConfig::default();
-    app_config.server = Some(ServerConfig {
-        listen: vec![format!("ws://127.0.0.1:{}/ws", server_ws_port)],
-        token: Some(auth_token.to_string()),
-        default_target: None,
+    let mut app_config = AppConfig {
+        server: Some(ServerConfig {
+            listen: vec![format!("ws://127.0.0.1:{}/ws", server_ws_port)],
+            token: Some(auth_token.to_string()),
+            default_target: None,
+            ..Default::default()
+        }),
         ..Default::default()
-    });
+    };
 
     app_config.tunnels.push(TunnelConfig {
         tag: "fwd-tunnel".to_string(),

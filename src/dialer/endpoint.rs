@@ -31,7 +31,7 @@ impl Endpoint {
             })?
             .to_string();
 
-        let port = parsed.port().unwrap_or_else(|| match scheme.as_str() {
+        let port = parsed.port().unwrap_or(match scheme.as_str() {
             "https" | "wss" | "h3" | "quic" => 443,
             "http" | "ws" => 80,
             _ => 0,

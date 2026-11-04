@@ -66,6 +66,7 @@ pub trait TransportConnector: Send + Sync {
 /// Dynamic trait object for accepting inbound tunnel streams from clients.
 pub trait TransportListener: Send + Sync {
     /// Asynchronously awaits and accepts the next incoming tunnel stream.
+    #[allow(clippy::type_complexity)]
     fn accept<'a>(
         &'a mut self,
     ) -> BoxFuture<'a, Result<(Box<dyn TunnelStream>, StreamMetadata), TunnelError>>;

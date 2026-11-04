@@ -16,18 +16,16 @@ use crate::core::stream::{BoxFuture, HeartbeatStatus, TunnelStream};
 type DynRead = Box<dyn AsyncRead + Send + Unpin>;
 type DynWrite = Box<dyn AsyncWrite + Send + Unpin>;
 
+type WsReadResult = (
+    WebSocketRead<DynRead>,
+    Vec<Frame<'static>>,
+    Result<(OpCode, Bytes), WebSocketError>,
+);
+type WsReadFuture = BoxFuture<'static, WsReadResult>;
+
 enum ReadState {
     Idle(WebSocketRead<DynRead>),
-    Reading(
-        BoxFuture<
-            'static,
-            (
-                WebSocketRead<DynRead>,
-                Vec<Frame<'static>>,
-                Result<(OpCode, Bytes), WebSocketError>,
-            ),
-        >,
-    ),
+    Reading(WsReadFuture),
     Buffered {
         rx: WebSocketRead<DynRead>,
         payload: Bytes,
@@ -58,10 +56,6 @@ pub struct WsTunnelStream {
     write_state: WriteState,
     control_queue: std::collections::VecDeque<Frame<'static>>,
 }
-
-// Safety: WsTunnelStream exposes no methods taking `&self` that mutate state without
-// synchronization. All reading and writing require `Pin<&mut Self>`.
-unsafe impl Sync for WsTunnelStream {}
 
 impl WsTunnelStream {
     /// Constructs a `WsTunnelStream` from an upgraded underlying I/O stream.
@@ -157,6 +151,7 @@ impl AsyncRead for WsTunnelStream {
                 ReadState::Idle(mut rx) => {
                     let fut = Box::pin(async move {
                         let mut obligated = Vec::new();
+                        let mut budget = 32usize;
                         let res = loop {
                             let mut send_fn = |f: Frame<'_>| {
                                 let frame_to_queue = match f.opcode {
@@ -183,7 +178,13 @@ impl AsyncRead for WsTunnelStream {
                                 OpCode::Close => {
                                     break Ok((OpCode::Close, Bytes::new()));
                                 }
-                                _ => {}
+                                _ => {
+                                    budget = budget.saturating_sub(1);
+                                    if budget == 0 {
+                                        // Reached budget limit on control frames: yield to avoid worker starvation
+                                        break Ok((frame.opcode, Bytes::new()));
+                                    }
+                                }
                             }
                         };
                         (rx, obligated, res)
@@ -210,7 +211,8 @@ impl AsyncRead for WsTunnelStream {
                         }
                         if payload.is_empty() {
                             self.read_state = ReadState::Idle(rx);
-                            continue;
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
                         }
                         self.read_state = ReadState::Buffered {
                             rx,
@@ -253,78 +255,74 @@ impl AsyncWrite for WsTunnelStream {
             return Poll::Ready(Err(e));
         }
 
-        loop {
-            match std::mem::replace(&mut self.write_state, WriteState::Failed) {
-                WriteState::Idle(mut tx) => {
-                    let len = buf.len();
-                    let payload = buf.to_vec();
-                    let mut fut = Box::pin(async move {
-                        let res = tx.write_frame(Frame::binary(Payload::Owned(payload))).await;
-                        (tx, res)
-                    });
-                    match fut.as_mut().poll(cx) {
-                        Poll::Ready((tx, Ok(()))) => {
-                            self.write_state = WriteState::Idle(tx);
-                            return Poll::Ready(Ok(len));
-                        }
-                        Poll::Ready((_tx, Err(e))) => {
-                            self.write_state = WriteState::Failed;
-                            return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
-                        }
-                        Poll::Pending => {
-                            self.write_state = WriteState::Writing { fut, written_len: len };
-                            return Poll::Pending;
-                        }
-                    }
-                }
-                WriteState::Writing { mut fut, written_len } => match fut.as_mut().poll(cx) {
-                    Poll::Pending => {
-                        self.write_state = WriteState::Writing { fut, written_len };
-                        return Poll::Pending;
-                    }
+        match std::mem::replace(&mut self.write_state, WriteState::Failed) {
+            WriteState::Idle(mut tx) => {
+                let len = buf.len();
+                let payload = buf.to_vec();
+                let mut fut = Box::pin(async move {
+                    let res = tx.write_frame(Frame::binary(Payload::Owned(payload))).await;
+                    (tx, res)
+                });
+                match fut.as_mut().poll(cx) {
                     Poll::Ready((tx, Ok(()))) => {
                         self.write_state = WriteState::Idle(tx);
-                        return Poll::Ready(Ok(written_len));
+                        Poll::Ready(Ok(len))
                     }
                     Poll::Ready((_tx, Err(e))) => {
                         self.write_state = WriteState::Failed;
-                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
+                        Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)))
                     }
-                },
-                WriteState::WritingControl(fut) => {
-                    self.write_state = WriteState::WritingControl(fut);
-                    if let Poll::Ready(Err(e)) = self.poll_flush_control(cx) {
-                        return Poll::Ready(Err(e));
-                    }
-                    return Poll::Pending;
-                }
-                WriteState::Closing(mut fut) => match fut.as_mut().poll(cx) {
                     Poll::Pending => {
-                        self.write_state = WriteState::Closing(fut);
-                        return Poll::Pending;
+                        self.write_state = WriteState::Writing { fut, written_len: len };
+                        Poll::Pending
                     }
-                    Poll::Ready((_tx, _)) => {
-                        self.write_state = WriteState::Closed;
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "WebSocket write half closed",
-                        )));
-                    }
-                },
-                WriteState::Closed => {
-                    self.write_state = WriteState::Closed;
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "WebSocket write half closed",
-                    )));
-                }
-                WriteState::Failed => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "WebSocket write half in failed state",
-                    )));
                 }
             }
+            WriteState::Writing { mut fut, written_len } => match fut.as_mut().poll(cx) {
+                Poll::Pending => {
+                    self.write_state = WriteState::Writing { fut, written_len };
+                    Poll::Pending
+                }
+                Poll::Ready((tx, Ok(()))) => {
+                    self.write_state = WriteState::Idle(tx);
+                    Poll::Ready(Ok(written_len))
+                }
+                Poll::Ready((_tx, Err(e))) => {
+                    self.write_state = WriteState::Failed;
+                    Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)))
+                }
+            },
+            WriteState::WritingControl(fut) => {
+                self.write_state = WriteState::WritingControl(fut);
+                if let Poll::Ready(Err(e)) = self.poll_flush_control(cx) {
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending
+            }
+            WriteState::Closing(mut fut) => match fut.as_mut().poll(cx) {
+                Poll::Pending => {
+                    self.write_state = WriteState::Closing(fut);
+                    Poll::Pending
+                }
+                Poll::Ready((_tx, _)) => {
+                    self.write_state = WriteState::Closed;
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "WebSocket write half closed",
+                    )))
+                }
+            },
+            WriteState::Closed => {
+                self.write_state = WriteState::Closed;
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "WebSocket write half closed",
+                )))
+            }
+            WriteState::Failed => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "WebSocket write half in failed state",
+            ))),
         }
     }
 
