@@ -189,12 +189,18 @@ impl ReplenishingStreamPool {
             const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
             const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(3);
             const MAX_CONCURRENT_CONNECTS: usize = 4;
+            const BACKOFF_BASE: Duration = Duration::from_millis(200);
+            const BACKOFF_MAX: Duration = Duration::from_secs(10);
+
+            let mut next_retry_at = Instant::now();
+            let mut backoff = BACKOFF_BASE;
 
             loop {
-                // 1. Replenish connecting futures if total (idle + in_flight) < target_size
+                // 1. Replenish connecting futures if total (idle + in_flight) < target_size and backoff passed
+                let now = Instant::now();
                 let in_flight = connecting_futures.len();
                 let current_total = idle_streams.len() + in_flight;
-                if current_total < target_size && in_flight < MAX_CONCURRENT_CONNECTS {
+                if current_total < target_size && in_flight < MAX_CONCURRENT_CONNECTS && now >= next_retry_at {
                     let c = Arc::clone(&connector);
                     let t = dummy_target.clone();
                     connecting_futures.push(Box::pin(async move {
@@ -204,7 +210,6 @@ impl ReplenishingStreamPool {
 
                 // 2. Perform non-blocking, multi-stream heartbeat sweep in a single poll
                 let mut surviving = VecDeque::with_capacity(idle_streams.len());
-                let now = Instant::now();
 
                 while let Some(mut managed) = idle_streams.pop_front() {
                     let mut is_dead = false;
@@ -273,6 +278,8 @@ impl ReplenishingStreamPool {
                     Some(conn_res) = connecting_futures.next(), if !connecting_futures.is_empty() => {
                         match conn_res {
                             Ok(stream) => {
+                                backoff = BACKOFF_BASE;
+                                next_retry_at = Instant::now();
                                 idle_streams.push_back(ManagedStream::new(stream));
                                 let mut st = stats_clone.lock();
                                 st.idle_count = idle_streams.len();
@@ -280,6 +287,8 @@ impl ReplenishingStreamPool {
                             }
                             Err(e) => {
                                 tracing::debug!("Background connect_pooled failed: {:?}", e);
+                                next_retry_at = Instant::now() + backoff;
+                                backoff = (backoff * 2).min(BACKOFF_MAX);
                             }
                         }
                     }
@@ -366,6 +375,9 @@ impl ReplenishingStreamPool {
                             None => break,
                         }
                     }
+                    _ = tokio::time::sleep_until(next_retry_at.into()), if current_total < target_size && in_flight == 0 && Instant::now() < next_retry_at => {
+                        // Backoff timer expired: wake loop to re-attempt connection replenishment
+                    }
                     _ = tokio::time::sleep(Duration::from_millis(500)) => {
                         // Periodic timer to wake up and drive heartbeat sweep even when idle
                     }
@@ -437,5 +449,62 @@ impl ReplenishingStreamPool {
         let mut st = *self.stats.lock();
         st.active_count = self.active_count.load(Ordering::Relaxed);
         st
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    struct MockFailingConnector {
+        call_count: Arc<AtomicUsize>,
+    }
+
+    impl TransportConnector for MockFailingConnector {
+        fn protocol_scheme(&self) -> &'static str {
+            "mock"
+        }
+
+        fn connect<'a>(
+            &'a self,
+            _target: &'a TargetAddr,
+            _session_id: Option<&'a str>,
+        ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(TunnelError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"))) })
+        }
+
+        fn connect_pooled<'a>(
+            &'a self,
+            _target: &'a TargetAddr,
+        ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(TunnelError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"))) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connection_pool_backoff_on_immediate_failures() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let connector = Arc::new(MockFailingConnector {
+            call_count: Arc::clone(&call_count),
+        });
+
+        let cancel_token = CancellationToken::new();
+        let _pool = ReplenishingStreamPool::new_shared(
+            connector,
+            4,
+            cancel_token.clone(),
+        );
+
+        // Sleep 400ms. In the buggy implementation without backoff, 400ms with instant failures
+        // resulted in >100,000 reconnect attempts. With 200ms base backoff, call count must be <= 3.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        cancel_token.cancel();
+
+        let count = call_count.load(Ordering::SeqCst);
+        assert!(count <= 3, "Reconnect rate must be throttled by backoff gate, got {count}");
+        assert!(count >= 1, "At least one attempt should be performed, got {count}");
     }
 }

@@ -59,6 +59,7 @@ pub struct WsTunnelStream {
     peer_closed: bool,
     close_sent: bool,
     fin_sent: bool,
+    fin_queued: bool,
 }
 
 impl WsTunnelStream {
@@ -81,6 +82,7 @@ impl WsTunnelStream {
             peer_closed: false,
             close_sent: false,
             fin_sent: false,
+            fin_queued: false,
         }
     }
 
@@ -373,6 +375,9 @@ impl AsyncWrite for WsTunnelStream {
                     }
                     Poll::Ready((tx, Ok(()))) => {
                         self.write_state = WriteState::Idle(tx);
+                        if self.fin_queued {
+                            self.fin_sent = true;
+                        }
                         continue;
                     }
                     Poll::Ready((_tx, Err(e))) => {
@@ -412,6 +417,7 @@ impl AsyncWrite for WsTunnelStream {
                         (tx, res)
                     });
                     self.write_state = WriteState::Writing { fut, written_len: 0 };
+                    self.fin_queued = true;
                     continue;
                 }
                 WriteState::Writing { mut fut, written_len } => match fut.as_mut().poll(cx) {
@@ -421,8 +427,12 @@ impl AsyncWrite for WsTunnelStream {
                     }
                     Poll::Ready((tx, Ok(()))) => {
                         self.write_state = WriteState::Idle(tx);
-                        self.fin_sent = true;
-                        return Poll::Ready(Ok(()));
+                        if self.fin_queued {
+                            self.fin_sent = true;
+                            return Poll::Ready(Ok(()));
+                        }
+                        // Data frame completed; loop to Idle to send logical FIN frame
+                        continue;
                     }
                     Poll::Ready((_tx, Err(e))) => {
                         self.write_state = WriteState::Failed;
@@ -840,5 +850,26 @@ mod tests {
         let mut buf = vec![0u8; test_payload.len()];
         server.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, test_payload.as_ref());
+    }
+
+    #[tokio::test]
+    async fn test_ws_shutdown_with_in_flight_data_sends_fin() {
+        let (raw_client, raw_server) = duplex(65536);
+
+        let mut client = WsTunnelStream::new(raw_client, Role::Client);
+        let mut server = WsTunnelStream::new(raw_server, Role::Server);
+
+        // Client writes data and immediately calls shutdown without manual flush
+        client.write_all(b"payload before shutdown").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        // Server should read the payload first
+        let mut buf = vec![0u8; 23];
+        server.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"payload before shutdown");
+
+        // Server should now read 0 bytes (EOF due to FIN frame)
+        let n = server.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0, "Server must receive EOF after client shutdown");
     }
 }

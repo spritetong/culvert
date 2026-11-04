@@ -101,11 +101,12 @@ impl H3Connector {
                 return Ok(conn.clone());
             }
 
-        let ips = self
-            .endpoint
-            .dns_resolver
-            .resolve(&self.endpoint.endpoint.host)
-            .await?;
+        let ips = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.endpoint.dns_resolver.resolve(&self.endpoint.endpoint.host),
+        )
+        .await
+        .map_err(|_| TunnelError::ConnectTimeout(std::time::Duration::from_secs(10)))??;
         let ip = ips.first().copied().ok_or_else(|| {
             TunnelError::DnsNoAddresses(self.endpoint.endpoint.host.clone(), "any".to_string())
         })?;
@@ -263,9 +264,14 @@ impl H3Connector {
             .map_err(|e| TunnelError::Config(format!("Invalid request headers: {:?}", e)))?;
 
         debug!(path = %path, target = %target, pool_idle, "Sending HTTP/3 CONNECT tunnel request");
-        let mut stream = match send_request.send_request(request).await {
-            Ok(s) => s,
-            Err(e) => {
+        let mut stream = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            send_request.send_request(request),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
                 *self.cached_h3_sender.write() = None;
                 *self.cached_quic_conn.write() = None;
                 return Err(TunnelError::ControlProtocol(format!(
@@ -273,17 +279,32 @@ impl H3Connector {
                     e
                 )));
             }
+            Err(_) => {
+                *self.cached_h3_sender.write() = None;
+                *self.cached_quic_conn.write() = None;
+                return Err(TunnelError::ConnectTimeout(std::time::Duration::from_secs(10)));
+            }
         };
 
-        let response = match stream.recv_response().await {
-            Ok(r) => r,
-            Err(e) => {
+        let response = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.recv_response(),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 *self.cached_h3_sender.write() = None;
                 *self.cached_quic_conn.write() = None;
                 return Err(TunnelError::ControlProtocol(format!(
                     "Failed to receive H3 response: {:?}",
                     e
                 )));
+            }
+            Err(_) => {
+                *self.cached_h3_sender.write() = None;
+                *self.cached_quic_conn.write() = None;
+                return Err(TunnelError::ConnectTimeout(std::time::Duration::from_secs(10)));
             }
         };
 
@@ -311,14 +332,23 @@ impl H3Connector {
         pool_idle: bool,
     ) -> Result<Box<dyn TunnelStream>, TunnelError> {
         let conn = self.get_or_connect().await?;
-        let (mut send, recv) = match conn.open_bi().await {
-            Ok(pair) => pair,
-            Err(e) => {
+        let (mut send, recv) = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            conn.open_bi(),
+        )
+        .await
+        {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => {
                 *self.cached_quic_conn.write() = None;
                 return Err(TunnelError::Tls(format!(
                     "Failed to open QUIC bi-stream: {:?}",
                     e
                 )));
+            }
+            Err(_) => {
+                *self.cached_quic_conn.write() = None;
+                return Err(TunnelError::ConnectTimeout(std::time::Duration::from_secs(10)));
             }
         };
 
@@ -341,9 +371,22 @@ impl H3Connector {
         header.extend_from_slice(&(handshake_bytes.len() as u32).to_be_bytes());
         header.extend_from_slice(&handshake_bytes);
 
-        if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut send, &header).await {
-            *self.cached_quic_conn.write() = None;
-            return Err(TunnelError::Io(e));
+        let write_res = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::io::AsyncWriteExt::write_all(&mut send, &header),
+        )
+        .await;
+
+        match write_res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                *self.cached_quic_conn.write() = None;
+                return Err(TunnelError::Io(e));
+            }
+            Err(_) => {
+                *self.cached_quic_conn.write() = None;
+                return Err(TunnelError::ConnectTimeout(std::time::Duration::from_secs(10)));
+            }
         }
 
         Ok(Box::new(QuinnTunnelStream::new(send, recv).with_connection(conn)) as Box<dyn TunnelStream>)
