@@ -100,7 +100,7 @@ impl WsListener {
                 let token = Arc::clone(&auth_token);
                 let path = Arc::clone(&expected_path);
                 let acceptor = tls_acceptor.clone();
-                let cancel_conn = cancel_token.clone();
+                let cancel_conn = cancel_token.child_token();
 
                 conn_tasks.spawn(async move {
                     tokio::select! {

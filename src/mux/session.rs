@@ -199,7 +199,9 @@ impl MuxSession {
                             stream_id,
                             "Multiplexer inbound stream backlog full; rejecting SYN with RST"
                         );
-                        let _ = tx_frames.try_send(MuxFrame::rst(stream_id));
+                        if let Err(e) = tx_frames.try_send(MuxFrame::rst(stream_id)) {
+                            warn!(stream_id, "Failed to enqueue RST frame on SYN reject (queue full/closed): {:?}", e);
+                        }
                         if let Some((_, (_, closed_flag))) = active_streams.remove(&stream_id) {
                             closed_streams.insert(stream_id, closed_flag);
                         }
@@ -234,7 +236,9 @@ impl MuxSession {
                                 stream_id,
                                 "Multiplexer stream buffer full; resetting slow stream to prevent session HOL blocking"
                             );
-                            let _ = tx_frames.try_send(MuxFrame::rst(stream_id));
+                            if let Err(e) = tx_frames.try_send(MuxFrame::rst(stream_id)) {
+                                warn!(stream_id, "Failed to enqueue RST frame on slow stream reset: {:?}", e);
+                            }
                             if let Some((_, (_, closed_flag))) = active_streams.remove(&stream_id) {
                                 closed_flag.store(true, Ordering::Release);
                                 closed_streams.insert(stream_id, closed_flag);
@@ -257,7 +261,7 @@ impl MuxSession {
                     closed_streams.insert(stream_id, closed_flag);
                 }
 
-                // Bound memory of closed_streams map
+                // Capacity-triggered high-watermark pruning (>4096 entries, retains top 2048)
                 if closed_streams.len() > 4096 {
                     let min_id = stream_id.saturating_sub(2048);
                     closed_streams.retain(|&id, _| id >= min_id);

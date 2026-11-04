@@ -186,39 +186,9 @@ where
     }
 }
 
-// Implement TunnelStream for tokio_rustls client TLS stream
-impl<S> TunnelStream for tokio_rustls::client::TlsStream<S>
-where
-    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
-{
-    fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
-        let mut b = [0u8; 1];
-        let mut buf = ReadBuf::new(&mut b);
-        match Pin::new(self).poll_read(cx, &mut buf) {
-            Poll::Ready(Ok(())) if buf.filled().is_empty() => Poll::Ready(HeartbeatStatus::Dead),
-            Poll::Ready(Ok(())) => Poll::Ready(HeartbeatStatus::Alive),
-            Poll::Ready(Err(_)) => Poll::Ready(HeartbeatStatus::Dead),
-            Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
-        }
-    }
-}
-
-// Implement TunnelStream for tokio_rustls server TLS stream
-impl<S> TunnelStream for tokio_rustls::server::TlsStream<S>
-where
-    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
-{
-    fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
-        let mut b = [0u8; 1];
-        let mut buf = ReadBuf::new(&mut b);
-        match Pin::new(self).poll_read(cx, &mut buf) {
-            Poll::Ready(Ok(())) if buf.filled().is_empty() => Poll::Ready(HeartbeatStatus::Dead),
-            Poll::Ready(Ok(())) => Poll::Ready(HeartbeatStatus::Alive),
-            Poll::Ready(Err(_)) => Poll::Ready(HeartbeatStatus::Dead),
-            Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
-        }
-    }
-}
+// Note: Direct `TunnelStream` implementation for raw `tokio_rustls::TlsStream` was removed
+// to prevent destructive 1-byte read probes. Raw TLS streams must always be wrapped with
+// `BufferedTlsStream` which supports non-destructive pushback.
 
 // Implement TunnelStream for tokio::io::DuplexStream for in-memory unit tests
 impl TunnelStream for tokio::io::DuplexStream {

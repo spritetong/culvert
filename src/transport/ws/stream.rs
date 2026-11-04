@@ -634,7 +634,10 @@ impl TunnelStream for WsTunnelStream {
                             Poll::Ready(HeartbeatStatus::Alive)
                         }
                     }
-                    _ => Poll::Ready(HeartbeatStatus::Alive),
+                    Poll::Ready(Ok(())) => match self.read_state {
+                        ReadState::Eof | ReadState::Failed => Poll::Ready(HeartbeatStatus::Dead),
+                        _ => Poll::Ready(HeartbeatStatus::Alive),
+                    },
                 }
             }
             ReadState::Reading(fut) => {
@@ -782,13 +785,42 @@ mod tests {
         let mut client = WsTunnelStream::new(raw_client, Role::Client);
         let mut server = WsTunnelStream::new(raw_server, Role::Server);
 
-        // Enqueue multiple control frames on server before writing data
-        server.control_queue.push_back(Frame::pong(Payload::Owned(b"pong1".to_vec())));
-        server.control_queue.push_back(Frame::pong(Payload::Owned(b"pong2".to_vec())));
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
 
-        // server writes data frame; poll_flush_control must flush control queue without lost wakeups
-        server.write_all(b"data frame after pong").await.unwrap();
-        server.flush().await.unwrap();
+        // Explicitly put server write_state into WritingControl waiting on gate_rx to ensure
+        // poll_flush_control returns Poll::Pending and registers the waker.
+        if let WriteState::Idle(mut tx) =
+            std::mem::replace(&mut server.write_state, WriteState::Failed)
+        {
+            let fut = Box::pin(async move {
+                let _ = gate_rx.await;
+                let res =
+                    tx.write_frame(Frame::pong(Payload::Owned(b"pong_delayed".to_vec()))).await;
+                (tx, res)
+            });
+            server.write_state = WriteState::WritingControl(fut);
+        } else {
+            panic!("Expected server write_state to be Idle");
+        }
+
+        // Spawn a task that writes data while WritingControl is pending
+        let write_handle = tokio::spawn(async move {
+            server.write_all(b"data frame after pong").await.unwrap();
+            server.flush().await.unwrap();
+            server
+        });
+
+        // Small sleep to ensure write_all ran and entered Poll::Pending via poll_flush_control
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Release the control frame write
+        gate_tx.send(()).unwrap();
+
+        // The write task must be woken up without lost wakeups and finish successfully
+        let _server = tokio::time::timeout(tokio::time::Duration::from_secs(3), write_handle)
+            .await
+            .expect("write_handle timed out - wakeup was lost!")
+            .unwrap();
 
         let mut buf = vec![0u8; 21];
         client.read_exact(&mut buf).await.unwrap();

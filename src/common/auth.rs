@@ -4,15 +4,38 @@
 use ring::digest::{SHA256, digest};
 use subtle::ConstantTimeEq;
 
+const TOKEN_MAX_LEN: usize = 256;
+
+fn pad_to_fixed_len(input: &[u8]) -> Option<[u8; TOKEN_MAX_LEN]> {
+    if input.len() > TOKEN_MAX_LEN {
+        return None;
+    }
+    let mut buf = [0u8; TOKEN_MAX_LEN];
+    buf[..input.len()].copy_from_slice(input);
+    Some(buf)
+}
+
 /// Compares two token byte sequences in constant time without leaking length information.
 ///
 /// Standard slice `ConstantTimeEq` returns immediately if slice lengths differ,
-/// leaking token length through side channels. This function pre-hashes both slices
-/// with SHA-256 to ensure comparison is strictly constant time across all inputs.
+/// leaking token length through side channels. This function pads inputs up to 256 bytes
+/// to enforce constant SHA-256 block compression counts before constant-time comparison,
+/// preventing length-based timing side channels.
 pub fn constant_time_token_eq(candidate: &[u8], expected: &[u8]) -> bool {
-    let hash_cand = digest(&SHA256, candidate);
-    let hash_exp = digest(&SHA256, expected);
-    bool::from(hash_cand.as_ref().ct_eq(hash_exp.as_ref()))
+    let eq_len = candidate.len().ct_eq(&expected.len());
+    match (pad_to_fixed_len(candidate), pad_to_fixed_len(expected)) {
+        (Some(c), Some(e)) => {
+            let hash_cand = digest(&SHA256, &c);
+            let hash_exp = digest(&SHA256, &e);
+            bool::from(hash_cand.as_ref().ct_eq(hash_exp.as_ref()) & eq_len)
+        }
+        (None, None) => {
+            let hash_cand = digest(&SHA256, candidate);
+            let hash_exp = digest(&SHA256, expected);
+            bool::from(hash_cand.as_ref().ct_eq(hash_exp.as_ref()) & eq_len)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]

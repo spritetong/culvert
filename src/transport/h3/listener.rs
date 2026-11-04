@@ -216,9 +216,12 @@ impl H3Listener {
             }
         };
 
+        let mut request_tasks = tokio::task::JoinSet::new();
+
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => break,
+                Some(_) = request_tasks.join_next(), if !request_tasks.is_empty() => continue,
                 resolver_opt = h3_conn.accept() => {
                     match resolver_opt {
                         Ok(Some(resolver)) => {
@@ -226,7 +229,7 @@ impl H3Listener {
                             let path_clone = Arc::clone(&expected_path);
                             let tx_clone = tx_streams.clone();
 
-                            tokio::spawn(async move {
+                            request_tasks.spawn(async move {
                                 let (req, mut stream) = match resolver.resolve_request().await {
                                     Ok(pair) => pair,
                                     Err(e) => {
@@ -365,6 +368,9 @@ impl H3Listener {
                 }
             }
         }
+
+        request_tasks.abort_all();
+        while request_tasks.join_next().await.is_some() {}
     }
 
     /// Processes raw QUIC bidirectional streams on the connection.

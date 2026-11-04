@@ -67,6 +67,7 @@ impl RelayEngine {
         // and achieve zero-allocation, purely event-driven cancellation without polling.
         let mut cancel_fut = pin!(cancel_token.cancelled_owned());
         let mut drain_sleep: Option<Pin<Box<tokio::time::Sleep>>> = None;
+        let mut spin_count: usize = 0;
 
         poll_fn(|cx| {
             let is_cancelled = cancel_fut.as_mut().poll(cx).is_ready();
@@ -115,8 +116,16 @@ impl RelayEngine {
             }
 
             if progress {
-                // Yield control to allow runtime cooperation
+                spin_count = spin_count.saturating_add(1);
+                // Bounded cooperative yield after consecutive busy spins to prevent worker starvation
+                if spin_count > 64 {
+                    spin_count = 0;
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
                 cx.waker().wake_by_ref();
+            } else {
+                spin_count = 0;
             }
 
             Poll::Pending

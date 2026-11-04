@@ -439,24 +439,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_h3_connector_fast_path_read_lock_concurrency() {
+        use std::sync::Arc;
+        use tokio::sync::Barrier;
+
         let app_cfg = AppConfig::default();
         let ep_cfg = EndpointConfig::Simple("h3://127.0.0.1:4433/tunnel".to_string());
         let ctx = EndpointContext::build(&ep_cfg, &app_cfg).unwrap();
-        let connector = H3Connector::new(&ctx, "test-token", TunnelMode::Forward).unwrap();
+        let connector = Arc::new(H3Connector::new(&ctx, "test-token", TunnelMode::Forward).unwrap());
 
         // Cached sender starts empty
         assert!(connector.cached_h3_sender.read().is_none());
         assert!(connector.cached_quic_conn.read().is_none());
 
-        // Concurrent reads can acquire the RwLock without contention or deadlocks
-        let handles: Vec<_> = (0..8)
-            .map(|_| {
-                let s = connector.cached_h3_sender.read().clone();
-                let q = connector.cached_quic_conn.read().clone();
+        let barrier = Arc::new(Barrier::new(8));
+        let mut tasks = Vec::new();
+
+        for _ in 0..8 {
+            let conn = Arc::clone(&connector);
+            let b = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                b.wait().await;
+                let s = conn.cached_h3_sender.read().clone();
+                let q = conn.cached_quic_conn.read().clone();
                 assert!(s.is_none());
                 assert!(q.is_none());
-            })
-            .collect();
-        assert_eq!(handles.len(), 8);
+            }));
+        }
+
+        for t in tasks {
+            t.await.unwrap();
+        }
     }
 }
