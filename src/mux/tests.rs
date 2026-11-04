@@ -158,3 +158,54 @@ async fn test_mux_rst_drops_trailing_in_flight_frames() {
 
     cancel.cancel();
 }
+
+#[tokio::test]
+async fn test_mux_slow_consumer_does_not_block_session_hol() {
+    let (pipe_client, pipe_server) = duplex(131072);
+    let cancel = CancellationToken::new();
+
+    let client_session = MuxSession::new(Box::new(pipe_client), true, cancel.clone());
+    let server_session = MuxSession::new(Box::new(pipe_server), false, cancel.clone());
+
+    // Open stream 1: a slow consumer that never reads
+    let mut client_slow = client_session.open_stream().await.unwrap();
+    let _server_slow = server_session.accept_stream().await.unwrap();
+
+    // Open stream 3: normal active stream
+    let mut client_fast = client_session.open_stream().await.unwrap();
+    let mut server_fast = server_session.accept_stream().await.unwrap();
+
+    // Flood slow stream beyond STREAM_BUFFER_SIZE (128)
+    for _ in 0..150 {
+        let _ = client_slow.write_all(b"data chunk").await;
+        let _ = client_slow.flush().await;
+    }
+
+    // Now send data on fast stream. If HOL blocking occurred, this would hang indefinitely!
+    client_fast.write_all(b"fast stream payload").await.unwrap();
+    client_fast.flush().await.unwrap();
+
+    let mut fast_buf = vec![0u8; 19];
+    server_fast.read_exact(&mut fast_buf).await.unwrap();
+    assert_eq!(&fast_buf, b"fast stream payload");
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_mux_stream_drop_cleans_active_streams() {
+    let (pipe_client, pipe_server) = duplex(65536);
+    let cancel = CancellationToken::new();
+
+    let client_session = MuxSession::new(Box::new(pipe_client), true, cancel.clone());
+    let _server_session = MuxSession::new(Box::new(pipe_server), false, cancel.clone());
+
+    let stream = client_session.open_stream().await.unwrap();
+    assert_eq!(client_session.active_stream_count(), 1);
+
+    drop(stream);
+    // Unregistered synchronously on drop via registry handle
+    assert_eq!(client_session.active_stream_count(), 0);
+
+    cancel.cancel();
+}

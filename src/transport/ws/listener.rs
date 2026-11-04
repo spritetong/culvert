@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::common::net::SocketTuner;
 use crate::core::error::TunnelError;
-use crate::core::stream::{BoxFuture, TunnelStream};
+use crate::core::stream::{BufferedTlsStream, BoxFuture, TunnelStream};
 use crate::transport::ws::model::WsHandshakeHeaders;
 use crate::transport::ws::stream::WsTunnelStream;
 use crate::transport::{StreamMetadata, TransportListener};
@@ -105,7 +105,7 @@ impl WsListener {
                     let io: TokioIo<Box<dyn TunnelStream>> = if let Some(tls) = acceptor {
                         match tokio::time::timeout(Duration::from_secs(10), tls.accept(stream)).await {
                             Ok(Ok(tls_stream)) => {
-                                TokioIo::new(Box::new(tls_stream) as Box<dyn TunnelStream>)
+                                TokioIo::new(Box::new(BufferedTlsStream::new(tls_stream)) as Box<dyn TunnelStream>)
                             }
                             Ok(Err(e)) => {
                                 tracing::debug!("WSS server TLS handshake failed: {:?}", e);

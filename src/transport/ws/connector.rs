@@ -11,7 +11,7 @@ use std::future::Future;
 
 use crate::config::model::TunnelMode;
 use crate::core::error::TunnelError;
-use crate::core::stream::{BoxFuture, TunnelStream};
+use crate::core::stream::{BufferedTlsStream, BoxFuture, TunnelStream};
 use crate::dialer::endpoint::EndpointContext;
 use crate::dialer::tls::TlsConfigBuilder;
 use crate::transport::ws::model::WsHandshakeHeaders;
@@ -77,7 +77,7 @@ impl WsConnector {
                     .await
                     .map_err(|e| TunnelError::Tls(format!("TLS handshake failed: {}", e)))?;
 
-                Box::new(tls_conn)
+                Box::new(BufferedTlsStream::new(tls_conn))
             } else {
                 raw_stream
             }

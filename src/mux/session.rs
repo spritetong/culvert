@@ -122,9 +122,21 @@ impl MuxSession {
 
         // Reader task: decodes inbound frames from `framed_reader` and demuxes to streams
         tokio::spawn(async move {
+            let mut gc_interval = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 tokio::select! {
                     _ = cancel_token.cancelled() => break,
+                    _ = gc_interval.tick() => {
+                        // Periodic GC: safely unregister streams whose receiver has been dropped
+                        active_streams.retain(|_, (tx, flag)| {
+                            if tx.is_closed() {
+                                flag.store(true, Ordering::Release);
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                    }
                     frame_res = framed_reader.next() => {
                         match frame_res {
                             Some(Ok(frame)) => {
@@ -177,7 +189,8 @@ impl MuxSession {
                 let closed_flag = Arc::new(AtomicBool::new(false));
                 active_streams.insert(stream_id, (data_tx, Arc::clone(&closed_flag)));
 
-                let new_stream = MuxStream::new(stream_id, tx_frames.clone(), data_rx, closed_flag);
+                let new_stream = MuxStream::new(stream_id, tx_frames.clone(), data_rx, closed_flag)
+                    .with_registry(Arc::clone(active_streams));
 
                 match tx_new_streams.try_send(new_stream) {
                     Ok(()) => {}
@@ -209,14 +222,32 @@ impl MuxSession {
                     return;
                 }
 
-                // Propagate true backpressure to the underlying socket instead of silently dropping payloads.
-                // Clone the sender and immediately drop the DashMap read guard to avoid holding synchronization locks across .await.
+                // Try sending data slice without blocking the entire session reader loop.
+                // A slow consumer cannot cause Head-Of-Line blocking across other logical streams;
+                // if its buffer fills completely, the slow stream is explicitly terminated with RST.
                 let tx_opt = active_streams.get(&stream_id).map(|e| e.value().0.clone());
-                if let Some(data_tx) = tx_opt
-                    && data_tx.send(frame.payload).await.is_err()
-                        && let Some((_, (_, closed_flag))) = active_streams.remove(&stream_id) {
-                            closed_streams.insert(stream_id, closed_flag);
+                if let Some(data_tx) = tx_opt {
+                    match data_tx.try_send(frame.payload) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            warn!(
+                                stream_id,
+                                "Multiplexer stream buffer full; resetting slow stream to prevent session HOL blocking"
+                            );
+                            let _ = tx_frames.try_send(MuxFrame::rst(stream_id));
+                            if let Some((_, (_, closed_flag))) = active_streams.remove(&stream_id) {
+                                closed_flag.store(true, Ordering::Release);
+                                closed_streams.insert(stream_id, closed_flag);
+                            }
                         }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            if let Some((_, (_, closed_flag))) = active_streams.remove(&stream_id) {
+                                closed_flag.store(true, Ordering::Release);
+                                closed_streams.insert(stream_id, closed_flag);
+                            }
+                        }
+                    }
+                }
             }
             FrameType::Fin => {
                 let stream_id = frame.stream_id;
@@ -288,7 +319,7 @@ impl MuxSession {
             self.tx_frames.clone(),
             data_rx,
             closed_flag,
-        ))
+        ).with_registry(Arc::clone(&self.active_streams)))
     }
 
     /// Sends a raw frame directly to the session writer queue (useful for testing or injects).

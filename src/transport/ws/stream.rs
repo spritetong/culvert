@@ -49,6 +49,9 @@ enum WriteState {
 ///
 /// Implements `AsyncRead` and `AsyncWrite` purely using state-machine transitions without
 /// intermediate duplex pipes, background tasks, or multi-copy buffering.
+/// Hard upper bound on pending control frames (Pong/Close) to prevent memory amplification attacks from Ping floods.
+const MAX_CONTROL_QUEUE: usize = 64;
+
 pub struct WsTunnelStream {
     read_state: ReadState,
     write_state: WriteState,
@@ -207,6 +210,9 @@ impl AsyncRead for WsTunnelStream {
                     }
                     Poll::Ready((_rx, obligated, Ok((OpCode::Close, payload)))) => {
                         if !obligated.is_empty() {
+                            while self.control_queue.len() + obligated.len() >= MAX_CONTROL_QUEUE {
+                                self.control_queue.pop_front();
+                            }
                             self.control_queue.extend(obligated);
                         }
                         self.peer_closed = true;
@@ -227,6 +233,13 @@ impl AsyncRead for WsTunnelStream {
                     }
                     Poll::Ready((rx, obligated, Ok((opcode, payload)))) => {
                         if !obligated.is_empty() {
+                            if self.control_queue.len() + obligated.len() > MAX_CONTROL_QUEUE {
+                                self.read_state = ReadState::Failed;
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "WebSocket control frame flood",
+                                )));
+                            }
                             self.control_queue.extend(obligated);
                             let _ = self.poll_flush_control(cx);
                         }
@@ -249,6 +262,9 @@ impl AsyncRead for WsTunnelStream {
                     }
                     Poll::Ready((_rx, obligated, Err(e))) => {
                         if !obligated.is_empty() {
+                            while self.control_queue.len() + obligated.len() > MAX_CONTROL_QUEUE {
+                                self.control_queue.pop_front();
+                            }
                             self.control_queue.extend(obligated);
                             let _ = self.poll_flush_control(cx);
                         }
@@ -701,5 +717,43 @@ mod tests {
         let mut buf = vec![0u8; 21];
         client.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"data frame after pong");
+    }
+
+    #[tokio::test]
+    async fn test_ws_control_frame_queue_bounded_against_flood() {
+        let (raw_client, raw_server) = duplex(65536);
+
+        let (r, w) = tokio::io::split(raw_client);
+        let (_rx, mut tx) = after_handshake_split(
+            Box::new(r) as DynRead,
+            Box::new(w) as DynWrite,
+            Role::Client,
+        );
+
+        let mut server = WsTunnelStream::new(raw_server, Role::Server);
+
+        // Pre-fill server's control queue to MAX_CONTROL_QUEUE and simulate write side backpressure
+        for _ in 0..MAX_CONTROL_QUEUE {
+            server.control_queue.push_back(Frame::pong(Payload::Owned(vec![])));
+        }
+        server.write_state = WriteState::Writing {
+            fut: Box::pin(std::future::pending()),
+            written_len: 0,
+        };
+
+        // Client sends a Ping frame (which triggers an obligated Pong frame on server)
+        // followed by a data frame so server's read completes its loop.
+        tx.write_frame(Frame::new(true, OpCode::Ping, None, Payload::Owned(b"flood".to_vec())))
+            .await
+            .unwrap();
+        tx.write_frame(Frame::binary(Payload::Owned(b"data".to_vec())))
+            .await
+            .unwrap();
+
+        // Server reading next frame must reject with InvalidData due to control frame queue overflow under backpressure
+        let mut buf = [0u8; 10];
+        let res = server.read(&mut buf).await;
+        assert!(res.is_err(), "Server must reject control frame flood under backpressure");
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 }

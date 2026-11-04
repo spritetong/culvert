@@ -75,6 +75,95 @@ impl TunnelStream for tokio::net::TcpStream {
     }
 }
 
+/// Non-destructive buffered wrapper for TLS or arbitrary async I/O streams.
+///
+/// Buffers peeked single bytes during `poll_check_alive` liveness checks into
+/// a pushback cache so that heartbeat inspections never destructively drop stream data.
+pub struct BufferedTlsStream<S> {
+    inner: S,
+    pushback: Option<u8>,
+}
+
+impl<S> BufferedTlsStream<S> {
+    /// Constructs a new `BufferedTlsStream` wrapping the inner stream.
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            pushback: None,
+        }
+    }
+
+    /// Returns a shared reference to the inner stream.
+    pub fn get_ref(&self) -> &S {
+        &self.inner
+    }
+
+    /// Returns a mutable reference to the inner stream.
+    pub fn get_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
+
+    /// Consumes the wrapper and returns the underlying stream.
+    pub fn into_inner(self) -> S {
+        self.inner
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for BufferedTlsStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if let Some(b) = self.pushback.take() {
+            buf.put_slice(&[b]);
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for BufferedTlsStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl<S> TunnelStream for BufferedTlsStream<S>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+        if self.pushback.is_some() {
+            return Poll::Ready(HeartbeatStatus::Alive);
+        }
+        let mut b = [0u8; 1];
+        let mut buf = ReadBuf::new(&mut b);
+        match Pin::new(&mut self.inner).poll_read(cx, &mut buf) {
+            Poll::Ready(Ok(())) if buf.filled().is_empty() => Poll::Ready(HeartbeatStatus::Dead),
+            Poll::Ready(Ok(())) => {
+                // Buffer the read byte so subsequent poll_read re-emits it non-destructively
+                self.pushback = Some(b[0]);
+                Poll::Ready(HeartbeatStatus::Alive)
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(HeartbeatStatus::Dead),
+            Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
+        }
+    }
+}
+
 // Implement TunnelStream for tokio_rustls client TLS stream
 impl<S> TunnelStream for tokio_rustls::client::TlsStream<S>
 where
@@ -119,5 +208,30 @@ impl TunnelStream for tokio::io::DuplexStream {
             Poll::Ready(Ok(())) => Poll::Ready(HeartbeatStatus::Alive),
             Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::poll_fn;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+    #[tokio::test]
+    async fn test_buffered_tls_stream_non_destructive_check_alive() {
+        let (mut client, server) = duplex(1024);
+        let mut buffered = BufferedTlsStream::new(server);
+
+        // Write "hello world" from client
+        client.write_all(b"hello world").await.unwrap();
+
+        // Perform heartbeat liveness check on buffered stream
+        let status = poll_fn(|cx| buffered.poll_check_alive(cx)).await;
+        assert_eq!(status, HeartbeatStatus::Alive);
+
+        // Verify that the peeked first byte was not lost, and full message is read intact
+        let mut buf = vec![0u8; 11];
+        buffered.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello world");
     }
 }

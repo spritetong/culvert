@@ -8,12 +8,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use bytes::{Buf, Bytes};
+use dashmap::DashMap;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use tokio_util::sync::PollSender;
 
 use crate::core::stream::{HeartbeatStatus, TunnelStream};
 use crate::mux::frame::{MAX_FRAME_PAYLOAD_SIZE, MuxFrame};
+
+type ActiveStreamsMap = Arc<DashMap<u32, (mpsc::Sender<Bytes>, Arc<AtomicBool>)>>;
 
 /// A logical bi-directional multiplexed sub-stream.
 pub struct MuxStream {
@@ -30,6 +33,8 @@ pub struct MuxStream {
     fin_sent: bool,
     /// Flag indicating if stream is terminated/reset.
     closed: Arc<AtomicBool>,
+    /// Handle to session active stream registry for guaranteed clean unregistration on drop.
+    registry: Option<ActiveStreamsMap>,
 }
 
 impl MuxStream {
@@ -48,7 +53,14 @@ impl MuxStream {
             pending_payload: None,
             fin_sent: false,
             closed,
+            registry: None,
         }
+    }
+
+    /// Attaches the session active streams registry so dropping this stream removes it immediately.
+    pub fn with_registry(mut self, registry: ActiveStreamsMap) -> Self {
+        self.registry = Some(registry);
+        self
     }
 
     /// Returns the logical identifier of this multiplexed stream.
@@ -199,6 +211,10 @@ impl TunnelStream for MuxStream {
 impl Drop for MuxStream {
     fn drop(&mut self) {
         let is_already_closed = self.closed.swap(true, Ordering::AcqRel);
+        if let Some(ref registry) = self.registry
+            && let Some((_, (_, flag))) = registry.remove(&self.stream_id) {
+                flag.store(true, Ordering::Release);
+            }
         if !is_already_closed && !self.fin_sent {
             // Unclean drop without graceful shutdown: emit RST to immediately inform peer
             // and trigger silent dropping of any remaining in-flight frames.
