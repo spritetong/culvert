@@ -190,17 +190,24 @@ impl RelayEngine {
                 Poll::Pending => return Poll::Pending,
             }
 
-            match Pin::new(&mut *writer).poll_shutdown(cx) {
-                Poll::Ready(Ok(())) => {
-                    state.write_shutdown = true;
-                    *progress = true;
+            if writer.supports_half_close() {
+                match Pin::new(&mut *writer).poll_shutdown(cx) {
+                    Poll::Ready(Ok(())) => {
+                        state.write_shutdown = true;
+                        *progress = true;
+                    }
+                    Poll::Ready(Err(e)) => {
+                        tracing::debug!("Relay writer shutdown error: {}", e);
+                        state.write_shutdown = true;
+                        *progress = true;
+                    }
+                    Poll::Pending => {}
                 }
-                Poll::Ready(Err(e)) => {
-                    tracing::debug!("Relay writer shutdown error: {}", e);
-                    state.write_shutdown = true;
-                    *progress = true;
-                }
-                Poll::Pending => {}
+            } else {
+                // For transports lacking half-close support, avoid shutting down the entire
+                // connection prematurely while opposite transfer direction is still in progress.
+                state.write_shutdown = true;
+                *progress = true;
             }
         }
 

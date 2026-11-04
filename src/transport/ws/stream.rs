@@ -42,8 +42,6 @@ enum WriteState {
         written_len: usize,
     },
     WritingControl(BoxFuture<'static, (WebSocketWrite<DynWrite>, Result<(), WebSocketError>)>),
-    Closing(BoxFuture<'static, (WebSocketWrite<DynWrite>, Result<(), WebSocketError>)>),
-    Closed,
     Failed,
 }
 
@@ -55,6 +53,9 @@ pub struct WsTunnelStream {
     read_state: ReadState,
     write_state: WriteState,
     control_queue: std::collections::VecDeque<Frame<'static>>,
+    peer_closed: bool,
+    close_sent: bool,
+    fin_sent: bool,
 }
 
 impl WsTunnelStream {
@@ -74,6 +75,9 @@ impl WsTunnelStream {
             read_state: ReadState::Idle(rx),
             write_state: WriteState::Idle(tx),
             control_queue: std::collections::VecDeque::new(),
+            peer_closed: false,
+            close_sent: false,
+            fin_sent: false,
         }
     }
 
@@ -176,7 +180,12 @@ impl AsyncRead for WsTunnelStream {
                                     break Ok((frame.opcode, payload));
                                 }
                                 OpCode::Close => {
-                                    break Ok((OpCode::Close, Bytes::new()));
+                                    let payload = match frame.payload {
+                                        Payload::Bytes(b) => b.freeze(),
+                                        Payload::Owned(v) => Bytes::from(v),
+                                        other => Bytes::copy_from_slice(&other),
+                                    };
+                                    break Ok((OpCode::Close, payload));
                                 }
                                 _ => {
                                     budget = budget.saturating_sub(1);
@@ -196,18 +205,35 @@ impl AsyncRead for WsTunnelStream {
                         self.read_state = ReadState::Reading(fut);
                         return Poll::Pending;
                     }
-                    Poll::Ready((_rx, obligated, Ok((OpCode::Close, _)))) => {
+                    Poll::Ready((_rx, obligated, Ok((OpCode::Close, payload)))) => {
+                        if !obligated.is_empty() {
+                            self.control_queue.extend(obligated);
+                        }
+                        self.peer_closed = true;
+                        if !self.close_sent {
+                            // RFC 6455 §5.5.1: If an endpoint receives a Close frame and did not previously
+                            // send a Close frame, the endpoint MUST send a Close frame in response.
+                            let close_frame = if payload.is_empty() {
+                                Frame::close(1000, &[])
+                            } else {
+                                Frame::close_raw(Payload::Owned(payload.to_vec()))
+                            };
+                            self.control_queue.push_back(close_frame);
+                            self.close_sent = true;
+                        }
+                        let _ = self.poll_flush_control(cx);
+                        self.read_state = ReadState::Eof;
+                        return Poll::Ready(Ok(()));
+                    }
+                    Poll::Ready((rx, obligated, Ok((opcode, payload)))) => {
                         if !obligated.is_empty() {
                             self.control_queue.extend(obligated);
                             let _ = self.poll_flush_control(cx);
                         }
-                        self.read_state = ReadState::Eof;
-                        return Poll::Ready(Ok(()));
-                    }
-                    Poll::Ready((rx, obligated, Ok((_, payload)))) => {
-                        if !obligated.is_empty() {
-                            self.control_queue.extend(obligated);
-                            let _ = self.poll_flush_control(cx);
+                        if opcode == OpCode::Binary && payload.is_empty() {
+                            // In-band logical FIN received: remote write direction is closed
+                            self.read_state = ReadState::Eof;
+                            return Poll::Ready(Ok(()));
                         }
                         if payload.is_empty() {
                             self.read_state = ReadState::Idle(rx);
@@ -251,8 +277,17 @@ impl AsyncWrite for WsTunnelStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if let Poll::Ready(Err(e)) = self.poll_flush_control(cx) {
-            return Poll::Ready(Err(e));
+        if self.peer_closed || self.close_sent {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "WebSocket peer or write half closed",
+            )));
+        }
+
+        match self.poll_flush_control(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => {}
         }
 
         match std::mem::replace(&mut self.write_state, WriteState::Failed) {
@@ -294,30 +329,7 @@ impl AsyncWrite for WsTunnelStream {
             },
             WriteState::WritingControl(fut) => {
                 self.write_state = WriteState::WritingControl(fut);
-                if let Poll::Ready(Err(e)) = self.poll_flush_control(cx) {
-                    return Poll::Ready(Err(e));
-                }
                 Poll::Pending
-            }
-            WriteState::Closing(mut fut) => match fut.as_mut().poll(cx) {
-                Poll::Pending => {
-                    self.write_state = WriteState::Closing(fut);
-                    Poll::Pending
-                }
-                Poll::Ready((_tx, _)) => {
-                    self.write_state = WriteState::Closed;
-                    Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "WebSocket write half closed",
-                    )))
-                }
-            },
-            WriteState::Closed => {
-                self.write_state = WriteState::Closed;
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "WebSocket write half closed",
-                )))
             }
             WriteState::Failed => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -327,8 +339,10 @@ impl AsyncWrite for WsTunnelStream {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if let Poll::Ready(Err(e)) = self.poll_flush_control(cx) {
-            return Poll::Ready(Err(e));
+        match self.poll_flush_control(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => {}
         }
         loop {
             match std::mem::replace(&mut self.write_state, WriteState::Failed) {
@@ -352,24 +366,7 @@ impl AsyncWrite for WsTunnelStream {
                 },
                 WriteState::WritingControl(fut) => {
                     self.write_state = WriteState::WritingControl(fut);
-                    if let Poll::Ready(Err(e)) = self.poll_flush_control(cx) {
-                        return Poll::Ready(Err(e));
-                    }
                     return Poll::Pending;
-                }
-                WriteState::Closing(mut fut) => match fut.as_mut().poll(cx) {
-                    Poll::Pending => {
-                        self.write_state = WriteState::Closing(fut);
-                        return Poll::Pending;
-                    }
-                    Poll::Ready(_) => {
-                        self.write_state = WriteState::Closed;
-                        return Poll::Ready(Ok(()));
-                    }
-                },
-                WriteState::Closed => {
-                    self.write_state = WriteState::Closed;
-                    return Poll::Ready(Ok(()));
                 }
                 WriteState::Failed => {
                     return Poll::Ready(Err(io::Error::new(
@@ -382,17 +379,23 @@ impl AsyncWrite for WsTunnelStream {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if let Poll::Ready(Err(e)) = self.poll_flush_control(cx) {
-            return Poll::Ready(Err(e));
+        if self.fin_sent || self.close_sent {
+            return Poll::Ready(Ok(()));
+        }
+        match self.poll_flush_control(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => {}
         }
         loop {
             match std::mem::replace(&mut self.write_state, WriteState::Failed) {
                 WriteState::Idle(mut tx) => {
+                    // Send 0-length binary frame as in-band logical FIN, supporting true half-close
                     let fut = Box::pin(async move {
-                        let res = tx.write_frame(Frame::close(1000, &[])).await;
+                        let res = tx.write_frame(Frame::binary(Payload::Owned(Vec::new()))).await;
                         (tx, res)
                     });
-                    self.write_state = WriteState::Closing(fut);
+                    self.write_state = WriteState::Writing { fut, written_len: 0 };
                     continue;
                 }
                 WriteState::Writing { mut fut, written_len } => match fut.as_mut().poll(cx) {
@@ -402,7 +405,8 @@ impl AsyncWrite for WsTunnelStream {
                     }
                     Poll::Ready((tx, Ok(()))) => {
                         self.write_state = WriteState::Idle(tx);
-                        continue;
+                        self.fin_sent = true;
+                        return Poll::Ready(Ok(()));
                     }
                     Poll::Ready((_tx, Err(e))) => {
                         self.write_state = WriteState::Failed;
@@ -411,28 +415,7 @@ impl AsyncWrite for WsTunnelStream {
                 },
                 WriteState::WritingControl(fut) => {
                     self.write_state = WriteState::WritingControl(fut);
-                    if let Poll::Ready(Err(e)) = self.poll_flush_control(cx) {
-                        return Poll::Ready(Err(e));
-                    }
                     return Poll::Pending;
-                }
-                WriteState::Closing(mut fut) => match fut.as_mut().poll(cx) {
-                    Poll::Pending => {
-                        self.write_state = WriteState::Closing(fut);
-                        return Poll::Pending;
-                    }
-                    Poll::Ready((_tx, Ok(()))) => {
-                        self.write_state = WriteState::Closed;
-                        return Poll::Ready(Ok(()));
-                    }
-                    Poll::Ready((_tx, Err(e))) => {
-                        self.write_state = WriteState::Failed;
-                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
-                    }
-                },
-                WriteState::Closed => {
-                    self.write_state = WriteState::Closed;
-                    return Poll::Ready(Ok(()));
                 }
                 WriteState::Failed => {
                     return Poll::Ready(Err(io::Error::new(
@@ -447,8 +430,8 @@ impl AsyncWrite for WsTunnelStream {
 
 impl TunnelStream for WsTunnelStream {
     fn supports_half_close(&self) -> bool {
-        // WebSocket RFC 6455 does not support half-close (closing one direction terminates session)
-        false
+        // Supported via in-band zero-length binary FIN frames without tearing down opposite stream
+        true
     }
 
     fn poll_send_ping(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -505,14 +488,6 @@ impl TunnelStream for WsTunnelStream {
                         return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
                     }
                 },
-                WriteState::Closing(fut) => {
-                    self.write_state = WriteState::Closing(fut);
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closing")));
-                }
-                WriteState::Closed => {
-                    self.write_state = WriteState::Closed;
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")));
-                }
                 WriteState::Failed => {
                     self.write_state = WriteState::Failed;
                     return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "failed")));
@@ -535,11 +510,21 @@ impl TunnelStream for WsTunnelStream {
                         // Check if poll_read transitioned into Reading and inspect completion
                         if let ReadState::Reading(ref mut fut) = self.read_state {
                             match fut.as_mut().poll(cx) {
-                                Poll::Ready((_rx, obligated, Ok((OpCode::Close, _)))) => {
+                                Poll::Ready((_rx, obligated, Ok((OpCode::Close, payload)))) => {
                                     if !obligated.is_empty() {
                                         self.control_queue.extend(obligated);
-                                        let _ = self.poll_flush_control(cx);
                                     }
+                                    self.peer_closed = true;
+                                    if !self.close_sent {
+                                        let close_frame = if payload.is_empty() {
+                                            Frame::close(1000, &[])
+                                        } else {
+                                            Frame::close_raw(Payload::Owned(payload.to_vec()))
+                                        };
+                                        self.control_queue.push_back(close_frame);
+                                        self.close_sent = true;
+                                    }
+                                    let _ = self.poll_flush_control(cx);
                                     self.read_state = ReadState::Eof;
                                     Poll::Ready(HeartbeatStatus::Dead)
                                 }
@@ -562,11 +547,21 @@ impl TunnelStream for WsTunnelStream {
             }
             ReadState::Reading(fut) => {
                 match fut.as_mut().poll(cx) {
-                    Poll::Ready((_rx, obligated, Ok((OpCode::Close, _)))) => {
+                    Poll::Ready((_rx, obligated, Ok((OpCode::Close, payload)))) => {
                         if !obligated.is_empty() {
                             self.control_queue.extend(obligated);
-                            let _ = self.poll_flush_control(cx);
                         }
+                        self.peer_closed = true;
+                        if !self.close_sent {
+                            let close_frame = if payload.is_empty() {
+                                Frame::close(1000, &[])
+                            } else {
+                                Frame::close_raw(Payload::Owned(payload.to_vec()))
+                            };
+                            self.control_queue.push_back(close_frame);
+                            self.close_sent = true;
+                        }
+                        let _ = self.poll_flush_control(cx);
                         self.read_state = ReadState::Eof;
                         Poll::Ready(HeartbeatStatus::Dead)
                     }
@@ -625,5 +620,86 @@ mod tests {
         let mut reply_buf = vec![0u8; reply.len()];
         client.read_exact(&mut reply_buf).await.unwrap();
         assert_eq!(&reply_buf, reply);
+    }
+
+    #[tokio::test]
+    async fn test_ws_half_close_bidirectional_transfer() {
+        let (raw_client, raw_server) = duplex(65536);
+
+        let mut client = WsTunnelStream::new(raw_client, Role::Client);
+        let mut server = WsTunnelStream::new(raw_server, Role::Server);
+
+        // 1. Client writes payload then cleanly shuts down its write half (in-band FIN)
+        client.write_all(b"half close request").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        // 2. Server reads the request then observes EOF
+        let mut req_buf = vec![0u8; 18];
+        server.read_exact(&mut req_buf).await.unwrap();
+        assert_eq!(&req_buf, b"half close request");
+
+        let mut eof_buf = [0u8; 1];
+        let n = server.read(&mut eof_buf).await.unwrap();
+        assert_eq!(n, 0, "Server must receive EOF after client half-close");
+
+        // 3. Server can still write response back to client
+        server.write_all(b"response after client fin").await.unwrap();
+        server.shutdown().await.unwrap();
+
+        // 4. Client reads response then observes EOF
+        let mut resp_buf = vec![0u8; 25];
+        client.read_exact(&mut resp_buf).await.unwrap();
+        assert_eq!(&resp_buf, b"response after client fin");
+
+        let n = client.read(&mut eof_buf).await.unwrap();
+        assert_eq!(n, 0, "Client must receive EOF after server half-close");
+    }
+
+    #[tokio::test]
+    async fn test_ws_close_contract_rejects_further_writes() {
+        let (raw_client, raw_server) = duplex(65536);
+
+        // Client is a raw WebSocket sender that emits a standard RFC 6455 Close frame
+        let (r, w) = tokio::io::split(raw_client);
+        let (_rx, mut tx) = after_handshake_split(
+            Box::new(r) as DynRead,
+            Box::new(w) as DynWrite,
+            Role::Client,
+        );
+
+        let mut server = WsTunnelStream::new(raw_server, Role::Server);
+
+        // Client sends RFC 6455 Close
+        tx.write_frame(Frame::close(1000, b"normal closure")).await.unwrap();
+
+        // Server reads EOF
+        let mut buf = [0u8; 10];
+        let n = server.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0, "Server must receive EOF on Close frame");
+
+        // Subsequent poll_write on server MUST fail with BrokenPipe per RFC 6455
+        let write_res = server.write_all(b"illegal data after peer close").await;
+        assert!(write_res.is_err(), "Write after peer close must fail");
+        assert_eq!(write_res.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn test_ws_writing_control_no_lost_wakeup() {
+        let (raw_client, raw_server) = duplex(65536);
+
+        let mut client = WsTunnelStream::new(raw_client, Role::Client);
+        let mut server = WsTunnelStream::new(raw_server, Role::Server);
+
+        // Enqueue multiple control frames on server before writing data
+        server.control_queue.push_back(Frame::pong(Payload::Owned(b"pong1".to_vec())));
+        server.control_queue.push_back(Frame::pong(Payload::Owned(b"pong2".to_vec())));
+
+        // server writes data frame; poll_flush_control must flush control queue without lost wakeups
+        server.write_all(b"data frame after pong").await.unwrap();
+        server.flush().await.unwrap();
+
+        let mut buf = vec![0u8; 21];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"data frame after pong");
     }
 }

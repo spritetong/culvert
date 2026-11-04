@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use http::{Request, StatusCode};
+use parking_lot::RwLock;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
@@ -23,8 +24,10 @@ pub struct H3Connector {
     auth_token: String,
     mode: TunnelMode,
     quinn_endpoint: quinn::Endpoint,
-    cached_h3_sender: Arc<Mutex<Option<h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>>>>,
-    cached_quic_conn: Arc<Mutex<Option<quinn::Connection>>>,
+    cached_h3_sender: Arc<RwLock<Option<h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>>>>,
+    cached_quic_conn: Arc<RwLock<Option<quinn::Connection>>>,
+    h3_establish_gate: Arc<Mutex<()>>,
+    quic_establish_gate: Arc<Mutex<()>>,
 }
 
 impl H3Connector {
@@ -73,25 +76,27 @@ impl H3Connector {
             auth_token: auth_token.to_string(),
             mode,
             quinn_endpoint,
-            cached_h3_sender: Arc::new(Mutex::new(None)),
-            cached_quic_conn: Arc::new(Mutex::new(None)),
+            cached_h3_sender: Arc::new(RwLock::new(None)),
+            cached_quic_conn: Arc::new(RwLock::new(None)),
+            h3_establish_gate: Arc::new(Mutex::new(())),
+            quic_establish_gate: Arc::new(Mutex::new(())),
         })
     }
 
     /// Establishes or returns an active QUIC connection to the target server.
+    /// Uses lock-free read path and single-flight gate; never holds cache locks across network RTTs.
     async fn get_or_connect(&self) -> Result<quinn::Connection, TunnelError> {
-        // Fast path: inspect under short lock
-        {
-            let guard = self.cached_quic_conn.lock().await;
-            if let Some(ref conn) = *guard
-                && conn.close_reason().is_none() {
-                    return Ok(conn.clone());
-                }
-        }
+        // Fast path: inspect under non-blocking read lock
+        if let Some(ref conn) = *self.cached_quic_conn.read()
+            && conn.close_reason().is_none() {
+                return Ok(conn.clone());
+            }
 
-        let mut guard = self.cached_quic_conn.lock().await;
-        // Double-check after acquiring write lock
-        if let Some(ref conn) = *guard
+        // Single-flight gate to serialize connection attempts without blocking readers
+        let _gate = self.quic_establish_gate.lock().await;
+
+        // Double-check after acquiring establishment gate
+        if let Some(ref conn) = *self.cached_quic_conn.read()
             && conn.close_reason().is_none() {
                 return Ok(conn.clone());
             }
@@ -118,46 +123,65 @@ impl H3Connector {
             .connect(resolved_addr, sni)
             .map_err(|e| TunnelError::Tls(format!("QUIC connect error: {:?}", e)))?;
 
-        let conn = connecting
+        let conn = tokio::time::timeout(std::time::Duration::from_secs(10), connecting)
             .await
+            .map_err(|_| TunnelError::ConnectTimeout(std::time::Duration::from_secs(10)))?
             .map_err(|e| TunnelError::Tls(format!("QUIC handshake error: {:?}", e)))?;
 
-        *guard = Some(conn.clone());
+        *self.cached_quic_conn.write() = Some(conn.clone());
         Ok(conn)
     }
 
-    /// Establishes and caches the H3 client sender with double-checked locking,
-    /// keeping subsequent multi-stream creation outside the lock.
+    /// Establishes and caches the H3 client sender with single-flight gating,
+    /// keeping subsequent multi-stream creation outside the lock and avoiding RTT holding.
     async fn establish_h3_sender(
         &self,
     ) -> Result<h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>, TunnelError> {
-        let mut sender_guard = self.cached_h3_sender.lock().await;
-        if let Some(ref sender) = *sender_guard {
-            let quic_alive = {
-                let qguard = self.cached_quic_conn.lock().await;
-                qguard
-                    .as_ref()
-                    .map(|c| c.close_reason().is_none())
-                    .unwrap_or(false)
-            };
+        // Fast path: inspect cache under read lock
+        if let Some(ref sender) = *self.cached_h3_sender.read() {
+            let quic_alive = self
+                .cached_quic_conn
+                .read()
+                .as_ref()
+                .map(|c| c.close_reason().is_none())
+                .unwrap_or(false);
+            if quic_alive {
+                return Ok(sender.clone());
+            }
+        }
+
+        // Single-flight gate
+        let _gate = self.h3_establish_gate.lock().await;
+
+        // Double check
+        if let Some(ref sender) = *self.cached_h3_sender.read() {
+            let quic_alive = self
+                .cached_quic_conn
+                .read()
+                .as_ref()
+                .map(|c| c.close_reason().is_none())
+                .unwrap_or(false);
             if quic_alive {
                 return Ok(sender.clone());
             }
         }
 
         let conn = self.get_or_connect().await?;
-        let (mut driver, sender) = h3::client::builder()
-            .build::<_, _, Bytes>(h3_quinn::Connection::new(conn))
-            .await
-            .map_err(|e| {
-                TunnelError::ControlProtocol(format!("H3 handshake failed: {:?}", e))
-            })?;
+        let (mut driver, sender) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            h3::client::builder().build::<_, _, Bytes>(h3_quinn::Connection::new(conn)),
+        )
+        .await
+        .map_err(|_| TunnelError::ConnectTimeout(std::time::Duration::from_secs(10)))?
+        .map_err(|e| {
+            TunnelError::ControlProtocol(format!("H3 handshake failed: {:?}", e))
+        })?;
 
         tokio::spawn(async move {
             let _ = driver.wait_idle().await;
         });
 
-        *sender_guard = Some(sender.clone());
+        *self.cached_h3_sender.write() = Some(sender.clone());
         Ok(sender)
     }
 
@@ -168,20 +192,16 @@ impl H3Connector {
         session_id: Option<&str>,
         pool_idle: bool,
     ) -> Result<Box<dyn TunnelStream>, TunnelError> {
-        // Fast path: clone cached sender with short lock duration
-        let existing_sender = {
-            let guard = self.cached_h3_sender.lock().await;
-            guard.clone()
-        };
+        // Fast path: clone cached sender under non-blocking read lock
+        let existing_sender = self.cached_h3_sender.read().clone();
 
         let send_request = if let Some(sender) = existing_sender {
-            let quic_alive = {
-                let qguard = self.cached_quic_conn.lock().await;
-                qguard
-                    .as_ref()
-                    .map(|c| c.close_reason().is_none())
-                    .unwrap_or(false)
-            };
+            let quic_alive = self
+                .cached_quic_conn
+                .read()
+                .as_ref()
+                .map(|c| c.close_reason().is_none())
+                .unwrap_or(false);
             if quic_alive {
                 sender
             } else {
@@ -246,10 +266,8 @@ impl H3Connector {
         let mut stream = match send_request.send_request(request).await {
             Ok(s) => s,
             Err(e) => {
-                let mut guard = self.cached_h3_sender.lock().await;
-                *guard = None;
-                let mut qguard = self.cached_quic_conn.lock().await;
-                *qguard = None;
+                *self.cached_h3_sender.write() = None;
+                *self.cached_quic_conn.write() = None;
                 return Err(TunnelError::ControlProtocol(format!(
                     "Failed to send H3 request: {:?}",
                     e
@@ -260,10 +278,8 @@ impl H3Connector {
         let response = match stream.recv_response().await {
             Ok(r) => r,
             Err(e) => {
-                let mut guard = self.cached_h3_sender.lock().await;
-                *guard = None;
-                let mut qguard = self.cached_quic_conn.lock().await;
-                *qguard = None;
+                *self.cached_h3_sender.write() = None;
+                *self.cached_quic_conn.write() = None;
                 return Err(TunnelError::ControlProtocol(format!(
                     "Failed to receive H3 response: {:?}",
                     e
@@ -298,8 +314,7 @@ impl H3Connector {
         let (mut send, recv) = match conn.open_bi().await {
             Ok(pair) => pair,
             Err(e) => {
-                let mut guard = self.cached_quic_conn.lock().await;
-                *guard = None;
+                *self.cached_quic_conn.write() = None;
                 return Err(TunnelError::Tls(format!(
                     "Failed to open QUIC bi-stream: {:?}",
                     e
@@ -327,8 +342,7 @@ impl H3Connector {
         header.extend_from_slice(&handshake_bytes);
 
         if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut send, &header).await {
-            let mut guard = self.cached_quic_conn.lock().await;
-            *guard = None;
+            *self.cached_quic_conn.write() = None;
             return Err(TunnelError::Io(e));
         }
 
@@ -372,5 +386,34 @@ impl TransportConnector for H3Connector {
         } else {
             "h3"
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::model::{AppConfig, EndpointConfig};
+
+    #[tokio::test]
+    async fn test_h3_connector_fast_path_read_lock_concurrency() {
+        let app_cfg = AppConfig::default();
+        let ep_cfg = EndpointConfig::Simple("h3://127.0.0.1:4433/tunnel".to_string());
+        let ctx = EndpointContext::build(&ep_cfg, &app_cfg).unwrap();
+        let connector = H3Connector::new(&ctx, "test-token", TunnelMode::Forward).unwrap();
+
+        // Cached sender starts empty
+        assert!(connector.cached_h3_sender.read().is_none());
+        assert!(connector.cached_quic_conn.read().is_none());
+
+        // Concurrent reads can acquire the RwLock without contention or deadlocks
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let s = connector.cached_h3_sender.read().clone();
+                let q = connector.cached_quic_conn.read().clone();
+                assert!(s.is_none());
+                assert!(q.is_none());
+            })
+            .collect();
+        assert_eq!(handles.len(), 8);
     }
 }

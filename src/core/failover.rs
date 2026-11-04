@@ -79,6 +79,10 @@ impl AsyncWrite for FailoverTunnelStream {
 }
 
 impl TunnelStream for FailoverTunnelStream {
+    fn supports_half_close(&self) -> bool {
+        self.primary.supports_half_close()
+    }
+
     fn poll_send_ping(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.primary.poll_send_ping(cx)
     }
