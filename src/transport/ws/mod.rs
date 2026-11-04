@@ -42,14 +42,20 @@ impl TransportDriver for WsTransportDriver {
         listen_addr: &str,
         auth_token: Option<&str>,
         path: Option<&str>,
-        tls_cert: Option<&str>,
-        tls_key: Option<&str>,
+        tls: Option<&crate::config::model::TlsConfig>,
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
         let is_wss = listen_addr.starts_with("wss://") || listen_addr.starts_with("https://");
-        let tls_acceptor = if is_wss || tls_cert.is_some() || tls_key.is_some() {
+        let cert_str = tls.and_then(|t| t.certificate.as_ref()).and_then(|p| p.to_str());
+        let key_str = tls.and_then(|t| t.key.as_ref()).and_then(|p| p.to_str());
+        let (min_v, max_v) = match tls {
+            Some(t) => (t.min_version.as_deref(), t.max_version.as_deref()),
+            None => (None, None),
+        };
+
+        let tls_acceptor = if is_wss || cert_str.is_some() || key_str.is_some() {
             let server_rustls =
                 crate::dialer::tls::TlsConfigBuilder::build_server_config(
-                    tls_cert, tls_key, None, None, None,
+                    cert_str, key_str, None, min_v, max_v,
                 )?;
             Some(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(
                 server_rustls,

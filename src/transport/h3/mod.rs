@@ -37,16 +37,22 @@ impl TransportDriver for H3TransportDriver {
         listen_addr: &str,
         auth_token: Option<&str>,
         path: Option<&str>,
-        tls_cert: Option<&str>,
-        tls_key: Option<&str>,
+        tls: Option<&crate::config::model::TlsConfig>,
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
         let alpn = vec![b"h3".to_vec(), b"micro-tunnel-quic".to_vec()];
+        let cert_str = tls.and_then(|t| t.certificate.as_ref()).and_then(|p| p.to_str());
+        let key_str = tls.and_then(|t| t.key.as_ref()).and_then(|p| p.to_str());
+        let (min_v, max_v) = match tls {
+            Some(t) => (t.min_version.as_deref(), t.max_version.as_deref()),
+            None => (None, None),
+        };
+
         let server_rustls = crate::dialer::tls::TlsConfigBuilder::build_server_config(
-            tls_cert,
-            tls_key,
+            cert_str,
+            key_str,
             Some(alpn),
-            None,
-            None,
+            min_v,
+            max_v,
         )?;
 
         let listener = H3Listener::bind(listen_addr, auth_token, path, server_rustls)?;

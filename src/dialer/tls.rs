@@ -76,9 +76,11 @@ impl TlsConfigBuilder {
     ) -> Result<&'static [&'static rustls::SupportedProtocolVersion], TunnelError> {
         match (min_version, max_version) {
             (None, None) => Ok(ALL_VERSIONS),
-            (Some("1.2"), None | Some("1.3")) => Ok(ALL_VERSIONS),
-            (Some("1.3"), None | Some("1.3")) => Ok(TLS13_ONLY),
+            (None, Some("1.3")) => Ok(ALL_VERSIONS),
             (None, Some("1.2")) => Ok(TLS12_ONLY),
+            (Some("1.2"), None | Some("1.3")) => Ok(ALL_VERSIONS),
+            (Some("1.2"), Some("1.2")) => Ok(TLS12_ONLY),
+            (Some("1.3"), None | Some("1.3")) => Ok(TLS13_ONLY),
             (Some(min_v), Some(max_v)) if min_v == "1.3" && max_v == "1.2" => {
                 Err(TunnelError::Config(format!(
                     "invalid TLS version range: min_version \"{min_v}\" > max_version \"{max_v}\""
@@ -258,29 +260,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_protocol_versions_valid() {
-        let v_default = TlsConfigBuilder::parse_protocol_versions(None, None).unwrap();
-        assert_eq!(v_default.len(), 2);
+    fn test_parse_protocol_versions_matrix() {
+        // 1. (None, None) -> 1.2 + 1.3
+        let v1 = TlsConfigBuilder::parse_protocol_versions(None, None).unwrap();
+        assert_eq!(v1.len(), 2);
 
-        let v_12 = TlsConfigBuilder::parse_protocol_versions(None, Some("1.2")).unwrap();
-        assert_eq!(v_12.len(), 1);
-        assert_eq!(v_12[0].version, rustls::version::TLS12.version);
+        // 2. (None, Some("1.3")) -> 1.2 + 1.3 (default min is 1.2)
+        let v2 = TlsConfigBuilder::parse_protocol_versions(None, Some("1.3")).unwrap();
+        assert_eq!(v2.len(), 2);
 
-        let v_13 = TlsConfigBuilder::parse_protocol_versions(Some("1.3"), None).unwrap();
-        assert_eq!(v_13.len(), 1);
-        assert_eq!(v_13[0].version, rustls::version::TLS13.version);
-    }
+        // 3. (None, Some("1.2")) -> 1.2 only
+        let v3 = TlsConfigBuilder::parse_protocol_versions(None, Some("1.2")).unwrap();
+        assert_eq!(v3.len(), 1);
+        assert_eq!(v3[0].version, rustls::version::TLS12.version);
 
-    #[test]
-    fn test_parse_protocol_versions_invalid() {
+        // 4. (Some("1.2"), None) -> 1.2 + 1.3
+        let v4 = TlsConfigBuilder::parse_protocol_versions(Some("1.2"), None).unwrap();
+        assert_eq!(v4.len(), 2);
+
+        // 5. (Some("1.2"), Some("1.3")) -> 1.2 + 1.3
+        let v5 = TlsConfigBuilder::parse_protocol_versions(Some("1.2"), Some("1.3")).unwrap();
+        assert_eq!(v5.len(), 2);
+
+        // 6. (Some("1.2"), Some("1.2")) -> 1.2 only (previously rejected as unsupported)
+        let v6 = TlsConfigBuilder::parse_protocol_versions(Some("1.2"), Some("1.2")).unwrap();
+        assert_eq!(v6.len(), 1);
+        assert_eq!(v6[0].version, rustls::version::TLS12.version);
+
+        // 7. (Some("1.3"), None) -> 1.3 only
+        let v7 = TlsConfigBuilder::parse_protocol_versions(Some("1.3"), None).unwrap();
+        assert_eq!(v7.len(), 1);
+        assert_eq!(v7[0].version, rustls::version::TLS13.version);
+
+        // 8. (Some("1.3"), Some("1.3")) -> 1.3 only
+        let v8 = TlsConfigBuilder::parse_protocol_versions(Some("1.3"), Some("1.3")).unwrap();
+        assert_eq!(v8.len(), 1);
+        assert_eq!(v8[0].version, rustls::version::TLS13.version);
+
+        // 9. Inverted range: min 1.3 > max 1.2 -> Err
         assert!(TlsConfigBuilder::parse_protocol_versions(Some("1.3"), Some("1.2")).is_err());
+
+        // 10. Unsupported versions -> Err
+        assert!(TlsConfigBuilder::parse_protocol_versions(Some("1.1"), None).is_err());
+        assert!(TlsConfigBuilder::parse_protocol_versions(None, Some("1.4")).is_err());
         assert!(TlsConfigBuilder::parse_protocol_versions(Some("TLS1.2"), None).is_err());
-        assert!(TlsConfigBuilder::parse_protocol_versions(None, Some("unknown")).is_err());
     }
 
     #[test]
     fn test_build_server_config_with_versions() {
-        let cfg = TlsConfigBuilder::build_server_config(None, None, None, Some("1.3"), None).unwrap();
-        assert!(!cfg.alpn_protocols.is_empty() || cfg.alpn_protocols.is_empty());
+        let alpn = vec![b"h3".to_vec()];
+        let cfg = TlsConfigBuilder::build_server_config(
+            None,
+            None,
+            Some(alpn.clone()),
+            Some("1.3"),
+            Some("1.3"),
+        )
+        .unwrap();
+        assert_eq!(cfg.alpn_protocols, alpn);
     }
 }

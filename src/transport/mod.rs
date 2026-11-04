@@ -91,7 +91,6 @@ pub trait TransportDriver: Send + Sync + 'static {
         listen_addr: &str,
         auth_token: Option<&str>,
         path: Option<&str>,
-        tls_cert: Option<&str>,
-        tls_key: Option<&str>,
+        tls: Option<&crate::config::model::TlsConfig>,
     ) -> Result<Box<dyn TransportListener>, TunnelError>;
 }

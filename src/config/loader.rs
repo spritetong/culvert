@@ -33,6 +33,15 @@ impl ConfigLoader {
             )?;
         }
 
+        if let Some(ref server) = config.server
+            && let Some(ref tls) = server.tls
+        {
+            crate::dialer::tls::TlsConfigBuilder::parse_protocol_versions(
+                tls.min_version.as_deref(),
+                tls.max_version.as_deref(),
+            )?;
+        }
+
         for tunnel in &config.tunnels {
             if let Some(ref m) = tunnel.multiplex
                 && m.enabled
@@ -144,6 +153,36 @@ tunnels:
         let res2 = ConfigLoader::from_yaml_str(yaml_contradictory);
         assert!(res2.is_err());
         assert!(res2.unwrap_err().to_string().contains("invalid TLS version range"));
+
+        // Test server.tls validation
+        let yaml_server_bad_tls = r#"
+server:
+  listen: ["wss://0.0.0.0:8443"]
+  tls:
+    min_version: "1.1"
+"#;
+        let res3 = ConfigLoader::from_yaml_str(yaml_server_bad_tls);
+        assert!(res3.is_err());
+        assert!(res3.unwrap_err().to_string().contains("unsupported TLS version"));
+
+        // Test previously rejected valid combinations (min=1.2, max=1.2) and (None, max=1.3)
+        let yaml_valid_tls = r#"
+server:
+  listen: ["wss://0.0.0.0:8443"]
+  tls:
+    min_version: "1.2"
+    max_version: "1.2"
+"#;
+        assert!(ConfigLoader::from_yaml_str(yaml_valid_tls).is_ok());
+
+        let yaml_valid_max13 = r#"
+tls:
+  max_version: "1.3"
+tunnels:
+  - tag: "valid13"
+    endpoint: "ws://127.0.0.1:8080/tunnel"
+"#;
+        assert!(ConfigLoader::from_yaml_str(yaml_valid_max13).is_ok());
     }
 
     #[test]

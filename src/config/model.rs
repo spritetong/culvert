@@ -136,6 +136,10 @@ pub struct ServerConfig {
     /// TLS private key file path for direct TLS/WSS/H3 termination (optional, fallback to self-signed).
     #[serde(default)]
     pub key: Option<String>,
+
+    /// Advanced TLS options (version bounds, cert paths, ALPN) for server termination.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
 }
 
 impl ServerConfig {
@@ -146,6 +150,26 @@ impl ServerConfig {
             default_target,
             certificate: None,
             key: None,
+            tls: None,
+        }
+    }
+
+    /// Returns the effective `TlsConfig` for server termination, merging explicit fields.
+    pub fn effective_tls(&self, global_tls: Option<&TlsConfig>) -> Option<TlsConfig> {
+        let base = self.tls.clone().or_else(|| global_tls.cloned());
+
+        if self.certificate.is_some() || self.key.is_some() {
+            let mut cfg = base.unwrap_or_default();
+            if cfg.certificate.is_none() {
+                cfg.certificate = self.certificate.as_ref().map(PathBuf::from);
+            }
+            if cfg.key.is_none() {
+                cfg.key = self.key.as_ref().map(PathBuf::from);
+            }
+            cfg.enabled = true;
+            Some(cfg)
+        } else {
+            base
         }
     }
 
@@ -280,6 +304,14 @@ pub struct TlsConfig {
 
     /// Client private key path for mTLS.
     pub client_key: Option<PathBuf>,
+
+    /// Server certificate path for TLS termination.
+    #[serde(default, alias = "cert")]
+    pub certificate: Option<PathBuf>,
+
+    /// Server private key path for TLS termination.
+    #[serde(default)]
+    pub key: Option<PathBuf>,
 
     /// Minimum TLS version constraint (e.g. "1.2", "1.3").
     pub min_version: Option<String>,

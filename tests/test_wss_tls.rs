@@ -316,11 +316,7 @@ async fn test_wss_forward_tunnel_with_custom_ca_and_sni() {
                 server_name: Some("tunnel.secure.io".to_string()),
                 insecure: false, // Strict CA validation!
                 ca_certificate: Some(pki.ca_cert_path.clone()),
-                client_certificate: None,
-                client_key: None,
-                alpn: None,
-                min_version: None,
-                max_version: None,
+                ..Default::default()
             }),
         },
     };
@@ -334,18 +330,25 @@ async fn test_wss_forward_tunnel_with_custom_ca_and_sni() {
             run_forward_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
     });
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // 5. Connect to client listen port and verify bidirectional echo
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", client_listen_port))
-        .await
-        .expect("Failed to connect client listen port");
+    // 5. Connect to client listen port with retry loop and verify bidirectional echo
+    let mut stream = None;
+    for _ in 0..50 {
+        if let Ok(s) = TcpStream::connect(format!("127.0.0.1:{}", client_listen_port)).await {
+            stream = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut stream = stream.expect("Failed to connect client listen port after retries");
 
     let payload = b"Hello encrypted WSS tunnel with strict CA and SNI validation!";
     stream.write_all(payload).await.unwrap();
 
     let mut buf = vec![0u8; payload.len()];
-    stream.read_exact(&mut buf).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+        .await
+        .expect("Timeout reading WSS echo")
+        .unwrap();
     assert_eq!(&buf, payload, "Echo mismatch over TLS 1.3 WSS");
 
     // Cleanup
@@ -422,12 +425,7 @@ async fn test_wss_forward_tunnel_insecure_mode() {
                 enabled: true,
                 server_name: Some("untrusted.host".to_string()),
                 insecure: true, // Should skip all cert validation!
-                ca_certificate: None,
-                client_certificate: None,
-                client_key: None,
-                alpn: None,
-                min_version: None,
-                max_version: None,
+                ..Default::default()
             }),
         },
     };
@@ -441,17 +439,24 @@ async fn test_wss_forward_tunnel_insecure_mode() {
             run_forward_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
     });
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", client_listen_port))
-        .await
-        .expect("Failed to connect client listen port");
+    let mut stream = None;
+    for _ in 0..50 {
+        if let Ok(s) = TcpStream::connect(format!("127.0.0.1:{}", client_listen_port)).await {
+            stream = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut stream = stream.expect("Failed to connect client listen port after retries");
 
     let payload = b"Testing insecure mode TLS bypass!";
     stream.write_all(payload).await.unwrap();
 
     let mut buf = vec![0u8; payload.len()];
-    stream.read_exact(&mut buf).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+        .await
+        .expect("Timeout reading insecure WSS echo")
+        .unwrap();
     assert_eq!(&buf, payload);
 
     cancel_token.cancel();
@@ -531,9 +536,7 @@ async fn test_wss_mtls_mutual_authentication() {
                 ca_certificate: Some(pki.ca_cert_path.clone()),
                 client_certificate: Some(pki.client_cert_path.clone()),
                 client_key: Some(pki.client_key_path.clone()),
-                alpn: None,
-                min_version: None,
-                max_version: None,
+                ..Default::default()
             }),
         },
     };
@@ -547,17 +550,24 @@ async fn test_wss_mtls_mutual_authentication() {
             run_forward_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
     });
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", client_listen_port))
-        .await
-        .expect("Failed to connect client listen port");
+    let mut stream = None;
+    for _ in 0..50 {
+        if let Ok(s) = TcpStream::connect(format!("127.0.0.1:{}", client_listen_port)).await {
+            stream = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut stream = stream.expect("Failed to connect client listen port after retries");
 
     let payload = b"mTLS bidirectional authentication succeeded!";
     stream.write_all(payload).await.unwrap();
 
     let mut buf = vec![0u8; payload.len()];
-    stream.read_exact(&mut buf).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+        .await
+        .expect("Timeout reading mTLS echo")
+        .unwrap();
     assert_eq!(&buf, payload);
 
     cancel_token.cancel();
@@ -637,11 +647,7 @@ async fn test_wss_reverse_tunnel_e2e() {
                 server_name: Some("localhost".to_string()),
                 insecure: false,
                 ca_certificate: Some(pki.ca_cert_path.clone()),
-                client_certificate: None,
-                client_key: None,
-                alpn: None,
-                min_version: None,
-                max_version: None,
+                ..Default::default()
             }),
         },
     };
@@ -657,18 +663,112 @@ async fn test_wss_reverse_tunnel_e2e() {
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // 5. External visitor connects to reverse_listen_port on server
-    let mut visitor = TcpStream::connect(format!("127.0.0.1:{}", reverse_listen_port))
-        .await
-        .expect("Failed to connect reverse listener port on server");
+    // 5. External visitor connects to reverse_listen_port on server with retry loop
+    let mut visitor = None;
+    for _ in 0..50 {
+        if let Ok(stream) = TcpStream::connect(format!("127.0.0.1:{}", reverse_listen_port)).await {
+            visitor = Some(stream);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut visitor = visitor.expect("Failed to connect reverse listener port on server after retries");
 
     let payload = b"Reverse tunnel over encrypted TLS 1.3 WebSocket!";
     visitor.write_all(payload).await.unwrap();
 
     let mut buf = vec![0u8; payload.len()];
-    visitor.read_exact(&mut buf).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), visitor.read_exact(&mut buf))
+        .await
+        .expect("Timeout reading reverse tunnel echo")
+        .unwrap();
     assert_eq!(&buf, payload, "Echo mismatch on reverse WSS tunnel");
 
     cancel_token.cancel();
     let _ = tokio::join!(echo_handle, server_handle, tls_handle, client_handle);
+}
+
+#[tokio::test]
+async fn test_wss_server_tls_version_enforcement() {
+    let cancel_token = CancellationToken::new();
+    let pki = generate_test_pki();
+    let server_port = get_available_port();
+
+    let mut reg = TransportRegistry::new();
+    reg.register(WsTransportDriver);
+    let registry = Arc::new(reg);
+    let session_mgr = Arc::new(SessionManager::new());
+
+    // 1. Configure Server to strictly enforce TLS 1.3
+    let server_config = ServerConfig {
+        listen: vec![format!("wss://127.0.0.1:{}/tunnel", server_port)],
+        tls: Some(TlsConfig {
+            certificate: Some(pki.server_cert_path.clone()),
+            key: Some(pki.server_key_path.clone()),
+            min_version: Some("1.3".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let server_runner = ServerRunner::new(
+        server_config,
+        Arc::clone(&registry),
+        Arc::clone(&session_mgr),
+    );
+    let s_cancel = cancel_token.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = server_runner.run(s_cancel).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 2. Client restricted to TLS 1.2 only must fail to handshake
+    let client_tls_12 = TlsConfig {
+        enabled: true,
+        server_name: Some("localhost".to_string()),
+        ca_certificate: Some(pki.ca_cert_path.clone()),
+        max_version: Some("1.2".to_string()),
+        ..Default::default()
+    };
+    let app_cfg = AppConfig::default();
+    let ep_cfg = EndpointConfig::Detailed {
+        url: format!("wss://127.0.0.1:{}/tunnel", server_port),
+        dns: None,
+        dialer: None,
+        tls: Some(client_tls_12),
+    };
+    let ep_ctx = EndpointContext::build(&ep_cfg, &app_cfg).unwrap();
+    let connector_12 = registry
+        .create_connector(&ep_ctx, None, TunnelMode::Forward)
+        .unwrap();
+
+    let target = micro_tunnel::transport::TargetAddr::Domain("127.0.0.1".into(), 80);
+    let connect_res_12 = connector_12.connect(&target, None).await;
+    assert!(connect_res_12.is_err(), "Server enforcing TLS 1.3 must reject client capped at TLS 1.2");
+
+    // 3. Client allowing TLS 1.3 must succeed
+    let client_tls_13 = TlsConfig {
+        enabled: true,
+        server_name: Some("localhost".to_string()),
+        ca_certificate: Some(pki.ca_cert_path.clone()),
+        min_version: Some("1.3".to_string()),
+        ..Default::default()
+    };
+    let ep_cfg_13 = EndpointConfig::Detailed {
+        url: format!("wss://127.0.0.1:{}/tunnel", server_port),
+        dns: None,
+        dialer: None,
+        tls: Some(client_tls_13),
+    };
+    let ep_ctx_13 = EndpointContext::build(&ep_cfg_13, &app_cfg).unwrap();
+    let connector_13 = registry
+        .create_connector(&ep_ctx_13, None, TunnelMode::Forward)
+        .unwrap();
+
+    let connect_res_13 = connector_13.connect(&target, None).await;
+    assert!(connect_res_13.is_ok(), "Client connecting with TLS 1.3 must succeed");
+
+    cancel_token.cancel();
+    let _ = tokio::join!(server_handle);
 }
