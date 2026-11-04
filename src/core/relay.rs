@@ -344,4 +344,103 @@ mod tests {
 
         assert!(res.is_ok());
     }
+
+    #[tokio::test]
+    async fn test_relay_boxed_consumes_owned_write_delegation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::task::Context;
+        use std::io;
+        use bytes::Bytes;
+
+        struct MockOwnedWriter {
+            write_bytes_called: Arc<AtomicUsize>,
+            poll_write_called: Arc<AtomicUsize>,
+        }
+
+        impl tokio::io::AsyncRead for MockOwnedWriter {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        impl tokio::io::AsyncWrite for MockOwnedWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.poll_write_called.fetch_add(1, Ordering::SeqCst);
+                Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        impl TunnelStream for MockOwnedWriter {
+            fn consumes_owned_write(&self) -> bool {
+                true
+            }
+
+            fn poll_write_bytes(
+                &mut self,
+                _cx: &mut Context<'_>,
+                buf: Bytes,
+            ) -> Poll<io::Result<usize>> {
+                self.write_bytes_called.fetch_add(1, Ordering::SeqCst);
+                Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_check_alive(
+                &mut self,
+                _cx: &mut Context<'_>,
+            ) -> Poll<crate::core::stream::HeartbeatStatus> {
+                Poll::Ready(crate::core::stream::HeartbeatStatus::Alive)
+            }
+        }
+
+        let write_bytes_called = Arc::new(AtomicUsize::new(0));
+        let poll_write_called = Arc::new(AtomicUsize::new(0));
+
+        let mock = MockOwnedWriter {
+            write_bytes_called: Arc::clone(&write_bytes_called),
+            poll_write_called: Arc::clone(&poll_write_called),
+        };
+
+        let boxed: Box<dyn TunnelStream> = Box::new(mock);
+        assert!(
+            boxed.consumes_owned_write(),
+            "Box<dyn TunnelStream> must forward consumes_owned_write"
+        );
+
+        let (mut client_app, client_side) = duplex(65536);
+        let relay_handle = tokio::spawn(async move {
+            RelayEngine::relay(Box::new(client_side), boxed).await
+        });
+
+        client_app.write_all(b"payload for owned writer").await.unwrap();
+        client_app.shutdown().await.unwrap();
+
+        relay_handle.await.unwrap().unwrap();
+
+        assert_eq!(
+            poll_write_called.load(Ordering::SeqCst),
+            0,
+            "Must not call raw poll_write for owned writer"
+        );
+        assert!(
+            write_bytes_called.load(Ordering::SeqCst) > 0,
+            "Must call poll_write_bytes via Path A"
+        );
+    }
 }

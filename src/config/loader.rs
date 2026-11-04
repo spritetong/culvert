@@ -33,16 +33,36 @@ impl ConfigLoader {
             )?;
         }
 
-        if let Some(ref server) = config.server
-            && let Some(ref tls) = server.tls
-        {
-            crate::dialer::tls::TlsConfigBuilder::parse_protocol_versions(
-                tls.min_version.as_deref(),
-                tls.max_version.as_deref(),
-            )?;
+        if let Some(ref server) = config.server {
+            if let Some(ref token) = server.token
+                && token.len() > crate::common::auth::TOKEN_MAX_LEN
+            {
+                return Err(TunnelError::Config(format!(
+                    "server.token length ({} bytes) exceeds maximum supported token length ({} bytes)",
+                    token.len(),
+                    crate::common::auth::TOKEN_MAX_LEN
+                )));
+            }
+
+            if let Some(ref tls) = server.tls {
+                crate::dialer::tls::TlsConfigBuilder::parse_protocol_versions(
+                    tls.min_version.as_deref(),
+                    tls.max_version.as_deref(),
+                )?;
+            }
         }
 
         for tunnel in &config.tunnels {
+            if let Some(ref token) = tunnel.token
+                && token.len() > crate::common::auth::TOKEN_MAX_LEN
+            {
+                return Err(TunnelError::Config(format!(
+                    "tunnel '{}': token length ({} bytes) exceeds maximum supported token length ({} bytes)",
+                    tunnel.tag,
+                    token.len(),
+                    crate::common::auth::TOKEN_MAX_LEN
+                )));
+            }
             if let Some(ref m) = tunnel.multiplex
                 && m.enabled
             {
@@ -183,6 +203,33 @@ tunnels:
     endpoint: "ws://127.0.0.1:8080/tunnel"
 "#;
         assert!(ConfigLoader::from_yaml_str(yaml_valid_max13).is_ok());
+    }
+
+    #[test]
+    fn test_reject_token_exceeding_max_len() {
+        let long_token = "a".repeat(257);
+        let yaml_server_long_token = format!(
+            r#"
+server:
+  listen: ["ws://127.0.0.1:8080"]
+  token: "{}"
+"#,
+            long_token
+        );
+        let res = ConfigLoader::from_yaml_str(&yaml_server_long_token);
+        assert!(res.is_err(), "Must reject server.token > 256 bytes");
+
+        let yaml_tunnel_long_token = format!(
+            r#"
+tunnels:
+  - tag: "long_tok_tunnel"
+    endpoint: "ws://127.0.0.1:8080/tunnel"
+    token: "{}"
+"#,
+            long_token
+        );
+        let res2 = ConfigLoader::from_yaml_str(&yaml_tunnel_long_token);
+        assert!(res2.is_err(), "Must reject tunnel.token > 256 bytes");
     }
 
     #[test]

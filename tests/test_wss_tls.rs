@@ -772,3 +772,97 @@ async fn test_wss_server_tls_version_enforcement() {
     cancel_token.cancel();
     let _ = tokio::join!(server_handle);
 }
+
+#[tokio::test]
+async fn test_wss_server_inherits_global_tls_config() {
+    let cancel_token = CancellationToken::new();
+    let pki = generate_test_pki();
+    let server_port = get_available_port();
+
+    let mut reg = TransportRegistry::new();
+    reg.register(WsTransportDriver);
+    let registry = Arc::new(reg);
+    let session_mgr = Arc::new(SessionManager::new());
+
+    // 1. Configure Server with server.tls = None, but supply top-level global TLS
+    let server_config = ServerConfig {
+        listen: vec![format!("wss://127.0.0.1:{}/tunnel", server_port)],
+        tls: None, // server.tls is None
+        ..Default::default()
+    };
+
+    let global_tls = TlsConfig {
+        certificate: Some(pki.server_cert_path.clone()),
+        key: Some(pki.server_key_path.clone()),
+        min_version: Some("1.3".to_string()),
+        ..Default::default()
+    };
+
+    let server_runner = ServerRunner::with_global_tls(
+        server_config,
+        Some(global_tls),
+        Arc::clone(&registry),
+        Arc::clone(&session_mgr),
+    );
+    let s_cancel = cancel_token.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = server_runner.run(s_cancel).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 2. Client restricted to TLS 1.2 only must fail because server inherited min_version: 1.3
+    let client_tls_12 = TlsConfig {
+        enabled: true,
+        server_name: Some("localhost".to_string()),
+        ca_certificate: Some(pki.ca_cert_path.clone()),
+        max_version: Some("1.2".to_string()),
+        ..Default::default()
+    };
+    let app_cfg = AppConfig::default();
+    let ep_cfg = EndpointConfig::Detailed {
+        url: format!("wss://127.0.0.1:{}/tunnel", server_port),
+        dns: None,
+        dialer: None,
+        tls: Some(client_tls_12),
+    };
+    let ep_ctx = EndpointContext::build(&ep_cfg, &app_cfg).unwrap();
+    let connector_12 = registry
+        .create_connector(&ep_ctx, None, TunnelMode::Forward)
+        .unwrap();
+
+    let target = micro_tunnel::transport::TargetAddr::Domain("127.0.0.1".into(), 80);
+    let connect_res_12 = connector_12.connect(&target, None).await;
+    assert!(
+        connect_res_12.is_err(),
+        "Server inheriting global TLS must reject client capped at TLS 1.2"
+    );
+
+    // 3. Client using TLS 1.3 must succeed
+    let client_tls_13 = TlsConfig {
+        enabled: true,
+        server_name: Some("localhost".to_string()),
+        ca_certificate: Some(pki.ca_cert_path.clone()),
+        min_version: Some("1.3".to_string()),
+        ..Default::default()
+    };
+    let ep_cfg_13 = EndpointConfig::Detailed {
+        url: format!("wss://127.0.0.1:{}/tunnel", server_port),
+        dns: None,
+        dialer: None,
+        tls: Some(client_tls_13),
+    };
+    let ep_ctx_13 = EndpointContext::build(&ep_cfg_13, &app_cfg).unwrap();
+    let connector_13 = registry
+        .create_connector(&ep_ctx_13, None, TunnelMode::Forward)
+        .unwrap();
+
+    let connect_res_13 = connector_13.connect(&target, None).await;
+    assert!(
+        connect_res_13.is_ok(),
+        "Server inheriting global TLS must accept client with TLS 1.3"
+    );
+
+    cancel_token.cancel();
+    let _ = tokio::join!(server_handle);
+}

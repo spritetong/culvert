@@ -50,5 +50,21 @@ mod tests {
         assert!(!constant_time_token_eq(b"short", expected));
         assert!(!constant_time_token_eq(b"my_secret_token_12345_extra_long_payload", expected));
         assert!(!constant_time_token_eq(b"", expected));
+
+        // Exactly TOKEN_MAX_LEN (256 bytes)
+        let token_256 = vec![b'a'; TOKEN_MAX_LEN];
+        assert!(constant_time_token_eq(&token_256, &token_256));
+
+        // Tokens exceeding TOKEN_MAX_LEN (256 bytes) must be rejected in constant time
+        let token_300 = vec![b'a'; 300];
+        assert!(
+            !constant_time_token_eq(&token_300, &token_300),
+            "Tokens > 256 bytes must be rejected"
+        );
+        assert!(!constant_time_token_eq(&token_300, &token_256));
+        assert!(!constant_time_token_eq(&token_256, &token_300));
+
+        let token_257 = vec![b'a'; 257];
+        assert!(!constant_time_token_eq(&token_257, &token_256));
     }
 }

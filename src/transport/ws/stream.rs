@@ -940,14 +940,20 @@ mod tests {
 
         // 4. Server drains all data; this unblocks the in-flight data frame and lets shutdown emit FIN
         let mut received = Vec::new();
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = server.read(&mut buf).await.unwrap();
-            if n == 0 {
-                break;
+        let drain_task = async {
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = server.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buf[..n]);
             }
-            received.extend_from_slice(&buf[..n]);
-        }
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(15), drain_task)
+            .await
+            .expect("Server must observe EOF (FIN) within 15s");
 
         client_task.await.unwrap();
         assert_eq!(received.len(), 300_000, "Server must receive all 300,000 bytes");

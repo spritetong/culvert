@@ -14,12 +14,14 @@ use micro_tunnel::transport::{TargetAddr, TransportConnector, TransportListener}
 
 use std::sync::atomic::{AtomicU16, Ordering};
 
-static PORT_COUNTER: AtomicU16 = AtomicU16::new(53100);
-
 fn get_ephemeral_port() -> u16 {
+    static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
+    let base = 48000 + (std::process::id() as u16 % 1000) * 15;
     for _ in 0..200 {
-        let port = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
-        if let Ok(u) = std::net::UdpSocket::bind(("127.0.0.1", port))
+        let offset = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let port = base.wrapping_add(offset);
+        if port >= 1024
+            && let Ok(u) = std::net::UdpSocket::bind(("127.0.0.1", port))
             && let Ok(t) = std::net::TcpListener::bind(("127.0.0.1", port))
         {
             drop(u);
@@ -27,7 +29,8 @@ fn get_ephemeral_port() -> u16 {
             return port;
         }
     }
-    let listener = std::net::UdpSocket::bind("127.0.0.1:0").expect("Failed to bind UDP ephemeral port");
+    let listener =
+        std::net::UdpSocket::bind("127.0.0.1:0").expect("Failed to bind UDP ephemeral port");
     listener.local_addr().unwrap().port()
 }
 
@@ -41,6 +44,24 @@ async fn connect_with_retry(addr: &str) -> tokio::net::TcpStream {
     tokio::net::TcpStream::connect(addr)
         .await
         .expect("Failed to connect to local tunnel port after retries")
+}
+
+async fn read_exact_timed<T: tokio::io::AsyncRead + Unpin>(
+    s: &mut T,
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), s.read_exact(buf))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read_exact timed out"))?
+}
+
+async fn read_to_end_timed<T: tokio::io::AsyncRead + Unpin>(
+    s: &mut T,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<usize> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), s.read_to_end(buf))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read_to_end timed out"))?
 }
 
 /// Helper to generate a test PKI certificate and ServerConfig for QUIC.
@@ -93,7 +114,7 @@ async fn test_h3_transport_handshake_and_bidirectional_transfer() {
 
         // Read 100KB test data from client
         let mut buf = vec![0u8; 100 * 1024];
-        stream.read_exact(&mut buf).await.unwrap();
+        read_exact_timed(&mut stream, &mut buf).await.unwrap();
 
         // Echo reversed data back
         buf.reverse();
@@ -134,7 +155,7 @@ async fn test_h3_transport_handshake_and_bidirectional_transfer() {
 
     // Read echoed response
     let mut response = vec![0u8; 100 * 1024];
-    client_stream.read_exact(&mut response).await.unwrap();
+    read_exact_timed(&mut client_stream, &mut response).await.unwrap();
 
     let mut expected = test_data.clone();
     expected.reverse();
@@ -200,7 +221,7 @@ async fn test_quic_raw_stream_bidirectional_transfer() {
         assert_eq!(metadata.session_id.as_deref(), Some("sess_quic_raw_1"));
 
         let mut buf = vec![0u8; 64 * 1024];
-        stream.read_exact(&mut buf).await.unwrap();
+        read_exact_timed(&mut stream, &mut buf).await.unwrap();
         buf.reverse();
         stream.write_all(&buf).await.unwrap();
         stream.shutdown().await.unwrap();
@@ -236,7 +257,7 @@ async fn test_quic_raw_stream_bidirectional_transfer() {
     client_stream.shutdown().await.unwrap();
 
     let mut response = vec![0u8; 64 * 1024];
-    client_stream.read_exact(&mut response).await.unwrap();
+    read_exact_timed(&mut client_stream, &mut response).await.unwrap();
 
     let mut expected = test_data.clone();
     expected.reverse();
@@ -268,7 +289,7 @@ async fn test_h3_stream_multiplexing_over_single_quic_connection() {
             let (mut stream, _) = listener.accept().await.unwrap();
             tokio::spawn(async move {
                 let mut data = Vec::new();
-                stream.read_to_end(&mut data).await.unwrap();
+                read_to_end_timed(&mut stream, &mut data).await.unwrap();
                 data.reverse();
                 stream.write_all(&data).await.unwrap();
                 stream.shutdown().await.unwrap();
@@ -306,7 +327,7 @@ async fn test_h3_stream_multiplexing_over_single_quic_connection() {
             stream.shutdown().await.unwrap();
 
             let mut resp = Vec::new();
-            stream.read_to_end(&mut resp).await.unwrap();
+            read_to_end_timed(&mut stream, &mut resp).await.unwrap();
 
             let mut expected = payload.clone();
             expected.reverse();
@@ -772,7 +793,13 @@ async fn test_h3_concurrent_forward_stress() {
             let mut received = 0;
             let mut buf = vec![0u8; CHUNK_SIZE];
             loop {
-                let n = rd.read(&mut buf).await.unwrap();
+                let n = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    rd.read(&mut buf),
+                )
+                .await
+                .expect("read timed out in concurrent forward stress")
+                .unwrap();
                 if n == 0 {
                     break;
                 }

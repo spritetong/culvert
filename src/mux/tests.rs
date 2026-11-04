@@ -211,7 +211,7 @@ async fn test_mux_stream_drop_cleans_active_streams() {
 }
 
 #[tokio::test]
-async fn test_mux_poll_write_bytes_and_shutdown_flushes_pending() {
+async fn test_mux_poll_write_bytes_and_shutdown_flushes_outbound() {
     use std::future::poll_fn;
     use crate::core::stream::TunnelStream;
 

@@ -65,6 +65,10 @@ pub trait TunnelStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {
 
 // Implement TunnelStream for Box<dyn TunnelStream> to allow trait-object wrapping.
 impl TunnelStream for Box<dyn TunnelStream> {
+    fn consumes_owned_write(&self) -> bool {
+        (**self).consumes_owned_write()
+    }
+
     fn poll_write_bytes(
         &mut self,
         cx: &mut Context<'_>,
