@@ -206,7 +206,7 @@ impl H3Listener {
         cancel_token: CancellationToken,
     ) {
         let mut h3_conn = match h3::server::builder()
-            .build::<_, Bytes>(h3_quinn::Connection::new(conn))
+            .build::<_, Bytes>(h3_quinn::Connection::new(conn.clone()))
             .await
         {
             Ok(server) => server,
@@ -228,6 +228,7 @@ impl H3Listener {
                             let auth_clone = Arc::clone(&auth_token);
                             let path_clone = Arc::clone(&expected_path);
                             let tx_clone = tx_streams.clone();
+                            let conn_clone = conn.clone();
 
                             request_tasks.spawn(async move {
                                 let (req, mut stream) = match resolver.resolve_request().await {
@@ -354,7 +355,10 @@ impl H3Listener {
                                     target,
                                     pool_idle,
                                 };
-                                let tunnel_stream = Box::new(H3TunnelStream::from_server(stream)) as Box<dyn TunnelStream>;
+                                let tunnel_stream = Box::new(
+                                    H3TunnelStream::from_server(stream)
+                                        .with_connection(conn_clone),
+                                ) as Box<dyn TunnelStream>;
 
                                 let _ = tx_clone.send((tunnel_stream, metadata)).await;
                             });
@@ -369,8 +373,15 @@ impl H3Listener {
             }
         }
 
-        request_tasks.abort_all();
-        while request_tasks.join_next().await.is_some() {}
+        // Allow in-flight request setup tasks to finish sending responses
+        while let Some(_) = request_tasks.join_next().await {}
+
+        // Keep h3_conn alive until connection is closed by peer or cancelled,
+        // preventing premature QUIC teardown while accepted streams are still relaying.
+        tokio::select! {
+            _ = cancel_token.cancelled() => {}
+            _ = conn.closed() => {}
+        }
     }
 
     /// Processes raw QUIC bidirectional streams on the connection.

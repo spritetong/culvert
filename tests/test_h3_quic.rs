@@ -822,3 +822,143 @@ async fn test_h3_concurrent_forward_stress() {
         "Timeout waiting for tasks to exit after cancellation in test_h3_concurrent_forward_stress",
     );
 }
+
+#[tokio::test]
+async fn test_h3_sibling_streams_survive_sibling_abort() {
+    let port = get_ephemeral_port();
+    let listen_addr = format!("127.0.0.1:{}", port);
+    let auth_token = "sibling_survive_token";
+
+    let (server_rustls, _) = generate_test_quic_pki();
+    let mut listener =
+        H3Listener::bind(&listen_addr, Some(auth_token), None, server_rustls).unwrap();
+    let (tx_done, rx_done) = tokio::sync::oneshot::channel::<()>();
+
+    // Server accepts multiple streams
+    let server_task = tokio::spawn(async move {
+        // Stream 1 handler: echo
+        let (mut stream1, _) = listener.accept().await.unwrap();
+        let s1_handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 16 * 1024];
+            read_exact_timed(&mut stream1, &mut buf).await.unwrap();
+            buf.reverse();
+            stream1.write_all(&buf).await.unwrap();
+            stream1.shutdown().await.unwrap();
+        });
+
+        // Stream 2 handler: just accepted, then client will abruptly drop
+        let (mut stream2, _) = listener.accept().await.unwrap();
+        let s2_handle = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let _ = stream2.read(&mut buf).await;
+        });
+
+        let _ = rx_done.await;
+        let _ = s1_handle.await;
+        let _ = s2_handle.await;
+    });
+
+    let endpoint_cfg = EndpointConfig::Detailed {
+        url: format!("h3://{}/tunnel", listen_addr),
+        dns: None,
+        dialer: None,
+        tls: Some(TlsConfig {
+            enabled: true,
+            insecure: true,
+            server_name: Some("localhost".to_string()),
+            ..Default::default()
+        }),
+    };
+
+    let app_cfg = AppConfig::default();
+    let endpoint_ctx = EndpointContext::build(&endpoint_cfg, &app_cfg).unwrap();
+    let connector =
+        Arc::new(H3Connector::new(&endpoint_ctx, auth_token, TunnelMode::Forward).unwrap());
+
+    let target = TargetAddr::Domain("backend.local".to_string(), 80);
+
+    // 1. Open stream 1
+    let mut stream1 = connector.connect(&target, None).await.unwrap();
+
+    // 2. Open stream 2 and abruptly drop it (simulating error/abort)
+    let stream2 = connector.connect(&target, None).await.unwrap();
+    drop(stream2);
+
+    // 3. Verify stream 1 over the shared connection is completely unaffected
+    let test_data: Vec<u8> = (0..16 * 1024).map(|i| (i % 251) as u8).collect();
+    stream1.write_all(&test_data).await.unwrap();
+    stream1.shutdown().await.unwrap();
+
+    let mut response = vec![0u8; 16 * 1024];
+    read_exact_timed(&mut stream1, &mut response).await.unwrap();
+
+    let mut expected = test_data.clone();
+    expected.reverse();
+    assert_eq!(
+        response, expected,
+        "Stream 1 must complete echoed transfer unaffected by sibling stream drop"
+    );
+
+    let _ = tx_done.send(());
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_h3_stream_liveness_detects_closed_connection() {
+    let port = get_ephemeral_port();
+    let listen_addr = format!("127.0.0.1:{}", port);
+    let auth_token = "liveness_test_token";
+
+    let (server_rustls, _) = generate_test_quic_pki();
+    let mut listener =
+        H3Listener::bind(&listen_addr, Some(auth_token), None, server_rustls).unwrap();
+
+    let server_task = tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            // Keep stream open until client reads or terminates
+            let mut buf = [0u8; 16];
+            let _ = stream.read(&mut buf).await;
+        }
+    });
+
+    let endpoint_cfg = EndpointConfig::Detailed {
+        url: format!("h3://{}/tunnel", listen_addr),
+        dns: None,
+        dialer: None,
+        tls: Some(TlsConfig {
+            enabled: true,
+            insecure: true,
+            server_name: Some("localhost".to_string()),
+            ..Default::default()
+        }),
+    };
+
+    let app_cfg = AppConfig::default();
+    let endpoint_ctx = EndpointContext::build(&endpoint_cfg, &app_cfg).unwrap();
+    let connector =
+        Arc::new(H3Connector::new(&endpoint_ctx, auth_token, TunnelMode::Forward).unwrap());
+
+    let target = TargetAddr::Domain("backend.local".to_string(), 80);
+    let mut stream = connector.connect(&target, None).await.unwrap();
+
+    // While connection is open, check alive
+    let waker = futures_util::task::noop_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
+    assert_eq!(
+        stream.poll_check_alive(&mut cx),
+        std::task::Poll::Ready(micro_tunnel::core::stream::HeartbeatStatus::Alive)
+    );
+    assert!(stream.poll_send_ping(&mut cx).is_ready());
+
+    // Abort server task, dropping listener and triggering cancellation
+    server_task.abort();
+    let _ = server_task.await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Stream must now detect dead/closed connection
+    let alive_status = stream.poll_check_alive(&mut cx);
+    assert_eq!(
+        alive_status,
+        std::task::Poll::Ready(micro_tunnel::core::stream::HeartbeatStatus::Dead)
+    );
+}

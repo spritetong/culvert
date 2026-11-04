@@ -201,7 +201,7 @@ impl ReplenishingStreamPool {
             const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
             const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(3);
             const HEARTBEAT_TICK_INTERVAL: Duration = Duration::from_secs(1);
-            const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+            const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(15);
             const MAX_CONCURRENT_CONNECTS: usize = 4;
             const MAX_POOL_CAPACITY: usize = 16;
             const BACKOFF_BASE: Duration = Duration::from_millis(200);
@@ -228,13 +228,16 @@ impl ReplenishingStreamPool {
                 let active = stats_clone.lock().active_count;
                 let total_allocated = active + current_total;
 
+                let has_waiters = !pending_requests.is_empty();
                 let needed = (current_total < target_size)
-                    || (!pending_requests.is_empty() && in_flight < pending_requests.len());
+                    || (has_waiters && in_flight < pending_requests.len());
                 let capacity_available =
                     total_allocated < MAX_POOL_CAPACITY && in_flight < MAX_CONCURRENT_CONNECTS;
 
                 if needed && capacity_available {
-                    if now >= next_retry_at {
+                    // Active callers waiting in pending_requests bypass idle replenishment backoff timer
+                    // to facilitate immediate connection establishment upon demand.
+                    if has_waiters || now >= next_retry_at {
                         let c = Arc::clone(&connector);
                         let t = dummy_target.clone();
                         connecting_futures

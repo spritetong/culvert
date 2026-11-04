@@ -82,6 +82,18 @@ impl AsyncWrite for QuinnTunnelStream {
 }
 
 impl TunnelStream for QuinnTunnelStream {
+    fn poll_send_ping(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(ref conn) = self.conn
+            && let Some(reason) = conn.close_reason()
+        {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                format!("Underlying QUIC connection closed: {:?}", reason),
+            )));
+        }
+        Poll::Ready(Ok(()))
+    }
+
     fn poll_check_alive(&mut self, _cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
         if let Some(ref conn) = self.conn
             && conn.close_reason().is_some()
@@ -95,9 +107,10 @@ impl TunnelStream for QuinnTunnelStream {
 /// Bidirectional stream adapter for HTTP/3 request streams (`h3::client` or `h3::server`).
 pub struct H3TunnelStream {
     tx_outbound: Option<PollSender<Bytes>>,
-    rx_inbound: mpsc::Receiver<Bytes>,
+    rx_inbound: mpsc::Receiver<io::Result<Bytes>>,
     read_buf: Option<Bytes>,
     shutdown_rx: Option<oneshot::Receiver<io::Result<()>>>,
+    conn: Option<quinn::Connection>,
     shutdown_done: bool,
     fin_sent: bool,
 }
@@ -119,13 +132,19 @@ impl H3TunnelStream {
         Self::spawn_split_pump(send, recv)
     }
 
+    /// Associates the underlying Quinn connection for accurate liveness detection.
+    pub fn with_connection(mut self, conn: quinn::Connection) -> Self {
+        self.conn = Some(conn);
+        self
+    }
+
     fn spawn_split_pump<S, R>(mut send_stream: S, mut recv_stream: R) -> Self
     where
         S: H3SendStream,
         R: H3RecvStream,
     {
         let (tx_outbound, mut rx_outbound) = mpsc::channel::<Bytes>(128);
-        let (tx_inbound, rx_inbound) = mpsc::channel::<Bytes>(128);
+        let (tx_inbound, rx_inbound) = mpsc::channel::<io::Result<Bytes>>(128);
         let (tx_shutdown, rx_shutdown) = oneshot::channel::<io::Result<()>>();
 
         // Outbound send task: continuously drains outgoing chunks without being blocked by incoming reading
@@ -152,13 +171,14 @@ impl H3TunnelStream {
             loop {
                 match recv_stream.recv_chunk().await {
                     Ok(Some(data)) => {
-                        if tx_inbound.send(data).await.is_err() {
+                        if tx_inbound.send(Ok(data)).await.is_err() {
                             break;
                         }
                     }
                     Ok(None) => break, // EOF reached cleanly
                     Err(e) => {
                         debug!("H3 recv_chunk failed: {:?}", e);
+                        let _ = tx_inbound.send(Err(e)).await;
                         break;
                     }
                 }
@@ -170,6 +190,7 @@ impl H3TunnelStream {
             rx_inbound,
             read_buf: None,
             shutdown_rx: Some(rx_shutdown),
+            conn: None,
             shutdown_done: false,
             fin_sent: false,
         }
@@ -193,7 +214,7 @@ impl AsyncRead for H3TunnelStream {
         }
 
         match self.rx_inbound.poll_recv(cx) {
-            Poll::Ready(Some(mut bytes)) => {
+            Poll::Ready(Some(Ok(mut bytes))) => {
                 let to_copy = std::cmp::min(buf.remaining(), bytes.len());
                 buf.put_slice(&bytes[..to_copy]);
                 bytes.advance(to_copy);
@@ -202,6 +223,7 @@ impl AsyncRead for H3TunnelStream {
                 }
                 Poll::Ready(Ok(()))
             }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(e)),
             Poll::Ready(None) => Poll::Ready(Ok(())), // EOF
             Poll::Pending => Poll::Pending,
         }
@@ -269,10 +291,23 @@ impl AsyncWrite for H3TunnelStream {
 
         if let Some(ref mut rx) = self.shutdown_rx {
             match Future::poll(Pin::new(rx), cx) {
-                Poll::Ready(_) => {
+                Poll::Ready(Ok(Ok(()))) => {
                     self.shutdown_done = true;
                     self.shutdown_rx.take();
                     Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Ok(Err(e))) => {
+                    self.shutdown_done = true;
+                    self.shutdown_rx.take();
+                    Poll::Ready(Err(e))
+                }
+                Poll::Ready(Err(_)) => {
+                    self.shutdown_done = true;
+                    self.shutdown_rx.take();
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "HTTP/3 background pump task terminated",
+                    )))
                 }
                 Poll::Pending => Poll::Pending,
             }
@@ -284,16 +319,39 @@ impl AsyncWrite for H3TunnelStream {
 }
 
 impl TunnelStream for H3TunnelStream {
+    fn poll_send_ping(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(ref conn) = self.conn
+            && let Some(reason) = conn.close_reason()
+        {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                format!("Underlying QUIC connection closed: {:?}", reason),
+            )));
+        }
+        if let Poll::Ready(HeartbeatStatus::Dead) = self.poll_check_alive(cx) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "HTTP/3 stream closed or in error state",
+            )));
+        }
+        Poll::Ready(Ok(()))
+    }
+
     fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+        if let Some(ref conn) = self.conn
+            && conn.close_reason().is_some()
+        {
+            return Poll::Ready(HeartbeatStatus::Dead);
+        }
         if self.read_buf.is_some() {
             return Poll::Ready(HeartbeatStatus::Alive);
         }
         match self.rx_inbound.poll_recv(cx) {
-            Poll::Ready(Some(bytes)) => {
+            Poll::Ready(Some(Ok(bytes))) => {
                 self.read_buf = Some(bytes);
                 Poll::Ready(HeartbeatStatus::Alive)
             }
-            Poll::Ready(None) => Poll::Ready(HeartbeatStatus::Dead),
+            Poll::Ready(Some(Err(_))) | Poll::Ready(None) => Poll::Ready(HeartbeatStatus::Dead),
             Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
         }
     }
@@ -360,5 +418,77 @@ impl H3RecvStream for h3::server::RequestStream<h3_quinn::RecvStream, Bytes> {
             Ok(None) => Ok(None),
             Err(e) => Err(io::Error::other(e.to_string())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    struct MockSendStream {
+        #[allow(dead_code)]
+        sent: Vec<Bytes>,
+        #[allow(dead_code)]
+        finished: bool,
+    }
+
+    impl H3SendStream for MockSendStream {
+        async fn send_chunk(&mut self, chunk: Bytes) -> Result<(), io::Error> {
+            self.sent.push(chunk);
+            Ok(())
+        }
+        async fn finish_stream(&mut self) -> Result<(), io::Error> {
+            self.finished = true;
+            Ok(())
+        }
+    }
+
+    struct MockFailingRecvStream {
+        sent_item: bool,
+    }
+
+    impl H3RecvStream for MockFailingRecvStream {
+        async fn recv_chunk(&mut self) -> Result<Option<Bytes>, io::Error> {
+            if !self.sent_item {
+                self.sent_item = true;
+                Ok(Some(Bytes::from_static(b"hello before error")))
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "simulated h3 reset",
+                ))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_h3_stream_error_propagation_not_swallowed_as_eof() {
+        let send = MockSendStream {
+            sent: vec![],
+            finished: false,
+        };
+        let recv = MockFailingRecvStream { sent_item: false };
+        let mut stream = H3TunnelStream::spawn_split_pump(send, recv);
+
+        let mut buf = vec![0u8; 18];
+        let n = stream.read(&mut buf).await.expect("initial read succeeds");
+        assert_eq!(&buf[..n], b"hello before error");
+
+        // Next read MUST return Err(ConnectionReset), NOT Ok(0) (which would be masked EOF)
+        let mut err_buf = [0u8; 10];
+        let res = stream.read(&mut err_buf).await;
+        assert!(
+            res.is_err(),
+            "Error must be propagated to caller, not masked as EOF"
+        );
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::ConnectionReset);
+
+        // Liveness check must also report Dead
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert_eq!(
+            stream.poll_check_alive(&mut cx),
+            Poll::Ready(HeartbeatStatus::Dead)
+        );
     }
 }
