@@ -127,6 +127,7 @@ impl ManagedStream {
 
 /// Request sent to the pool actor to acquire a stream.
 struct AcquireRequest {
+    #[allow(dead_code)]
     target: Option<TargetAddr>,
     reply: oneshot::Sender<Result<Box<dyn TunnelStream>, TunnelError>>,
 }
@@ -148,6 +149,7 @@ enum PoolEvent {
 }
 
 /// Auto-replenishing stream pool managed by an actor loop with active heartbeat and self-healing.
+#[derive(Clone)]
 pub struct ReplenishingStreamPool {
     tx_cmd: mpsc::Sender<PoolCommand>,
     stats: Arc<Mutex<PoolStats>>,
@@ -186,10 +188,9 @@ impl ReplenishingStreamPool {
         let stats_clone = Arc::clone(&stats);
         let active_count = Arc::new(AtomicUsize::new(0));
 
-        let dial_semaphore = Arc::new(tokio::sync::Semaphore::new(16));
-
         tokio::spawn(async move {
             let mut idle_streams: VecDeque<ManagedStream> = VecDeque::new();
+            let mut pending_requests: VecDeque<(AcquireRequest, Instant)> = VecDeque::new();
             let mut connecting_futures: FuturesUnordered<
                 BoxFuture<'static, Result<Box<dyn TunnelStream>, TunnelError>>,
             > = FuturesUnordered::new();
@@ -200,7 +201,9 @@ impl ReplenishingStreamPool {
             const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
             const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(3);
             const HEARTBEAT_TICK_INTERVAL: Duration = Duration::from_secs(1);
+            const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
             const MAX_CONCURRENT_CONNECTS: usize = 4;
+            const MAX_POOL_CAPACITY: usize = 16;
             const BACKOFF_BASE: Duration = Duration::from_millis(200);
             const BACKOFF_MAX: Duration = Duration::from_secs(10);
 
@@ -214,16 +217,23 @@ impl ReplenishingStreamPool {
             );
             heartbeat_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-            let cancel_token_for_dial = cancel_token.clone();
             let cancel_fut = cancel_token.cancelled();
             tokio::pin!(cancel_fut);
 
             loop {
-                // 1. Replenish connecting futures if total (idle + in_flight) < target_size and backoff passed
+                // 1. Replenish connecting futures if needed (idle streams < target_size OR waiters in pending_requests)
                 let now = Instant::now();
                 let in_flight = connecting_futures.len();
                 let current_total = idle_streams.len() + in_flight;
-                if current_total < target_size && in_flight < MAX_CONCURRENT_CONNECTS {
+                let active = stats_clone.lock().active_count;
+                let total_allocated = active + current_total;
+
+                let needed = (current_total < target_size)
+                    || (!pending_requests.is_empty() && in_flight < pending_requests.len());
+                let capacity_available =
+                    total_allocated < MAX_POOL_CAPACITY && in_flight < MAX_CONCURRENT_CONNECTS;
+
+                if needed && capacity_available {
                     if now >= next_retry_at {
                         let c = Arc::clone(&connector);
                         let t = dummy_target.clone();
@@ -332,17 +342,48 @@ impl ReplenishingStreamPool {
 
                 // 3. Dispatch and process pool events
                 match event {
-                    PoolEvent::Cancelled => break,
+                    PoolEvent::Cancelled => {
+                        for (req, _) in pending_requests.drain(..) {
+                            let _ = req.reply.send(Err(TunnelError::PoolExhausted));
+                        }
+                        break;
+                    }
                     PoolEvent::ConnectionResult(conn_res) => {
                         match conn_res {
                             Ok(stream) => {
                                 backoff = BACKOFF_BASE;
                                 next_retry_at = Instant::now();
                                 retry_timer = None;
-                                idle_streams.push_back(ManagedStream::new(stream));
-                                let mut st = stats_clone.lock();
-                                st.idle_count = idle_streams.len();
-                                st.total_created += 1;
+
+                                // Try direct hand-off to pending requests before pushing to idle_streams
+                                let mut cur_stream = Some(stream);
+                                while let Some((pending_req, _)) = pending_requests.pop_front() {
+                                    if let Some(s) = cur_stream.take() {
+                                        match pending_req.reply.send(Ok(s)) {
+                                            Ok(()) => {
+                                                let mut st = stats_clone.lock();
+                                                st.active_count += 1;
+                                                st.total_created += 1;
+                                                break;
+                                            }
+                                            Err(returned_res) => {
+                                                // Caller dropped rx; reclaim the stream and offer to next waiter
+                                                if let Ok(returned) = returned_res {
+                                                    cur_stream = Some(returned);
+                                                } else {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if let Some(s) = cur_stream {
+                                    idle_streams.push_back(ManagedStream::new(s));
+                                    let mut st = stats_clone.lock();
+                                    st.idle_count = idle_streams.len();
+                                    st.total_created += 1;
+                                }
                             }
                             Err(e) => {
                                 tracing::debug!("Background connect_pooled failed: {:?}", e);
@@ -380,51 +421,37 @@ impl ReplenishingStreamPool {
                                     st.active_count += 1;
                                     let _ = req.reply.send(Ok(stream));
                                 } else {
-                                    // Idle pool exhausted: dial on demand directly with bounded concurrency semaphore
-                                    let effective_target = req.target
-                                        .or_else(|| default_target.clone())
-                                        .unwrap_or_else(|| TargetAddr::Domain("pool.idle".to_string(), 0));
-                                    let c = Arc::clone(&connector);
-                                    let stats_inner = Arc::clone(&stats_clone);
-                                    let cancel_inner = cancel_token_for_dial.clone();
-                                    let sem = Arc::clone(&dial_semaphore);
-
-                                    tokio::spawn(async move {
-                                        let permit = match sem.acquire_owned().await {
-                                            Ok(p) => p,
-                                            Err(_) => {
-                                                let _ = req.reply.send(Err(TunnelError::PoolExhausted));
-                                                return;
-                                            }
-                                        };
-
-                                        let connect_fut = c.connect_pooled(&effective_target);
-                                        let res = tokio::select! {
-                                            _ = cancel_inner.cancelled() => Err(TunnelError::PoolExhausted),
-                                            r = connect_fut => r,
-                                        };
-                                        drop(permit);
-
-                                        match res {
-                                            Ok(stream) => {
-                                                let mut st = stats_inner.lock();
-                                                st.active_count += 1;
-                                                st.total_created += 1;
-                                                let _ = req.reply.send(Ok(stream));
-                                            }
-                                            Err(e) => {
-                                                let _ = req.reply.send(Err(e));
-                                            }
-                                        }
-                                    });
+                                    // Idle pool exhausted: enqueue into pending requests for hand-off
+                                    pending_requests.push_back((req, Instant::now()));
                                 }
                                 stats_clone.lock().idle_count = idle_streams.len();
                             }
                             Some(PoolCommand::PushIdle(stream)) => {
-                                idle_streams.push_back(ManagedStream::new(stream));
-                                let mut st = stats_clone.lock();
-                                st.idle_count = idle_streams.len();
-                                st.total_created += 1;
+                                let mut cur_stream = Some(stream);
+                                while let Some((pending_req, _)) = pending_requests.pop_front() {
+                                    if let Some(s) = cur_stream.take() {
+                                        match pending_req.reply.send(Ok(s)) {
+                                            Ok(()) => {
+                                                let mut st = stats_clone.lock();
+                                                st.active_count += 1;
+                                                break;
+                                            }
+                                            Err(returned_res) => {
+                                                if let Ok(returned) = returned_res {
+                                                    cur_stream = Some(returned);
+                                                } else {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if let Some(s) = cur_stream {
+                                    idle_streams.push_back(ManagedStream::new(s));
+                                    let mut st = stats_clone.lock();
+                                    st.idle_count = idle_streams.len();
+                                }
                             }
                             Some(PoolCommand::StreamClosed) => {
                                 let mut st = stats_clone.lock();
@@ -432,13 +459,30 @@ impl ReplenishingStreamPool {
                                     st.active_count -= 1;
                                 }
                             }
-                            None => break,
+                            None => {
+                                for (req, _) in pending_requests.drain(..) {
+                                    let _ = req.reply.send(Err(TunnelError::PoolExhausted));
+                                }
+                                break;
+                            }
                         }
                     }
                     PoolEvent::RetryTimerExpired => {
                         retry_timer = None;
                     }
                     PoolEvent::HeartbeatTick => {
+                        let now = Instant::now();
+                        // Prune closed and timed-out requests in FIFO order
+                        while let Some((front, enqueued_at)) = pending_requests.front() {
+                            if front.reply.is_closed() {
+                                pending_requests.pop_front();
+                            } else if now.duration_since(*enqueued_at) > ACQUIRE_TIMEOUT {
+                                let (req, _) = pending_requests.pop_front().unwrap();
+                                let _ = req.reply.send(Err(TunnelError::PoolExhausted));
+                            } else {
+                                break;
+                            }
+                        }
                         stats_clone.lock().idle_count = idle_streams.len();
                     }
                 }
@@ -618,6 +662,37 @@ mod tests {
 
         let stats_after = pool.stats();
         assert_eq!(stats_after.active_count, 1, "Expected 1 active stream");
+
+        cancel_token.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_connection_pool_wait_queue_hand_off() {
+        let connector = Arc::new(MockSuccessfulConnector);
+        let cancel_token = CancellationToken::new();
+        // target_size 0: no automatic background idle replenishment
+        let pool = ReplenishingStreamPool::new_shared(connector, 0, cancel_token.clone());
+
+        // Spawn a task waiting on acquire
+        let pool_clone = pool.clone();
+        let acquire_task = tokio::spawn(async move {
+            pool_clone.acquire(None).await
+        });
+
+        // Give the task a moment to register into pending_requests
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Return a new stream via push_idle
+        let (client, _server) = tokio::io::duplex(1024);
+        pool.push_idle(Box::new(client));
+
+        // The waiting acquire task should immediately receive the stream via direct hand-off
+        let acquired = tokio::time::timeout(Duration::from_secs(1), acquire_task).await;
+        assert!(acquired.is_ok(), "Acquire task should complete via hand-off");
+        assert!(acquired.unwrap().unwrap().is_ok(), "Stream acquisition should succeed");
+
+        // Idle count should still be 0 because it bypassed idle_streams directly to the waiting request
+        assert_eq!(pool.stats().idle_count, 0, "Handed-off stream must bypass idle_streams");
 
         cancel_token.cancel();
     }
