@@ -6,12 +6,10 @@
 
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
-use tokio::net::TcpStream;
 use tokio::time::{Duration, interval};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::common::net::SocketTuner;
 use crate::common::task::TaskTracker;
 use crate::config::model::{TunnelConfig, TunnelMode};
 use crate::consts::DEFAULT_HEARTBEAT_INTERVAL;
@@ -190,15 +188,12 @@ pub async fn run_reverse_mapping(
 
                                 conn_tracker.spawn_with_cancel(move |token| async move {
                                     // 1. Dial local target service
-                                    let dial_local_fut = TcpStream::connect(&target_clone);
+                                    let dial_local_fut = crate::platform::connect_target_str(&target_clone);
                                     let local_stream = match tokio::select! {
                                         _ = token.cancelled() => return,
                                         res = dial_local_fut => res,
                                     } {
-                                        Ok(s) => {
-                                            let _ = SocketTuner::tune_tcp_stream(&s, true, None);
-                                            s
-                                        }
+                                        Ok(s) => s,
                                         Err(e) => {
                                             error!("Failed to connect to local target {}: {:?}", target_clone, e);
                                             return;
@@ -220,7 +215,7 @@ pub async fn run_reverse_mapping(
 
                                     // 3. Relay bidirectionally
                                     let _ = RelayEngine::relay_with_cancel(
-                                        Box::new(local_stream),
+                                        local_stream,
                                         data_stream,
                                         token,
                                     ).await;

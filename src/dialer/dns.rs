@@ -115,7 +115,9 @@ impl CachedDnsResolver {
     ///
     /// # Panics
     /// Panics if the resolver configuration is invalid. Prefer [`CachedDnsResolver::try_new`].
-    #[deprecated(note = "Prefer CachedDnsResolver::try_new to handle configuration errors gracefully")]
+    #[deprecated(
+        note = "Prefer CachedDnsResolver::try_new to handle configuration errors gracefully"
+    )]
     pub fn new(config: DnsConfig) -> Self {
         Self::try_new(config).expect("invalid DNS configuration")
     }

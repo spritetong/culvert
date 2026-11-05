@@ -8,12 +8,10 @@ use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::AsyncReadExt;
-use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::common::net::SocketTuner;
 use crate::common::task::TaskTracker;
 use crate::config::model::{ServerConfig, TlsConfig, TunnelMode};
 use crate::consts::{ACTIVATE_STREAM_MAGIC, DEFAULT_SESSION_PAIR_TIMEOUT};
@@ -163,13 +161,9 @@ impl ServerRunner {
                                                                             warn!("Failed to read activation target payload: {:?}", e);
                                                                             return;
                                                                         }
-                                                                        if let Ok(t_str) = std::str::from_utf8(&target_bytes) {
-                                                                            if let Ok(sa) = t_str.parse() {
-                                                                                dynamic_target = Some(TargetAddr::Ip(sa));
-                                                                            } else if let Some((h, p)) = t_str.rsplit_once(':')
-                                                                                && let Ok(port) = p.parse() {
-                                                                                    dynamic_target = Some(TargetAddr::Domain(h.to_string(), port));
-                                                                                }
+                                                                        if let Ok(t_str) = std::str::from_utf8(&target_bytes)
+                                                                            && let Ok(sa) = crate::tunnel::forward::parse_target_addr(t_str) {
+                                                                                dynamic_target = Some(sa);
                                                                         }
                                                                     }
                                                                 }
@@ -193,18 +187,7 @@ impl ServerRunner {
                                                 let valid_meta_target = if is_dummy_target { None } else { metadata.target };
 
                                                 let target_opt = dynamic_target.or(valid_meta_target).or_else(|| {
-                                                    default_target.and_then(|dt| {
-                                                        if let Ok(sa) = dt.parse() {
-                                                            Some(TargetAddr::Ip(sa))
-                                                        } else {
-                                                            let parts: Vec<&str> = dt.rsplitn(2, ':').collect();
-                                                            if parts.len() == 2 {
-                                                                parts[0].parse().ok().map(|p| TargetAddr::Domain(parts[1].to_string(), p))
-                                                            } else {
-                                                                None
-                                                            }
-                                                        }
-                                                    })
+                                                    default_target.and_then(|dt| crate::tunnel::forward::parse_target_addr(&dt).ok())
                                                 });
 
                                                 let target = match target_opt {
@@ -216,15 +199,12 @@ impl ServerRunner {
                                                 };
 
                                                 info!(target = %target, "Dialing forward target in local/internal network");
-                                                let dial_target_fut = TcpStream::connect(target.to_string());
+                                                let dial_target_fut = crate::platform::connect_target(&target);
                                                 let target_conn = match tokio::select! {
                                                     _ = conn_token.cancelled() => return,
                                                     res = dial_target_fut => res,
                                                 } {
-                                                    Ok(s) => {
-                                                        let _ = SocketTuner::tune_tcp_stream(&s, true, None);
-                                                        s
-                                                    }
+                                                    Ok(s) => s,
                                                     Err(e) => {
                                                         error!(target = %target, "Failed to connect to forward target: {:?}", e);
                                                         return;
@@ -232,7 +212,7 @@ impl ServerRunner {
                                                 };
 
                                                 let _ = RelayEngine::relay_with_cancel(
-                                                    Box::new(target_conn),
+                                                    target_conn,
                                                     stream,
                                                     conn_token,
                                                 ).await;
@@ -346,7 +326,7 @@ impl ServerRunner {
 
         info!(addr = %listen_addr, target = %target_addr, "Attempting to bind reverse listening port on server");
 
-        let listener = match TcpListener::bind(&listen_addr).await {
+        let mut listener = match crate::platform::GenericListener::bind(&listen_addr).await {
             Ok(l) => {
                 let _ = tokio::select! {
                     _ = cancel_token.cancelled() => return,
@@ -382,7 +362,6 @@ impl ServerRunner {
                 accept_res = listener.accept() => {
                     match accept_res {
                         Ok((visitor_stream, visitor_addr)) => {
-                            let _ = SocketTuner::tune_tcp_stream(&visitor_stream, true, None);
                             let session_id = format!(
                                 "sess_{}_{}",
                                 std::process::id(),
@@ -427,7 +406,7 @@ impl ServerRunner {
                                     Ok(Ok(data_stream)) => {
                                         info!(session = %session_id_clone, "Reverse data stream paired successfully. Starting relay.");
                                         let _ = RelayEngine::relay_with_cancel(
-                                            Box::new(visitor_stream),
+                                            visitor_stream,
                                             data_stream,
                                             token,
                                         ).await;

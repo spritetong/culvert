@@ -12,6 +12,7 @@ pub mod control;
 pub mod core;
 pub mod dialer;
 pub mod mux;
+pub mod platform;
 pub mod pool;
 pub mod server;
 pub mod session;

@@ -15,11 +15,11 @@ use micro_tunnel::transport::h3::H3Connector;
 use micro_tunnel::transport::h3::listener::H3Listener;
 use micro_tunnel::transport::{TargetAddr, TransportConnector, TransportListener};
 
-
 /// Helper to get an available ephemeral port from the OS that is free for both TCP and UDP.
 fn get_ephemeral_port() -> u16 {
     for _ in 0..100 {
-        let t = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral TCP port");
+        let t =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral TCP port");
         let port = t.local_addr().unwrap().port();
         if let Ok(u) = std::net::UdpSocket::bind(("127.0.0.1", port)) {
             drop(u);

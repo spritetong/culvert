@@ -24,6 +24,7 @@ pub use registry::TransportRegistry;
 pub enum TargetAddr {
     Ip(SocketAddr),
     Domain(String, u16),
+    Path(std::path::PathBuf),
 }
 
 impl std::fmt::Display for TargetAddr {
@@ -31,6 +32,7 @@ impl std::fmt::Display for TargetAddr {
         match self {
             TargetAddr::Ip(addr) => write!(f, "{}", addr),
             TargetAddr::Domain(host, port) => write!(f, "{}:{}", host, port),
+            TargetAddr::Path(path) => write!(f, "{}", path.display()),
         }
     }
 }

@@ -162,12 +162,14 @@ impl TlsConfigBuilder {
             }
             (Some(_), None) => {
                 return Err(TunnelError::Tls(
-                    "client_certificate is specified but client_key is missing for mTLS".to_string(),
+                    "client_certificate is specified but client_key is missing for mTLS"
+                        .to_string(),
                 ));
             }
             (None, Some(_)) => {
                 return Err(TunnelError::Tls(
-                    "client_key is specified but client_certificate is missing for mTLS".to_string(),
+                    "client_key is specified but client_certificate is missing for mTLS"
+                        .to_string(),
                 ));
             }
             (None, None) => builder.with_no_client_auth(),

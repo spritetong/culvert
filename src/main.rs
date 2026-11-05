@@ -41,10 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_config = match ConfigLoader::from_file(&cli.config) {
         Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!(
-                "Configuration error in '{:?}': {}",
-                cli.config, e
-            );
+            eprintln!("Configuration error in '{:?}': {}", cli.config, e);
             std::process::exit(1);
         }
     };
@@ -66,8 +63,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "error" => tracing::Level::ERROR,
         _ => tracing::Level::INFO,
     };
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(filter.as_str()));
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter.as_str()));
 
     let fmt_builder = tracing_subscriber::fmt()
         .with_env_filter(env_filter)
@@ -89,7 +86,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::runtime::Builder::new_current_thread()
         }
         Some(n) => {
-            info!(threads = n, "Configuring multi-threaded Tokio runtime with custom worker threads");
+            info!(
+                threads = n,
+                "Configuring multi-threaded Tokio runtime with custom worker threads"
+            );
             let mut b = tokio::runtime::Builder::new_multi_thread();
             b.worker_threads(n);
             b
@@ -113,33 +113,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime.block_on(run_daemon(app_config))
 }
 
-async fn run_daemon(app_config: micro_tunnel::config::model::AppConfig) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_daemon(
+    app_config: micro_tunnel::config::model::AppConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     let cancel_token = CancellationToken::new();
 
     // Listen for graceful shutdown signals (SIGINT / SIGTERM / Ctrl+C)
     let shutdown_token = cancel_token.clone();
     tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
-            let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
-
-            tokio::select! {
-                _ = sigint.recv() => {
-                    info!("Received SIGINT signal. Initiating graceful shutdown...");
-                }
-                _ = sigterm.recv() => {
-                    info!("Received SIGTERM signal. Initiating graceful shutdown...");
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            if let Ok(()) = tokio::signal::ctrl_c().await {
-                info!("Received termination signal (Ctrl+C). Initiating shutdown...");
-            }
-        }
+        micro_tunnel::platform::wait_for_shutdown_signal().await;
         shutdown_token.cancel();
     });
 

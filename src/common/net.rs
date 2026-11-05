@@ -25,13 +25,8 @@ impl SocketTuner {
 
         let sock_ref = SockRef::from(stream);
         let keepalive_time = keepalive.unwrap_or(Duration::from_secs(15));
-        #[allow(unused_mut)]
-        let mut ka = TcpKeepalive::new().with_time(keepalive_time);
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            ka = ka.with_interval(Duration::from_secs(5));
-        }
+        let ka = TcpKeepalive::new().with_time(keepalive_time);
+        let ka = crate::platform::configure_tcp_keepalive(ka);
 
         let _ = sock_ref.set_tcp_keepalive(&ka);
         Ok(())

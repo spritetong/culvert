@@ -17,11 +17,11 @@ use micro_tunnel::transport::h3::H3Connector;
 use micro_tunnel::transport::h3::listener::H3Listener;
 use micro_tunnel::transport::{TargetAddr, TransportConnector, TransportListener};
 
-
 /// Helper to get an available ephemeral port from the OS that is free for both TCP and UDP.
 fn get_ephemeral_port() -> u16 {
     for _ in 0..100 {
-        let t = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral TCP port");
+        let t =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral TCP port");
         let port = t.local_addr().unwrap().port();
         if let Ok(u) = std::net::UdpSocket::bind(("127.0.0.1", port)) {
             drop(u);
@@ -1028,7 +1028,12 @@ async fn test_h3_connector_recovers_after_server_restart() {
     let mut listener_2 = None;
     let mut last_err = None;
     for _ in 0..20 {
-        match H3Listener::bind(&listen_addr, Some(auth_token), None, server_rustls_2.clone()) {
+        match H3Listener::bind(
+            &listen_addr,
+            Some(auth_token),
+            None,
+            server_rustls_2.clone(),
+        ) {
             Ok(l) => {
                 listener_2 = Some(l);
                 break;
@@ -1039,7 +1044,8 @@ async fn test_h3_connector_recovers_after_server_restart() {
             }
         }
     }
-    let mut listener_2 = listener_2.unwrap_or_else(|| panic!("Failed to re-bind H3Listener on restart: {:?}", last_err));
+    let mut listener_2 = listener_2
+        .unwrap_or_else(|| panic!("Failed to re-bind H3Listener on restart: {:?}", last_err));
 
     let server_2_cancel = tokio_util::sync::CancellationToken::new();
     let s2_cancel = server_2_cancel.clone();

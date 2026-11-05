@@ -99,12 +99,9 @@ impl ServerListenSpec {
                 })
             }
             "uds" | "unix" => {
-                let socket_path = if rest.starts_with('/') {
-                    rest.to_string()
-                } else {
-                    format!("/{}", rest)
-                };
-                if socket_path.is_empty() || socket_path == "/" {
+                let socket_path = crate::platform::normalize_uds_path(rest);
+                let socket_path_str = socket_path.to_string_lossy().to_string();
+                if socket_path_str.is_empty() || socket_path_str == "/" {
                     return Err(crate::core::error::TunnelError::Config(format!(
                         "Invalid server listen URL '{}': socket file path must not be empty",
                         raw
@@ -112,7 +109,7 @@ impl ServerListenSpec {
                 }
                 Ok(Self {
                     scheme,
-                    bind_addr: socket_path,
+                    bind_addr: socket_path_str,
                     path: None,
                 })
             }
@@ -486,7 +483,10 @@ impl TlsConfig {
             return self.clone();
         };
         Self {
-            server_name: over.server_name.clone().or_else(|| self.server_name.clone()),
+            server_name: over
+                .server_name
+                .clone()
+                .or_else(|| self.server_name.clone()),
             insecure: over.insecure.or(self.insecure),
             alpn: over.alpn.clone().or_else(|| self.alpn.clone()),
             ca_certificate: over
@@ -498,7 +498,10 @@ impl TlsConfig {
                 .clone()
                 .or_else(|| self.client_certificate.clone()),
             client_key: over.client_key.clone().or_else(|| self.client_key.clone()),
-            certificate: over.certificate.clone().or_else(|| self.certificate.clone()),
+            certificate: over
+                .certificate
+                .clone()
+                .or_else(|| self.certificate.clone()),
             key: over.key.clone().or_else(|| self.key.clone()),
             min_version: over
                 .min_version
@@ -744,9 +747,8 @@ impl<'de> Deserialize<'de> for EndpointConfig {
                     tls: Option<TlsConfig>,
                 }
 
-                let helper = DetailedHelper::deserialize(
-                    serde::de::value::MapAccessDeserializer::new(map),
-                )?;
+                let helper =
+                    DetailedHelper::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
                 Ok(EndpointConfig::Detailed {
                     url: helper.url,
                     dns: helper.dns,

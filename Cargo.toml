@@ -43,6 +43,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "2"
 
+# Synchronization & Utilities
+scopeguard = "1.2"
+
 # TLS
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
@@ -64,7 +67,11 @@ h3-quinn = "0.0.10"
 rcgen = "0.14"
 hickory-resolver = { version = "0.26.3", default-features = false, features = ["tokio", "tls-ring", "https-ring", "webpki-roots", "system-config"] }
 
+[target.'cfg(windows)'.dependencies]
+uds_windows = "1"
+
 [dev-dependencies]
+tempfile = "3"
 criterion = { version = "0.8", features = ["async_tokio"] }
 
 [[bench]]

@@ -45,6 +45,9 @@ pub const HEADER_TARGET_HOST: &str = "x-target-host";
 /// HTTP Header key for dynamic target port forwarding.
 pub const HEADER_TARGET_PORT: &str = "x-target-port";
 
+/// HTTP Header key for dynamic target UDS path forwarding.
+pub const HEADER_TARGET_PATH: &str = "x-target-path";
+
 /// Value for forward mode in header.
 pub const TUNNEL_MODE_FORWARD: &str = "forward";
 

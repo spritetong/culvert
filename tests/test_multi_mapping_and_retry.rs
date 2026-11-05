@@ -17,7 +17,8 @@ use micro_tunnel::supervisor::TunnelSupervisor;
 
 /// Helper to get an available random ephemeral port assigned by the OS.
 fn get_available_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral port");
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral port");
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     port

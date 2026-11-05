@@ -31,10 +31,7 @@ impl ConfigLoader {
     /// Validates configuration constraints, semantic integrity, and fail-fast constraints.
     pub fn validate(config: &AppConfig) -> Result<(), TunnelError> {
         // 1. Top-level: config must define at least one server listener or one tunnel
-        let has_server = config
-            .server
-            .as_ref()
-            .is_some_and(|s| !s.listen.is_empty());
+        let has_server = config.server.as_ref().is_some_and(|s| !s.listen.is_empty());
         let has_tunnels = !config.tunnels.is_empty();
         if !has_server && !has_tunnels {
             return Err(TunnelError::Config(
@@ -54,7 +51,10 @@ impl ConfigLoader {
 
         // 3. Log level & output validation
         let level = config.log.level.to_lowercase();
-        if !matches!(level.as_str(), "trace" | "debug" | "info" | "warn" | "error") {
+        if !matches!(
+            level.as_str(),
+            "trace" | "debug" | "info" | "warn" | "error"
+        ) {
             return Err(TunnelError::Config(format!(
                 "Invalid log.level '{}'. Supported levels: trace, debug, info, warn, error",
                 config.log.level
@@ -87,12 +87,8 @@ impl ConfigLoader {
                     "dialer.connect_timeout must be greater than 0".to_string(),
                 ));
             }
-            #[cfg(not(target_os = "linux"))]
             if let Some(ref iface) = d.bind_interface {
-                return Err(TunnelError::Config(format!(
-                    "dialer.bind_interface '{}' is only supported on Linux (SO_BINDTODEVICE)",
-                    iface
-                )));
+                crate::platform::validate_bind_interface(iface)?;
             }
         }
 
@@ -152,14 +148,6 @@ impl ConfigLoader {
             }
 
             let specs = server.parse_specs()?;
-            for spec in &specs {
-                #[cfg(not(unix))]
-                if spec.is_uds() {
-                    return Err(TunnelError::UnsupportedScheme(
-                        "Unix Domain Sockets (uds:// or unix://) are only supported on Unix platforms (Linux/macOS)".to_string(),
-                    ));
-                }
-            }
 
             // Reject TLS cert configuration if all server listeners are plaintext ws:// or uds://
             let any_tls_listener = specs
@@ -184,7 +172,9 @@ impl ConfigLoader {
 
         for tunnel in &config.tunnels {
             if tunnel.tag.trim().is_empty() {
-                return Err(TunnelError::Config("Tunnel 'tag' must not be empty".to_string()));
+                return Err(TunnelError::Config(
+                    "Tunnel 'tag' must not be empty".to_string(),
+                ));
             }
             if !seen_tags.insert(&tunnel.tag) {
                 return Err(TunnelError::Config(format!(
@@ -263,14 +253,14 @@ impl ConfigLoader {
             for mapping in &tunnel.mappings {
                 let _ = crate::tunnel::forward::parse_target_addr(&mapping.listen).map_err(|_| {
                     TunnelError::Config(format!(
-                        "tunnel '{}': invalid listen address '{}' in mapping. Expected 'host:port' or 'ip:port'",
+                        "tunnel '{}': invalid listen address '{}' in mapping. Expected 'host:port', 'ip:port', or socket path",
                         tunnel.tag, mapping.listen
                     ))
                 })?;
 
                 let _ = crate::tunnel::forward::parse_target_addr(&mapping.target).map_err(|_| {
                     TunnelError::Config(format!(
-                        "tunnel '{}': invalid target address '{}' in mapping. Expected 'host:port' or 'ip:port'",
+                        "tunnel '{}': invalid target address '{}' in mapping. Expected 'host:port', 'ip:port', or socket path",
                         tunnel.tag, mapping.target
                     ))
                 })?;
@@ -299,17 +289,10 @@ impl ConfigLoader {
                 )));
             }
 
-            if (ep.scheme == "uds" || ep.scheme == "unix") && (ep.path.is_empty() || ep.path == "/") {
+            if (ep.scheme == "uds" || ep.scheme == "unix") && (ep.path.is_empty() || ep.path == "/")
+            {
                 return Err(TunnelError::Config(format!(
                     "tunnel '{}': Unix Domain Socket endpoint URL must include a socket file path (e.g. uds:///run/tunnel.sock)",
-                    tunnel.tag
-                )));
-            }
-
-            #[cfg(not(unix))]
-            if ep.scheme == "uds" || ep.scheme == "unix" {
-                return Err(TunnelError::UnsupportedScheme(format!(
-                    "tunnel '{}': Unix Domain Sockets (uds:// or unix://) are only supported on Unix platforms (Linux/macOS)",
                     tunnel.tag
                 )));
             }
@@ -343,12 +326,8 @@ impl ConfigLoader {
                             tunnel.tag
                         )));
                     }
-                    #[cfg(not(target_os = "linux"))]
                     if let Some(ref iface) = dl.bind_interface {
-                        return Err(TunnelError::Config(format!(
-                            "tunnel '{}': dialer.bind_interface '{}' is only supported on Linux (SO_BINDTODEVICE)",
-                            tunnel.tag, iface
-                        )));
+                        crate::platform::validate_bind_interface(iface)?;
                     }
                 }
             }
@@ -391,7 +370,11 @@ impl ConfigLoader {
         Ok(())
     }
 
-    fn validate_pem_private_key(path: &Path, file_role: &str, context: &str) -> Result<(), TunnelError> {
+    fn validate_pem_private_key(
+        path: &Path,
+        file_role: &str,
+        context: &str,
+    ) -> Result<(), TunnelError> {
         if !path.exists() {
             return Err(TunnelError::Config(format!(
                 "{}: {} file not found: {:?}",
@@ -503,7 +486,10 @@ impl ConfigLoader {
 
                 if let crate::config::model::DnsResolverConfig::Detailed(d) = resolver {
                     let t = d.r#type.to_lowercase();
-                    if !matches!(t.as_str(), "https" | "tls" | "udp" | "dns" | "tcp" | "system") {
+                    if !matches!(
+                        t.as_str(),
+                        "https" | "tls" | "udp" | "dns" | "tcp" | "system"
+                    ) {
                         return Err(TunnelError::Config(format!(
                             "{}: unsupported DNS resolver type '{}'. Supported types: https, tls, udp, tcp, system",
                             context, d.r#type
@@ -805,7 +791,11 @@ tunnels:
 "#;
         let res = ConfigLoader::from_yaml_str(yaml_tags);
         assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("Duplicate tunnel tag"));
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("Duplicate tunnel tag")
+        );
 
         // Duplicate forward mapping listen port
         let yaml_ports = r#"
@@ -911,7 +901,11 @@ server:
 "#;
         let res = ConfigLoader::from_yaml_str(yaml_server_empty_token);
         assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("server.token must not be empty"));
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("server.token must not be empty")
+        );
 
         let yaml_tunnel_empty_token = r#"
 tunnels:
@@ -925,7 +919,11 @@ tunnels:
 "#;
         let res2 = ConfigLoader::from_yaml_str(yaml_tunnel_empty_token);
         assert!(res2.is_err());
-        assert!(res2.unwrap_err().to_string().contains("token must not be empty"));
+        assert!(
+            res2.unwrap_err()
+                .to_string()
+                .contains("token must not be empty")
+        );
     }
 
     #[test]
@@ -937,7 +935,11 @@ server:
 "#;
         let res = ConfigLoader::from_yaml_str(yaml);
         assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("server.default_target"));
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("server.default_target")
+        );
     }
 
     #[test]
@@ -953,7 +955,11 @@ tunnels:
 "#;
         let res = ConfigLoader::from_yaml_str(yaml);
         assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("Unix Domain Socket endpoint URL must include a socket file path"));
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("Unix Domain Socket endpoint URL must include a socket file path")
+        );
     }
 
     #[test]
@@ -972,6 +978,49 @@ tunnels:
 "#;
         let res = ConfigLoader::from_yaml_str(yaml);
         assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("failover is not wired into the data path yet"));
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("failover is not wired into the data path yet")
+        );
+    }
+
+    #[test]
+    fn test_accept_server_uds_url() {
+        let yaml = r#"
+server:
+  listen: "uds:///tmp/tunnel.sock"
+"#;
+        let res = ConfigLoader::from_yaml_str(yaml);
+        assert!(res.is_ok());
+        let cfg = res.unwrap();
+        let specs = cfg.server.unwrap().parse_specs().unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].scheme, "uds");
+        assert!(specs[0].is_uds());
+    }
+
+    #[test]
+    fn test_accept_mapping_with_uds_listen_or_target() {
+        let yaml = r#"
+tunnels:
+  - tag: "uds-mapping-tunnel"
+    endpoint: "ws://127.0.0.1:8080/tunnel"
+    mappings:
+      - mode: "forward"
+        listen: "/tmp/forward_listen.sock"
+        target: "127.0.0.1:8080"
+      - mode: "forward"
+        listen: "127.0.0.1:18080"
+        target: "/tmp/forward_target.sock"
+      - mode: "reverse"
+        listen: "/tmp/reverse_listen.sock"
+        target: "/tmp/reverse_target.sock"
+"#;
+        let res = ConfigLoader::from_yaml_str(yaml);
+        assert!(res.is_ok());
+        let cfg = res.unwrap();
+        let tunnel = &cfg.tunnels[0];
+        assert_eq!(tunnel.mappings.len(), 3);
     }
 }

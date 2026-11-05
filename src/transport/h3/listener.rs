@@ -44,16 +44,29 @@ impl H3Listener {
             use std::net::ToSocketAddrs;
             clean_addr
                 .to_socket_addrs()
-                .map_err(|e| TunnelError::Config(format!("Invalid listen address '{}': {}", listen_addr, e)))?
+                .map_err(|e| {
+                    TunnelError::Config(format!("Invalid listen address '{}': {}", listen_addr, e))
+                })?
                 .next()
-                .ok_or_else(|| TunnelError::Config(format!("Listen address '{}' resolved to no socket addresses", listen_addr)))
+                .ok_or_else(|| {
+                    TunnelError::Config(format!(
+                        "Listen address '{}' resolved to no socket addresses",
+                        listen_addr
+                    ))
+                })
         })?;
 
         let is_quic_listener = listen_addr.starts_with("quic://");
         let mut rustls_server = server_rustls_config;
         if is_quic_listener {
-            if !rustls_server.alpn_protocols.iter().any(|p| p == b"micro-tunnel-quic") {
-                rustls_server.alpn_protocols.push(b"micro-tunnel-quic".to_vec());
+            if !rustls_server
+                .alpn_protocols
+                .iter()
+                .any(|p| p == b"micro-tunnel-quic")
+            {
+                rustls_server
+                    .alpn_protocols
+                    .push(b"micro-tunnel-quic".to_vec());
             }
         } else {
             // For H3 or generic listen addresses, ensure h3 is prioritized at index 0
@@ -66,8 +79,14 @@ impl H3Listener {
                 rustls_server.alpn_protocols.insert(0, b"h3".to_vec());
             }
             // Retain micro-tunnel-quic fallback so raw QUIC clients can still negotiate
-            if !rustls_server.alpn_protocols.iter().any(|p| p == b"micro-tunnel-quic") {
-                rustls_server.alpn_protocols.push(b"micro-tunnel-quic".to_vec());
+            if !rustls_server
+                .alpn_protocols
+                .iter()
+                .any(|p| p == b"micro-tunnel-quic")
+            {
+                rustls_server
+                    .alpn_protocols
+                    .push(b"micro-tunnel-quic".to_vec());
             }
         }
 
@@ -321,16 +340,12 @@ impl H3Listener {
                                     .headers()
                                     .get("x-tunnel-target")
                                     .and_then(|v| v.to_str().ok())
-                                    .and_then(|s| {
-                                        if let Ok(addr) = s.parse::<SocketAddr>() {
-                                            Some(TargetAddr::Ip(addr))
-                                        } else if let Some((h, p)) = s.split_once(':') {
-                                            p.parse::<u16>()
-                                                .ok()
-                                                .map(|port| TargetAddr::Domain(h.to_string(), port))
-                                        } else {
-                                            None
-                                        }
+                                    .and_then(|s| crate::tunnel::forward::parse_target_addr(s).ok())
+                                    .or_else(|| {
+                                        req.headers()
+                                            .get(crate::consts::HEADER_TARGET_PATH)
+                                            .and_then(|v| v.to_str().ok())
+                                            .map(|p| TargetAddr::Path(std::path::PathBuf::from(p)))
                                     })
                                     .or_else(|| {
                                         let host = req

@@ -25,19 +25,38 @@ pub struct Endpoint {
 impl Endpoint {
     /// Parses an endpoint URL string into a structured `Endpoint`.
     pub fn parse(url_str: &str) -> Result<Self, TunnelError> {
-        let parsed = Url::parse(url_str)?;
-        let scheme = parsed.scheme().to_lowercase();
-        let host = if scheme == "uds" || scheme == "unix" {
-            let h = parsed.host_str().unwrap_or("");
-            if h.is_empty() { "localhost".to_string() } else { h.to_string() }
+        let scheme = if let Some(idx) = url_str.find("://") {
+            url_str[..idx].to_lowercase()
         } else {
-            parsed
-                .host_str()
-                .ok_or_else(|| {
-                    TunnelError::Config(format!("Missing host in endpoint URL: {}", url_str))
-                })?
-                .to_string()
+            return Err(TunnelError::Config(format!(
+                "Missing scheme in endpoint URL: {}",
+                url_str
+            )));
         };
+
+        if scheme == "uds" || scheme == "unix" {
+            let path_raw = &url_str[scheme.len() + 3..];
+            let norm_path = crate::platform::normalize_uds_path(path_raw);
+            let mut path_str = norm_path.to_string_lossy().to_string();
+            if path_str.is_empty() {
+                path_str = "/".to_string();
+            }
+            return Ok(Self {
+                scheme,
+                host: "localhost".to_string(),
+                port: 0,
+                path: path_str,
+                query: None,
+            });
+        }
+
+        let parsed = Url::parse(url_str)?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| {
+                TunnelError::Config(format!("Missing host in endpoint URL: {}", url_str))
+            })?
+            .to_string();
 
         let port = parsed.port().unwrap_or(match scheme.as_str() {
             "https" | "wss" | "h3" | "quic" => 443,

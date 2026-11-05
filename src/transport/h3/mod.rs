@@ -44,7 +44,11 @@ impl TransportDriver for H3TransportDriver {
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
         let mut alpn = tls
             .and_then(|t| t.alpn.as_ref())
-            .map(|list| list.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>())
+            .map(|list| {
+                list.iter()
+                    .map(|s| s.as_bytes().to_vec())
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         if !alpn.iter().any(|p| p == b"h3") {
             alpn.push(b"h3".to_vec());

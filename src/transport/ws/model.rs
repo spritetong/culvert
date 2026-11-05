@@ -9,9 +9,9 @@ use http::request::Builder as RequestBuilder;
 
 use crate::config::model::TunnelMode;
 use crate::consts::{
-    HEADER_SESSION_ID, HEADER_TARGET_HOST, HEADER_TARGET_PORT, HEADER_TUNNEL_AUTH,
-    HEADER_TUNNEL_MODE, HEADER_TUNNEL_POOL, TUNNEL_MODE_FORWARD, TUNNEL_MODE_REVERSE_CTRL,
-    TUNNEL_MODE_REVERSE_DATA, TUNNEL_POOL_IDLE,
+    HEADER_SESSION_ID, HEADER_TARGET_HOST, HEADER_TARGET_PATH, HEADER_TARGET_PORT,
+    HEADER_TUNNEL_AUTH, HEADER_TUNNEL_MODE, HEADER_TUNNEL_POOL, TUNNEL_MODE_FORWARD,
+    TUNNEL_MODE_REVERSE_CTRL, TUNNEL_MODE_REVERSE_DATA, TUNNEL_POOL_IDLE,
 };
 use crate::core::error::TunnelError;
 use crate::transport::{StreamMetadata, TargetAddr};
@@ -24,6 +24,7 @@ pub struct WsHandshakeHeaders {
     pub session_id: Option<String>,
     pub target_host: Option<String>,
     pub target_port: Option<u16>,
+    pub target_path: Option<String>,
     pub pool_idle: bool,
 }
 
@@ -36,6 +37,7 @@ impl WsHandshakeHeaders {
             session_id: None,
             target_host: None,
             target_port: None,
+            target_path: None,
             pool_idle: false,
         }
     }
@@ -59,10 +61,17 @@ impl WsHandshakeHeaders {
                 TargetAddr::Ip(sa) => {
                     self.target_host = Some(sa.ip().to_string());
                     self.target_port = Some(sa.port());
+                    self.target_path = None;
                 }
                 TargetAddr::Domain(host, port) => {
                     self.target_host = Some(host.clone());
                     self.target_port = Some(*port);
+                    self.target_path = None;
+                }
+                TargetAddr::Path(path) => {
+                    self.target_host = None;
+                    self.target_port = None;
+                    self.target_path = Some(path.to_string_lossy().to_string());
                 }
             }
         }
@@ -112,6 +121,11 @@ impl WsHandshakeHeaders {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u16>().ok());
 
+        let target_path = headers
+            .get(HEADER_TARGET_PATH)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
         let pool_idle = headers
             .get(HEADER_TUNNEL_POOL)
             .and_then(|v| v.to_str().ok())
@@ -124,6 +138,7 @@ impl WsHandshakeHeaders {
             session_id,
             target_host,
             target_port,
+            target_path,
             pool_idle,
         })
     }
@@ -164,20 +179,28 @@ impl WsHandshakeHeaders {
             builder = builder.header(HEADER_TARGET_PORT, port.to_string());
         }
 
+        if let Some(ref path) = self.target_path {
+            builder = builder.header(HEADER_TARGET_PATH, path);
+        }
+
         builder
     }
 
     /// Converts the handshake headers into unified `StreamMetadata`.
     pub fn to_stream_metadata(&self) -> StreamMetadata {
-        let target = match (&self.target_host, self.target_port) {
-            (Some(host), Some(port)) => {
-                if let Ok(ip) = host.parse() {
-                    Some(TargetAddr::Ip(std::net::SocketAddr::new(ip, port)))
-                } else {
-                    Some(TargetAddr::Domain(host.clone(), port))
+        let target = if let Some(ref path) = self.target_path {
+            Some(TargetAddr::Path(std::path::PathBuf::from(path)))
+        } else {
+            match (&self.target_host, self.target_port) {
+                (Some(host), Some(port)) => {
+                    if let Ok(ip) = host.parse() {
+                        Some(TargetAddr::Ip(std::net::SocketAddr::new(ip, port)))
+                    } else {
+                        Some(TargetAddr::Domain(host.clone(), port))
+                    }
                 }
+                _ => None,
             }
-            _ => None,
         };
 
         StreamMetadata {

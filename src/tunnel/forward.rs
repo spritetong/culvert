@@ -6,11 +6,9 @@
 
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::common::net::SocketTuner;
 use crate::common::task::TaskTracker;
 use crate::config::model::{TunnelConfig, TunnelMode};
 use crate::core::error::TunnelError;
@@ -31,6 +29,17 @@ impl Drop for ActiveStreamGuard {
 
 /// Helper to parse target address string.
 pub fn parse_target_addr(target_str: &str) -> Result<TargetAddr, TunnelError> {
+    if crate::platform::is_uds_path(target_str) {
+        let path = crate::platform::normalize_uds_path(target_str);
+        if path.as_os_str().is_empty() {
+            return Err(TunnelError::Config(format!(
+                "Invalid target UDS path: {}",
+                target_str
+            )));
+        }
+        return Ok(TargetAddr::Path(path));
+    }
+
     if let Ok(sa) = target_str.parse() {
         Ok(TargetAddr::Ip(sa))
     } else {
@@ -67,7 +76,7 @@ pub async fn run_forward_mapping(
         "Starting forward tunnel listener"
     );
 
-    let listener = TcpListener::bind(&listen).await?;
+    let mut listener = crate::platform::GenericListener::bind(&listen).await?;
     let mut conn_tracker = TaskTracker::<()>::new(cancel_token.clone());
     let target = parse_target_addr(&target_str)?;
 
@@ -97,7 +106,6 @@ pub async fn run_forward_mapping(
             accept_res = listener.accept() => {
                 match accept_res {
                     Ok((inbound_stream, peer_addr)) => {
-                        let _ = SocketTuner::tune_tcp_stream(&inbound_stream, true, None);
                         info!(tag = %tag, peer = %peer_addr, "Inbound connection accepted");
                         let target = target.clone();
                         let pool_clone = pool.clone();
@@ -144,7 +152,7 @@ pub async fn run_forward_mapping(
                                     }
 
                                     let _ = RelayEngine::relay_with_cancel(
-                                        Box::new(inbound_stream),
+                                        inbound_stream,
                                         remote_stream,
                                         conn_token,
                                     ).await;

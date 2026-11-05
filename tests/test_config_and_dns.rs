@@ -19,7 +19,8 @@ fn test_complex_yaml_config_parsing() {
     #[cfg(not(target_os = "linux"))]
     let iface_line = "";
 
-    let yaml = format!(r#"
+    let yaml = format!(
+        r#"
 log:
   level: "debug"
   output: "stdout"
@@ -76,7 +77,9 @@ tunnels:
         target: "internal.corp:80"
     token: "tunnel_secret_token_2"
     endpoint: "ws://10.0.0.1:8080/tunnel"
-"#, iface_line);
+"#,
+        iface_line
+    );
 
     let app_config = ConfigLoader::from_yaml_str(&yaml).expect("Failed to parse complex YAML");
 
@@ -288,7 +291,8 @@ dns:
         strategy: Some(DnsStrategy::Ipv4Only),
         resolvers: Some(resolvers),
         cache_capacity: Some(100),
-    }).unwrap();
+    })
+    .unwrap();
     let fast_path2 = structured_resolver.resolve("1.1.1.1").await.unwrap();
     assert_eq!(
         fast_path2,
@@ -320,7 +324,11 @@ server:
 "#;
     let res = ConfigLoader::from_yaml_str(yaml);
     assert!(res.is_err());
-    assert!(res.unwrap_err().to_string().contains("dns.cache_capacity must be at least 1"));
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("dns.cache_capacity must be at least 1")
+    );
 }
 
 #[test]
@@ -333,7 +341,11 @@ server:
 "#;
     let res = ConfigLoader::from_yaml_str(yaml);
     assert!(res.is_err());
-    assert!(res.unwrap_err().to_string().contains("dialer.connect_timeout must be greater than 0"));
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("dialer.connect_timeout must be greater than 0")
+    );
 }
 
 #[tokio::test]
@@ -348,7 +360,8 @@ async fn test_empty_server_listen_with_tunnels_does_not_exit_prematurely() {
         .local_addr()
         .unwrap()
         .port();
-    let yaml = format!(r#"
+    let yaml = format!(
+        r#"
 server:
   listen: []
 tunnels:
@@ -361,8 +374,11 @@ tunnels:
       - mode: "forward"
         listen: "127.0.0.1:{}"
         target: "127.0.0.1:{}"
-"#, port_listen, port_listen, port_target);
-    let config = ConfigLoader::from_yaml_str(&yaml).expect("Failed to parse config with empty server listen");
+"#,
+        port_listen, port_listen, port_target
+    );
+    let config = ConfigLoader::from_yaml_str(&yaml)
+        .expect("Failed to parse config with empty server listen");
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let shutdown_token = cancel_token.clone();
 
@@ -379,14 +395,22 @@ tunnels:
     let elapsed = start.elapsed();
 
     // Verify it did not exit immediately in 16ms, but stayed alive until cancel_token was triggered
-    assert!(elapsed >= std::time::Duration::from_millis(250), "Supervisor exited too quickly: {:?}", elapsed);
-    assert!(res.is_ok(), "Supervisor should exit cleanly on cancellation: {:?}", res);
+    assert!(
+        elapsed >= std::time::Duration::from_millis(250),
+        "Supervisor exited too quickly: {:?}",
+        elapsed
+    );
+    assert!(
+        res.is_ok(),
+        "Supervisor should exit cleanly on cancellation: {:?}",
+        res
+    );
 }
 
 #[test]
 fn test_cached_dns_resolver_try_new_rejects_missing_server() {
-    use micro_tunnel::dialer::dns::CachedDnsResolver;
     use micro_tunnel::config::model::{DnsConfig, DnsResolverConfig, DnsServerConfig};
+    use micro_tunnel::dialer::dns::CachedDnsResolver;
 
     let dns_cfg = DnsConfig {
         strategy: None,
@@ -416,9 +440,12 @@ server:
     - "ws://127.0.0.1:19702/admin"
     - "https://[::1]:8443/h3"
 "#;
-    let config = ConfigLoader::from_yaml_str(yaml).expect("Failed to parse valid server listen URLs");
+    let config =
+        ConfigLoader::from_yaml_str(yaml).expect("Failed to parse valid server listen URLs");
     let server = config.server.expect("Server config should be present");
-    let specs = server.parse_specs().expect("Failed to parse server listen specs");
+    let specs = server
+        .parse_specs()
+        .expect("Failed to parse server listen specs");
     assert_eq!(specs.len(), 3);
     assert_eq!(specs[0].scheme, "ws");
     assert_eq!(specs[0].bind_addr, "0.0.0.0:19702");
@@ -432,5 +459,3 @@ server:
     assert_eq!(specs[2].bind_addr, "[::1]:8443");
     assert_eq!(specs[2].path.as_deref(), Some("/h3"));
 }
-
-
