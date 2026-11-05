@@ -66,18 +66,22 @@
 * **FR-1.2 WSS 兼容回退传输**：
   * 基于高性能 `fastwebsockets` 实现标准 WebSocket（TCP 443）全双工二进制帧传输。
   * 支持 AVX2/NEON 硬件 SIMD 掩码加速，当 UDP 受阻时自动平滑降级至 WSS。
-* **FR-1.3 IPC 极速互联 (UDS，仅限 Unix/Linux)**：
-  * 服务端与 Caddy 之间严格走 Unix Domain Socket (`/run/tunnel.sock`)，免去内核网络协议栈封包、校验和计算与端口耗尽风险。
+* **FR-1.3 跨平台 IPC 极速互联 (Unix Domain Socket - UDS)**：
+  * 服务端与 Caddy/Nginx 之间走 Unix Domain Socket（如 Linux/macOS 的 `/run/tunnel.sock` 或 Windows 的 `C:/temp/tunnel.sock`），免去内核网络协议栈封包、校验和计算与端口耗尽风险。
+  * **全平台原生支持**：支持 Unix（Linux/macOS）以及 Windows（Windows 10 17063+ / Windows 11 / Server 2019+，基于 WinSock `AF_UNIX`），统一封装于内部 `platform` 模块，保障 100% Tokio 取消安全且零线程泄露。
 
 ### 3.2 统一 URL 解析、Server 显式协议与 Endpoint 专属绑定
-* **FR-2.1 Server 显式协议 URL 与 Path 路由校验**：
-  * Server 的 `listen` 字段采用严格的 Full URL 格式（如 `ws://0.0.0.0:8080/tunnel`, `h3://0.0.0.0:8443/tunnel`, `uds:///run/tunnel.sock`），不再支持隐式无协议写法。
-  * 支持数组声明多个 Listen URLs，服务端自动启动对应的异构协议监听。
+* **FR-2.1 Server 监听配置（结构化正交配置与显式协议 URL）与 Path 路由校验**：
+  * Server 的 `listen` 字段支持**结构化正交配置**（`transport: uds/tcp`, `protocol: ws`, `socket`/`bind`, `path`, `chmod`）与**显式协议 URL 格式**（如 `ws://0.0.0.0:8080/tunnel`, `h3://0.0.0.0:8443/tunnel`, `uds:///run/tunnel.sock`, 复合协议 `ws+unix:///run/a.sock?path=/tunnel&chmod=0o660`）。
+  * 彻底解耦 L4 传输介质（TCP/UDS）与 L7 应用协议（WebSocket/H3）及 HTTP URI Path 路由，消除 Windows 盘符与路径斜杠歧义。
+  * 支持在 Unix 平台上为 UDS 套接字指定权限模式（`chmod: 0o660` 或 `?chmod=0o660`）。
+  * 支持数组声明多个 Listen 端点，服务端自动启动对应的异构协议监听。
   * **Path 路由伪装**：客户端发起请求的 URI Path 必须与服务端精确匹配；不匹配时直接以标准 **HTTP 404 Not Found** 响应，防范未授权扫描。
 * **FR-2.2 可选 Token 鉴权 (Optional Auth)**：
   * Server 与 Tunnel 的 `token` 字段均为可选。未配置或设为 null 时跳过鉴权（空字符串 "" 会在加载期被拒绝），方便内网通信或前置由 Caddy/Nginx 执行鉴权。
 * **FR-2.3 标准化 URL 与复合 Endpoint 解析**：
-  * 支持统一解析各种端点 URL：如 `ws://...`、`wss://...`、`https://...`、`h3://...`、`quic://...`、`uds://...`、`unix://...`（其中 `uds`/`unix` 仅支持 Unix 平台）。
+  * 支持统一解析各种端点 URL：如 `ws://...`、`wss://...`、`https://...`、`h3://...`、`quic://...`、`uds://...`、`unix://...`、`ws+uds://...`、`ws+unix://...`（全平台统一支持，无 OS 差别）。
+  * 端口映射（`mappings`）中的 `listen` 与 `target` 同样全平台支持 UDS 套接字路径（如 `/run/app.sock` 或 `C:/temp/backend.sock`）。
   * 支持将 `endpoint` 配置为简易 URL 字符串，或绑定独立上下文的高级对象结构。
 * **FR-2.4 丰富的主机名与 DNS 解析支持 (wstunnel 兼容规范)**：
   * 支持多种主流 DNS 协议类型：
@@ -165,8 +169,16 @@ tls:
 
 # 服务端 Ingress 配置 (支持与客户端 tunnels 共存同一配置)
 server:
-  # 必须使用带显式协议的完整 URL，支持 URI Path 路由 (ws, wss, h3, quic, uds)
+  # 支持结构化正交配置与显式协议 URL (支持 URI Path 路由与复合协议)
   listen:
+    # 结构化解耦配置 (推荐)
+    - transport: "uds"
+      protocol: "ws"
+      socket: "/run/tunnel.sock"
+      path: "/tunnel"
+      chmod: 0o660
+    # 复合与标准 URL
+    - "ws+unix:///run/tunnel2.sock?path=/tunnel"
     - "wss://0.0.0.0:8443/tunnel"
     - "h3://0.0.0.0:8443/tunnel"
     - "ws://127.0.0.1:8080/tunnel"

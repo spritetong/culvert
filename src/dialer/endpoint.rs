@@ -34,9 +34,14 @@ impl Endpoint {
             )));
         };
 
-        if scheme == "uds" || scheme == "unix" {
+        if scheme == "uds" || scheme == "unix" || scheme == "ws+uds" || scheme == "ws+unix" {
             let path_raw = &url_str[scheme.len() + 3..];
-            let norm_path = crate::platform::normalize_uds_path(path_raw);
+            let (path_part, query_part) = if let Some(q_idx) = path_raw.find('?') {
+                (&path_raw[..q_idx], Some(path_raw[q_idx + 1..].to_string()))
+            } else {
+                (path_raw, None)
+            };
+            let norm_path = crate::platform::normalize_uds_path(path_part);
             let mut path_str = norm_path.to_string_lossy().to_string();
             if path_str.is_empty() {
                 path_str = "/".to_string();
@@ -46,7 +51,7 @@ impl Endpoint {
                 host: "localhost".to_string(),
                 port: 0,
                 path: path_str,
-                query: None,
+                query: query_part,
             });
         }
 

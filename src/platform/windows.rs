@@ -133,3 +133,8 @@ pub async fn connect_uds(path: &Path) -> io::Result<Box<dyn TunnelStream>> {
     let stream = TcpStream::from_std(std_tcp)?;
     Ok(Box::new(stream))
 }
+
+/// Sets filesystem permissions mode on a socket (no-op on Windows).
+pub fn set_socket_permissions(_path: &Path, _mode: u32) -> io::Result<()> {
+    Ok(())
+}

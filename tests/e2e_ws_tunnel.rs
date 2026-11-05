@@ -80,7 +80,7 @@ async fn test_forward_tunnel_ws_e2e() {
     let session_mgr = Arc::new(SessionManager::new());
 
     let server_config = ServerConfig {
-        listen: vec![format!("ws://{}/tunnel", server_listen)],
+        listen: vec![format!("ws://{}/tunnel", server_listen).into()],
         token: Some(auth_token.to_string()),
         default_target: None,
         ..Default::default()
@@ -173,7 +173,7 @@ async fn test_reverse_tunnel_ws_e2e() {
     let session_mgr = Arc::new(SessionManager::new());
 
     let server_config = ServerConfig {
-        listen: vec![format!("ws://{}/tunnel", server_ws_listen)],
+        listen: vec![format!("ws://{}/tunnel", server_ws_listen).into()],
         token: Some(auth_token.to_string()),
         default_target: None,
         ..Default::default()
@@ -265,7 +265,7 @@ async fn test_supervisor_multi_tunnel_concurrency_e2e() {
     // 1. Configure AppConfig with Server + Forward Tunnel + Reverse Tunnel concurrently
     let mut app_config = AppConfig {
         server: Some(ServerConfig {
-            listen: vec![format!("ws://127.0.0.1:{}/ws", server_ws_port)],
+            listen: vec![format!("ws://127.0.0.1:{}/ws", server_ws_port).into()],
             token: Some(auth_token.to_string()),
             default_target: None,
             ..Default::default()

@@ -845,6 +845,10 @@ micro-tunnel/
     ├── pool/                   # 连接池
     │   ├── mod.rs              # StreamPool Trait
     │   └── connection_pool.rs  # 具备 Draining 排空协议的 WSS 连接池
+    ├── platform/               # 跨平台 OS 系统隔离层（所有 #[cfg] 严格收敛于此）
+    │   ├── mod.rs              # GenericListener, is_uds_path, normalize_uds_path
+    │   ├── unix.rs             # Unix 原生 UnixListener / UnixStream / 信号集成
+    │   └── windows.rs          # Windows WinSock AF_UNIX 专用线程 + MPSC 通道与 IOCP 桥接
     ├── session/                # 会话配对
     │   ├── mod.rs
     │   └── manager.rs          # SessionManager (DashMap 内存路由表)
@@ -893,3 +897,29 @@ micro-tunnel/
 * 针对正向监听、反向访客入站、服务端代理回拨、本地目标回拨的所有 TCP Stream，在连接建立或 `accept()` 的第一时刻立即通过 `SocketTuner` 强制应用：
   - `set_nodelay(true)`：彻底禁用 Nagle 延迟缓冲算法，杜绝 40ms~200ms ACK 延迟；
   - `socket2::TcpKeepalive`：自动配置 15s 空闲保活与探测间隔，及时清理网络死连接并防范中间 NAT 超时掉线。
+
+### 10.6 跨平台 Unix Domain Socket (UDS) 隔离架构与 Windows AF_UNIX Cancel-Safe 引擎
+* **架构隔离原则（Zero External `#[cfg]`）**：
+  * 将所有操作系统相关差异（套接字绑定、Keepalive 配置、Linux SO_BINDTODEVICE 网卡绑定、进程退出信号捕捉）完全内聚收敛于 `src/platform/` 模块；
+  * `src/platform/` 外部的所有核心模块（`main.rs`, `server/runner.rs`, `tunnel/`, `dialer/`, `transport/uds.rs`）一律禁止出现平台条件编译宏 `#[cfg(windows)]` 或 `#[cfg(unix)]`，彻底保持业务与传输驱动代码的纯粹性与平台正交性。
+* **Windows AF_UNIX 内核特性攻坚与 Cancel-Safe 保证**：
+  * **WinSock 内核限制**：Windows 10 (17063+) 及更高版本虽然引入了 `afunix.sys` 支持，但其 AF_UNIX 监听套接字不支持重叠 I/O 的 `AcceptEx`，导致常规基于 IOCP 的异步 `accept()` 会失败；
+  * **传统 `spawn_blocking` 的取消陷阱**：若在 `tokio::select!` 循环中反复调用 `spawn_blocking(l.accept)`，当其他分支（如 TaskTracker 的退出信号）命中时，先前被 drop 的 Future 不会也无法取消阻塞在内核 `WSAAccept` 的操作系统线程，导致大量线程泄漏并永远锁定 socket 文件句柄；
+  * **专用常驻线程 + Tokio MPSC 通道方案**：
+    - Windows 端 `PlatformUdsListener` 在启动时创建且仅创建一个常驻操作系统后台线程，以独占同步阻塞模式执行 `std::os::windows::io` 的套接字 `accept()`；
+    - 接收到的连接通过 Tokio `mpsc::channel(32)` 安全、非阻塞地派发给 Tokio 运行时执行；
+    - 对外部调用者呈现与标准异步监听器完全相同的 `async fn accept(&mut self)` 接口，具备 **100% Cancel-Safe（取消安全）**，即使在 `select!` 中频繁被丢弃也不会泄漏任何内核线程；
+    - **干净析构与清理**：在 Drop 时，原子标记 `closed = true`，主动通过一次虚拟轻量级 `UnixStream::connect` 唤醒阻塞在内核 `accept()` 的后台线程，随后删除 socket 文件并执行 `thread.join()`，确保无文件残留与无进程挂起。
+
+### 10.7 结构化 Server Listen 配置与复合 URI 协议规范
+* **传输层与应用层协议彻底解耦**：
+  * 传统 `uds:///path` 格式虽然简洁，但隐藏了“在 UDS 传输层上运行 WebSocket 协议”这一应用层事实；
+  * 引入 `StructuredListenConfig` 结构化配置，通过正交字段分离关注点：
+    - `transport`: 显式声明底层传输介质（`uds` / `unix` / `tcp`）；
+    - `protocol`: 显式声明应用层协议（`ws`, `wss`, `h3`, `quic` 等，默认 `ws`）；
+    - `socket` / `bind`: 独立指定文件路径或 IP:Port 绑定地址，彻底杜绝 Windows 盘符（如 `C:/...`）与 URI scheme 双斜杠的路径解析冲突；
+    - `path`: 独立定义 HTTP / WebSocket 的 URI Path（如 `/tunnel`）；
+    - `chmod`: 独立为 Unix 平台提供套接字文件权限设置（如 `0o660`）。
+* **URI 复合协议支持**：
+  * 支持类数据库复合协议标准：`ws+unix:///run/tunnel.sock?path=/tunnel&chmod=0o660` 与 `ws+uds://...`；
+  * 全面兼容既有单行 URL 语法，并提供严格的 YAML 反序列化校验（结合自定义 Visitor 零回溯准确解析字符串与 Mapping 字典）。

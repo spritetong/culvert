@@ -89,6 +89,20 @@ impl ServerRunner {
                     server_tls.as_ref(),
                 )?;
 
+                if let Some(mode) = spec_clone.chmod
+                    && let Err(e) = crate::platform::set_socket_permissions(
+                        std::path::Path::new(&spec_clone.bind_addr),
+                        mode,
+                    )
+                {
+                    tracing::warn!(
+                        bind = %spec_clone.bind_addr,
+                        mode = format_args!("{:#o}", mode),
+                        error = %e,
+                        "Failed to set socket permissions"
+                    );
+                }
+
                 info!(
                     scheme = %spec_clone.scheme,
                     bind = %spec_clone.bind_addr,

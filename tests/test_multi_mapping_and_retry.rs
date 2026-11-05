@@ -63,7 +63,7 @@ async fn test_multi_mapping_shared_pool_and_path_matching_e2e() {
     // Single unified AppConfig with Server + Tunnel containing multiple mappings
     let mut app_config = AppConfig {
         server: Some(ServerConfig {
-            listen: vec![format!("ws://127.0.0.1:{}/secret_path", server_ws_port)],
+            listen: vec![format!("ws://127.0.0.1:{}/secret_path", server_ws_port).into()],
             token: None, // No-auth mode
             default_target: None,
             ..Default::default()
@@ -153,7 +153,7 @@ async fn test_path_mismatch_rejection() {
 
     let mut app_config = AppConfig {
         server: Some(ServerConfig {
-            listen: vec![format!("ws://127.0.0.1:{}/valid_path", server_ws_port)],
+            listen: vec![format!("ws://127.0.0.1:{}/valid_path", server_ws_port).into()],
             token: None,
             default_target: None,
             ..Default::default()

@@ -459,3 +459,58 @@ server:
     assert_eq!(specs[2].bind_addr, "[::1]:8443");
     assert_eq!(specs[2].path.as_deref(), Some("/h3"));
 }
+
+#[test]
+fn test_structured_server_listen_configs_yaml() {
+    let yaml = r#"
+server:
+  listen:
+    - transport: "uds"
+      protocol: "ws"
+      socket: "/run/tunnel.sock"
+      path: "/tunnel-ws"
+      chmod: 0o660
+    - transport: "tcp"
+      protocol: "ws"
+      bind: "0.0.0.0:9090"
+      path: "/ws"
+    - "ws+unix:///run/app.sock?path=/api/ws&chmod=0o664"
+    - "ws://127.0.0.1:8080/plain"
+"#;
+    let config =
+        ConfigLoader::from_yaml_str(yaml).expect("Failed to parse structured server config");
+    let server = config.server.expect("Server config should be present");
+    let specs = server.parse_specs().expect("Failed to parse server specs");
+
+    assert_eq!(specs.len(), 4);
+
+    // 1. Structured UDS
+    assert_eq!(specs[0].scheme, "uds");
+    assert_eq!(
+        specs[0].bind_addr,
+        std::path::Path::new("/run/tunnel.sock").to_string_lossy()
+    );
+    assert_eq!(specs[0].path.as_deref(), Some("/tunnel-ws"));
+    assert_eq!(specs[0].chmod, Some(0o660));
+
+    // 2. Structured TCP
+    assert_eq!(specs[1].scheme, "ws");
+    assert_eq!(specs[1].bind_addr, "0.0.0.0:9090");
+    assert_eq!(specs[1].path.as_deref(), Some("/ws"));
+    assert_eq!(specs[1].chmod, None);
+
+    // 3. Composite ws+unix URL with query parameters
+    assert_eq!(specs[2].scheme, "uds");
+    assert_eq!(
+        specs[2].bind_addr,
+        std::path::Path::new("/run/app.sock").to_string_lossy()
+    );
+    assert_eq!(specs[2].path.as_deref(), Some("/api/ws"));
+    assert_eq!(specs[2].chmod, Some(0o664));
+
+    // 4. Standard ws URL string
+    assert_eq!(specs[3].scheme, "ws");
+    assert_eq!(specs[3].bind_addr, "127.0.0.1:8080");
+    assert_eq!(specs[3].path.as_deref(), Some("/plain"));
+    assert_eq!(specs[3].chmod, None);
+}

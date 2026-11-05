@@ -98,7 +98,7 @@ Client                                                   Caddy / Server
 ### 3.2 UDS（Unix Domain Socket）IPC 优化
 Caddy 到 Server 端采用 UDS 替代传统的 `127.0.0.1` TCP Loopback：
 * **资源保护**：完全跳过 TCP/IP 协议栈封包、校验和计算与滑动窗口，避免高频短连接下的临时端口耗尽（Ephemeral Port Exhaustion）与系统 `TIME_WAIT` 堆积。
-* **IPC 效率**：直接在 Linux 内核缓冲区完成进程间内存拷贝，吞吐量提升约 20%，并借助文件系统权限（`0660`）天然防御本机未授权进程的探测。
+* **IPC 效率**：直接在内核缓冲区完成进程间内存拷贝，吞吐量提升约 20%，并借助文件系统权限（`0660`）天然防御本机未授权进程的探测。全平台原生支持 Linux、macOS 以及 Windows（WinSock `AF_UNIX`）。
 
 ### 3.3 协议级 0-RTT 连接池（Protocol-Aware Connection Pool）
 针对 WSS 模式（单连接模型）及未来 P2P 通道，必须避免频繁建立 TLS 握手或打洞，同时防止借出“僵尸连接”。

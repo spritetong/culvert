@@ -47,7 +47,7 @@ pub struct UdsTransportDriver;
 
 impl TransportDriver for UdsTransportDriver {
     fn schemes(&self) -> &[&'static str] {
-        &["uds", "unix"]
+        &["uds", "unix", "ws+uds", "ws+unix"]
     }
 
     fn build_connector(
@@ -292,9 +292,26 @@ impl UdsConnector {
         let stream = connect_uds(&socket_path).await.map_err(TunnelError::Io)?;
 
         // Perform client HTTP upgrade over Unix socket
+        let uri = if let Some(ref q) = self.endpoint.endpoint.query {
+            let mut custom_path = None;
+            for param in q.split('&') {
+                if let Some(val) = param.strip_prefix("path=") {
+                    custom_path = Some(if !val.starts_with('/') {
+                        format!("/{}", val)
+                    } else {
+                        val.to_string()
+                    });
+                    break;
+                }
+            }
+            custom_path.unwrap_or_else(|| "/".to_string())
+        } else {
+            "/".to_string()
+        };
+
         let req_builder = Request::builder()
             .method("GET")
-            .uri("/")
+            .uri(uri)
             .header("Host", "localhost")
             .header("Upgrade", "websocket")
             .header("Connection", "Upgrade")
@@ -347,7 +364,7 @@ impl TransportConnector for UdsConnector {
 
     fn protocol_scheme(&self) -> &'static str {
         match self.endpoint.endpoint.scheme.as_str() {
-            "unix" => "unix",
+            "unix" | "ws+unix" => "unix",
             _ => "uds",
         }
     }

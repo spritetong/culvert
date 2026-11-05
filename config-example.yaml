@@ -41,8 +41,14 @@ tls:
 
 # Server Ingress configuration (can coexist with tunnels in same config!)
 server:
-  # Explicit scheme URL(s) with path routing support: ws, wss, h3, quic, https, uds, unix (uds/unix on Unix only)
+  # Structured configurations or explicit scheme URL(s) with path routing support:
   listen:
+    - transport: "uds"
+      protocol: "ws"
+      socket: "/run/tunnel.sock"
+      path: "/tunnel"
+      chmod: 0o660
+    - "ws+unix:///run/tunnel2.sock?path=/tunnel"
     - "wss://0.0.0.0:8443/tunnel"
     - "h3://0.0.0.0:8443/tunnel"
     - "ws://127.0.0.1:8080/tunnel"

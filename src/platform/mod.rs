@@ -25,7 +25,11 @@ use crate::transport::TargetAddr;
 /// Checks if a given address string represents a Unix Domain Socket path or URL.
 pub fn is_uds_path(s: &str) -> bool {
     let trimmed = s.trim();
-    if trimmed.starts_with("uds://") || trimmed.starts_with("unix://") {
+    if trimmed.starts_with("uds://")
+        || trimmed.starts_with("unix://")
+        || trimmed.starts_with("ws+uds://")
+        || trimmed.starts_with("ws+unix://")
+    {
         return true;
     }
     if trimmed.ends_with(".sock") {
@@ -59,21 +63,31 @@ pub fn normalize_uds_path(s: &str) -> PathBuf {
         stripped
     } else if let Some(stripped) = trimmed.strip_prefix("unix://") {
         stripped
+    } else if let Some(stripped) = trimmed.strip_prefix("ws+uds://") {
+        stripped
+    } else if let Some(stripped) = trimmed.strip_prefix("ws+unix://") {
+        stripped
     } else {
         trimmed
     };
 
-    // If path begins with "/C:..." on Windows or if drive letter follows leading slash,
-    // strip the leading slash so PathBuf recognizes the drive letter.
-    let normalized_str = if rest.starts_with('/') && rest.len() >= 3 {
-        let b = rest.as_bytes();
-        if b[1].is_ascii_alphabetic() && b[2] == b':' {
-            &rest[1..]
-        } else {
-            rest
-        }
+    let path_only = if let Some(q_idx) = rest.find('?') {
+        &rest[..q_idx]
     } else {
         rest
+    };
+
+    // If path begins with "/C:..." on Windows or if drive letter follows leading slash,
+    // strip the leading slash so PathBuf recognizes the drive letter.
+    let normalized_str = if path_only.starts_with('/') && path_only.len() >= 3 {
+        let b = path_only.as_bytes();
+        if b[1].is_ascii_alphabetic() && b[2] == b':' {
+            &path_only[1..]
+        } else {
+            path_only
+        }
+    } else {
+        path_only
     };
 
     PathBuf::from(normalized_str)

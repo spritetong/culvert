@@ -50,7 +50,7 @@ async fn test_e2e_server_uds_url_and_mappings() {
         dialer: None,
         tls: None,
         server: Some(ServerConfig {
-            listen: vec![server_sock_url.clone()],
+            listen: vec![server_sock_url.clone().into()],
             token: Some("secret123".to_string()),
             default_target: None,
             tls: None,
@@ -139,7 +139,7 @@ async fn test_e2e_reverse_mapping_uds() {
         dialer: None,
         tls: None,
         server: Some(ServerConfig {
-            listen: vec![server_sock_url.clone()],
+            listen: vec![server_sock_url.clone().into()],
             token: Some("rev_secret".to_string()),
             default_target: None,
             tls: None,
@@ -190,6 +190,108 @@ async fn test_e2e_reverse_mapping_uds() {
         connected,
         "Failed to connect and relay through reverse UDS tunnel"
     );
+
+    backend_task.await.unwrap();
+    cancel_token.cancel();
+    let _ = sup_task.await;
+}
+
+#[tokio::test]
+async fn test_e2e_server_structured_uds_listen() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let server_sock = temp_dir.path().join("server_structured.sock");
+    let target_sock = temp_dir.path().join("target_backend.sock");
+    let fwd_listen_sock = temp_dir.path().join("fwd_listen.sock");
+
+    let server_sock_str = server_sock.to_string_lossy().to_string();
+    let target_sock_str = target_sock.to_string_lossy().to_string();
+    let fwd_listen_str = fwd_listen_sock.to_string_lossy().to_string();
+
+    // 1. Target backend UDS service
+    let mut target_listener = PlatformUdsListener::bind(&target_sock).unwrap();
+    let backend_task = tokio::spawn(async move {
+        if let Ok((mut stream, _)) = target_listener.accept().await {
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+            stream.flush().await.unwrap();
+        }
+    });
+
+    // 2. Client connects with composite scheme and query path: ws+uds:///path?path=/custom-path
+    let client_endpoint = format!("ws+uds://{}?path=/custom-path", server_sock_str);
+
+    let structured_listen = micro_tunnel::config::model::StructuredListenConfig {
+        transport: Some("uds".to_string()),
+        protocol: "ws".to_string(),
+        socket: Some(server_sock_str.clone()),
+        path: Some("/custom-path".to_string()),
+        ..Default::default()
+    };
+
+    let config = AppConfig {
+        log: LogConfig {
+            level: "debug".to_string(),
+            output: "stdout".to_string(),
+            no_color: true,
+        },
+        worker_threads: Some(2),
+        dns: None,
+        dialer: None,
+        tls: None,
+        server: Some(ServerConfig {
+            listen: vec![micro_tunnel::config::model::ServerListenConfig::Structured(
+                structured_listen,
+            )],
+            token: Some("token123".to_string()),
+            default_target: None,
+            tls: None,
+            certificate: None,
+            key: None,
+        }),
+        tunnels: vec![TunnelConfig {
+            tag: "structured-uds-tunnel".to_string(),
+            endpoint: EndpointConfig::Simple(client_endpoint),
+            token: Some("token123".to_string()),
+            pool_size: Some(2),
+            retry: None,
+            failover: None,
+            multiplex: None,
+            mappings: vec![PortMappingConfig {
+                mode: TunnelMode::Forward,
+                listen: fwd_listen_str.clone(),
+                target: target_sock_str.clone(),
+            }],
+        }],
+    };
+
+    let cancel_token = CancellationToken::new();
+    let supervisor = TunnelSupervisor::new(config, cancel_token.clone());
+
+    let sup_task = tokio::spawn(async move {
+        let _ = supervisor.run().await;
+    });
+
+    // Connect to local forward UDS listener which dials through UDS tunnel to UDS target
+    let mut visitor = None;
+    for _ in 0..50 {
+        if fwd_listen_sock.exists()
+            && let Ok(s) = connect_uds(&fwd_listen_sock).await
+        {
+            visitor = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut visitor = visitor.expect("Failed to connect to forward UDS listen socket");
+
+    visitor.write_all(b"ping").await.unwrap();
+    visitor.flush().await.unwrap();
+
+    let mut reply = [0u8; 4];
+    visitor.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply, b"pong");
 
     backend_task.await.unwrap();
     cancel_token.cancel();

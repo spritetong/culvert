@@ -279,7 +279,7 @@ async fn test_wss_forward_tunnel_with_custom_ca_and_sni() {
     let session_mgr = Arc::new(SessionManager::new());
 
     let server_config = ServerConfig {
-        listen: vec![format!("ws://127.0.0.1:{}/tunnel", backend_server_port)],
+        listen: vec![format!("ws://127.0.0.1:{}/tunnel", backend_server_port).into()],
         token: Some(auth_token.to_string()),
         default_target: None,
         ..Default::default()
@@ -396,7 +396,7 @@ async fn test_wss_forward_tunnel_insecure_mode() {
     let session_mgr = Arc::new(SessionManager::new());
 
     let server_config = ServerConfig {
-        listen: vec![format!("ws://127.0.0.1:{}/tunnel", backend_server_port)],
+        listen: vec![format!("ws://127.0.0.1:{}/tunnel", backend_server_port).into()],
         token: Some(auth_token.to_string()),
         default_target: None,
         ..Default::default()
@@ -509,7 +509,7 @@ async fn test_wss_mtls_mutual_authentication() {
     let session_mgr = Arc::new(SessionManager::new());
 
     let server_config = ServerConfig {
-        listen: vec![format!("ws://127.0.0.1:{}/tunnel", backend_server_port)],
+        listen: vec![format!("ws://127.0.0.1:{}/tunnel", backend_server_port).into()],
         token: Some(auth_token.to_string()),
         default_target: None,
         ..Default::default()
@@ -628,7 +628,7 @@ async fn test_wss_reverse_tunnel_e2e() {
     let session_mgr = Arc::new(SessionManager::new());
 
     let server_config = ServerConfig {
-        listen: vec![format!("ws://127.0.0.1:{}/tunnel", backend_server_port)],
+        listen: vec![format!("ws://127.0.0.1:{}/tunnel", backend_server_port).into()],
         token: Some(auth_token.to_string()),
         default_target: None,
         ..Default::default()
@@ -736,7 +736,7 @@ async fn test_wss_server_tls_version_enforcement() {
 
     // 1. Configure Server to strictly enforce TLS 1.3
     let server_config = ServerConfig {
-        listen: vec![format!("wss://127.0.0.1:{}/tunnel", server_port)],
+        listen: vec![format!("wss://127.0.0.1:{}/tunnel", server_port).into()],
         tls: Some(TlsConfig {
             certificate: Some(pki.server_cert_path.clone()),
             key: Some(pki.server_key_path.clone()),
@@ -833,7 +833,7 @@ async fn test_wss_server_inherits_global_tls_config() {
 
     // 1. Configure Server with server.tls = None, but supply top-level global TLS
     let server_config = ServerConfig {
-        listen: vec![format!("wss://127.0.0.1:{}/tunnel", server_port)],
+        listen: vec![format!("wss://127.0.0.1:{}/tunnel", server_port).into()],
         tls: None, // server.tls is None
         ..Default::default()
     };

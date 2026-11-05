@@ -120,3 +120,10 @@ pub async fn connect_uds(path: &Path) -> io::Result<Box<dyn TunnelStream>> {
     let boxed: Box<dyn TunnelStream> = Box::new(BufferedTlsStream::new(stream));
     Ok(boxed)
 }
+
+/// Sets filesystem permissions mode on a Unix socket or file.
+pub fn set_socket_permissions(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(mode);
+    std::fs::set_permissions(path, perms)
+}
