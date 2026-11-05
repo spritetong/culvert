@@ -61,6 +61,11 @@ impl H3Listener {
         transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(2)));
         transport_config.max_concurrent_bidi_streams(quinn::VarInt::from_u32(10_000));
         transport_config.max_concurrent_uni_streams(quinn::VarInt::from_u32(10_000));
+        // Per-stream window must stay small relative to the connection window:
+        // otherwise a couple of unread streams pin the whole connection's
+        // receive_window and head-of-line block every other stream (quinn docs
+        // explicitly warn about this). 4MiB x 32 concurrent stalled streams
+        // still fits inside the 128MiB connection window.
         transport_config.stream_receive_window(quinn::VarInt::from_u32(4 * 1024 * 1024));
         transport_config.receive_window(quinn::VarInt::from_u32(128 * 1024 * 1024));
         transport_config.send_window(128 * 1024 * 1024);
