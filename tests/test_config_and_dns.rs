@@ -24,7 +24,7 @@ worker_threads: 8
 
 dns:
   strategy: "prefer_ipv4"
-  servers:
+  resolvers:
     - "udp://8.8.8.8:53"
     - "udp://1.1.1.1:53"
   cache_capacity: 1024
@@ -50,9 +50,10 @@ server:
 
 tunnels:
   - tag: "ssh-reverse"
-    mode: "reverse"
-    listen: "0.0.0.0:2222"
-    target: "127.0.0.1:22"
+    mappings:
+      - mode: "reverse"
+        listen: "0.0.0.0:2222"
+        target: "127.0.0.1:22"
     token: "tunnel_secret_token_1"
     pool_size: 4
     endpoint:
@@ -67,9 +68,10 @@ tunnels:
         connect_timeout: "2s"
 
   - tag: "web-forward"
-    mode: "forward"
-    listen: "127.0.0.1:8000"
-    target: "internal.corp:80"
+    mappings:
+      - mode: "forward"
+        listen: "127.0.0.1:8000"
+        target: "internal.corp:80"
     token: "tunnel_secret_token_2"
     endpoint: "ws://10.0.0.1:8080/tunnel"
 "#;
@@ -88,7 +90,7 @@ tunnels:
     let dns = app_config.dns.as_ref().unwrap();
     assert_eq!(dns.strategy, Some(DnsStrategy::PreferIpv4));
     assert_eq!(dns.cache_capacity, Some(1024));
-    assert_eq!(dns.servers.as_ref().unwrap().len(), 2);
+    assert_eq!(dns.resolvers.as_ref().unwrap().len(), 2);
 
     // Verify Dialer
     let dialer = app_config.dialer.as_ref().unwrap();
@@ -125,7 +127,9 @@ tunnels:
     // Tunnel 1: detailed endpoint overriding global dns/tls/dialer
     let t1 = &app_config.tunnels[0];
     assert_eq!(t1.tag, "ssh-reverse");
-    assert_eq!(t1.mode, Some(TunnelMode::Reverse));
+    assert_eq!(t1.mappings[0].mode, TunnelMode::Reverse);
+    assert_eq!(t1.mappings[0].listen, "0.0.0.0:2222");
+    assert_eq!(t1.mappings[0].target, "127.0.0.1:22");
     assert_eq!(t1.pool_size, Some(4));
     assert_eq!(t1.endpoint.url(), "wss://vps.example.com:443/ws");
 
@@ -146,7 +150,9 @@ tunnels:
     // Tunnel 2: simple endpoint inheriting global defaults
     let t2 = &app_config.tunnels[1];
     assert_eq!(t2.tag, "web-forward");
-    assert_eq!(t2.mode, Some(TunnelMode::Forward));
+    assert_eq!(t2.mappings[0].mode, TunnelMode::Forward);
+    assert_eq!(t2.mappings[0].listen, "127.0.0.1:8000");
+    assert_eq!(t2.mappings[0].target, "internal.corp:80");
     assert_eq!(t2.endpoint.url(), "ws://10.0.0.1:8080/tunnel");
 
     let ep_ctx2 = EndpointContext::build(&t2.endpoint, &app_config)
@@ -161,7 +167,7 @@ async fn test_dns_resolver_strategies_and_caching() {
     // 1. IPv4 only strategy on localhost
     let ipv4_cfg = DnsConfig {
         strategy: Some(DnsStrategy::Ipv4Only),
-        servers: None,
+        resolvers: None,
         cache_capacity: Some(100),
     };
     let resolver = CachedDnsResolver::new(ipv4_cfg);
@@ -179,7 +185,7 @@ async fn test_dns_resolver_strategies_and_caching() {
     // 2. IPv6 only strategy on localhost
     let ipv6_cfg = DnsConfig {
         strategy: Some(DnsStrategy::Ipv6Only),
-        servers: None,
+        resolvers: None,
         cache_capacity: Some(100),
     };
     let resolver = CachedDnsResolver::new(ipv6_cfg);
@@ -194,7 +200,7 @@ async fn test_dns_resolver_strategies_and_caching() {
     // 3. Prefer IPv4 strategy
     let prefer_v4_cfg = DnsConfig {
         strategy: Some(DnsStrategy::PreferIpv4),
-        servers: None,
+        resolvers: None,
         cache_capacity: Some(100),
     };
     let resolver = CachedDnsResolver::new(prefer_v4_cfg);
@@ -221,25 +227,25 @@ async fn test_dns_resolver_strategies_and_caching() {
 }
 
 #[tokio::test]
-async fn test_wstunnel_style_dns_resolvers() {
+async fn test_standard_dns_resolvers() {
     // 1. System libc resolver
     let sys_cfg = DnsConfig {
         strategy: Some(DnsStrategy::PreferIpv4),
-        servers: Some(vec!["system://0.0.0.0".to_string()]),
+        resolvers: Some(vec!["system://0.0.0.0".into()]),
         cache_capacity: Some(10),
     };
     let sys_resolver = CachedDnsResolver::new(sys_cfg);
     let sys_addrs = sys_resolver.resolve("localhost").await.unwrap();
     assert!(!sys_addrs.is_empty());
 
-    // 2. Custom multi-protocol DNS configurations
+    // 2. Custom standard multi-protocol DNS configurations (https, tls, udp, system)
     let multi_cfg = DnsConfig {
         strategy: Some(DnsStrategy::PreferIpv4),
-        servers: Some(vec![
-            "dns://1.1.1.1".to_string(),
-            "dns+https://1.1.1.1?sni=cloudflare-dns.com".to_string(),
-            "dns+tls://8.8.8.8?sni=dns.google".to_string(),
-            "system://0.0.0.0".to_string(),
+        resolvers: Some(vec![
+            "dns://1.1.1.1".into(),
+            "https://1.1.1.1?sni=cloudflare-dns.com".into(),
+            "tls://8.8.8.8?sni=dns.google".into(),
+            "system://0.0.0.0".into(),
         ]),
         cache_capacity: Some(100),
     };
@@ -251,21 +257,37 @@ async fn test_wstunnel_style_dns_resolvers() {
         vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1))]
     );
 
-    // 3. YAML parsing with 'resolvers' alias
+    // 3. YAML parsing with standard structured resolvers: [{ type: "https", server: "1.1.1.1", tls: { server_name: "cloudflare-dns.com" } }]
     let yaml = r#"
 dns:
   strategy: "ipv4_only"
   resolvers:
-    - "dns://1.1.1.1"
-    - "dns+https://1.1.1.1?sni=cloudflare-dns.com"
-    - "dns+tls://8.8.8.8?sni=dns.google"
+    - type: "https"
+      server: "1.1.1.1"
+      tls:
+        server_name: "cloudflare-dns.com"
+    - type: "tls"
+      server: "8.8.8.8"
+      tls:
+        server_name: "dns.google"
+    - type: "udp"
+      server: "1.1.1.1:53"
+    - type: "system"
 "#;
     let config = ConfigLoader::from_yaml_str(yaml).unwrap();
     let dns = config.dns.unwrap();
     assert_eq!(dns.strategy, Some(DnsStrategy::Ipv4Only));
-    let servers = dns.servers.unwrap();
-    assert_eq!(servers.len(), 3);
-    assert_eq!(servers[0], "dns://1.1.1.1");
-    assert_eq!(servers[1], "dns+https://1.1.1.1?sni=cloudflare-dns.com");
-    assert_eq!(servers[2], "dns+tls://8.8.8.8?sni=dns.google");
+    let resolvers = dns.resolvers.unwrap();
+    assert_eq!(resolvers.len(), 4);
+
+    let structured_resolver = CachedDnsResolver::new(DnsConfig {
+        strategy: Some(DnsStrategy::Ipv4Only),
+        resolvers: Some(resolvers),
+        cache_capacity: Some(100),
+    });
+    let fast_path2 = structured_resolver.resolve("1.1.1.1").await.unwrap();
+    assert_eq!(
+        fast_path2,
+        vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1))]
+    );
 }

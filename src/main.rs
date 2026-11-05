@@ -30,16 +30,12 @@ struct Cli {
     /// Override the number of Tokio worker threads.
     #[arg(short = 'w', long)]
     worker_threads: Option<usize>,
-
-    /// DNS resolver to use (e.g. dns://1.1.1.1, dns+https://1.1.1.1?sni=cloudflare-dns.com, dns+tls://8.8.8.8?sni=dns.google, system://0.0.0.0). Can be specified multiple times.
-    #[arg(long = "dns-resolver", action = clap::ArgAction::Append)]
-    dns_resolver: Vec<String>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    let mut app_config = match ConfigLoader::from_file(&cli.config) {
+    let app_config = match ConfigLoader::from_file(&cli.config) {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!(
@@ -49,11 +45,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
-
-    if !cli.dns_resolver.is_empty() {
-        let dns = app_config.dns.get_or_insert_with(Default::default);
-        dns.servers = Some(cli.dns_resolver);
-    }
 
     // Initialize structured logging respecting LogConfig
     let env_filter =

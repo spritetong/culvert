@@ -9,6 +9,7 @@ pub mod model;
 
 pub use loader::ConfigLoader;
 pub use model::{
-    AppConfig, DialerConfig, DnsConfig, DnsStrategy, EndpointConfig, FailoverConfig, LogConfig,
-    ServerConfig, TlsConfig, TunnelConfig, TunnelMode,
+    AppConfig, DialerConfig, DnsConfig, DnsResolverConfig, DnsServerConfig, DnsStrategy,
+    DnsTlsConfig, EndpointConfig, FailoverConfig, LogConfig, PortMappingConfig, ServerConfig,
+    TlsConfig, TunnelConfig, TunnelMode, TunnelRetryConfig,
 };

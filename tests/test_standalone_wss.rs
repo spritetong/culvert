@@ -108,9 +108,6 @@ async fn test_standalone_wss_server_self_signed_direct_termination() {
             listen: format!("127.0.0.1:{}", client_listen_port),
             target: format!("127.0.0.1:{}", echo_port),
         }],
-        mode: None,
-        listen: None,
-        target: None,
     });
 
     // 3. Launch supervisor

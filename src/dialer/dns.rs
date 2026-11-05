@@ -16,7 +16,7 @@ use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::{Resolver, TokioResolver};
 use tracing::{debug, warn};
 
-use crate::config::model::{DnsConfig, DnsStrategy};
+use crate::config::model::{DnsConfig, DnsResolverConfig, DnsServerConfig, DnsStrategy};
 use crate::consts::{DEFAULT_DNS_CACHE_CAPACITY, DEFAULT_DNS_CACHE_TTL};
 use crate::core::error::TunnelError;
 use crate::core::stream::BoxFuture;
@@ -55,9 +55,9 @@ impl CachedDnsResolver {
         let mut name_servers = Vec::new();
         let mut has_system_resolver = false;
 
-        if let Some(ref servers) = config.servers {
-            for server in servers {
-                match Self::parse_server(server) {
+        if let Some(ref resolvers) = config.resolvers {
+            for resolver in resolvers {
+                match Self::parse_resolver(resolver) {
                     Ok(ParsedDnsServer::System) => {
                         has_system_resolver = true;
                     }
@@ -65,7 +65,7 @@ impl CachedDnsResolver {
                         name_servers.push(ns);
                     }
                     Err(e) => {
-                        warn!(server = %server, error = ?e, "Failed to parse DNS resolver, skipping");
+                        warn!(resolver = ?resolver, error = ?e, "Failed to parse DNS resolver, skipping");
                     }
                 }
             }
@@ -114,23 +114,150 @@ impl CachedDnsResolver {
         }
     }
 
+    /// Parses a DNS resolver configuration into a `ParsedDnsServer`.
+    pub fn parse_resolver(resolver: &DnsResolverConfig) -> Result<ParsedDnsServer, TunnelError> {
+        match resolver {
+            DnsResolverConfig::Detailed(cfg) => Self::parse_detailed_server(cfg),
+            DnsResolverConfig::Simple(raw) => Self::parse_server(raw),
+        }
+    }
+
+    /// Parses a structured `DnsServerConfig` into a `ParsedDnsServer`.
+    pub fn parse_detailed_server(cfg: &DnsServerConfig) -> Result<ParsedDnsServer, TunnelError> {
+        let proto = cfg.r#type.trim().to_lowercase();
+        if proto == "system" {
+            return Ok(ParsedDnsServer::System);
+        }
+
+        let raw_server = cfg.server.as_deref().unwrap_or("").trim();
+        if raw_server.is_empty() {
+            return Err(TunnelError::Config(format!(
+                "Missing 'server' field for DNS resolver of type '{}'",
+                proto
+            )));
+        }
+
+        let (host_str, extracted_port) = Self::extract_host_and_port(raw_server);
+        let ip = Self::resolve_or_parse_ip(&host_str)?;
+        let effective_port = cfg.port.or(extracted_port);
+
+        let sni: Arc<str> = cfg
+            .tls
+            .as_ref()
+            .and_then(|t| t.server_name.as_deref())
+            .map(Arc::from)
+            .unwrap_or_else(|| Arc::from(host_str.as_str()));
+
+        match proto.as_str() {
+            "udp" | "dns" => {
+                let port = effective_port.unwrap_or(53);
+                let mut ns = NameServerConfig::udp(ip);
+                if let Some(conn) = ns.connections.first_mut() {
+                    conn.port = port;
+                }
+                Ok(ParsedDnsServer::NameServer(ns))
+            }
+            "tcp" => {
+                let port = effective_port.unwrap_or(53);
+                let mut ns = NameServerConfig::tcp(ip);
+                if let Some(conn) = ns.connections.first_mut() {
+                    conn.port = port;
+                }
+                Ok(ParsedDnsServer::NameServer(ns))
+            }
+            "tls" => {
+                let port = effective_port.unwrap_or(853);
+                let mut ns = NameServerConfig::tls(ip, sni);
+                if let Some(conn) = ns.connections.first_mut() {
+                    conn.port = port;
+                }
+                Ok(ParsedDnsServer::NameServer(ns))
+            }
+            "https" => {
+                let port = effective_port.unwrap_or(443);
+                let path = cfg.path.as_deref().map(Arc::from);
+                let mut ns = NameServerConfig::https(ip, sni, path);
+                if let Some(conn) = ns.connections.first_mut() {
+                    conn.port = port;
+                }
+                Ok(ParsedDnsServer::NameServer(ns))
+            }
+            unknown => Err(TunnelError::Config(format!(
+                "Unsupported DNS resolver type '{}'. Supported types: 'https', 'tls', 'udp', 'tcp', 'system'",
+                unknown
+            ))),
+        }
+    }
+
+    /// Extracts host and optional port from a string like "1.1.1.1:53" or "[::1]:53".
+    fn extract_host_and_port(raw: &str) -> (String, Option<u16>) {
+        let clean = raw.trim();
+        if clean.starts_with('[') {
+            if let Some(closing) = clean.find(']') {
+                let host = clean[1..closing].to_string();
+                let port = if let Some(colon) = clean[closing..].find(':') {
+                    clean[closing + colon + 1..].parse::<u16>().ok()
+                } else {
+                    None
+                };
+                return (host, port);
+            }
+        }
+        if let Some(colon) = clean.rfind(':') {
+            if clean.matches(':').count() == 1 {
+                let host = clean[..colon].to_string();
+                let port = clean[colon + 1..].parse::<u16>().ok();
+                return (host, port);
+            }
+        }
+        (clean.to_string(), None)
+    }
+
+    /// Resolves or parses an IP address literal or hostname.
+    fn resolve_or_parse_ip(host_str: &str) -> Result<IpAddr, TunnelError> {
+        let clean_host = host_str.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(ip) = clean_host.parse::<IpAddr>() {
+            return Ok(ip);
+        }
+        let addr_str = format!("{}:53", clean_host);
+        match addr_str.to_socket_addrs() {
+            Ok(mut addrs) => addrs
+                .next()
+                .map(|sa| sa.ip())
+                .ok_or_else(|| TunnelError::Config(format!("No IP found for DNS host '{}'", clean_host))),
+            Err(e) => Err(TunnelError::Config(format!(
+                "Invalid or unresolvable DNS server address '{}': {}",
+                clean_host, e
+            ))),
+        }
+    }
+
     /// Parses a DNS resolver server URI into a `ParsedDnsServer`.
     ///
-    /// Supported formats (aligned with wstunnel):
-    /// - `system://0.0.0.0`: Use native libc resolver.
-    /// - `dns://1.1.1.1[:port]`: Standard unencrypted UDP DNS.
-    /// - `dns+https://1.1.1.1[:port][/path]?sni=cloudflare-dns.com`: DNS over HTTPS (DoH).
-    /// - `dns+tls://8.8.8.8[:port]?sni=dns.google`: DNS over TLS (DoT).
+    /// Supported formats:
+    /// - `system://0.0.0.0` or `system`: Use native libc resolver.
+    /// - `udp://1.1.1.1[:port]` or `dns://1.1.1.1[:port]`: Standard unencrypted UDP DNS.
+    /// - `https://1.1.1.1[:port][/path]?sni=cloudflare-dns.com`: DNS over HTTPS (DoH).
+    /// - `tls://8.8.8.8[:port]?sni=dns.google`: DNS over TLS (DoT).
+    /// - `tcp://1.1.1.1[:port]`: DNS over TCP.
     pub fn parse_server(raw: &str) -> Result<ParsedDnsServer, TunnelError> {
         let clean = raw.trim();
-        if clean.starts_with("system://") {
+        if clean.eq_ignore_ascii_case("system") || clean.starts_with("system://") {
             return Ok(ParsedDnsServer::System);
+        }
+
+        // Explicitly reject non-standard "dns+" schemes
+        if clean.starts_with("dns+https://") || clean.starts_with("dns+tls://") {
+            return Err(TunnelError::Config(format!(
+                "Non-standard 'dns+' schemes are no longer supported in '{}'. Use standard 'https://', 'tls://', 'udp://', or structured resolver configuration [{{ type: \"https\", server: \"...\", tls: {{ server_name: \"...\" }} }}].",
+                raw
+            )));
         }
 
         let url_str = if clean.contains("://") {
             clean.to_string()
         } else {
-            format!("dns://{}", clean)
+            format!("udp://{}", clean)
         };
 
         let parsed = url::Url::parse(&url_str).map_err(|e| {
@@ -142,23 +269,7 @@ impl CachedDnsResolver {
         })?;
 
         let clean_host = host_str.trim_start_matches('[').trim_end_matches(']');
-        let ip: IpAddr = if let Ok(ip) = clean_host.parse::<IpAddr>() {
-            ip
-        } else {
-            let port = parsed.port().unwrap_or(53);
-            let addr_str = format!("{}:{}", clean_host, port);
-            match addr_str.to_socket_addrs() {
-                Ok(mut addrs) => addrs.next().map(|sa| sa.ip()).ok_or_else(|| {
-                    TunnelError::Config(format!("No IP found for DNS host '{}'", clean_host))
-                })?,
-                Err(e) => {
-                    return Err(TunnelError::Config(format!(
-                        "Invalid or unresolvable DNS server address '{}': {}",
-                        clean_host, e
-                    )));
-                }
-            }
-        };
+        let ip = Self::resolve_or_parse_ip(clean_host)?;
 
         let scheme = parsed.scheme();
         let query_sni = parsed
@@ -180,7 +291,15 @@ impl CachedDnsResolver {
                 }
                 Ok(ParsedDnsServer::NameServer(ns))
             }
-            "dns+tls" | "tls" => {
+            "tcp" => {
+                let port = parsed.port().unwrap_or(53);
+                let mut ns = NameServerConfig::tcp(ip);
+                if let Some(conn) = ns.connections.first_mut() {
+                    conn.port = port;
+                }
+                Ok(ParsedDnsServer::NameServer(ns))
+            }
+            "tls" => {
                 let port = parsed.port().unwrap_or(853);
                 let mut ns = NameServerConfig::tls(ip, sni);
                 if let Some(conn) = ns.connections.first_mut() {
@@ -188,7 +307,7 @@ impl CachedDnsResolver {
                 }
                 Ok(ParsedDnsServer::NameServer(ns))
             }
-            "dns+https" | "https" => {
+            "https" => {
                 let port = parsed.port().unwrap_or(443);
                 let path = if !parsed.path().is_empty() && parsed.path() != "/" {
                     Some(Arc::from(parsed.path()))
@@ -201,16 +320,8 @@ impl CachedDnsResolver {
                 }
                 Ok(ParsedDnsServer::NameServer(ns))
             }
-            "tcp" => {
-                let port = parsed.port().unwrap_or(53);
-                let mut ns = NameServerConfig::tcp(ip);
-                if let Some(conn) = ns.connections.first_mut() {
-                    conn.port = port;
-                }
-                Ok(ParsedDnsServer::NameServer(ns))
-            }
             unknown => Err(TunnelError::Config(format!(
-                "Unsupported DNS resolver scheme '{}' in '{}'",
+                "Unsupported DNS resolver scheme '{}' in '{}'. Supported schemes: https, tls, udp, tcp, dns, system",
                 unknown, raw
             ))),
         }
@@ -354,9 +465,8 @@ mod tests {
             _ => panic!("Expected NameServer"),
         }
 
-        // 2. DNS over HTTPS (DoH)
-        let doh =
-            CachedDnsResolver::parse_server("dns+https://1.1.1.1?sni=cloudflare-dns.com").unwrap();
+        // 2. DNS over HTTPS (DoH) using standard URL scheme
+        let doh = CachedDnsResolver::parse_server("https://1.1.1.1?sni=cloudflare-dns.com").unwrap();
         match doh {
             ParsedDnsServer::NameServer(ns) => {
                 assert_eq!(ns.ip, IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
@@ -365,8 +475,8 @@ mod tests {
             _ => panic!("Expected NameServer"),
         }
 
-        // 3. DNS over TLS (DoT)
-        let dot = CachedDnsResolver::parse_server("dns+tls://8.8.8.8?sni=dns.google").unwrap();
+        // 3. DNS over TLS (DoT) using standard URL scheme
+        let dot = CachedDnsResolver::parse_server("tls://8.8.8.8?sni=dns.google").unwrap();
         match dot {
             ParsedDnsServer::NameServer(ns) => {
                 assert_eq!(ns.ip, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
@@ -381,6 +491,52 @@ mod tests {
             ParsedDnsServer::System => {}
             _ => panic!("Expected System resolver"),
         }
+        let sys_bare = CachedDnsResolver::parse_server("system").unwrap();
+        match sys_bare {
+            ParsedDnsServer::System => {}
+            _ => panic!("Expected System resolver"),
+        }
+
+        // 5. Standard structured resolver configuration: [{ type: "https", server: "1.1.1.1", tls: { server_name: "cloudflare-dns.com" } }]
+        let struct_doh_yaml = r#"
+type: "https"
+server: "1.1.1.1"
+tls:
+  server_name: "cloudflare-dns.com"
+"#;
+        let struct_doh: DnsResolverConfig = serde_yaml::from_str(struct_doh_yaml).unwrap();
+        let parsed_doh = CachedDnsResolver::parse_resolver(&struct_doh).unwrap();
+        match parsed_doh {
+            ParsedDnsServer::NameServer(ns) => {
+                assert_eq!(ns.ip, IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+                assert_eq!(ns.connections[0].port, 443);
+            }
+            _ => panic!("Expected NameServer for structured DoH"),
+        }
+
+        // 6. Structured DoT configuration
+        let struct_dot = DnsResolverConfig::Detailed(DnsServerConfig {
+            r#type: "tls".to_string(),
+            server: Some("8.8.8.8".to_string()),
+            port: Some(853),
+            path: None,
+            tls: Some(crate::config::model::DnsTlsConfig {
+                server_name: Some("dns.google".to_string()),
+                insecure: false,
+            }),
+        });
+        let parsed_dot = CachedDnsResolver::parse_resolver(&struct_dot).unwrap();
+        match parsed_dot {
+            ParsedDnsServer::NameServer(ns) => {
+                assert_eq!(ns.ip, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+                assert_eq!(ns.connections[0].port, 853);
+            }
+            _ => panic!("Expected NameServer for structured DoT"),
+        }
+
+        // 7. Verify non-standard "dns+" schemes are rejected
+        assert!(CachedDnsResolver::parse_server("dns+https://1.1.1.1?sni=cloudflare-dns.com").is_err());
+        assert!(CachedDnsResolver::parse_server("dns+tls://8.8.8.8?sni=dns.google").is_err());
     }
 
     #[test]

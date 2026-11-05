@@ -6,14 +6,21 @@ log:
 # Worker threads (default: auto-detected CPU cores; 1 for single-thread runtime)
 worker_threads: 4
 
-# Global default DNS resolver settings (wstunnel & sing-box compatible)
+# Global default DNS resolver settings
 dns:
   strategy: "prefer_ipv4"
   resolvers:
-    - "dns://1.1.1.1"
-    - "dns+https://1.1.1.1?sni=cloudflare-dns.com"
-    - "dns+tls://8.8.8.8?sni=dns.google"
-    - "system://0.0.0.0"
+    - type: "https"
+      server: "1.1.1.1"
+      tls:
+        server_name: "cloudflare-dns.com"
+    - type: "tls"
+      server: "8.8.8.8"
+      tls:
+        server_name: "dns.google"
+    - type: "udp"
+      server: "1.1.1.1:53"
+    - type: "system"
 
 # Global default dialer settings
 dialer:
@@ -64,13 +71,14 @@ tunnels:
         listen: "0.0.0.0:2222"
         target: "127.0.0.1:22"
 
-  # Tunnel 2: Backward-compatible single-mapping tunnel with HTTP/3 & multiplexing
+  # Tunnel 2: Multi-port tunnel with HTTP/3 & multiplexing
   - tag: "cloud-h3-forward"
-    mode: "forward"
-    listen: "127.0.0.1:18080"
-    target: "10.0.0.8:8080"
-    token: "SECURE_PRESHARED_TOKEN"
     endpoint: "https://tunnel.example.com/tunnel"
+    token: "SECURE_PRESHARED_TOKEN"
+    mappings:
+      - mode: "forward"
+        listen: "127.0.0.1:18080"
+        target: "10.0.0.8:8080"
     multiplex:
       enabled: false  # Note: MUX engine is in preview and not yet wired into the production path
       max_streams: 128

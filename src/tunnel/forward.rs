@@ -174,8 +174,12 @@ pub async fn run_forward_tunnel(
     transport_registry: Arc<TransportRegistry>,
     cancel_token: CancellationToken,
 ) -> Result<(), TunnelError> {
-    let listen = config.listen.clone().unwrap_or_default();
-    let target = config.target.clone().unwrap_or_default();
+    let mappings = config.canonical_mappings()?;
+    let mapping = mappings.first().ok_or_else(|| {
+        TunnelError::Config(format!("Tunnel '{}' has no port mappings", config.tag))
+    })?;
+    let listen = mapping.listen.clone();
+    let target = mapping.target.clone();
 
     let pool = if let Some(size) = config.pool_size.filter(|&s| s > 0) {
         let connector: Arc<dyn TransportConnector> =

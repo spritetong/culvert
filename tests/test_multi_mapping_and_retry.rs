@@ -103,9 +103,6 @@ async fn test_multi_mapping_shared_pool_and_path_matching_e2e() {
                 target: format!("127.0.0.1:{}", echo_target2_port),
             },
         ],
-        mode: None,
-        listen: None,
-        target: None,
     });
 
     let supervisor = TunnelSupervisor::new(app_config, cancel_token.clone());
@@ -187,9 +184,6 @@ async fn test_path_mismatch_rejection() {
             listen: format!("127.0.0.1:{}", client_listen_port),
             target: format!("127.0.0.1:{}", echo_port),
         }],
-        mode: None,
-        listen: None,
-        target: None,
     });
 
     let supervisor = TunnelSupervisor::new(app_config, cancel_token.clone());

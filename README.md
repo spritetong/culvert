@@ -90,7 +90,6 @@ micro-tunnel [OPTIONS]
 | :--- | :---: | :--- | :--- | :--- |
 | `--config` | `-c` | `<PATH>` | Path to the YAML configuration file | `config.yaml` |
 | `--worker-threads` | `-w` | `<NUM>` | Override number of Tokio runtime worker threads (`1` for single-threaded runtime) | Auto-detect CPU cores |
-| `--dns-resolver` | | `<URI>` | Override or append upstream DNS resolver URI. Can be specified multiple times. | Config file values |
 | `--help` | `-h` | | Print command-line help message | |
 | `--version` | `-V` | | Print version information | |
 
@@ -101,9 +100,6 @@ micro-tunnel [OPTIONS]
 
 # Run with a custom config path and 2 worker threads
 ./micro-tunnel -c /etc/micro-tunnel/server.yaml -w 2
-
-# Override DNS resolvers via CLI
-./micro-tunnel -c client.yaml --dns-resolver "dns+https://1.1.1.1?sni=cloudflare-dns.com"
 ```
 
 ---
@@ -133,7 +129,9 @@ worker_threads: 4     # Number of Tokio worker threads.
 ---
 
 ### 2. DNS Settings (`dns`)
-Global DNS resolution settings compatible with wstunnel and sing-box URL conventions. Can be overridden per-endpoint.
+Global DNS resolution settings. Can be overridden per-endpoint.
+
+`micro-tunnel` supports standard structured resolver configuration as well as standard URL schemes (non-standard `dns+` schemes like `dns+https://` or `dns+tls://` are removed).
 
 ```yaml
 dns:
@@ -142,13 +140,38 @@ dns:
                             #   "prefer_ipv6": prefer IPv6, fallback to IPv4
                             #   "ipv4_only": resolve A records only; ignore AAAA
                             #   "ipv6_only": resolve AAAA records only; ignore A
-  resolvers:                # Upstream DNS resolvers (alias: `servers`)
-    - "system://0.0.0.0"                                  # OS libc local resolver
-    - "dns://1.1.1.1:53"                                  # Standard UDP DNS
-    - "dns+https://1.1.1.1?sni=cloudflare-dns.com"       # DNS-over-HTTPS (DoH)
-    - "dns+tls://8.8.8.8?sni=dns.google"                 # DNS-over-TLS (DoT)
+  resolvers:
+    # Standard structured resolver objects:
+    - type: "https"
+      server: "1.1.1.1"
+      tls:
+        server_name: "cloudflare-dns.com"
+    - type: "tls"
+      server: "8.8.8.8"
+      tls:
+        server_name: "dns.google"
+    - type: "udp"
+      server: "1.1.1.1:53"
+    - type: "system"
+
+    # Standard URL strings are also supported:
+    # - "https://1.1.1.1?sni=cloudflare-dns.com"
+    # - "tls://8.8.8.8?sni=dns.google"
+    # - "udp://1.1.1.1:53"
+    # - "system://0.0.0.0"
   cache_capacity: 1024      # In-memory DNS cache capacity (default: 1024 entries)
 ```
+
+#### Structured DNS Resolver Reference
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `type` | String | Protocol type: `"https"` (DoH), `"tls"` (DoT), `"udp"`/`"dns"`, `"tcp"`, `"system"` |
+| `server` | String | Upstream server IP address or hostname (e.g. `"1.1.1.1"`, `"8.8.8.8:853"`) |
+| `port` | Integer | Custom upstream port (optional; defaults to standard port: 443 for https, 853 for tls, 53 for udp/tcp) |
+| `path` | String | URL path for DoH (optional; e.g. `"/dns-query"`) |
+| `tls.server_name` | String | Expected TLS SNI domain for DoH/DoT validation (e.g. `"cloudflare-dns.com"`) |
+| `tls.insecure` | Boolean | Skip TLS verification for encrypted DNS (default: `false`) |
 
 ---
 
@@ -177,7 +200,7 @@ tls:
   ca_certificate: "/etc/ssl/ca.crt"    # Custom CA certificate file path for server verification
   client_certificate: "/etc/ssl/client.crt" # Client certificate for mutual TLS (mTLS)
   client_key: "/etc/ssl/client.key"         # Client private key for mutual TLS (mTLS)
-  certificate: "/etc/ssl/server.crt"   # Server certificate for direct TLS termination (alias: cert)
+  certificate: "/etc/ssl/server.crt"   # Server certificate for direct TLS termination
   key: "/etc/ssl/server.key"           # Server private key for direct TLS termination
   min_version: "1.2"                   # Minimum TLS version ("1.2" or "1.3")
   max_version: "1.3"                   # Maximum TLS version ("1.2" or "1.3")
@@ -211,7 +234,7 @@ server:
 
   # Optional direct TLS termination certificates (used for wss/h3 if not behind a reverse proxy).
   # If omitted on wss/h3, a temporary self-signed certificate is automatically generated.
-  certificate: "/etc/ssl/server.crt"    # alias: cert
+  certificate: "/etc/ssl/server.crt"
   key: "/etc/ssl/server.key"
 
   # Optional advanced TLS settings overriding global tls block
@@ -292,19 +315,6 @@ tunnels:
       - mode: "forward"
         listen: "127.0.0.1:8080"
         target: "127.0.0.1:80"
-```
-
-#### Single-Mapping Legacy Syntax (Backward Compatibility)
-For simple tunnels, single mappings can be declared directly at the tunnel root:
-
-```yaml
-tunnels:
-  - tag: "simple-forward"
-    endpoint: "wss://tunnel.example.com/tunnel"
-    token: "SECRET_PRESHARED_TOKEN"
-    mode: "forward"
-    listen: "127.0.0.1:15201"
-    target: "127.0.0.1:5201"
 ```
 
 ---

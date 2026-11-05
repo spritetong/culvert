@@ -89,9 +89,9 @@ impl EndpointContext {
             strategy: endpoint_dns
                 .and_then(|d| d.strategy)
                 .or_else(|| global_app.dns.as_ref().and_then(|d| d.strategy)),
-            servers: endpoint_dns
-                .and_then(|d| d.servers.clone())
-                .or_else(|| global_app.dns.as_ref().and_then(|d| d.servers.clone())),
+            resolvers: endpoint_dns
+                .and_then(|d| d.resolvers.clone())
+                .or_else(|| global_app.dns.as_ref().and_then(|d| d.resolvers.clone())),
             cache_capacity: endpoint_dns
                 .and_then(|d| d.cache_capacity)
                 .or_else(|| global_app.dns.as_ref().and_then(|d| d.cache_capacity)),

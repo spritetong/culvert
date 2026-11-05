@@ -121,7 +121,6 @@ pub struct ServerConfig {
     /// Ingress listening URLs (e.g. "ws://0.0.0.0:8080/tunnel", ["ws://...", "h3://..."]).
     #[serde(
         default,
-        alias = "listens",
         deserialize_with = "deserialize_one_or_many"
     )]
     pub listen: Vec<String>,
@@ -133,7 +132,7 @@ pub struct ServerConfig {
     pub default_target: Option<String>,
 
     /// TLS certificate file path for direct TLS/WSS/H3 termination (optional, fallback to self-signed).
-    #[serde(default, alias = "cert")]
+    #[serde(default)]
     pub certificate: Option<String>,
 
     /// TLS private key file path for direct TLS/WSS/H3 termination (optional, fallback to self-signed).
@@ -217,7 +216,7 @@ impl Default for LogConfig {
 }
 
 /// IP address family selection strategy for DNS resolution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DnsStrategy {
     #[default]
@@ -227,13 +226,74 @@ pub enum DnsStrategy {
     Ipv6Only,
 }
 
+/// Configuration for an individual DNS resolver backend.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum DnsResolverConfig {
+    Detailed(DnsServerConfig),
+    Simple(String),
+}
+
+impl From<&str> for DnsResolverConfig {
+    fn from(s: &str) -> Self {
+        DnsResolverConfig::Simple(s.to_string())
+    }
+}
+
+impl From<String> for DnsResolverConfig {
+    fn from(s: String) -> Self {
+        DnsResolverConfig::Simple(s)
+    }
+}
+
+impl From<DnsServerConfig> for DnsResolverConfig {
+    fn from(cfg: DnsServerConfig) -> Self {
+        DnsResolverConfig::Detailed(cfg)
+    }
+}
+
+/// Structured DNS server configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub struct DnsServerConfig {
+    /// DNS transport protocol type: "https", "tls", "udp", "dns", "tcp", "system".
+    #[serde(rename = "type")]
+    pub r#type: String,
+
+    /// Upstream DNS server address (IP address or hostname, optionally with port).
+    #[serde(default)]
+    pub server: Option<String>,
+
+    /// Upstream DNS server port (optional; defaults to standard port for protocol).
+    #[serde(default)]
+    pub port: Option<u16>,
+
+    /// URL path for DNS-over-HTTPS (e.g. "/dns-query").
+    #[serde(default)]
+    pub path: Option<String>,
+
+    /// TLS options for encrypted DNS (DoH and DoT).
+    #[serde(default)]
+    pub tls: Option<DnsTlsConfig>,
+}
+
+/// TLS settings for DNS-over-HTTPS or DNS-over-TLS.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub struct DnsTlsConfig {
+    /// Expected SNI hostname for TLS verification (e.g. "cloudflare-dns.com").
+    #[serde(default)]
+    pub server_name: Option<String>,
+
+    /// Skip TLS certificate verification (default: false).
+    #[serde(default)]
+    pub insecure: bool,
+}
+
 /// DNS resolver configuration.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct DnsConfig {
     pub strategy: Option<DnsStrategy>,
 
-    #[serde(alias = "resolvers")]
-    pub servers: Option<Vec<String>>,
+    pub resolvers: Option<Vec<DnsResolverConfig>>,
 
     pub cache_capacity: Option<usize>,
 }
@@ -311,7 +371,7 @@ pub struct TlsConfig {
     pub client_key: Option<PathBuf>,
 
     /// Server certificate path for TLS termination.
-    #[serde(default, alias = "cert")]
+    #[serde(default)]
     pub certificate: Option<PathBuf>,
 
     /// Server private key path for TLS termination.
@@ -404,11 +464,6 @@ pub struct TunnelConfig {
     /// Multiple bidirectional port mappings sharing this endpoint and connection pool.
     #[serde(default)]
     pub mappings: Vec<PortMappingConfig>,
-
-    // Backward-compatibility single mapping fields
-    pub mode: Option<TunnelMode>,
-    pub listen: Option<String>,
-    pub target: Option<String>,
 }
 
 impl TunnelConfig {
@@ -418,15 +473,9 @@ impl TunnelConfig {
     ) -> Result<Vec<PortMappingConfig>, crate::core::error::TunnelError> {
         if !self.mappings.is_empty() {
             Ok(self.mappings.clone())
-        } else if let (Some(listen), Some(target)) = (&self.listen, &self.target) {
-            Ok(vec![PortMappingConfig {
-                mode: self.mode.unwrap_or(TunnelMode::Forward),
-                listen: listen.clone(),
-                target: target.clone(),
-            }])
         } else {
             Err(crate::core::error::TunnelError::Config(format!(
-                "Tunnel '{}' has no port mappings configured. Please provide 'mappings: [...]' or 'listen' and 'target'.",
+                "Tunnel '{}' has no port mappings configured. Please provide 'mappings: [...]'.",
                 self.tag
             )))
         }

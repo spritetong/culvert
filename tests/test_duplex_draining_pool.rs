@@ -13,7 +13,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
 use micro_tunnel::config::model::{
-    AppConfig, EndpointConfig, ServerConfig, TunnelConfig, TunnelMode,
+    AppConfig, EndpointConfig, PortMappingConfig, ServerConfig, TunnelConfig, TunnelMode,
 };
 use micro_tunnel::dialer::endpoint::EndpointContext;
 use micro_tunnel::server::ServerRunner;
@@ -102,14 +102,15 @@ async fn test_high_volume_duplex_stream_integrity() {
 
     let tunnel_config = TunnelConfig {
         tag: "test-volume".to_string(),
-        mode: Some(TunnelMode::Forward),
-        listen: Some(client_listen.clone()),
-        target: Some(format!("127.0.0.1:{}", echo_port)),
         token: Some(auth_token.to_string()),
         pool_size: None,
         failover: None,
         multiplex: None,
-        mappings: vec![],
+        mappings: vec![PortMappingConfig {
+            mode: TunnelMode::Forward,
+            listen: client_listen.clone(),
+            target: format!("127.0.0.1:{}", echo_port),
+        }],
         retry: None,
         endpoint: EndpointConfig::Simple(format!("ws://{}/ws", server_ws_listen)),
     };
@@ -245,14 +246,15 @@ async fn test_stream_half_close_and_draining() {
 
     let tunnel_config = TunnelConfig {
         tag: "test-draining".to_string(),
-        mode: Some(TunnelMode::Forward),
-        listen: Some(client_listen.clone()),
-        target: Some(format!("127.0.0.1:{}", backend_service_port)),
         token: Some(auth_token.to_string()),
         pool_size: None,
         failover: None,
         multiplex: None,
-        mappings: vec![],
+        mappings: vec![PortMappingConfig {
+            mode: TunnelMode::Forward,
+            listen: client_listen.clone(),
+            target: format!("127.0.0.1:{}", backend_service_port),
+        }],
         retry: None,
         endpoint: EndpointConfig::Simple(format!("ws://{}/ws", server_ws_listen)),
     };
@@ -338,14 +340,15 @@ async fn test_pool_prewarm_and_reuse() {
     // Configure tunnel with pool_size: 4
     let tunnel_config = TunnelConfig {
         tag: "test-pool".to_string(),
-        mode: Some(TunnelMode::Forward),
-        listen: Some(client_listen.clone()),
-        target: Some(format!("127.0.0.1:{}", echo_port)),
         token: Some(auth_token.to_string()),
         pool_size: Some(4), // Pre-warm 4 connections
         failover: None,
         multiplex: None,
-        mappings: vec![],
+        mappings: vec![PortMappingConfig {
+            mode: TunnelMode::Forward,
+            listen: client_listen.clone(),
+            target: format!("127.0.0.1:{}", echo_port),
+        }],
         retry: None,
         endpoint: EndpointConfig::Simple(format!("ws://{}/ws", server_ws_listen)),
     };
@@ -433,14 +436,15 @@ async fn test_pool_resilience_after_disconnect_and_high_churn() {
     // Configure tunnel with pool_size: 4
     let tunnel_config = TunnelConfig {
         tag: "test-pool-churn".to_string(),
-        mode: Some(TunnelMode::Forward),
-        listen: Some(client_listen.clone()),
-        target: Some(format!("127.0.0.1:{}", echo_port)),
         token: Some(auth_token.to_string()),
         pool_size: Some(4),
         failover: None,
         multiplex: None,
-        mappings: vec![],
+        mappings: vec![PortMappingConfig {
+            mode: TunnelMode::Forward,
+            listen: client_listen.clone(),
+            target: format!("127.0.0.1:{}", echo_port),
+        }],
         retry: None,
         endpoint: EndpointConfig::Simple(format!("ws://{}/ws", server_ws_listen)),
     };
