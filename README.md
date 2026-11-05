@@ -60,10 +60,12 @@ flowchart LR
 ## Installation & Build
 
 ### Prerequisites
+
 - [Rust 1.85+](https://www.rust-lang.org/tools/install) (Edition 2024 support)
 - C/C++ build toolchain (for `ring` / `mimalloc`)
 
 ### Build from Source
+
 ```bash
 # Clone the repository
 git clone https://github.com/spritetong/micro-tunnel.git
@@ -93,7 +95,8 @@ micro-tunnel [OPTIONS]
 | `--help` | `-h` | | Print command-line help message | |
 | `--version` | `-V` | | Print version information | |
 
-#### Example CLI Commands:
+#### Example CLI Commands
+
 ```bash
 # Run with default config.yaml
 ./micro-tunnel
@@ -111,7 +114,9 @@ Configuration files are written in declarative **YAML**. All top-level and neste
 ### 1. Global Settings
 
 #### `log` (Logging Options)
+
 Configures structured log output using Tokio `tracing`.
+
 ```yaml
 log:
   level: "info"      # Log verbosity level: "trace", "debug", "info", "warn", "error" (default: "info")
@@ -120,6 +125,7 @@ log:
 ```
 
 #### `worker_threads` (Runtime Concurrency)
+
 ```yaml
 worker_threads: 4     # Number of Tokio worker threads.
                       # Omit or set to null for auto-detecting CPU cores.
@@ -129,6 +135,7 @@ worker_threads: 4     # Number of Tokio worker threads.
 ---
 
 ### 2. DNS Settings (`dns`)
+
 Global DNS resolution settings. Can be overridden per-endpoint.
 
 `micro-tunnel` supports standard structured resolver configuration as well as standard URL schemes (non-standard `dns+` schemes like `dns+https://` or `dns+tls://` are removed).
@@ -176,6 +183,7 @@ dns:
 ---
 
 ### 3. Socket Dialer Settings (`dialer`)
+
 Low-level TCP socket configuration for outbound dialing. Can be overridden per-endpoint.
 
 ```yaml
@@ -189,6 +197,7 @@ dialer:
 ---
 
 ### 4. TLS Settings (`tls`)
+
 Global default TLS configuration for outbound client connections and fallback server termination.
 
 > **Note**: TLS activation is strictly determined by the URL scheme (`wss://`, `https://`, `h3://`, `quic://` vs unencrypted `ws://`, `uds://`). The `tls` configuration block specifies cryptographic parameters (SNI, certificates, versions) without any ambiguous `enabled` flag, avoiding implicit protocol conversions between `ws://` and `wss://`.
@@ -210,6 +219,7 @@ tls:
 ---
 
 ### 5. Server Ingress (`server`)
+
 Configures `micro-tunnel` as an ingress gateway on a cloud VPS or host.
 
 > **Note**: In a typical setup behind Caddy or Nginx, configure `listen` to a Unix Domain Socket (`uds:///run/tunnel.sock`) or loopback (`ws://127.0.0.1:8080/tunnel`).
@@ -259,6 +269,7 @@ server:
 ---
 
 ### 6. Tunnel Client (`tunnels`)
+
 Defines one or more outbound tunnel client instances.
 
 ```yaml
@@ -292,6 +303,7 @@ tunnels:
 ```
 
 #### Detailed Endpoint Configuration (Per-Endpoint Overrides)
+
 Instead of a simple URL string, `endpoint` can be declared as an object with dedicated `dns`, `dialer`, and `tls` overrides:
 
 ```yaml
@@ -326,6 +338,7 @@ tunnels:
 Let Caddy handle public HTTPS, HTTP/3, and automated Let's Encrypt certificates. Micro-tunnel listens securely over Unix Domain Sockets.
 
 #### `server.yaml` (micro-tunnel configuration)
+
 ```yaml
 log:
   level: "info"
@@ -337,6 +350,7 @@ server:
 ```
 
 #### `Caddyfile` (Caddy reverse proxy configuration)
+
 ```caddy
 tunnel.yourdomain.com {
     # Match micro-tunnel path
@@ -361,6 +375,7 @@ tunnel.yourdomain.com {
 Access an internal MySQL database (`10.0.0.5:3306`) in a private cloud network through a local port (`127.0.0.1:13306`).
 
 #### `client.yaml`
+
 ```yaml
 log:
   level: "info"
@@ -377,6 +392,7 @@ tunnels:
 ```
 
 Now connect locally using any database tool:
+
 ```bash
 mysql -h 127.0.0.1 -P 13306 -u root -p
 ```
@@ -388,6 +404,7 @@ mysql -h 127.0.0.1 -P 13306 -u root -p
 Expose a home computer's SSH server (`127.0.0.1:22`) on the public VPS port `2222` without configuring port forwarding on your home router.
 
 #### `client.yaml` (running on home computer)
+
 ```yaml
 log:
   level: "info"
@@ -414,6 +431,7 @@ Anyone connecting to `vps-ip:2222` is transparently routed back to your home mac
 Run `micro-tunnel` directly without a reverse proxy, leveraging HTTP/3 over UDP port `8443`.
 
 #### `server.yaml`
+
 ```yaml
 log:
   level: "info"
@@ -429,7 +447,8 @@ server:
   # key: "/etc/ssl/key.pem"
 ```
 
-#### `client.yaml`
+#### `client.yaml` (h3)
+
 ```yaml
 log:
   level: "info"
@@ -469,6 +488,7 @@ cargo bench
 ```
 
 ### Performance Characteristics
+
 - **Memory Footprint**: Under 15 MB RSS under high load.
 - **Throughput**: Saturated 10 Gbps+ line rate over loopback and LAN with minimal CPU overhead.
 - **Zero-Copy I/O**: Direct 64 KB kernel buffer splicing with `mimalloc` zero-fragmentation allocator.
