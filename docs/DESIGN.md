@@ -178,8 +178,8 @@ pub trait Dialer: Send + Sync {
 * `-c, --config <PATH>`：指定主配置文件路径（默认 `config.yaml`）。
 * `-w, --worker-threads <NUM>`：覆盖 Tokio 运行时工作线程数。
 * `--check`：启动前 Pre-flight Dry-Run 校验（涵盖 Schema 静态检查、TLS 证书合法性、DNS 解析验证与监听端口绑定探测）。
-* `--no-bind`：在 `--check` 时跳过本地网卡端口绑定探测（适用于当前主机服务已在运行时的配置校验或跨机构建）。
-* `--syntax-only`：仅执行配置语法与 Schema 纯静态校验（跳过 DNS 与端口探测）。
+* `--no-bind`：配合 `--check` 使用（须传入 `--check --no-bind`），跳过本地网卡端口绑定探测（保留 DNS 域名解析，适用于本地已有守护进程运行或 CI 环境）。
+* `--syntax-only`：独立执行纯静态配置语法、Schema、证书路径与协议族去重校验（不触发任何 DNS 解析与套接字绑定，完全离线运行）。
 
 ```yaml
 # ==================================================
@@ -316,11 +316,8 @@ pub struct TunnelConfig {
     pub endpoint: EndpointConfig,
     pub token: Option<String>,
     pub pool_size: Option<usize>,
-    pub failover: Option<FailoverConfig>,
-    pub multiplex: Option<MultiplexConfig>,
     pub retry: Option<TunnelRetryConfig>,
     pub mappings: Vec<PortMappingConfig>,
-
 }
 ```
 pub struct AppConfig {

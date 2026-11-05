@@ -1024,18 +1024,22 @@ async fn test_h3_connector_recovers_after_server_restart() {
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     // 4. Start Server 2 on the exact same port with fresh TLS config
+    let (server_rustls_2, _) = generate_test_quic_pki();
     let mut listener_2 = None;
+    let mut last_err = None;
     for _ in 0..20 {
-        let (server_rustls_2, _) = generate_test_quic_pki();
-        match H3Listener::bind(&listen_addr, Some(auth_token), None, server_rustls_2) {
+        match H3Listener::bind(&listen_addr, Some(auth_token), None, server_rustls_2.clone()) {
             Ok(l) => {
                 listener_2 = Some(l);
                 break;
             }
-            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
         }
     }
-    let mut listener_2 = listener_2.expect("Failed to re-bind H3Listener on restart");
+    let mut listener_2 = listener_2.unwrap_or_else(|| panic!("Failed to re-bind H3Listener on restart: {:?}", last_err));
 
     let server_2_cancel = tokio_util::sync::CancellationToken::new();
     let s2_cancel = server_2_cancel.clone();

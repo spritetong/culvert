@@ -40,8 +40,13 @@ impl H3Listener {
             listen_addr
         };
 
-        let addr: SocketAddr = clean_addr.parse().map_err(|e| {
-            TunnelError::Config(format!("Invalid listen address '{}': {}", listen_addr, e))
+        let addr: SocketAddr = clean_addr.parse().or_else(|_| {
+            use std::net::ToSocketAddrs;
+            clean_addr
+                .to_socket_addrs()
+                .map_err(|e| TunnelError::Config(format!("Invalid listen address '{}': {}", listen_addr, e)))?
+                .next()
+                .ok_or_else(|| TunnelError::Config(format!("Listen address '{}' resolved to no socket addresses", listen_addr)))
         })?;
 
         let is_quic_listener = listen_addr.starts_with("quic://");

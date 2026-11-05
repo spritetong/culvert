@@ -106,11 +106,11 @@ endpoint: "quic://127.0.0.1:8443/raw"
 ```
 *Evaluates Quinn QUIC engine with 0-RTT connection re-use and UDP packet pacing.*
 
-### Scenario D: Connection Pool vs. Multiplexing
-- **Pre-warmed Pool (`pool_size: 16`, `multiplex: { enabled: false }`)**:
-  Ideal for dedicated high-bandwidth TCP stream throughput.
-- **Frame Multiplexing (`multiplex: { enabled: true, max_streams: 256 }`)**:
-  Ideal for high connection churn (thousands of short-lived connections multiplexed over a single physical transport pipe).
+### Scenario D: Connection Pool Sizing
+- **Pre-warmed Pool (`pool_size: 16`)**:
+  Ideal for dedicated high-bandwidth TCP stream throughput with 0-RTT tunnel acquisition.
+- **Dynamic Pool Sizing**:
+  Configure pool capacity based on concurrent connection load and memory footprint.
 
 ---
 

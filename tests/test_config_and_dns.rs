@@ -343,6 +343,11 @@ async fn test_empty_server_listen_with_tunnels_does_not_exit_prematurely() {
         .local_addr()
         .unwrap()
         .port();
+    let port_target = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     let yaml = format!(r#"
 server:
   listen: []
@@ -355,8 +360,8 @@ tunnels:
     mappings:
       - mode: "forward"
         listen: "127.0.0.1:{}"
-        target: "127.0.0.1:5201"
-"#, port_listen, port_listen);
+        target: "127.0.0.1:{}"
+"#, port_listen, port_listen, port_target);
     let config = ConfigLoader::from_yaml_str(&yaml).expect("Failed to parse config with empty server listen");
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let shutdown_token = cancel_token.clone();
@@ -413,6 +418,60 @@ server:
     let res = ConfigLoader::from_yaml_str(yaml);
     assert!(res.is_err());
     assert!(res.unwrap_err().to_string().contains("Duplicate server listener address '127.0.0.1:19220'"));
+}
+
+#[test]
+fn test_reject_duplicate_https_and_h3_listener() {
+    let yaml = r#"
+server:
+  listen:
+    - "https://127.0.0.1:19522/a"
+    - "h3://127.0.0.1:19522/b"
+"#;
+    let res = ConfigLoader::from_yaml_str(yaml);
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("Duplicate server listener address '127.0.0.1:19522' conflict on transport protocol 'udp'"));
+}
+
+#[test]
+fn test_allow_coexisting_tcp_and_udp_same_port() {
+    let yaml = r#"
+server:
+  listen:
+    - "ws://127.0.0.1:19522/a"
+    - "https://127.0.0.1:19522/b"
+"#;
+    let res = ConfigLoader::from_yaml_str(yaml);
+    assert!(res.is_ok(), "TCP (ws) and UDP (https/h3) on the same port should coexist without conflict");
+}
+
+#[test]
+fn test_reject_wildcard_overlap_listener() {
+    let yaml = r#"
+server:
+  listen:
+    - "ws://0.0.0.0:19502/a"
+    - "ws://127.0.0.1:19502/b"
+"#;
+    let res = ConfigLoader::from_yaml_str(yaml);
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("overlaps with wildcard listener '0.0.0.0:19502'"));
+}
+
+#[test]
+fn test_reject_loopback_alias_listener() {
+    let yaml = r#"
+server:
+  listen:
+    - "ws://localhost:19503/a"
+    - "ws://127.0.0.1:19503/b"
+"#;
+    let res = ConfigLoader::from_yaml_str(yaml);
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("conflicts with loopback alias 'localhost:19503'"));
 }
 
 

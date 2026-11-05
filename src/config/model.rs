@@ -28,6 +28,24 @@ pub struct AppConfig {
     pub tunnels: Vec<TunnelConfig>,
 }
 
+/// Transport protocol family for server listeners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransportProtocolFamily {
+    Tcp,
+    Udp,
+    Uds,
+}
+
+impl std::fmt::Display for TransportProtocolFamily {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tcp => write!(f, "tcp"),
+            Self::Udp => write!(f, "udp"),
+            Self::Uds => write!(f, "uds"),
+        }
+    }
+}
+
 /// Parsed server listening specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerListenSpec {
@@ -37,6 +55,19 @@ pub struct ServerListenSpec {
 }
 
 impl ServerListenSpec {
+    /// Returns the underlying transport protocol family for this listener specification.
+    pub fn transport_family(&self) -> TransportProtocolFamily {
+        match self.scheme.as_str() {
+            "h3" | "https" | "quic" => TransportProtocolFamily::Udp,
+            "uds" | "unix" => TransportProtocolFamily::Uds,
+            _ => TransportProtocolFamily::Tcp,
+        }
+    }
+
+    /// Returns true if this listener uses Unix Domain Sockets.
+    pub fn is_uds(&self) -> bool {
+        self.transport_family() == TransportProtocolFamily::Uds
+    }
     pub fn parse(raw: &str) -> Result<Self, crate::core::error::TunnelError> {
         let raw = raw.trim();
         let (scheme, rest) = if let Some(idx) = raw.find("://") {

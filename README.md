@@ -93,8 +93,8 @@ micro-tunnel [OPTIONS]
 | `--config` | `-c` | `<PATH>` | Path to the YAML configuration file | `config.yaml` |
 | `--worker-threads` | `-w` | `<NUM>` | Override number of Tokio runtime worker threads (`1` for single-threaded runtime) | Auto-detect CPU cores |
 | `--check` | | | Pre-flight dry-run: validate schema, TLS certs, DNS resolution, and listener interface bindability | |
-| `--no-bind` | | | Skip local interface binding tests during `--check` (useful in CI or when daemon is running) | `false` |
-| `--syntax-only` | | | Syntax and schema only check (skips DNS resolution and interface binding tests) | `false` |
+| `--no-bind` | | | Skip local interface binding tests during `--check` (requires `--check`; useful in CI or when daemon is running) | `false` |
+| `--syntax-only` | | | Pure static syntax and schema check (skips DNS resolution and interface binding tests) | `false` |
 | `--help` | `-h` | | Print command-line help message | |
 | `--version` | `-V` | | Print version information | |
 
@@ -104,7 +104,10 @@ micro-tunnel [OPTIONS]
 # Validate configuration file without starting services (performs pre-flight including DNS and port bindability checks)
 ./micro-tunnel --check -c /etc/micro-tunnel/config.yaml
 
-# Syntax and schema validation only (offline CI or when daemon is already active)
+# Pre-flight check with DNS resolution while skipping port binding (when daemon is already active)
+./micro-tunnel --check --no-bind -c /etc/micro-tunnel/config.yaml
+
+# Pure static syntax and schema validation (offline CI, no network or port access)
 ./micro-tunnel --syntax-only -c /etc/micro-tunnel/config.yaml
 
 # Run with default config.yaml
@@ -268,13 +271,14 @@ server:
 | :--- | :--- | :--- |
 | `ws` | Unencrypted WebSocket over TCP | `ws://127.0.0.1:8080/tunnel` |
 | `wss` | TLS-encrypted WebSocket over TCP | `wss://0.0.0.0:8443/tunnel` |
-| `https` | TLS-encrypted HTTP/1.1 or HTTP/2 WebSocket | `https://0.0.0.0:8443/tunnel` |
+| `https` | HTTP/3 bidirectional stream over QUIC/UDP (alias for h3) | `https://0.0.0.0:8443/tunnel` |
 | `h3` | HTTP/3 bidirectional stream over QUIC/UDP | `h3://0.0.0.0:8443/tunnel` |
 | `quic` | Raw QUIC bidirectional stream | `quic://0.0.0.0:8443/tunnel` |
 | `uds` / `unix` | Unix Domain Socket (IPC, Unix platforms only) | `uds:///run/tunnel.sock` or `unix:///run/tunnel.sock` |
 
 > [!NOTE]
 > `uds` and `unix` schemes are supported only on Unix platforms (Linux / macOS) and will be rejected at configuration validation time on Windows.
+> For `h3` and `https` listeners, `"h3"` is prioritized at index 0 of ALPN negotiation per RFC 7301 / RFC 9114 so standard HTTP/3 clients always negotiate `h3`. Custom `tls.alpn` options serve as fallback identifiers for raw QUIC or specialized non-browser clients.
 
 > [!IMPORTANT]
 > **Path Matching**: Client requests must match the server URL's path exactly (e.g., `/tunnel`). Mismatched paths receive an HTTP `404 Not Found` response to defend against scanner probes.

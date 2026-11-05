@@ -41,7 +41,7 @@ struct Cli {
     check: bool,
 
     /// When performing pre-flight check, skip local interface binding tests.
-    #[arg(long)]
+    #[arg(long, requires = "check")]
     no_bind: bool,
 
     /// Syntax and schema only check (skips network DNS queries and local interface binding tests).
@@ -63,10 +63,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let is_check = cli.check || cli.syntax_only;
-    let no_bind = cli.no_bind || cli.syntax_only;
+    if cli.syntax_only {
+        println!(
+            "Configuration check succeeded: '{:?}' is valid.",
+            cli.config
+        );
+        return Ok(());
+    }
 
-    if is_check {
+    if cli.check {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -78,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let check_res = runtime.block_on(async { preflight_check(&app_config, no_bind) });
+        let check_res = runtime.block_on(async { preflight_check(&app_config, cli.no_bind) });
         if let Err(e) = check_res {
             eprintln!(
                 "Configuration pre-flight check failed for '{:?}': {}",
@@ -209,7 +214,7 @@ fn preflight_check(config: &AppConfig, no_bind: bool) -> Result<(), TunnelError>
                 .get_driver(&spec.scheme)
                 .ok_or_else(|| TunnelError::UnsupportedScheme(spec.scheme.clone()))?;
 
-            if !no_bind && matches!(spec.scheme.as_str(), "ws" | "wss" | "h3" | "quic" | "https") {
+            if !spec.is_uds() {
                 use std::net::ToSocketAddrs;
                 let addrs: Vec<_> = spec.bind_addr.to_socket_addrs().map_err(|e| {
                     TunnelError::Config(format!(
@@ -227,23 +232,60 @@ fn preflight_check(config: &AppConfig, no_bind: bool) -> Result<(), TunnelError>
 
                 // Pre-flight test bind to detect AddrNotAvailable and AddrInUse early.
                 // Keep sockets held until all specs are verified to catch internal duplicate port conflicts.
-                for addr in &addrs {
-                    if matches!(spec.scheme.as_str(), "h3" | "quic") {
-                        let socket = std::net::UdpSocket::bind(addr).map_err(|e| {
-                            TunnelError::Config(format!(
-                                "Server listen address '{}' ({}) cannot be bound: {}",
-                                spec.bind_addr, addr, e
-                            ))
-                        })?;
-                        _held_udp_sockets.push(socket);
-                    } else {
-                        let listener = std::net::TcpListener::bind(addr).map_err(|e| {
-                            TunnelError::Config(format!(
-                                "Server listen address '{}' ({}) cannot be bound: {}",
-                                spec.bind_addr, addr, e
-                            ))
-                        })?;
-                        _held_tcp_listeners.push(listener);
+                if !no_bind {
+                    use micro_tunnel::config::model::TransportProtocolFamily;
+                    match spec.transport_family() {
+                        TransportProtocolFamily::Udp => {
+                            let mut bound = None;
+                            let mut last_err = None;
+                            for addr in &addrs {
+                                match std::net::UdpSocket::bind(addr) {
+                                    Ok(sock) => {
+                                        bound = Some(sock);
+                                        break;
+                                    }
+                                    Err(e) => last_err = Some(e),
+                                }
+                            }
+                            match bound {
+                                Some(sock) => _held_udp_sockets.push(sock),
+                                None => {
+                                    let err_str = last_err
+                                        .map(|e| e.to_string())
+                                        .unwrap_or_else(|| "no address could be bound".to_string());
+                                    return Err(TunnelError::Config(format!(
+                                        "Server listen address '{}' cannot be bound: {}",
+                                        spec.bind_addr, err_str
+                                    )));
+                                }
+                            }
+                        }
+                        TransportProtocolFamily::Tcp => {
+                            let mut bound = None;
+                            let mut last_err = None;
+                            for addr in &addrs {
+                                match std::net::TcpListener::bind(addr) {
+                                    Ok(listener) => {
+                                        bound = Some(listener);
+                                        break;
+                                    }
+                                    Err(e) => last_err = Some(e),
+                                }
+                            }
+                            match bound {
+                                Some(listener) => _held_tcp_listeners.push(listener),
+                                None => {
+                                    let err_str = last_err
+                                        .map(|e| e.to_string())
+                                        .unwrap_or_else(|| "no address could be bound".to_string());
+                                    return Err(TunnelError::Config(format!(
+                                        "Server listen address '{}' cannot be bound: {}",
+                                        spec.bind_addr, err_str
+                                    )));
+                                }
+                            }
+                        }
+                        TransportProtocolFamily::Uds => {}
                     }
                 }
             }
@@ -263,7 +305,7 @@ fn preflight_check(config: &AppConfig, no_bind: bool) -> Result<(), TunnelError>
                     .map(|list| list.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>())
                     .unwrap_or_default();
 
-                if matches!(spec.scheme.as_str(), "h3") && !alpn.iter().any(|p| p == b"h3") {
+                if matches!(spec.scheme.as_str(), "h3" | "https") && !alpn.iter().any(|p| p == b"h3") {
                     alpn.push(b"h3".to_vec());
                 } else if matches!(spec.scheme.as_str(), "quic")
                     && !alpn.iter().any(|p| p == b"micro-tunnel-quic")

@@ -152,27 +152,151 @@ impl ConfigLoader {
             }
 
             let specs = server.parse_specs()?;
-            let mut seen_bind_addrs = HashSet::new();
+
+            // Validate against duplicate, loopback alias, and wildcard overlapping listeners
+            #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+            enum HostKind {
+                WildcardV4,
+                WildcardV6,
+                LoopbackV4,
+                LoopbackV6,
+                Localhost,
+                SpecificV4(std::net::Ipv4Addr),
+                SpecificV6(std::net::Ipv6Addr),
+            }
+
+            struct SeenSpec {
+                bind_addr: String,
+                family: crate::config::model::TransportProtocolFamily,
+                port: Option<u16>,
+                host_kind: Option<HostKind>,
+                hostname: Option<String>,
+            }
+
+            let mut seen_specs: Vec<SeenSpec> = Vec::new();
+
             for spec in &specs {
                 #[cfg(not(unix))]
-                if spec.scheme == "uds" || spec.scheme == "unix" {
+                if spec.is_uds() {
                     return Err(TunnelError::UnsupportedScheme(
                         "Unix Domain Sockets (uds:// or unix://) are only supported on Unix platforms (Linux/macOS)".to_string(),
                     ));
                 }
 
-                let transport_proto = match spec.scheme.as_str() {
-                    "h3" | "quic" => "udp",
-                    "uds" | "unix" => "uds",
-                    _ => "tcp",
-                };
-                let bind_key = (transport_proto, spec.bind_addr.clone());
-                if !seen_bind_addrs.insert(bind_key) {
-                    return Err(TunnelError::Config(format!(
-                        "Duplicate server listener address '{}' conflict on transport protocol '{}'",
-                        spec.bind_addr, transport_proto
-                    )));
+                let family = spec.transport_family();
+
+                if spec.is_uds() {
+                    if seen_specs.iter().any(|s| s.family == family && s.bind_addr == spec.bind_addr) {
+                        return Err(TunnelError::Config(format!(
+                            "Duplicate server listener socket path '{}' conflict on transport protocol '{}'",
+                            spec.bind_addr, family
+                        )));
+                    }
+                    seen_specs.push(SeenSpec {
+                        bind_addr: spec.bind_addr.clone(),
+                        family,
+                        port: None,
+                        host_kind: None,
+                        hostname: None,
+                    });
+                    continue;
                 }
+
+                let (host_str, port_str) = spec.bind_addr.rsplit_once(':').ok_or_else(|| {
+                    TunnelError::Config(format!("Invalid listen address format: '{}'", spec.bind_addr))
+                })?;
+                let port: u16 = port_str.parse().map_err(|_| {
+                    TunnelError::Config(format!("Invalid listen port: '{}'", port_str))
+                })?;
+
+                let trimmed_host = host_str.trim_matches(|c| c == '[' || c == ']');
+                let (host_kind, hostname) = if trimmed_host.eq_ignore_ascii_case("localhost") {
+                    (Some(HostKind::Localhost), None)
+                } else if let Ok(ip) = trimmed_host.parse::<std::net::IpAddr>() {
+                    let kind = match ip {
+                        std::net::IpAddr::V4(v4) if v4.is_unspecified() => HostKind::WildcardV4,
+                        std::net::IpAddr::V4(v4) if v4.is_loopback() => HostKind::LoopbackV4,
+                        std::net::IpAddr::V4(v4) => HostKind::SpecificV4(v4),
+                        std::net::IpAddr::V6(v6) if v6.is_unspecified() => HostKind::WildcardV6,
+                        std::net::IpAddr::V6(v6) if v6.is_loopback() => HostKind::LoopbackV6,
+                        std::net::IpAddr::V6(v6) => HostKind::SpecificV6(v6),
+                    };
+                    (Some(kind), None)
+                } else {
+                    (None, Some(trimmed_host.to_ascii_lowercase()))
+                };
+
+                for prev in &seen_specs {
+                    if prev.family != family || prev.port != Some(port) {
+                        continue;
+                    }
+
+                    // 1. Exact string duplicate
+                    if prev.bind_addr == spec.bind_addr {
+                        return Err(TunnelError::Config(format!(
+                            "Duplicate server listener address '{}' conflict on transport protocol '{}'",
+                            spec.bind_addr, family
+                        )));
+                    }
+
+                    // 2. Wildcard overlaps
+                    match (prev.host_kind, host_kind) {
+                        (Some(HostKind::WildcardV4), Some(HostKind::WildcardV4 | HostKind::LoopbackV4 | HostKind::Localhost | HostKind::SpecificV4(_)))
+                        | (Some(HostKind::LoopbackV4 | HostKind::Localhost | HostKind::SpecificV4(_)), Some(HostKind::WildcardV4)) => {
+                            return Err(TunnelError::Config(format!(
+                                "Server listener address '{}' overlaps with wildcard listener '{}' on transport protocol '{}'",
+                                spec.bind_addr, prev.bind_addr, family
+                            )));
+                        }
+                        (Some(HostKind::WildcardV6), Some(HostKind::WildcardV6 | HostKind::LoopbackV6 | HostKind::Localhost | HostKind::SpecificV6(_)))
+                        | (Some(HostKind::LoopbackV6 | HostKind::Localhost | HostKind::SpecificV6(_)), Some(HostKind::WildcardV6)) => {
+                            return Err(TunnelError::Config(format!(
+                                "Server listener address '{}' overlaps with wildcard listener '{}' on transport protocol '{}'",
+                                spec.bind_addr, prev.bind_addr, family
+                            )));
+                        }
+                        // 3. Loopback alias conflicts (e.g. localhost vs 127.0.0.1 or ::1)
+                        (Some(HostKind::Localhost), Some(HostKind::Localhost | HostKind::LoopbackV4 | HostKind::LoopbackV6))
+                        | (Some(HostKind::LoopbackV4 | HostKind::LoopbackV6), Some(HostKind::Localhost))
+                        | (Some(HostKind::LoopbackV4), Some(HostKind::LoopbackV4))
+                        | (Some(HostKind::LoopbackV6), Some(HostKind::LoopbackV6)) => {
+                            return Err(TunnelError::Config(format!(
+                                "Server listener address '{}' conflicts with loopback alias '{}' on transport protocol '{}'",
+                                spec.bind_addr, prev.bind_addr, family
+                            )));
+                        }
+                        // 4. Specific IP conflicts
+                        (Some(HostKind::SpecificV4(ip1)), Some(HostKind::SpecificV4(ip2))) if ip1 == ip2 => {
+                            return Err(TunnelError::Config(format!(
+                                "Duplicate server listener address '{}' conflict on transport protocol '{}'",
+                                spec.bind_addr, family
+                            )));
+                        }
+                        (Some(HostKind::SpecificV6(ip1)), Some(HostKind::SpecificV6(ip2))) if ip1 == ip2 => {
+                            return Err(TunnelError::Config(format!(
+                                "Duplicate server listener address '{}' conflict on transport protocol '{}'",
+                                spec.bind_addr, family
+                            )));
+                        }
+                        _ => {}
+                    }
+
+                    // 5. Hostname conflicts
+                    if prev.hostname.is_some() && prev.hostname == hostname {
+                        return Err(TunnelError::Config(format!(
+                            "Duplicate server listener address '{}' conflict on transport protocol '{}'",
+                            spec.bind_addr, family
+                        )));
+                    }
+                }
+
+                seen_specs.push(SeenSpec {
+                    bind_addr: spec.bind_addr.clone(),
+                    family,
+                    port: Some(port),
+                    host_kind,
+                    hostname,
+                });
             }
 
             // Reject TLS cert configuration if all server listeners are plaintext ws:// or uds://
