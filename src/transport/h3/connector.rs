@@ -157,12 +157,12 @@ impl H3Connector {
         let connecting = self
             .quinn_endpoint
             .connect(resolved_addr, sni)
-            .map_err(|e| TunnelError::Tls(format!("QUIC connect error: {:?}", e)))?;
+            .map_err(|e| TunnelError::TlsHandshake(format!("QUIC connect error: {:?}", e)))?;
 
         let conn = tokio::time::timeout(std::time::Duration::from_secs(5), connecting)
             .await
             .map_err(|_| TunnelError::ConnectTimeout(std::time::Duration::from_secs(5)))?
-            .map_err(|e| TunnelError::Tls(format!("QUIC handshake error: {:?}", e)))?;
+            .map_err(|e| TunnelError::TlsHandshake(format!("QUIC handshake error: {:?}", e)))?;
 
         Ok(conn)
     }

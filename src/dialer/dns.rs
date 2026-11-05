@@ -522,7 +522,6 @@ tls:
             path: None,
             tls: Some(crate::config::model::DnsTlsConfig {
                 server_name: Some("dns.google".to_string()),
-                insecure: false,
             }),
         });
         let parsed_dot = CachedDnsResolver::parse_resolver(&struct_dot).unwrap();

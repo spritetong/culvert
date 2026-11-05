@@ -54,8 +54,13 @@ impl TransportDriver for UdsTransportDriver {
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
         #[cfg(unix)]
         {
+            let clean_path = if let Some(idx) = socket_path.find("://") {
+                &socket_path[idx + 3..]
+            } else {
+                socket_path
+            };
             Ok(Box::new(unix_impl::UdsListener::new(
-                socket_path,
+                clean_path,
                 auth_token,
                 path,
             )))
@@ -74,12 +79,13 @@ impl TransportDriver for UdsTransportDriver {
 #[cfg(unix)]
 mod unix_impl {
     use super::*;
-    use fastwebsockets::{upgrade::upgrade, Role};
+    use fastwebsockets::{upgrade::upgrade, Role, handshake};
     use http_body_util::Empty;
     use hyper::body::{Bytes, Incoming};
     use hyper::service::service_fn;
     use hyper::{Request, Response, StatusCode};
     use hyper_util::rt::TokioIo;
+    use std::future::Future;
     use std::path::Path;
     use std::sync::Arc;
     use std::time::Duration;
@@ -91,6 +97,19 @@ mod unix_impl {
     use crate::transport::ws::stream::WsTunnelStream;
 
     type AcceptedResult = Result<(Box<dyn TunnelStream>, StreamMetadata), TunnelError>;
+
+    /// Hyper executor bridging Hyper futures onto Tokio runtime.
+    struct TokioSpawnExecutor;
+
+    impl<Fut> hyper::rt::Executor<Fut> for TokioSpawnExecutor
+    where
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        fn execute(&self, fut: Fut) {
+            tokio::task::spawn(fut);
+        }
+    }
 
     pub struct UdsListener {
         socket_path: String,
@@ -168,7 +187,7 @@ mod unix_impl {
                         tokio::select! {
                             _ = cancel_conn.cancelled() => {}
                             _ = async {
-                                let io = TokioIo::new(Box::new(stream) as Box<dyn TunnelStream>);
+                                let io = TokioIo::new(stream);
                                 let service_cancel = cancel_conn.clone();
                                 let service = service_fn(move |mut req: Request<Incoming>| {
                                     let tx = tx.clone();
@@ -188,21 +207,33 @@ mod unix_impl {
                                             }
                                         }
 
-                                        let headers = WsHandshakeHeaders::from_header_map(req.headers());
-                                        if let Some(ref expected_tok) = *token {
-                                            let client_tok = headers.auth_token.as_deref().unwrap_or("");
-                                            if !crate::common::auth::constant_time_token_eq(client_tok, expected_tok) {
+                                        let headers = match WsHandshakeHeaders::from_http_headers(req.headers()) {
+                                            Ok(h) => h,
+                                            Err(_) => {
                                                 return Ok(Response::builder()
                                                     .status(StatusCode::UNAUTHORIZED)
                                                     .body(Empty::<Bytes>::new())
                                                     .unwrap());
                                             }
+                                        };
+
+                                        if let Some(ref expected) = *token {
+                                            if !expected.is_empty() {
+                                                let matches = headers
+                                                    .auth_token
+                                                    .as_deref()
+                                                    .map(|t| crate::common::constant_time_token_eq(t.as_bytes(), expected.as_bytes()))
+                                                    .unwrap_or(false);
+                                                if !matches {
+                                                    return Ok(Response::builder()
+                                                        .status(StatusCode::FORBIDDEN)
+                                                        .body(Empty::<Bytes>::new())
+                                                        .unwrap());
+                                                }
+                                            }
                                         }
 
-                                        let mode = headers.mode;
-                                        let target = headers.target.clone();
-                                        let session_id = headers.session_id.clone();
-                                        let pool_idle = headers.pool_idle;
+                                        let metadata = headers.to_stream_metadata();
 
                                         let (response, fut) = match upgrade(&mut req) {
                                             Ok(res) => res,
@@ -217,19 +248,16 @@ mod unix_impl {
                                         tokio::spawn(async move {
                                             tokio::select! {
                                                 _ = cancel_upgrade.cancelled() => {}
-                                                res = fut => match res {
-                                                    Ok(ws) => {
-                                                        let ws_stream = WsTunnelStream::new(ws, Role::Server);
-                                                        let meta = StreamMetadata {
-                                                            mode,
-                                                            session_id,
-                                                            target,
-                                                            pool_idle,
-                                                        };
-                                                        let _ = tx.send(Ok((Box::new(ws_stream), meta))).await;
+                                                res = tokio::time::timeout(Duration::from_secs(10), fut) => match res {
+                                                    Ok(Ok(ws)) => {
+                                                        let ws_stream = WsTunnelStream::new(ws.into_inner(), Role::Server);
+                                                        let _ = tx.send(Ok((Box::new(ws_stream) as Box<dyn TunnelStream>, metadata))).await;
                                                     }
-                                                    Err(e) => {
+                                                    Ok(Err(e)) => {
                                                         let _ = tx.send(Err(TunnelError::Internal(e.to_string()))).await;
+                                                    }
+                                                    Err(_) => {
+                                                        let _ = tx.send(Err(TunnelError::Internal("UDS WebSocket upgrade timed out".to_string()))).await;
                                                     }
                                                 }
                                             }
@@ -239,10 +267,13 @@ mod unix_impl {
                                     }
                                 });
 
-                                let _ = hyper::server::conn::http1::Builder::new()
-                                    .serve_connection(io, service)
-                                    .with_upgrades()
-                                    .await;
+                                let _ = tokio::time::timeout(
+                                    Duration::from_secs(10),
+                                    hyper::server::conn::http1::Builder::new()
+                                        .serve_connection(io, service)
+                                        .with_upgrades(),
+                                )
+                                .await;
                             } => {}
                         }
                     });
@@ -302,7 +333,7 @@ mod unix_impl {
             session_id: Option<&'a str>,
         ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
             Box::pin(async move {
-                let socket_path = self.endpoint.endpoint.host.as_str();
+                let socket_path = self.endpoint.endpoint.path.as_str();
                 let stream = TokioUnixStream::connect(socket_path)
                     .await
                     .map_err(TunnelError::Io)?;
@@ -310,66 +341,33 @@ mod unix_impl {
                 // Perform client HTTP upgrade over Unix socket
                 let req_builder = Request::builder()
                     .method("GET")
-                    .uri(self.endpoint.endpoint.path.as_deref().unwrap_or("/"))
+                    .uri("/")
                     .header("Host", "localhost")
                     .header("Upgrade", "websocket")
                     .header("Connection", "Upgrade")
                     .header("Sec-WebSocket-Key", fastwebsockets::handshake::generate_key())
                     .header("Sec-WebSocket-Version", "13");
 
-                let mut req_builder = match self.mode {
-                    TunnelMode::Forward => req_builder
-                        .header("X-Tunnel-Mode", "forward")
-                        .header("X-Tunnel-Target", target.to_string()),
-                    TunnelMode::Reverse => {
-                        let b = req_builder.header("X-Tunnel-Mode", "reverse");
-                        if let Some(sid) = session_id {
-                            b.header("X-Tunnel-Session-Id", sid)
-                        } else {
-                            b
-                        }
-                    }
-                };
+                let pool_idle = self.mode == TunnelMode::Reverse && session_id.is_none();
+                let headers = WsHandshakeHeaders::new(self.auth_token.clone(), self.mode)
+                    .with_session_id(session_id.map(|s| s.to_string()))
+                    .with_target(Some(target))
+                    .with_pool_idle(pool_idle);
 
-                if let Some(ref tok) = self.auth_token {
-                    req_builder = req_builder.header("X-Tunnel-Auth", tok);
-                }
+                let req_builder = headers.apply_to_request_builder(req_builder);
 
                 let req = req_builder
                     .body(Empty::<Bytes>::new())
                     .map_err(|e| TunnelError::Internal(e.to_string()))?;
 
-                let io = TokioIo::new(Box::new(stream) as Box<dyn TunnelStream>);
-                let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+                let (ws, _response) = handshake::client(&TokioSpawnExecutor, req, stream)
                     .await
-                    .map_err(|e| TunnelError::Internal(e.to_string()))?;
+                    .map_err(|e| {
+                        TunnelError::ControlProtocol(format!("UDS WebSocket client handshake failed: {}", e))
+                    })?;
 
-                tokio::spawn(async move {
-                    let _ = conn.with_upgrades().await;
-                });
-
-                let res = sender
-                    .send_request(req)
-                    .await
-                    .map_err(|e| TunnelError::Internal(e.to_string()))?;
-
-                if res.status() != StatusCode::SWITCHING_PROTOCOLS {
-                    return Err(TunnelError::Internal(format!(
-                        "UDS WebSocket handshake failed with status {}",
-                        res.status()
-                    )));
-                }
-
-                let upgraded = hyper::upgrade::on(res)
-                    .await
-                    .map_err(|e| TunnelError::Internal(e.to_string()))?;
-
-                let ws = fastwebsockets::WebSocket::after_handshake(
-                    TokioIo::new(upgraded),
-                    Role::Client,
-                );
-
-                Ok(Box::new(WsTunnelStream::new(ws, Role::Client)) as Box<dyn TunnelStream>)
+                let tunnel_stream = WsTunnelStream::new(ws.into_inner(), Role::Client);
+                Ok(Box::new(tunnel_stream) as Box<dyn TunnelStream>)
             })
         }
 

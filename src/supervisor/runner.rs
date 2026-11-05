@@ -16,9 +16,6 @@ use crate::dialer::endpoint::EndpointContext;
 use crate::server::ServerRunner;
 use crate::session::SessionManager;
 use crate::transport::TransportRegistry;
-use crate::transport::h3::H3TransportDriver;
-use crate::transport::uds::UdsTransportDriver;
-use crate::transport::ws::WsTransportDriver;
 use crate::tunnel::run_tunnel_cluster;
 
 /// Multi-tunnel supervisor that concurrently runs multiple tunnels and ensures orderly shutdown.
@@ -32,15 +29,10 @@ pub struct TunnelSupervisor {
 impl TunnelSupervisor {
     /// Creates a new `TunnelSupervisor` instance.
     pub fn new(config: AppConfig, cancel_token: CancellationToken) -> Self {
-        let mut registry = TransportRegistry::new();
-        registry.register(WsTransportDriver);
-        registry.register(H3TransportDriver);
-        registry.register(UdsTransportDriver);
-
         Self {
             config,
             cancel_token,
-            transport_registry: Arc::new(registry),
+            transport_registry: Arc::new(TransportRegistry::default()),
             session_manager: Arc::new(SessionManager::new()),
         }
     }

@@ -12,9 +12,20 @@ use crate::dialer::endpoint::EndpointContext;
 use crate::transport::{TransportConnector, TransportDriver, TransportListener};
 
 /// Global transport registry managing driver instances.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TransportRegistry {
     drivers: Arc<HashMap<&'static str, Arc<dyn TransportDriver>>>,
+}
+
+impl Default for TransportRegistry {
+    /// Creates a `TransportRegistry` pre-populated with standard transport drivers (WS, H3, UDS).
+    fn default() -> Self {
+        let mut reg = Self::new();
+        reg.register(crate::transport::ws::WsTransportDriver);
+        reg.register(crate::transport::h3::H3TransportDriver);
+        reg.register(crate::transport::uds::UdsTransportDriver);
+        reg
+    }
 }
 
 impl TransportRegistry {

@@ -57,9 +57,13 @@ impl TransportDriver for WsTransportDriver {
             None => (None, None),
         };
 
+        let alpn = tls.and_then(|t| t.alpn.as_ref()).map(|list| {
+            list.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>()
+        });
+
         let tls_acceptor = if is_wss {
             let server_rustls = crate::dialer::tls::TlsConfigBuilder::build_server_config(
-                cert_str, key_str, None, min_v, max_v,
+                cert_str, key_str, alpn, min_v, max_v,
             )?;
             Some(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(
                 server_rustls,

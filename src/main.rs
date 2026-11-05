@@ -12,7 +12,12 @@ use tracing_subscriber::EnvFilter;
 
 use micro_tunnel::config::ConfigLoader;
 use micro_tunnel::config::model::AppConfig;
+use micro_tunnel::core::error::TunnelError;
+use micro_tunnel::dialer::endpoint::EndpointContext;
+use micro_tunnel::dialer::tls::TlsConfigBuilder;
 use micro_tunnel::supervisor::TunnelSupervisor;
+use micro_tunnel::transport::TransportRegistry;
+use std::sync::Arc;
 
 use mimalloc::MiMalloc;
 
@@ -51,6 +56,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if cli.check {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("Failed to initialize Tokio runtime for check: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        let check_res = runtime.block_on(async { preflight_check(&app_config) });
+        if let Err(e) = check_res {
+            eprintln!(
+                "Configuration pre-flight check failed for '{:?}': {}",
+                cli.config, e
+            );
+            std::process::exit(1);
+        }
         println!(
             "Configuration check succeeded: '{:?}' is valid.",
             cli.config
@@ -147,5 +171,52 @@ async fn async_main(app_config: AppConfig) -> Result<(), Box<dyn std::error::Err
     }
 
     info!("Micro-tunnel daemon exited cleanly.");
+    Ok(())
+}
+
+fn preflight_check(config: &AppConfig) -> Result<(), TunnelError> {
+    let registry = Arc::new(TransportRegistry::default());
+
+    // 1. Dry-run tunnels: build EndpointContext and connectors
+    for tunnel in &config.tunnels {
+        let ctx = EndpointContext::build(&tunnel.endpoint, config)?;
+        let auth_token = tunnel.token.as_deref();
+        for mapping in &tunnel.mappings {
+            let _connector = registry.create_connector(&ctx, auth_token, mapping.mode)?;
+        }
+    }
+
+    // 2. Dry-run server: parse specs and verify TlsAcceptor if TLS scheme is present
+    if let Some(ref server) = config.server {
+        let specs = server.parse_specs()?;
+        let effective_tls = server.effective_tls(config.tls.as_ref());
+        for spec in &specs {
+            let _driver = registry
+                .get_driver(&spec.scheme)
+                .ok_or_else(|| TunnelError::UnsupportedScheme(spec.scheme.clone()))?;
+
+            if matches!(spec.scheme.as_str(), "wss" | "https" | "h3" | "quic") {
+                let cert_str = effective_tls
+                    .as_ref()
+                    .and_then(|t| t.certificate.as_ref())
+                    .and_then(|p| p.to_str());
+                let key_str = effective_tls
+                    .as_ref()
+                    .and_then(|t| t.key.as_ref())
+                    .and_then(|p| p.to_str());
+                let alpn = effective_tls.as_ref().and_then(|t| t.alpn.as_ref()).map(|list| {
+                    list.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>()
+                });
+                let (min_v, max_v) = match effective_tls {
+                    Some(ref t) => (t.min_version.as_deref(), t.max_version.as_deref()),
+                    None => (None, None),
+                };
+                let _server_rustls = TlsConfigBuilder::build_server_config(
+                    cert_str, key_str, alpn, min_v, max_v,
+                )?;
+            }
+        }
+    }
+
     Ok(())
 }

@@ -257,7 +257,7 @@ tunnels:
       dns:
         strategy: "prefer_ipv6"
       tls:
-              server_name: "db-edge.example.com"
+        server_name: "db-edge.example.com"
         alpn: ["h3"]
         ca_certificate: "/etc/ssl/certs/custom_ca.pem"
         client_certificate: "/etc/ssl/certs/client.crt"

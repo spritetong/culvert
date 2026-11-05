@@ -42,7 +42,10 @@ impl TransportDriver for H3TransportDriver {
         path: Option<&str>,
         tls: Option<&crate::config::model::TlsConfig>,
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
-        let alpn = vec![b"h3".to_vec(), b"micro-tunnel-quic".to_vec()];
+        let alpn = tls
+            .and_then(|t| t.alpn.as_ref())
+            .map(|list| list.iter().map(|s| s.as_bytes().to_vec()).collect())
+            .unwrap_or_else(|| vec![b"h3".to_vec(), b"micro-tunnel-quic".to_vec()]);
         let cert_str = tls
             .and_then(|t| t.certificate.as_ref())
             .and_then(|p| p.to_str());

@@ -86,31 +86,35 @@ impl ConfigLoader {
                 ));
             }
 
-            if let Some(ref token) = server.token
-                && token.len() > crate::common::auth::TOKEN_MAX_LEN
-            {
-                return Err(TunnelError::Config(format!(
-                    "server.token length ({} bytes) exceeds maximum supported token length ({} bytes)",
-                    token.len(),
-                    crate::common::auth::TOKEN_MAX_LEN
-                )));
+            if let Some(ref token) = server.token {
+                if token.is_empty() {
+                    return Err(TunnelError::Config(
+                        "server.token must not be empty. Omit the 'token' field if authentication is not required.".to_string(),
+                    ));
+                }
+                if token.len() > crate::common::auth::TOKEN_MAX_LEN {
+                    return Err(TunnelError::Config(format!(
+                        "server.token length ({} bytes) exceeds maximum supported token length ({} bytes)",
+                        token.len(),
+                        crate::common::auth::TOKEN_MAX_LEN
+                    )));
+                }
+            }
+
+            if let Some(ref dt) = server.default_target {
+                crate::tunnel::forward::parse_target_addr(dt).map_err(|_| {
+                    TunnelError::Config(format!(
+                        "server.default_target '{}' is invalid. Expected 'host:port' or 'ip:port'",
+                        dt
+                    ))
+                })?;
             }
 
             // Server cert/key pairing validation
             match (&server.certificate, &server.key) {
                 (Some(c), Some(k)) => {
-                    if !Path::new(c).exists() {
-                        return Err(TunnelError::Config(format!(
-                            "Server certificate file not found: {}",
-                            c
-                        )));
-                    }
-                    if !Path::new(k).exists() {
-                        return Err(TunnelError::Config(format!(
-                            "Server private key file not found: {}",
-                            k
-                        )));
-                    }
+                    Self::validate_pem_certs(Path::new(c), "server certificate", "server")?;
+                    Self::validate_pem_private_key(Path::new(k), "server private key", "server")?;
                 }
                 (Some(_), None) => {
                     return Err(TunnelError::Config(
@@ -132,6 +136,13 @@ impl ConfigLoader {
             let specs = server.parse_specs()?;
             let mut seen_specs = HashSet::new();
             for spec in &specs {
+                #[cfg(not(unix))]
+                if spec.scheme == "uds" || spec.scheme == "unix" {
+                    return Err(TunnelError::UnsupportedScheme(
+                        "Unix Domain Sockets (uds://) are only supported on Unix platforms (Linux/macOS)".to_string(),
+                    ));
+                }
+
                 let key = (spec.scheme.clone(), spec.bind_addr.clone(), spec.path.clone());
                 if !seen_specs.insert(key) {
                     return Err(TunnelError::Config(format!(
@@ -173,15 +184,21 @@ impl ConfigLoader {
                 )));
             }
 
-            if let Some(ref token) = tunnel.token
-                && token.len() > crate::common::auth::TOKEN_MAX_LEN
-            {
-                return Err(TunnelError::Config(format!(
-                    "tunnel '{}': token length ({} bytes) exceeds maximum supported token length ({} bytes)",
-                    tunnel.tag,
-                    token.len(),
-                    crate::common::auth::TOKEN_MAX_LEN
-                )));
+            if let Some(ref token) = tunnel.token {
+                if token.is_empty() {
+                    return Err(TunnelError::Config(format!(
+                        "tunnel '{}': token must not be empty. Omit the 'token' field if authentication is not required.",
+                        tunnel.tag
+                    )));
+                }
+                if token.len() > crate::common::auth::TOKEN_MAX_LEN {
+                    return Err(TunnelError::Config(format!(
+                        "tunnel '{}': token length ({} bytes) exceeds maximum supported token length ({} bytes)",
+                        tunnel.tag,
+                        token.len(),
+                        crate::common::auth::TOKEN_MAX_LEN
+                    )));
+                }
             }
 
             if let Some(p) = tunnel.pool_size
@@ -212,20 +229,16 @@ impl ConfigLoader {
                 }
             }
 
-            if let Some(ref m) = tunnel.multiplex
-                && m.enabled
-            {
+            if tunnel.multiplex.is_some() {
                 return Err(TunnelError::Config(format!(
-                    "tunnel '{}': multiplex is not wired into the data path yet; remove it or set enabled: false",
+                    "tunnel '{}': multiplex is not wired into the data path yet; remove the 'multiplex' section",
                     tunnel.tag
                 )));
             }
 
-            if let Some(ref f) = tunnel.failover
-                && f.enabled
-            {
+            if tunnel.failover.is_some() {
                 return Err(TunnelError::Config(format!(
-                    "tunnel '{}': failover is not wired into the data path yet; remove it or set enabled: false",
+                    "tunnel '{}': failover is not wired into the data path yet; remove the 'failover' section",
                     tunnel.tag
                 )));
             }
@@ -277,6 +290,21 @@ impl ConfigLoader {
                 )));
             }
 
+            if (ep.scheme == "uds" || ep.scheme == "unix") && (ep.path.is_empty() || ep.path == "/") {
+                return Err(TunnelError::Config(format!(
+                    "tunnel '{}': Unix Domain Socket endpoint URL must include a socket file path (e.g. uds:///run/tunnel.sock)",
+                    tunnel.tag
+                )));
+            }
+
+            #[cfg(not(unix))]
+            if ep.scheme == "uds" || ep.scheme == "unix" {
+                return Err(TunnelError::UnsupportedScheme(format!(
+                    "tunnel '{}': Unix Domain Sockets (uds://) are only supported on Unix platforms (Linux/macOS)",
+                    tunnel.tag
+                )));
+            }
+
             if let crate::config::model::EndpointConfig::Detailed {
                 ref tls,
                 ref dns,
@@ -315,6 +343,66 @@ impl ConfigLoader {
         Ok(())
     }
 
+    fn validate_pem_certs(path: &Path, file_role: &str, context: &str) -> Result<(), TunnelError> {
+        if !path.exists() {
+            return Err(TunnelError::Config(format!(
+                "{}: {} file not found: {:?}",
+                context, file_role, path
+            )));
+        }
+        let file = std::fs::File::open(path).map_err(|e| {
+            TunnelError::Config(format!(
+                "{}: failed to open {} file {:?}: {}",
+                context, file_role, path, e
+            ))
+        })?;
+        let mut reader = std::io::BufReader::new(file);
+        let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                TunnelError::Config(format!(
+                    "{}: {} file {:?} contains invalid PEM: {}",
+                    context, file_role, path, e
+                ))
+            })?;
+        if certs.is_empty() {
+            return Err(TunnelError::Config(format!(
+                "{}: {} file {:?} contains no certificates",
+                context, file_role, path
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_pem_private_key(path: &Path, file_role: &str, context: &str) -> Result<(), TunnelError> {
+        if !path.exists() {
+            return Err(TunnelError::Config(format!(
+                "{}: {} file not found: {:?}",
+                context, file_role, path
+            )));
+        }
+        let file = std::fs::File::open(path).map_err(|e| {
+            TunnelError::Config(format!(
+                "{}: failed to open {} file {:?}: {}",
+                context, file_role, path, e
+            ))
+        })?;
+        let mut reader = std::io::BufReader::new(file);
+        let key = rustls_pemfile::private_key(&mut reader).map_err(|e| {
+            TunnelError::Config(format!(
+                "{}: {} file {:?} contains invalid private key: {}",
+                context, file_role, path, e
+            ))
+        })?;
+        if key.is_none() {
+            return Err(TunnelError::Config(format!(
+                "{}: {} file {:?} contains no private key",
+                context, file_role, path
+            )));
+        }
+        Ok(())
+    }
+
     fn validate_tls_config(
         tls: &crate::config::model::TlsConfig,
         context: &str,
@@ -327,18 +415,8 @@ impl ConfigLoader {
         // Server cert/key pairing validation
         match (&tls.certificate, &tls.key) {
             (Some(c), Some(k)) => {
-                if !c.exists() {
-                    return Err(TunnelError::Config(format!(
-                        "{}: server certificate file not found: {:?}",
-                        context, c
-                    )));
-                }
-                if !k.exists() {
-                    return Err(TunnelError::Config(format!(
-                        "{}: server private key file not found: {:?}",
-                        context, k
-                    )));
-                }
+                Self::validate_pem_certs(c, "server certificate", context)?;
+                Self::validate_pem_private_key(k, "server private key", context)?;
             }
             (Some(_), None) => {
                 return Err(TunnelError::Config(format!(
@@ -358,18 +436,8 @@ impl ConfigLoader {
         // Client mTLS cert/key pairing validation
         match (&tls.client_certificate, &tls.client_key) {
             (Some(c), Some(k)) => {
-                if !c.exists() {
-                    return Err(TunnelError::Config(format!(
-                        "{}: client certificate file not found: {:?}",
-                        context, c
-                    )));
-                }
-                if !k.exists() {
-                    return Err(TunnelError::Config(format!(
-                        "{}: client private key file not found: {:?}",
-                        context, k
-                    )));
-                }
+                Self::validate_pem_certs(c, "client certificate", context)?;
+                Self::validate_pem_private_key(k, "client private key", context)?;
             }
             (Some(_), None) => {
                 return Err(TunnelError::Config(format!(
@@ -386,14 +454,9 @@ impl ConfigLoader {
             (None, None) => {}
         }
 
-        // CA cert existence
-        if let Some(ref ca) = tls.ca_certificate
-            && !ca.exists()
-        {
-            return Err(TunnelError::Config(format!(
-                "{}: CA certificate file not found: {:?}",
-                context, ca
-            )));
+        // CA cert existence and validity
+        if let Some(ref ca) = tls.ca_certificate {
+            Self::validate_pem_certs(ca, "CA certificate", context)?;
         }
 
         Ok(())
@@ -424,14 +487,6 @@ impl ConfigLoader {
                         return Err(TunnelError::Config(format!(
                             "{}: DNS resolver of type '{}' requires a 'server' address",
                             context, d.r#type
-                        )));
-                    }
-                    if let Some(ref tls) = d.tls
-                        && tls.insecure
-                    {
-                        return Err(TunnelError::Config(format!(
-                            "{}: DNS-over-HTTPS / DNS-over-TLS does not support 'insecure: true'. Valid TLS certificates are required.",
-                            context
                         )));
                     }
                 }
@@ -819,5 +874,78 @@ tunnels:
             assert_eq!(config.worker_threads, Some(4));
             assert_eq!(config.tunnels.len(), 2);
         }
+    }
+
+    #[test]
+    fn test_reject_empty_tokens() {
+        let yaml_server_empty_token = r#"
+server:
+  listen: ["ws://127.0.0.1:8080"]
+  token: ""
+"#;
+        let res = ConfigLoader::from_yaml_str(yaml_server_empty_token);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("server.token must not be empty"));
+
+        let yaml_tunnel_empty_token = r#"
+tunnels:
+  - tag: "empty-tok"
+    endpoint: "ws://127.0.0.1:8080/tunnel"
+    token: ""
+    mappings:
+      - mode: "forward"
+        listen: "127.0.0.1:10040"
+        target: "127.0.0.1:10041"
+"#;
+        let res2 = ConfigLoader::from_yaml_str(yaml_tunnel_empty_token);
+        assert!(res2.is_err());
+        assert!(res2.unwrap_err().to_string().contains("token must not be empty"));
+    }
+
+    #[test]
+    fn test_reject_invalid_server_default_target() {
+        let yaml = r#"
+server:
+  listen: ["ws://127.0.0.1:8080"]
+  default_target: "bad@@target@@without_port"
+"#;
+        let res = ConfigLoader::from_yaml_str(yaml);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("server.default_target"));
+    }
+
+    #[test]
+    fn test_reject_uds_without_socket_path() {
+        let yaml = r#"
+tunnels:
+  - tag: "uds-no-path"
+    endpoint: "uds://"
+    mappings:
+      - mode: "forward"
+        listen: "127.0.0.1:10050"
+        target: "127.0.0.1:10051"
+"#;
+        let res = ConfigLoader::from_yaml_str(yaml);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("Unix Domain Socket endpoint URL must include a socket file path"));
+    }
+
+    #[test]
+    fn test_reject_unwired_failover_even_if_disabled() {
+        let yaml = r#"
+tunnels:
+  - tag: "failover-tunnel"
+    endpoint: "ws://127.0.0.1:8080/tunnel"
+    failover:
+      enabled: false
+      standby_endpoint: "ws://127.0.0.1:8081/tunnel"
+    mappings:
+      - mode: "forward"
+        listen: "127.0.0.1:10060"
+        target: "127.0.0.1:10061"
+"#;
+        let res = ConfigLoader::from_yaml_str(yaml);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("failover is not wired into the data path yet"));
     }
 }

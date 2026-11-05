@@ -341,10 +341,6 @@ pub struct DnsTlsConfig {
     /// Expected SNI hostname for TLS verification (e.g. "cloudflare-dns.com").
     #[serde(default)]
     pub server_name: Option<String>,
-
-    /// Skip TLS certificate verification (default: false).
-    #[serde(default)]
-    pub insecure: bool,
 }
 
 /// DNS resolver configuration.

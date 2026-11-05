@@ -93,7 +93,7 @@ impl WsConnector {
             let tls_conn = connector
                 .connect(server_name, raw_stream)
                 .await
-                .map_err(|e| TunnelError::Tls(format!("TLS handshake failed: {}", e)))?;
+                .map_err(|e| TunnelError::TlsHandshake(format!("TLS handshake failed: {}", e)))?;
 
             Box::new(BufferedTlsStream::new(tls_conn))
         } else {

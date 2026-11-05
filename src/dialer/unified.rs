@@ -71,6 +71,8 @@ impl Dialer for DefaultDialer {
                 )));
             }
 
+            let iface_opt = self.config.bind_interface.as_deref();
+
             let connect_timeout = self
                 .config
                 .connect_timeout
@@ -79,13 +81,44 @@ impl Dialer for DefaultDialer {
             let nodelay = self.config.tcp_nodelay.unwrap_or(true);
             let tcp_keepalive = self.config.tcp_keepalive;
 
+            async fn try_connect(
+                addr: SocketAddr,
+                timeout_dur: std::time::Duration,
+                bind_iface: Option<&str>,
+            ) -> Result<TcpStream, TunnelError> {
+                let connect_fut = async {
+                    #[cfg(target_os = "linux")]
+                    if let Some(iface) = bind_iface {
+                        let socket = if addr.is_ipv6() {
+                            tokio::net::TcpSocket::new_v6().map_err(TunnelError::Io)?
+                        } else {
+                            tokio::net::TcpSocket::new_v4().map_err(TunnelError::Io)?
+                        };
+                        let sock_ref = socket2::SockRef::from(&socket);
+                        sock_ref
+                            .bind_device(Some(iface.as_bytes()))
+                            .map_err(TunnelError::Io)?;
+                        return socket.connect(addr).await.map_err(TunnelError::Io);
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    if let Some(iface) = bind_iface {
+                        return Err(TunnelError::Config(format!(
+                            "bind_interface '{}' is only supported on Linux (SO_BINDTODEVICE)",
+                            iface
+                        )));
+                    }
+                    TcpStream::connect(addr).await.map_err(TunnelError::Io)
+                };
+
+                match timeout(timeout_dur, connect_fut).await {
+                    Ok(res) => res,
+                    Err(_) => Err(TunnelError::ConnectTimeout(timeout_dur)),
+                }
+            }
+
             if ips.len() == 1 {
                 let addr = SocketAddr::new(ips[0], port);
-                let stream = match timeout(connect_timeout, TcpStream::connect(addr)).await {
-                    Ok(Ok(s)) => s,
-                    Ok(Err(e)) => return Err(TunnelError::Io(e)),
-                    Err(_) => return Err(TunnelError::ConnectTimeout(connect_timeout)),
-                };
+                let stream = try_connect(addr, connect_timeout, iface_opt).await?;
                 SocketTuner::tune_tcp_stream(&stream, nodelay, tcp_keepalive)
                     .map_err(TunnelError::Io)?;
                 return Ok(Box::new(stream) as Box<dyn TunnelStream>);
@@ -95,20 +128,9 @@ impl Dialer for DefaultDialer {
             let mut ordered_ips = ips;
             ordered_ips.sort_by_key(|ip| if ip.is_ipv6() { 0 } else { 1 });
 
-            async fn try_connect(
-                addr: SocketAddr,
-                timeout_dur: std::time::Duration,
-            ) -> Result<TcpStream, TunnelError> {
-                match timeout(timeout_dur, TcpStream::connect(addr)).await {
-                    Ok(Ok(stream)) => Ok(stream),
-                    Ok(Err(e)) => Err(TunnelError::Io(e)),
-                    Err(_) => Err(TunnelError::ConnectTimeout(timeout_dur)),
-                }
-            }
-
             let mut futs = FuturesUnordered::new();
             let first_addr = SocketAddr::new(ordered_ips[0], port);
-            futs.push(Box::pin(try_connect(first_addr, connect_timeout)));
+            futs.push(Box::pin(try_connect(first_addr, connect_timeout, iface_opt)));
 
             let mut next_idx = 1;
             let delay = tokio::time::sleep(std::time::Duration::from_millis(250));
@@ -132,7 +154,7 @@ impl Dialer for DefaultDialer {
                     _ = &mut delay, if next_idx < ordered_ips.len() => {
                         let next_addr = SocketAddr::new(ordered_ips[next_idx], port);
                         next_idx += 1;
-                        futs.push(Box::pin(try_connect(next_addr, connect_timeout)));
+                        futs.push(Box::pin(try_connect(next_addr, connect_timeout, iface_opt)));
                         delay.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_millis(250));
                     }
                 }

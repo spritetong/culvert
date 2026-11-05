@@ -31,6 +31,9 @@ pub enum TunnelError {
     #[error("TLS configuration error: {0}")]
     Tls(String),
 
+    #[error("TLS handshake error: {0}")]
+    TlsHandshake(String),
+
     #[error("Connection timeout after {0:?}")]
     ConnectTimeout(std::time::Duration),
 

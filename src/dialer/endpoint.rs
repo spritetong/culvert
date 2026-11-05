@@ -27,12 +27,17 @@ impl Endpoint {
     pub fn parse(url_str: &str) -> Result<Self, TunnelError> {
         let parsed = Url::parse(url_str)?;
         let scheme = parsed.scheme().to_lowercase();
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| {
-                TunnelError::Config(format!("Missing host in endpoint URL: {}", url_str))
-            })?
-            .to_string();
+        let host = if scheme == "uds" || scheme == "unix" {
+            let h = parsed.host_str().unwrap_or("");
+            if h.is_empty() { "localhost".to_string() } else { h.to_string() }
+        } else {
+            parsed
+                .host_str()
+                .ok_or_else(|| {
+                    TunnelError::Config(format!("Missing host in endpoint URL: {}", url_str))
+                })?
+                .to_string()
+        };
 
         let port = parsed.port().unwrap_or(match scheme.as_str() {
             "https" | "wss" | "h3" | "quic" => 443,
