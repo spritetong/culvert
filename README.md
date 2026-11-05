@@ -231,7 +231,7 @@ Configures `micro-tunnel` as an ingress gateway on a cloud VPS or host.
 server:
   # Listening URLs with explicit protocol schemes and path routing.
   # Can be a single string or an array of URLs.
-  # Supported schemes: ws, wss, h3, quic, uds
+  # Supported schemes: ws, wss, h3, quic, https, uds, unix (uds/unix on Unix only)
   listen:
     - "ws://127.0.0.1:8080/tunnel"       # Behind local reverse proxy (Caddy/Nginx)
     - "uds:///run/tunnel.sock"           # Ultra-fast zero-network-stack IPC behind Caddy
@@ -239,7 +239,7 @@ server:
     - "h3://0.0.0.0:8443/tunnel"         # Direct standalone HTTP/3 over QUIC/UDP
 
   # Pre-shared authentication token (PSK).
-  # Optional: omit or set to null/empty for unauthenticated mode.
+  # Optional: omit or set to null for unauthenticated mode (empty string "" is rejected).
   # Maximum length: 256 bytes.
   token: "SECRET_PRESHARED_TOKEN"
 
@@ -262,9 +262,13 @@ server:
 | :--- | :--- | :--- |
 | `ws` | Unencrypted WebSocket over TCP | `ws://127.0.0.1:8080/tunnel` |
 | `wss` | TLS-encrypted WebSocket over TCP | `wss://0.0.0.0:8443/tunnel` |
+| `https` | TLS-encrypted HTTP/1.1 or HTTP/2 WebSocket | `https://0.0.0.0:8443/tunnel` |
 | `h3` | HTTP/3 bidirectional stream over QUIC/UDP | `h3://0.0.0.0:8443/tunnel` |
 | `quic` | Raw QUIC bidirectional stream | `quic://0.0.0.0:8443/tunnel` |
-| `uds` | Unix Domain Socket (IPC) | `uds:///run/tunnel.sock` |
+| `uds` / `unix` | Unix Domain Socket (IPC, Unix platforms only) | `uds:///run/tunnel.sock` or `unix:///run/tunnel.sock` |
+
+> [!NOTE]
+> `uds` and `unix` schemes are supported only on Unix platforms (Linux / macOS) and will be rejected at configuration validation time on Windows.
 
 > [!IMPORTANT]
 > **Path Matching**: Client requests must match the server URL's path exactly (e.g., `/tunnel`). Mismatched paths receive an HTTP `404 Not Found` response to defend against scanner probes.
@@ -279,7 +283,7 @@ Defines one or more outbound tunnel client instances.
 tunnels:
   - tag: "corp-cluster"                         # Unique identifier for the tunnel
     endpoint: "wss://tunnel.example.com/tunnel" # Remote ingress server URL (or detailed endpoint object)
-    token: "SECRET_PRESHARED_TOKEN"             # PSK token matching server.token (optional)
+    token: "SECRET_PRESHARED_TOKEN"             # PSK token matching server.token (optional: omit or null, empty string rejected)
     pool_size: 8                                # Pre-warmed idle connection pool size (default: 0)
 
     # Reconnection & self-healing supervisor settings

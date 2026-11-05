@@ -135,7 +135,7 @@ pub struct TlsConfig {
     pub server_name: Option<String>,
     /// 调试或自签场景跳过证书链合法性检查
     #[serde(default)]
-    pub insecure: bool,
+    pub insecure: Option<bool>,
     /// ALPN 协商标识列表 (例如: ["h3"], ["h2", "http/1.1"])
     pub alpn: Option<Vec<String>>,
     /// 自定义 CA 根证书路径
@@ -183,7 +183,7 @@ pub trait Dialer: Send + Sync {
 
 log:
   level: "info"         # trace | debug | info | warn | error
-  output: "stdout"      # stdout | file path
+  output: "stdout"      # stdout | stderr
   no_color: false       # 禁用彩色输出 (适合容器日志采集)
 
 # Tokio 运行时 worker 线程数 (可选，默认核心数；1 为单线程运行时)
@@ -248,9 +248,6 @@ tunnels:
 
   # 隧道 2：经典单映射正向穿透，定制专属 IPv6 优先与 mTLS 双向认证
   - tag: "cloud-db-forward"
-    mode: "forward"
-    listen: "127.0.0.1:18080"
-    target: "10.0.0.8:8080"
     token: "SECURE_PRESHARED_TOKEN"
     endpoint:
       url: "https://db-edge.example.com:443/tunnel"
@@ -319,10 +316,6 @@ pub struct TunnelConfig {
     pub retry: Option<TunnelRetryConfig>,
     pub mappings: Vec<PortMappingConfig>,
 
-    // 向前兼容单映射字段
-    pub mode: Option<TunnelMode>,
-    pub listen: Option<String>,
-    pub target: Option<String>,
 }
 ```
 pub struct AppConfig {

@@ -77,7 +77,7 @@
 * **FR-2.2 可选 Token 鉴权 (Optional Auth)**：
   * Server 与 Tunnel 的 `token` 字段均为可选。未配置或置空时跳过鉴权，方便内网通信或前置由 Caddy/Nginx 执行鉴权。
 * **FR-2.3 标准化 URL 与复合 Endpoint 解析**：
-  * 支持统一解析各种端点 URL：如 `wss://...`、`https://...`、`h3://...`、`uds://...`、`tcp://...`。
+  * 支持统一解析各种端点 URL：如 `ws://...`、`wss://...`、`https://...`、`h3://...`、`quic://...`、`uds://...`、`unix://...`（其中 `uds`/`unix` 仅支持 Unix 平台）。
   * 支持将 `endpoint` 配置为简易 URL 字符串，或绑定独立上下文的高级对象结构。
 * **FR-2.4 丰富的主机名与 DNS 解析支持 (wstunnel 兼容规范)**：
   * 支持多种主流 DNS 协议类型：
@@ -109,7 +109,7 @@
   * `log.no_color` 支持纯文本日志输出；`worker_threads` 精确指定 Tokio 运行时线程数（1 为单线程当前运行时）。
 * **FR-3.2 纳管集群多端口映射 (Cluster Multi-Port Mappings)**：
   * 针对每个 Tunnel Endpoint，支持声明 `mappings: [...]` 数组，定义多个独立的端口转发（Forward / Reverse 混合）。
-  * 保持对经典单端口 `listen` / `target` / `mode` 的完整向前兼容。
+  * 强制通过 `mappings: [...]` 数组统一定义映射规则，不再支持隧道层级顶层的 `listen` / `target` / `mode`。
 * **FR-3.3 集中式生命周期监控与失败重试 (Supervisor & Retry Loop)**：
   * 主管协程（Supervisor）统一纳管 Server 与所有 Tunnel 任务的生命周期，支持在收到退出信号时一键安全平滑退出。
   * **失败自愈与重试**：支持配置 `retry: { delay: "3s", max_retries: 10 }`。初始连接失败或网络临时中断不导致进程崩溃，而是按指数/固定延时自动恢复。默认无重试次数限制（持续重连）。
@@ -201,9 +201,6 @@ tunnels:
 
   # 隧道 2：经典单映射正向穿透，定制专属 IPv6 优先与 mTLS 双向认证
   - tag: "cloud-db-forward"
-    mode: "forward"
-    listen: "127.0.0.1:18080"
-    target: "10.0.0.8:8080"
     token: "SECURE_PRESHARED_TOKEN"
     endpoint:
       url: "https://db-edge.example.com:443/tunnel"

@@ -1,5 +1,8 @@
 # Micro-Tunnel: 轻量级 HTTP/3 & WSS TCP 隧道技术方案与需求规格说明书
 
+> [!WARNING]
+> **Deprecated Design Document**: This document represents an early architectural draft and contains legacy specifications that have been superseded. For current, authoritative design, architecture, and configuration specifications, refer to [README.md](../README.md), [DESIGN.md](DESIGN.md), and [PRD.md](PRD.md).
+
 ---
 
 ## 1. 项目背景与设计哲学

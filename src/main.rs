@@ -195,6 +195,16 @@ fn preflight_check(config: &AppConfig) -> Result<(), TunnelError> {
                 .get_driver(&spec.scheme)
                 .ok_or_else(|| TunnelError::UnsupportedScheme(spec.scheme.clone()))?;
 
+            if matches!(spec.scheme.as_str(), "ws" | "wss" | "h3" | "quic" | "https") {
+                use std::net::ToSocketAddrs;
+                let _ = spec.bind_addr.to_socket_addrs().map_err(|e| {
+                    TunnelError::Config(format!(
+                        "Server listen address '{}' cannot be resolved or is invalid: {}",
+                        spec.bind_addr, e
+                    ))
+                })?;
+            }
+
             if matches!(spec.scheme.as_str(), "wss" | "https" | "h3" | "quic") {
                 let cert_str = effective_tls
                     .as_ref()
@@ -204,15 +214,28 @@ fn preflight_check(config: &AppConfig) -> Result<(), TunnelError> {
                     .as_ref()
                     .and_then(|t| t.key.as_ref())
                     .and_then(|p| p.to_str());
-                let alpn = effective_tls.as_ref().and_then(|t| t.alpn.as_ref()).map(|list| {
-                    list.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>()
-                });
+                let mut alpn = effective_tls
+                    .as_ref()
+                    .and_then(|t| t.alpn.as_ref())
+                    .map(|list| list.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>())
+                    .unwrap_or_default();
+
+                if matches!(spec.scheme.as_str(), "h3" | "quic") {
+                    if !alpn.iter().any(|p| p == b"h3") {
+                        alpn.push(b"h3".to_vec());
+                    }
+                    if !alpn.iter().any(|p| p == b"micro-tunnel-quic") {
+                        alpn.push(b"micro-tunnel-quic".to_vec());
+                    }
+                }
+
+                let alpn_opt = if alpn.is_empty() { None } else { Some(alpn) };
                 let (min_v, max_v) = match effective_tls {
                     Some(ref t) => (t.min_version.as_deref(), t.max_version.as_deref()),
                     None => (None, None),
                 };
                 let _server_rustls = TlsConfigBuilder::build_server_config(
-                    cert_str, key_str, alpn, min_v, max_v,
+                    cert_str, key_str, alpn_opt, min_v, max_v,
                 )?;
             }
         }

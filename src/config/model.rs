@@ -60,10 +60,42 @@ impl ServerListenSpec {
                     (rest, "/")
                 };
 
-                if host_port.is_empty() {
+                let (host, port_str) = host_port.rsplit_once(':').ok_or_else(|| {
+                    crate::core::error::TunnelError::Config(format!(
+                        "Invalid server listen URL '{}': missing port in '{}'. Expected format '<host>:<port>'",
+                        raw, host_port
+                    ))
+                })?;
+
+                if host.is_empty() {
                     return Err(crate::core::error::TunnelError::Config(format!(
-                        "Invalid server listen URL '{}': missing host and port",
+                        "Invalid server listen URL '{}': host cannot be empty",
                         raw
+                    )));
+                }
+
+                let port: u16 = port_str.parse().map_err(|_| {
+                    crate::core::error::TunnelError::Config(format!(
+                        "Invalid server listen URL '{}': invalid port '{}' (must be a valid integer 1-65535)",
+                        raw, port_str
+                    ))
+                })?;
+
+                if port == 0 {
+                    return Err(crate::core::error::TunnelError::Config(format!(
+                        "Invalid server listen URL '{}': port must not be 0",
+                        raw
+                    )));
+                }
+
+                // If host looks like an IP address, validate its syntax
+                let trimmed_host = host.trim_matches(|c| c == '[' || c == ']');
+                if trimmed_host.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ':')
+                    && trimmed_host.parse::<std::net::IpAddr>().is_err()
+                {
+                    return Err(crate::core::error::TunnelError::Config(format!(
+                        "Invalid server listen URL '{}': invalid IP address '{}'",
+                        raw, host
                     )));
                 }
 
@@ -79,20 +111,26 @@ impl ServerListenSpec {
                     path,
                 })
             }
-            "uds" => {
+            "uds" | "unix" => {
                 let socket_path = if rest.starts_with('/') {
                     rest.to_string()
                 } else {
                     format!("/{}", rest)
                 };
+                if socket_path.is_empty() || socket_path == "/" {
+                    return Err(crate::core::error::TunnelError::Config(format!(
+                        "Invalid server listen URL '{}': socket file path must not be empty",
+                        raw
+                    )));
+                }
                 Ok(Self {
-                    scheme: "uds".to_string(),
+                    scheme,
                     bind_addr: socket_path,
                     path: None,
                 })
             }
             other => Err(crate::core::error::TunnelError::Config(format!(
-                "Unsupported server protocol scheme '{}' in URL '{}'. Supported schemes: ws, wss, h3, quic, https, uds",
+                "Unsupported server protocol scheme '{}' in URL '{}'. Supported schemes: ws, wss, h3, quic, https, uds, unix",
                 other, raw
             ))),
         }

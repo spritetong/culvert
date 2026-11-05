@@ -253,7 +253,13 @@ impl ServerRunner {
                                     });
                                 }
                                 Err(e) => {
-                                    error!("Error accepting stream on server ingress: {:?}", e);
+                                    error!(
+                                        scheme = %spec_clone.scheme,
+                                        bind = %spec_clone.bind_addr,
+                                        "Server ingress listener accept failure: {:?}",
+                                        e
+                                    );
+                                    return Err(e);
                                 }
                             }
                         }

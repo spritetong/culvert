@@ -35,12 +35,12 @@ tls:
 
 # Server Ingress configuration (can coexist with tunnels in same config!)
 server:
-  # Explicit scheme URL(s) with path routing support: ws, wss, h3, quic, uds
+  # Explicit scheme URL(s) with path routing support: ws, wss, h3, quic, https, uds, unix (uds/unix on Unix only)
   listen:
     - "wss://0.0.0.0:8443/tunnel"
     - "h3://0.0.0.0:8443/tunnel"
     - "ws://127.0.0.1:8080/tunnel"
-  token: "SECURE_PRESHARED_TOKEN"   # Optional: omit or leave empty for no-auth mode
+  token: "SECURE_PRESHARED_TOKEN"   # Optional: omit or null for no-auth mode (empty string "" is rejected)
   default_target: "127.0.0.1:5201"  # Optional: fallback target
   # TLS certificate & private key (Optional: wss/h3/quic auto-generate self-signed cert if omitted)
   # certificate: "/path/to/server.crt"

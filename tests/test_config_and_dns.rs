@@ -14,7 +14,12 @@ use micro_tunnel::dialer::endpoint::EndpointContext;
 
 #[test]
 fn test_complex_yaml_config_parsing() {
-    let yaml = r#"
+    #[cfg(target_os = "linux")]
+    let iface_line = "  bind_interface: \"eth0\"\n";
+    #[cfg(not(target_os = "linux"))]
+    let iface_line = "";
+
+    let yaml = format!(r#"
 log:
   level: "debug"
   output: "stdout"
@@ -33,8 +38,7 @@ dialer:
   connect_timeout: "4s"
   tcp_keepalive: "20s"
   tcp_nodelay: true
-  bind_interface: "eth0"
-
+{}
 tls:
   insecure: false
   alpn:
@@ -72,9 +76,9 @@ tunnels:
         target: "internal.corp:80"
     token: "tunnel_secret_token_2"
     endpoint: "ws://10.0.0.1:8080/tunnel"
-"#;
+"#, iface_line);
 
-    let app_config = ConfigLoader::from_yaml_str(yaml).expect("Failed to parse complex YAML");
+    let app_config = ConfigLoader::from_yaml_str(&yaml).expect("Failed to parse complex YAML");
 
     // Verify Log
     assert_eq!(app_config.log.level, "debug");
@@ -95,6 +99,7 @@ tunnels:
     assert_eq!(dialer.connect_timeout, Some(Duration::from_secs(4)));
     assert_eq!(dialer.tcp_keepalive, Some(Duration::from_secs(20)));
     assert_eq!(dialer.tcp_nodelay, Some(true));
+    #[cfg(target_os = "linux")]
     assert_eq!(dialer.bind_interface.as_deref(), Some("eth0"));
 
     // Verify TLS
@@ -289,4 +294,44 @@ dns:
         fast_path2,
         vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1))]
     );
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn test_reject_bind_interface_on_non_linux() {
+    let yaml = r#"
+dialer:
+  bind_interface: "eth0"
+server:
+  listen: ["ws://127.0.0.1:8080"]
+"#;
+    let res = ConfigLoader::from_yaml_str(yaml);
+    assert!(res.is_err());
+    assert!(res.unwrap_err().to_string().contains("SO_BINDTODEVICE"));
+}
+
+#[test]
+fn test_reject_dns_cache_capacity_zero() {
+    let yaml = r#"
+dns:
+  cache_capacity: 0
+server:
+  listen: ["ws://127.0.0.1:8080"]
+"#;
+    let res = ConfigLoader::from_yaml_str(yaml);
+    assert!(res.is_err());
+    assert!(res.unwrap_err().to_string().contains("dns.cache_capacity must be at least 1"));
+}
+
+#[test]
+fn test_reject_global_dialer_connect_timeout_zero() {
+    let yaml = r#"
+dialer:
+  connect_timeout: "0s"
+server:
+  listen: ["ws://127.0.0.1:8080"]
+"#;
+    let res = ConfigLoader::from_yaml_str(yaml);
+    assert!(res.is_err());
+    assert!(res.unwrap_err().to_string().contains("dialer.connect_timeout must be greater than 0"));
 }

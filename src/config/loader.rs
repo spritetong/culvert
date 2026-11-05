@@ -78,11 +78,29 @@ impl ConfigLoader {
             Self::validate_dns_config(dns, "global 'dns'")?;
         }
 
+        // Global dialer validation
+        if let Some(ref d) = config.dialer {
+            if let Some(ct) = d.connect_timeout
+                && ct.is_zero()
+            {
+                return Err(TunnelError::Config(
+                    "dialer.connect_timeout must be greater than 0".to_string(),
+                ));
+            }
+            #[cfg(not(target_os = "linux"))]
+            if let Some(ref iface) = d.bind_interface {
+                return Err(TunnelError::Config(format!(
+                    "dialer.bind_interface '{}' is only supported on Linux (SO_BINDTODEVICE)",
+                    iface
+                )));
+            }
+        }
+
         // 6. Server configuration validation
         if let Some(ref server) = config.server {
-            if server.listen.is_empty() {
+            if server.listen.is_empty() && !has_tunnels {
                 return Err(TunnelError::Config(
-                    "server.listen must contain at least one listening URL".to_string(),
+                    "server.listen must contain at least one listening URL when no tunnels are configured".to_string(),
                 ));
             }
 
@@ -281,11 +299,11 @@ impl ConfigLoader {
             let is_tls = matches!(ep.scheme.as_str(), "https" | "wss" | "h3" | "quic");
             let is_supported = matches!(
                 ep.scheme.as_str(),
-                "ws" | "wss" | "h3" | "quic" | "https" | "uds"
+                "ws" | "wss" | "h3" | "quic" | "https" | "uds" | "unix"
             );
             if !is_supported {
                 return Err(TunnelError::Config(format!(
-                    "tunnel '{}': unsupported endpoint scheme '{}'. Supported schemes: ws, wss, h3, quic, uds",
+                    "tunnel '{}': unsupported endpoint scheme '{}'. Supported schemes: ws, wss, h3, quic, https, uds, unix",
                     tunnel.tag, ep.scheme
                 )));
             }
@@ -325,14 +343,22 @@ impl ConfigLoader {
                 if let Some(d) = dns {
                     Self::validate_dns_config(d, &format!("tunnel '{}' endpoint.dns", tunnel.tag))?;
                 }
-                if let Some(dl) = dialer
-                    && let Some(ct) = dl.connect_timeout
-                    && ct.is_zero()
-                {
-                    return Err(TunnelError::Config(format!(
-                        "tunnel '{}': dialer.connect_timeout must be greater than 0",
-                        tunnel.tag
-                    )));
+                if let Some(dl) = dialer {
+                    if let Some(ct) = dl.connect_timeout
+                        && ct.is_zero()
+                    {
+                        return Err(TunnelError::Config(format!(
+                            "tunnel '{}': dialer.connect_timeout must be greater than 0",
+                            tunnel.tag
+                        )));
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    if let Some(ref iface) = dl.bind_interface {
+                        return Err(TunnelError::Config(format!(
+                            "tunnel '{}': dialer.bind_interface '{}' is only supported on Linux (SO_BINDTODEVICE)",
+                            tunnel.tag, iface
+                        )));
+                    }
                 }
             }
 
@@ -466,6 +492,15 @@ impl ConfigLoader {
         dns: &crate::config::model::DnsConfig,
         context: &str,
     ) -> Result<(), TunnelError> {
+        if let Some(c) = dns.cache_capacity
+            && c == 0
+        {
+            return Err(TunnelError::Config(format!(
+                "{}: dns.cache_capacity must be at least 1",
+                context
+            )));
+        }
+
         if let Some(ref resolvers) = dns.resolvers {
             for resolver in resolvers {
                 crate::dialer::dns::CachedDnsResolver::parse_resolver(resolver).map_err(|e| {
