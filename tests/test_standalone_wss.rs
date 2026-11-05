@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
 //! Test standalone direct WSS termination with self-signed certificate fallback.
 //! All comments and docstrings must be in English.
 

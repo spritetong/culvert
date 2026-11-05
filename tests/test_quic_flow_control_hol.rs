@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
 //! Test verifying that large unread streams do not cause connection-level
 //! head-of-line (HOL) blocking for healthy sibling streams under QUIC flow control.
 //! All comments and docstrings must be in English.

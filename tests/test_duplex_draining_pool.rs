@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
 //! Integration tests for duplex data transfer, graceful half-close draining,
 //! and connection pool pre-warming / reuse.
 //! All comments and docstrings must be in English.

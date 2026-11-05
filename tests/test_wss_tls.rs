@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
 //! Comprehensive integration tests for WSS (WebSocket over TLS 1.3 / Rustls).
 //! Covers SNI override, self-signed/insecure mode, custom CA verification, and mTLS.
 //! All comments and docstrings must be in English.
