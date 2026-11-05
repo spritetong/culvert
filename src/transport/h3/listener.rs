@@ -51,9 +51,16 @@ impl H3Listener {
                 rustls_server.alpn_protocols.push(b"micro-tunnel-quic".to_vec());
             }
         } else {
-            if !rustls_server.alpn_protocols.iter().any(|p| p == b"h3") {
-                rustls_server.alpn_protocols.push(b"h3".to_vec());
+            // For H3 or generic listen addresses, ensure h3 is prioritized at index 0
+            if let Some(pos) = rustls_server.alpn_protocols.iter().position(|p| p == b"h3") {
+                if pos != 0 {
+                    let h3 = rustls_server.alpn_protocols.remove(pos);
+                    rustls_server.alpn_protocols.insert(0, h3);
+                }
+            } else {
+                rustls_server.alpn_protocols.insert(0, b"h3".to_vec());
             }
+            // Retain micro-tunnel-quic fallback so raw QUIC clients can still negotiate
             if !rustls_server.alpn_protocols.iter().any(|p| p == b"micro-tunnel-quic") {
                 rustls_server.alpn_protocols.push(b"micro-tunnel-quic".to_vec());
             }

@@ -1,3 +1,10 @@
+# ==============================================================================
+# Micro-Tunnel Configuration Example
+# Validate with:
+#   micro-tunnel --check -c config-example.yaml       # Full pre-flight (DNS + port bind)
+#   micro-tunnel --syntax-only -c config-example.yaml # Syntax/schema only (no probes)
+# ==============================================================================
+
 log:
   level: "info"         # trace | debug | info | warn | error (Note: RUST_LOG env var overrides this if set)
   output: "stdout"

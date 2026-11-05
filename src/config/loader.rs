@@ -152,7 +152,7 @@ impl ConfigLoader {
             }
 
             let specs = server.parse_specs()?;
-            let mut seen_specs = HashSet::new();
+            let mut seen_bind_addrs = HashSet::new();
             for spec in &specs {
                 #[cfg(not(unix))]
                 if spec.scheme == "uds" || spec.scheme == "unix" {
@@ -161,11 +161,16 @@ impl ConfigLoader {
                     ));
                 }
 
-                let key = (spec.scheme.clone(), spec.bind_addr.clone(), spec.path.clone());
-                if !seen_specs.insert(key) {
+                let transport_proto = match spec.scheme.as_str() {
+                    "h3" | "quic" => "udp",
+                    "uds" | "unix" => "uds",
+                    _ => "tcp",
+                };
+                let bind_key = (transport_proto, spec.bind_addr.clone());
+                if !seen_bind_addrs.insert(bind_key) {
                     return Err(TunnelError::Config(format!(
-                        "Duplicate server listener on scheme '{}' bind '{}' path {:?}",
-                        spec.scheme, spec.bind_addr, spec.path
+                        "Duplicate server listener address '{}' conflict on transport protocol '{}'",
+                        spec.bind_addr, transport_proto
                     )));
                 }
             }

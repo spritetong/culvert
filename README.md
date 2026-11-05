@@ -93,6 +93,8 @@ micro-tunnel [OPTIONS]
 | `--config` | `-c` | `<PATH>` | Path to the YAML configuration file | `config.yaml` |
 | `--worker-threads` | `-w` | `<NUM>` | Override number of Tokio runtime worker threads (`1` for single-threaded runtime) | Auto-detect CPU cores |
 | `--check` | | | Pre-flight dry-run: validate schema, TLS certs, DNS resolution, and listener interface bindability | |
+| `--no-bind` | | | Skip local interface binding tests during `--check` (useful in CI or when daemon is running) | `false` |
+| `--syntax-only` | | | Syntax and schema only check (skips DNS resolution and interface binding tests) | `false` |
 | `--help` | `-h` | | Print command-line help message | |
 | `--version` | `-V` | | Print version information | |
 
@@ -101,6 +103,9 @@ micro-tunnel [OPTIONS]
 ```bash
 # Validate configuration file without starting services (performs pre-flight including DNS and port bindability checks)
 ./micro-tunnel --check -c /etc/micro-tunnel/config.yaml
+
+# Syntax and schema validation only (offline CI or when daemon is already active)
+./micro-tunnel --syntax-only -c /etc/micro-tunnel/config.yaml
 
 # Run with default config.yaml
 ./micro-tunnel

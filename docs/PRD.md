@@ -104,8 +104,9 @@
   * `bind_interface`：单端点指定绑定的出站网卡（多网卡分流）。
 
 ### 3.3 声明式 YAML 配置、多端口映射与自愈重试 (Declarative YAML, Multi-Mapping & Retry)
-* **FR-3.1 规范化 YAML 分层声明**：
+* **FR-3.1 规范化 YAML 分层声明与预检工具**：
   * 采用分层结构，全局定义 `log`、`worker_threads`、`dns`、`dialer`、`tls` 作为默认基线；
+  * 提供完善的命令行校验体系：`--check` 执行完整 Pre-flight Dry-Run（涵盖配置反序列化、TLS 证书完整性、DNS 域名解析与监听端口绑定探测）；支持 `--no-bind` 或 `--syntax-only` 跳过网络与端口探测，专用于离线 CI 及进程运行时的配置语法热检；
   * `log.no_color` 支持纯文本日志输出；`worker_threads` 精确指定 Tokio 运行时线程数（1 为单线程当前运行时）。
 * **FR-3.2 纳管集群多端口映射 (Cluster Multi-Port Mappings)**：
   * 针对每个 Tunnel Endpoint，支持声明 `mappings: [...]` 数组，定义多个独立的端口转发（Forward / Reverse 混合）。

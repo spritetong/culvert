@@ -174,7 +174,12 @@ pub trait Dialer: Send + Sync {
 
 ## 3. 全量声明式 YAML 配置规范 (Full Schematic YAML)
 
-系统完全摒弃冗长脆弱的命令行 CLI 参数，采用规范化、分层清晰的 YAML 配置文件：
+系统完全摒弃冗长脆弱的业务命令行参数，采用规范化、分层清晰的 YAML 配置文件驱动，CLI 仅保留基础生命周期与运维校验命令：
+* `-c, --config <PATH>`：指定主配置文件路径（默认 `config.yaml`）。
+* `-w, --worker-threads <NUM>`：覆盖 Tokio 运行时工作线程数。
+* `--check`：启动前 Pre-flight Dry-Run 校验（涵盖 Schema 静态检查、TLS 证书合法性、DNS 解析验证与监听端口绑定探测）。
+* `--no-bind`：在 `--check` 时跳过本地网卡端口绑定探测（适用于当前主机服务已在运行时的配置校验或跨机构建）。
+* `--syntax-only`：仅执行配置语法与 Schema 纯静态校验（跳过 DNS 与端口探测）。
 
 ```yaml
 # ==================================================

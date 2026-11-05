@@ -172,7 +172,7 @@ async fn test_dns_resolver_strategies_and_caching() {
         resolvers: None,
         cache_capacity: Some(100),
     };
-    let resolver = CachedDnsResolver::new(ipv4_cfg);
+    let resolver = CachedDnsResolver::try_new(ipv4_cfg).unwrap();
     let addrs = resolver
         .resolve("localhost")
         .await
@@ -190,7 +190,7 @@ async fn test_dns_resolver_strategies_and_caching() {
         resolvers: None,
         cache_capacity: Some(100),
     };
-    let resolver = CachedDnsResolver::new(ipv6_cfg);
+    let resolver = CachedDnsResolver::try_new(ipv6_cfg).unwrap();
     if let Ok(addrs) = resolver.resolve("localhost").await {
         assert!(
             addrs.iter().all(|ip| ip.is_ipv6()),
@@ -205,7 +205,7 @@ async fn test_dns_resolver_strategies_and_caching() {
         resolvers: None,
         cache_capacity: Some(100),
     };
-    let resolver = CachedDnsResolver::new(prefer_v4_cfg);
+    let resolver = CachedDnsResolver::try_new(prefer_v4_cfg).unwrap();
     let addrs = resolver
         .resolve("localhost")
         .await
@@ -236,7 +236,7 @@ async fn test_standard_dns_resolvers() {
         resolvers: Some(vec!["system://0.0.0.0".into()]),
         cache_capacity: Some(10),
     };
-    let sys_resolver = CachedDnsResolver::new(sys_cfg);
+    let sys_resolver = CachedDnsResolver::try_new(sys_cfg).unwrap();
     let sys_addrs = sys_resolver.resolve("localhost").await.unwrap();
     assert!(!sys_addrs.is_empty());
 
@@ -251,7 +251,7 @@ async fn test_standard_dns_resolvers() {
         ]),
         cache_capacity: Some(100),
     };
-    let multi_resolver = CachedDnsResolver::new(multi_cfg);
+    let multi_resolver = CachedDnsResolver::try_new(multi_cfg).unwrap();
     // Direct literal fast path
     let fast_path = multi_resolver.resolve("1.1.1.1").await.unwrap();
     assert_eq!(
@@ -284,11 +284,11 @@ dns:
     let resolvers = dns.resolvers.unwrap();
     assert_eq!(resolvers.len(), 4);
 
-    let structured_resolver = CachedDnsResolver::new(DnsConfig {
+    let structured_resolver = CachedDnsResolver::try_new(DnsConfig {
         strategy: Some(DnsStrategy::Ipv4Only),
         resolvers: Some(resolvers),
         cache_capacity: Some(100),
-    });
+    }).unwrap();
     let fast_path2 = structured_resolver.resolve("1.1.1.1").await.unwrap();
     assert_eq!(
         fast_path2,
@@ -338,21 +338,26 @@ server:
 
 #[tokio::test]
 async fn test_empty_server_listen_with_tunnels_does_not_exit_prematurely() {
-    let yaml = r#"
+    let port_listen = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let yaml = format!(r#"
 server:
   listen: []
 tunnels:
   - tag: "client-only-tunnel"
-    endpoint: "ws://127.0.0.1:59999/tunnel"
+    endpoint: "ws://127.0.0.1:{}/tunnel"
     retry:
       delay: "1s"
       max_retries: 5
     mappings:
       - mode: "forward"
-        listen: "127.0.0.1:59998"
-        target: "127.0.0.1:59997"
-"#;
-    let config = ConfigLoader::from_yaml_str(yaml).expect("Failed to parse config with empty server listen");
+        listen: "127.0.0.1:{}"
+        target: "127.0.0.1:5201"
+"#, port_listen, port_listen);
+    let config = ConfigLoader::from_yaml_str(&yaml).expect("Failed to parse config with empty server listen");
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let shutdown_token = cancel_token.clone();
 
@@ -396,4 +401,18 @@ fn test_cached_dns_resolver_try_new_rejects_missing_server() {
         Ok(_) => panic!("Expected error for missing server field"),
     }
 }
+
+#[test]
+fn test_reject_duplicate_server_listener_ports() {
+    let yaml = r#"
+server:
+  listen:
+    - "ws://127.0.0.1:19220/a"
+    - "ws://127.0.0.1:19220/b"
+"#;
+    let res = ConfigLoader::from_yaml_str(yaml);
+    assert!(res.is_err());
+    assert!(res.unwrap_err().to_string().contains("Duplicate server listener address '127.0.0.1:19220'"));
+}
+
 

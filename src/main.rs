@@ -36,9 +36,17 @@ struct Cli {
     #[arg(short = 'w', long)]
     worker_threads: Option<usize>,
 
-    /// Check and validate configuration syntax and semantics without starting the daemon.
+    /// Check and validate configuration syntax, schema, and semantics without starting the daemon.
     #[arg(long)]
     check: bool,
+
+    /// When performing pre-flight check, skip local interface binding tests.
+    #[arg(long)]
+    no_bind: bool,
+
+    /// Syntax and schema only check (skips network DNS queries and local interface binding tests).
+    #[arg(long)]
+    syntax_only: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -55,7 +63,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    if cli.check {
+    let is_check = cli.check || cli.syntax_only;
+    let no_bind = cli.no_bind || cli.syntax_only;
+
+    if is_check {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -67,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let check_res = runtime.block_on(async { preflight_check(&app_config) });
+        let check_res = runtime.block_on(async { preflight_check(&app_config, no_bind) });
         if let Err(e) = check_res {
             eprintln!(
                 "Configuration pre-flight check failed for '{:?}': {}",
@@ -174,7 +185,7 @@ async fn async_main(app_config: AppConfig) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-fn preflight_check(config: &AppConfig) -> Result<(), TunnelError> {
+fn preflight_check(config: &AppConfig, no_bind: bool) -> Result<(), TunnelError> {
     let registry = Arc::new(TransportRegistry::default());
 
     // 1. Dry-run tunnels: build EndpointContext and connectors
@@ -190,12 +201,15 @@ fn preflight_check(config: &AppConfig) -> Result<(), TunnelError> {
     if let Some(ref server) = config.server {
         let specs = server.parse_specs()?;
         let effective_tls = server.effective_tls(config.tls.as_ref());
+        let mut _held_tcp_listeners = Vec::new();
+        let mut _held_udp_sockets = Vec::new();
+
         for spec in &specs {
             let _driver = registry
                 .get_driver(&spec.scheme)
                 .ok_or_else(|| TunnelError::UnsupportedScheme(spec.scheme.clone()))?;
 
-            if matches!(spec.scheme.as_str(), "ws" | "wss" | "h3" | "quic" | "https") {
+            if !no_bind && matches!(spec.scheme.as_str(), "ws" | "wss" | "h3" | "quic" | "https") {
                 use std::net::ToSocketAddrs;
                 let addrs: Vec<_> = spec.bind_addr.to_socket_addrs().map_err(|e| {
                     TunnelError::Config(format!(
@@ -211,7 +225,8 @@ fn preflight_check(config: &AppConfig) -> Result<(), TunnelError> {
                     )));
                 }
 
-                // Pre-flight test bind to detect AddrNotAvailable and AddrInUse early
+                // Pre-flight test bind to detect AddrNotAvailable and AddrInUse early.
+                // Keep sockets held until all specs are verified to catch internal duplicate port conflicts.
                 for addr in &addrs {
                     if matches!(spec.scheme.as_str(), "h3" | "quic") {
                         let socket = std::net::UdpSocket::bind(addr).map_err(|e| {
@@ -220,7 +235,7 @@ fn preflight_check(config: &AppConfig) -> Result<(), TunnelError> {
                                 spec.bind_addr, addr, e
                             ))
                         })?;
-                        drop(socket);
+                        _held_udp_sockets.push(socket);
                     } else {
                         let listener = std::net::TcpListener::bind(addr).map_err(|e| {
                             TunnelError::Config(format!(
@@ -228,7 +243,7 @@ fn preflight_check(config: &AppConfig) -> Result<(), TunnelError> {
                                 spec.bind_addr, addr, e
                             ))
                         })?;
-                        drop(listener);
+                        _held_tcp_listeners.push(listener);
                     }
                 }
             }
@@ -248,13 +263,12 @@ fn preflight_check(config: &AppConfig) -> Result<(), TunnelError> {
                     .map(|list| list.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>())
                     .unwrap_or_default();
 
-                if matches!(spec.scheme.as_str(), "h3" | "quic") {
-                    if !alpn.iter().any(|p| p == b"h3") {
-                        alpn.push(b"h3".to_vec());
-                    }
-                    if !alpn.iter().any(|p| p == b"micro-tunnel-quic") {
-                        alpn.push(b"micro-tunnel-quic".to_vec());
-                    }
+                if matches!(spec.scheme.as_str(), "h3") && !alpn.iter().any(|p| p == b"h3") {
+                    alpn.push(b"h3".to_vec());
+                } else if matches!(spec.scheme.as_str(), "quic")
+                    && !alpn.iter().any(|p| p == b"micro-tunnel-quic")
+                {
+                    alpn.push(b"micro-tunnel-quic".to_vec());
                 }
 
                 let alpn_opt = if alpn.is_empty() { None } else { Some(alpn) };

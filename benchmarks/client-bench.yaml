@@ -45,10 +45,3 @@ tunnels:
 
     # Pre-warmed connection pool for 0-RTT tunnel acquisition
     pool_size: 16
-
-    # Lightweight frame multiplexing (sing-box style)
-    # Set to true to test single-connection multi-stream performance,
-    # or false to test raw zero-task stream pool performance.
-    multiplex:
-      enabled: false
-      max_streams: 256
