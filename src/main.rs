@@ -11,13 +11,7 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use micro_tunnel::config::ConfigLoader;
-use micro_tunnel::config::model::AppConfig;
-use micro_tunnel::core::error::TunnelError;
-use micro_tunnel::dialer::endpoint::EndpointContext;
-use micro_tunnel::dialer::tls::TlsConfigBuilder;
 use micro_tunnel::supervisor::TunnelSupervisor;
-use micro_tunnel::transport::TransportRegistry;
-use std::sync::Arc;
 
 use mimalloc::MiMalloc;
 
@@ -39,14 +33,6 @@ struct Cli {
     /// Check and validate configuration syntax, schema, and semantics without starting the daemon.
     #[arg(long)]
     check: bool,
-
-    /// When performing pre-flight check, skip local interface binding tests.
-    #[arg(long, requires = "check")]
-    no_bind: bool,
-
-    /// Syntax and schema only check (skips network DNS queries and local interface binding tests).
-    #[arg(long)]
-    syntax_only: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -63,34 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    if cli.syntax_only {
-        println!(
-            "Configuration check succeeded: '{:?}' is valid.",
-            cli.config
-        );
-        return Ok(());
-    }
-
     if cli.check {
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                eprintln!("Failed to initialize Tokio runtime for check: {}", e);
-                std::process::exit(1);
-            }
-        };
-
-        let check_res = runtime.block_on(async { preflight_check(&app_config, cli.no_bind) });
-        if let Err(e) = check_res {
-            eprintln!(
-                "Configuration pre-flight check failed for '{:?}': {}",
-                cli.config, e
-            );
-            std::process::exit(1);
-        }
         println!(
             "Configuration check succeeded: '{:?}' is valid.",
             cli.config
@@ -126,47 +85,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut builder = match threads {
         Some(1) => {
-            tracing::info!("Initialized single-threaded (current_thread) Tokio runtime");
+            info!("Configuring single-thread Tokio current_thread runtime");
             tokio::runtime::Builder::new_current_thread()
         }
         Some(n) => {
-            tracing::info!(
-                "Initialized multi-threaded Tokio runtime with {} worker threads",
-                n
-            );
+            info!(threads = n, "Configuring multi-threaded Tokio runtime with custom worker threads");
             let mut b = tokio::runtime::Builder::new_multi_thread();
             b.worker_threads(n);
             b
         }
-        None => tokio::runtime::Builder::new_multi_thread(),
+        None => {
+            info!("Configuring multi-threaded Tokio runtime auto-detecting CPU cores");
+            tokio::runtime::Builder::new_multi_thread()
+        }
     };
 
-    let runtime = builder.enable_all().build()?;
-    runtime.block_on(async_main(app_config))
+    builder.enable_all();
+
+    let runtime = match builder.build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            error!("Failed to create Tokio runtime: {:?}", e);
+            std::process::exit(1);
+        }
+    };
+
+    runtime.block_on(run_daemon(app_config))
 }
 
-async fn async_main(app_config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_daemon(app_config: micro_tunnel::config::model::AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     let cancel_token = CancellationToken::new();
-    let shutdown_token = cancel_token.clone();
 
-    // Spawn signal listener for graceful shutdown (SIGINT / Ctrl+C and Unix SIGTERM)
+    // Listen for graceful shutdown signals (SIGINT / SIGTERM / Ctrl+C)
+    let shutdown_token = cancel_token.clone();
     tokio::spawn(async move {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut sigterm = signal(SignalKind::terminate()).ok();
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+            let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    info!("Received termination signal (SIGINT/Ctrl+C). Initiating shutdown...");
+                _ = sigint.recv() => {
+                    info!("Received SIGINT signal. Initiating graceful shutdown...");
                 }
-                _ = async {
-                    if let Some(ref mut sig) = sigterm {
-                        sig.recv().await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => {
-                    info!("Received termination signal (SIGTERM). Initiating shutdown...");
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM signal. Initiating graceful shutdown...");
                 }
             }
         }
@@ -187,143 +151,5 @@ async fn async_main(app_config: AppConfig) -> Result<(), Box<dyn std::error::Err
     }
 
     info!("Micro-tunnel daemon exited cleanly.");
-    Ok(())
-}
-
-fn preflight_check(config: &AppConfig, no_bind: bool) -> Result<(), TunnelError> {
-    let registry = Arc::new(TransportRegistry::default());
-
-    // 1. Dry-run tunnels: build EndpointContext and connectors
-    for tunnel in &config.tunnels {
-        let ctx = EndpointContext::build(&tunnel.endpoint, config)?;
-        let auth_token = tunnel.token.as_deref();
-        for mapping in &tunnel.mappings {
-            let _connector = registry.create_connector(&ctx, auth_token, mapping.mode)?;
-        }
-    }
-
-    // 2. Dry-run server: parse specs and verify TlsAcceptor if TLS scheme is present
-    if let Some(ref server) = config.server {
-        let specs = server.parse_specs()?;
-        let effective_tls = server.effective_tls(config.tls.as_ref());
-        let mut _held_tcp_listeners = Vec::new();
-        let mut _held_udp_sockets = Vec::new();
-
-        for spec in &specs {
-            let _driver = registry
-                .get_driver(&spec.scheme)
-                .ok_or_else(|| TunnelError::UnsupportedScheme(spec.scheme.clone()))?;
-
-            if !spec.is_uds() {
-                use std::net::ToSocketAddrs;
-                let addrs: Vec<_> = spec.bind_addr.to_socket_addrs().map_err(|e| {
-                    TunnelError::Config(format!(
-                        "Server listen address '{}' cannot be resolved or is invalid: {}",
-                        spec.bind_addr, e
-                    ))
-                })?.collect();
-
-                if addrs.is_empty() {
-                    return Err(TunnelError::Config(format!(
-                        "Server listen address '{}' resolved to no socket addresses",
-                        spec.bind_addr
-                    )));
-                }
-
-                // Pre-flight test bind to detect AddrNotAvailable and AddrInUse early.
-                // Keep sockets held until all specs are verified to catch internal duplicate port conflicts.
-                if !no_bind {
-                    use micro_tunnel::config::model::TransportProtocolFamily;
-                    match spec.transport_family() {
-                        TransportProtocolFamily::Udp => {
-                            let mut bound = None;
-                            let mut last_err = None;
-                            for addr in &addrs {
-                                match std::net::UdpSocket::bind(addr) {
-                                    Ok(sock) => {
-                                        bound = Some(sock);
-                                        break;
-                                    }
-                                    Err(e) => last_err = Some(e),
-                                }
-                            }
-                            match bound {
-                                Some(sock) => _held_udp_sockets.push(sock),
-                                None => {
-                                    let err_str = last_err
-                                        .map(|e| e.to_string())
-                                        .unwrap_or_else(|| "no address could be bound".to_string());
-                                    return Err(TunnelError::Config(format!(
-                                        "Server listen address '{}' cannot be bound: {}",
-                                        spec.bind_addr, err_str
-                                    )));
-                                }
-                            }
-                        }
-                        TransportProtocolFamily::Tcp => {
-                            let mut bound = None;
-                            let mut last_err = None;
-                            for addr in &addrs {
-                                match std::net::TcpListener::bind(addr) {
-                                    Ok(listener) => {
-                                        bound = Some(listener);
-                                        break;
-                                    }
-                                    Err(e) => last_err = Some(e),
-                                }
-                            }
-                            match bound {
-                                Some(listener) => _held_tcp_listeners.push(listener),
-                                None => {
-                                    let err_str = last_err
-                                        .map(|e| e.to_string())
-                                        .unwrap_or_else(|| "no address could be bound".to_string());
-                                    return Err(TunnelError::Config(format!(
-                                        "Server listen address '{}' cannot be bound: {}",
-                                        spec.bind_addr, err_str
-                                    )));
-                                }
-                            }
-                        }
-                        TransportProtocolFamily::Uds => {}
-                    }
-                }
-            }
-
-            if matches!(spec.scheme.as_str(), "wss" | "https" | "h3" | "quic") {
-                let cert_str = effective_tls
-                    .as_ref()
-                    .and_then(|t| t.certificate.as_ref())
-                    .and_then(|p| p.to_str());
-                let key_str = effective_tls
-                    .as_ref()
-                    .and_then(|t| t.key.as_ref())
-                    .and_then(|p| p.to_str());
-                let mut alpn = effective_tls
-                    .as_ref()
-                    .and_then(|t| t.alpn.as_ref())
-                    .map(|list| list.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>())
-                    .unwrap_or_default();
-
-                if matches!(spec.scheme.as_str(), "h3" | "https") && !alpn.iter().any(|p| p == b"h3") {
-                    alpn.push(b"h3".to_vec());
-                } else if matches!(spec.scheme.as_str(), "quic")
-                    && !alpn.iter().any(|p| p == b"micro-tunnel-quic")
-                {
-                    alpn.push(b"micro-tunnel-quic".to_vec());
-                }
-
-                let alpn_opt = if alpn.is_empty() { None } else { Some(alpn) };
-                let (min_v, max_v) = match effective_tls {
-                    Some(ref t) => (t.min_version.as_deref(), t.max_version.as_deref()),
-                    None => (None, None),
-                };
-                let _server_rustls = TlsConfigBuilder::build_server_config(
-                    cert_str, key_str, alpn_opt, min_v, max_v,
-                )?;
-            }
-        }
-    }
-
     Ok(())
 }

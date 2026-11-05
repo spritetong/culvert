@@ -408,70 +408,29 @@ fn test_cached_dns_resolver_try_new_rejects_missing_server() {
 }
 
 #[test]
-fn test_reject_duplicate_server_listener_ports() {
+fn test_server_listen_urls_preserve_bind_addr() {
     let yaml = r#"
 server:
   listen:
-    - "ws://127.0.0.1:19220/a"
-    - "ws://127.0.0.1:19220/b"
+    - "ws://0.0.0.0:19702/tunnel"
+    - "ws://127.0.0.1:19702/admin"
+    - "https://[::1]:8443/h3"
 "#;
-    let res = ConfigLoader::from_yaml_str(yaml);
-    assert!(res.is_err());
-    assert!(res.unwrap_err().to_string().contains("Duplicate server listener address '127.0.0.1:19220'"));
-}
+    let config = ConfigLoader::from_yaml_str(yaml).expect("Failed to parse valid server listen URLs");
+    let server = config.server.expect("Server config should be present");
+    let specs = server.parse_specs().expect("Failed to parse server listen specs");
+    assert_eq!(specs.len(), 3);
+    assert_eq!(specs[0].scheme, "ws");
+    assert_eq!(specs[0].bind_addr, "0.0.0.0:19702");
+    assert_eq!(specs[0].path.as_deref(), Some("/tunnel"));
 
-#[test]
-fn test_reject_duplicate_https_and_h3_listener() {
-    let yaml = r#"
-server:
-  listen:
-    - "https://127.0.0.1:19522/a"
-    - "h3://127.0.0.1:19522/b"
-"#;
-    let res = ConfigLoader::from_yaml_str(yaml);
-    assert!(res.is_err());
-    let err = res.unwrap_err().to_string();
-    assert!(err.contains("Duplicate server listener address '127.0.0.1:19522' conflict on transport protocol 'udp'"));
-}
+    assert_eq!(specs[1].scheme, "ws");
+    assert_eq!(specs[1].bind_addr, "127.0.0.1:19702");
+    assert_eq!(specs[1].path.as_deref(), Some("/admin"));
 
-#[test]
-fn test_allow_coexisting_tcp_and_udp_same_port() {
-    let yaml = r#"
-server:
-  listen:
-    - "ws://127.0.0.1:19522/a"
-    - "https://127.0.0.1:19522/b"
-"#;
-    let res = ConfigLoader::from_yaml_str(yaml);
-    assert!(res.is_ok(), "TCP (ws) and UDP (https/h3) on the same port should coexist without conflict");
-}
-
-#[test]
-fn test_reject_wildcard_overlap_listener() {
-    let yaml = r#"
-server:
-  listen:
-    - "ws://0.0.0.0:19502/a"
-    - "ws://127.0.0.1:19502/b"
-"#;
-    let res = ConfigLoader::from_yaml_str(yaml);
-    assert!(res.is_err());
-    let err = res.unwrap_err().to_string();
-    assert!(err.contains("overlaps with wildcard listener '0.0.0.0:19502'"));
-}
-
-#[test]
-fn test_reject_loopback_alias_listener() {
-    let yaml = r#"
-server:
-  listen:
-    - "ws://localhost:19503/a"
-    - "ws://127.0.0.1:19503/b"
-"#;
-    let res = ConfigLoader::from_yaml_str(yaml);
-    assert!(res.is_err());
-    let err = res.unwrap_err().to_string();
-    assert!(err.contains("conflicts with loopback alias 'localhost:19503'"));
+    assert_eq!(specs[2].scheme, "https");
+    assert_eq!(specs[2].bind_addr, "[::1]:8443");
+    assert_eq!(specs[2].path.as_deref(), Some("/h3"));
 }
 
 

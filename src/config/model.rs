@@ -28,24 +28,6 @@ pub struct AppConfig {
     pub tunnels: Vec<TunnelConfig>,
 }
 
-/// Transport protocol family for server listeners.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TransportProtocolFamily {
-    Tcp,
-    Udp,
-    Uds,
-}
-
-impl std::fmt::Display for TransportProtocolFamily {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Tcp => write!(f, "tcp"),
-            Self::Udp => write!(f, "udp"),
-            Self::Uds => write!(f, "uds"),
-        }
-    }
-}
-
 /// Parsed server listening specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerListenSpec {
@@ -55,19 +37,11 @@ pub struct ServerListenSpec {
 }
 
 impl ServerListenSpec {
-    /// Returns the underlying transport protocol family for this listener specification.
-    pub fn transport_family(&self) -> TransportProtocolFamily {
-        match self.scheme.as_str() {
-            "h3" | "https" | "quic" => TransportProtocolFamily::Udp,
-            "uds" | "unix" => TransportProtocolFamily::Uds,
-            _ => TransportProtocolFamily::Tcp,
-        }
-    }
-
     /// Returns true if this listener uses Unix Domain Sockets.
     pub fn is_uds(&self) -> bool {
-        self.transport_family() == TransportProtocolFamily::Uds
+        self.scheme == "uds" || self.scheme == "unix"
     }
+
     pub fn parse(raw: &str) -> Result<Self, crate::core::error::TunnelError> {
         let raw = raw.trim();
         let (scheme, rest) = if let Some(idx) = raw.find("://") {
@@ -91,19 +65,12 @@ impl ServerListenSpec {
                     (rest, "/")
                 };
 
-                let (host, port_str) = host_port.rsplit_once(':').ok_or_else(|| {
+                let (_, port_str) = host_port.rsplit_once(':').ok_or_else(|| {
                     crate::core::error::TunnelError::Config(format!(
                         "Invalid server listen URL '{}': missing port in '{}'. Expected format '<host>:<port>'",
                         raw, host_port
                     ))
                 })?;
-
-                if host.is_empty() {
-                    return Err(crate::core::error::TunnelError::Config(format!(
-                        "Invalid server listen URL '{}': host cannot be empty",
-                        raw
-                    )));
-                }
 
                 let port: u16 = port_str.parse().map_err(|_| {
                     crate::core::error::TunnelError::Config(format!(
@@ -116,17 +83,6 @@ impl ServerListenSpec {
                     return Err(crate::core::error::TunnelError::Config(format!(
                         "Invalid server listen URL '{}': port must not be 0",
                         raw
-                    )));
-                }
-
-                // If host looks like an IP address, validate its syntax
-                let trimmed_host = host.trim_matches(|c| c == '[' || c == ']');
-                if trimmed_host.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ':')
-                    && trimmed_host.parse::<std::net::IpAddr>().is_err()
-                {
-                    return Err(crate::core::error::TunnelError::Config(format!(
-                        "Invalid server listen URL '{}': invalid IP address '{}'",
-                        raw, host
                     )));
                 }
 

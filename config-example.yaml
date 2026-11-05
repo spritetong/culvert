@@ -1,9 +1,7 @@
 # ==============================================================================
 # Micro-Tunnel Configuration Example
 # Validate with:
-#   micro-tunnel --check -c config-example.yaml               # Full pre-flight (DNS + port bind)
-#   micro-tunnel --check --no-bind -c config-example.yaml     # Pre-flight with DNS check, skipping port bind
-#   micro-tunnel --syntax-only -c config-example.yaml         # Pure syntax/schema/cert check (offline/no network)
+#   micro-tunnel --check -c config-example.yaml
 # ==============================================================================
 
 log:
