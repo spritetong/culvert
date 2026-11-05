@@ -197,12 +197,40 @@ fn preflight_check(config: &AppConfig) -> Result<(), TunnelError> {
 
             if matches!(spec.scheme.as_str(), "ws" | "wss" | "h3" | "quic" | "https") {
                 use std::net::ToSocketAddrs;
-                let _ = spec.bind_addr.to_socket_addrs().map_err(|e| {
+                let addrs: Vec<_> = spec.bind_addr.to_socket_addrs().map_err(|e| {
                     TunnelError::Config(format!(
                         "Server listen address '{}' cannot be resolved or is invalid: {}",
                         spec.bind_addr, e
                     ))
-                })?;
+                })?.collect();
+
+                if addrs.is_empty() {
+                    return Err(TunnelError::Config(format!(
+                        "Server listen address '{}' resolved to no socket addresses",
+                        spec.bind_addr
+                    )));
+                }
+
+                // Pre-flight test bind to detect AddrNotAvailable and AddrInUse early
+                for addr in &addrs {
+                    if matches!(spec.scheme.as_str(), "h3" | "quic") {
+                        let socket = std::net::UdpSocket::bind(addr).map_err(|e| {
+                            TunnelError::Config(format!(
+                                "Server listen address '{}' ({}) cannot be bound: {}",
+                                spec.bind_addr, addr, e
+                            ))
+                        })?;
+                        drop(socket);
+                    } else {
+                        let listener = std::net::TcpListener::bind(addr).map_err(|e| {
+                            TunnelError::Config(format!(
+                                "Server listen address '{}' ({}) cannot be bound: {}",
+                                spec.bind_addr, addr, e
+                            ))
+                        })?;
+                        drop(listener);
+                    }
+                }
             }
 
             if matches!(spec.scheme.as_str(), "wss" | "https" | "h3" | "quic") {

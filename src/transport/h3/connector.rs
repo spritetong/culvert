@@ -74,8 +74,17 @@ impl H3Connector {
 
         let mut tls_config = endpoint.tls_config.clone().unwrap_or_default();
         if is_quic_raw {
-            // For raw QUIC endpoints, force ALPN to micro-tunnel-quic regardless of generic global TLS settings
-            tls_config.alpn = Some(vec!["micro-tunnel-quic".to_string()]);
+            match tls_config.alpn.take() {
+                Some(mut list) => {
+                    if !list.iter().any(|p| p == "micro-tunnel-quic") {
+                        list.push("micro-tunnel-quic".to_string());
+                    }
+                    tls_config.alpn = Some(list);
+                }
+                None => {
+                    tls_config.alpn = Some(vec!["micro-tunnel-quic".to_string()]);
+                }
+            }
         } else {
             // For HTTP/3 endpoints, ensure "h3" is included in ALPN protocols
             match tls_config.alpn.take() {

@@ -39,7 +39,7 @@ impl TransportDriver for UdsTransportDriver {
         {
             let _ = (endpoint, auth_token, mode);
             Err(TunnelError::UnsupportedScheme(
-                "Unix Domain Sockets (uds://) are only supported on Unix platforms (Linux/macOS)"
+                "Unix Domain Sockets (uds:// or unix://) are only supported on Unix platforms (Linux/macOS)"
                     .to_string(),
             ))
         }
@@ -69,7 +69,7 @@ impl TransportDriver for UdsTransportDriver {
         {
             let _ = (socket_path, auth_token, path);
             Err(TunnelError::UnsupportedScheme(
-                "Unix Domain Sockets (uds://) are only supported on Unix platforms (Linux/macOS)"
+                "Unix Domain Sockets (uds:// or unix://) are only supported on Unix platforms (Linux/macOS)"
                     .to_string(),
             ))
         }
@@ -372,7 +372,10 @@ mod unix_impl {
         }
 
         fn protocol_scheme(&self) -> &'static str {
-            "uds"
+            match self.endpoint.endpoint.scheme.as_str() {
+                "unix" => "unix",
+                _ => "uds",
+            }
         }
     }
 }

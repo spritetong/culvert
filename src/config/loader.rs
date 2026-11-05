@@ -157,7 +157,7 @@ impl ConfigLoader {
                 #[cfg(not(unix))]
                 if spec.scheme == "uds" || spec.scheme == "unix" {
                     return Err(TunnelError::UnsupportedScheme(
-                        "Unix Domain Sockets (uds://) are only supported on Unix platforms (Linux/macOS)".to_string(),
+                        "Unix Domain Sockets (uds:// or unix://) are only supported on Unix platforms (Linux/macOS)".to_string(),
                     ));
                 }
 
@@ -318,7 +318,7 @@ impl ConfigLoader {
             #[cfg(not(unix))]
             if ep.scheme == "uds" || ep.scheme == "unix" {
                 return Err(TunnelError::UnsupportedScheme(format!(
-                    "tunnel '{}': Unix Domain Sockets (uds://) are only supported on Unix platforms (Linux/macOS)",
+                    "tunnel '{}': Unix Domain Sockets (uds:// or unix://) are only supported on Unix platforms (Linux/macOS)",
                     tunnel.tag
                 )));
             }

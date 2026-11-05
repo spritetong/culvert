@@ -182,7 +182,7 @@ pub trait Dialer: Send + Sync {
 # ==================================================
 
 log:
-  level: "info"         # trace | debug | info | warn | error
+  level: "info"         # trace | debug | info | warn | error (注意: RUST_LOG 环境变量优先级高于此项)
   output: "stdout"      # stdout | stderr
   no_color: false       # 禁用彩色输出 (适合容器日志采集)
 
@@ -216,7 +216,7 @@ server:
     - "wss://0.0.0.0:8443/tunnel"
     - "h3://0.0.0.0:8443/tunnel"
     - "ws://127.0.0.1:8080/tunnel"
-  token: "SECURE_PRESHARED_TOKEN"   # 可选，省略或置空为免密
+  token: "SECURE_PRESHARED_TOKEN"   # 可选，省略或设为 null 为免密（空字符串 "" 会被拒绝）
   default_target: "127.0.0.1:5201"  # 可选
   # TLS 证书文件 (可选，未指定时 wss/h3/quic 自动生成内存自签名证书以实现开箱即用)
   # certificate: "/path/to/server.crt"

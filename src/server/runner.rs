@@ -62,7 +62,8 @@ impl ServerRunner {
     pub async fn run(&self, cancel_token: CancellationToken) -> Result<(), TunnelError> {
         let specs = self.config.parse_specs()?;
         if specs.is_empty() {
-            info!("No server listen endpoints configured, skipping server runner");
+            info!("No server listen endpoints configured, waiting for cancellation signal");
+            cancel_token.cancelled().await;
             return Ok(());
         }
 
@@ -272,23 +273,40 @@ impl ServerRunner {
         }
 
         let mut exit_err: Option<TunnelError> = None;
-        tokio::select! {
-            _ = cancel_token.cancelled() => {
-                info!("Server ingress runner received cancellation signal");
-            }
-            res = tracker.join_next() => {
-                match res {
-                    Some(Ok(Err(e))) => {
-                        error!("A server ingress listener terminated with error: {:?}", e);
-                        exit_err = Some(e);
-                        cancel_token.cancel();
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => {
+                    info!("Server ingress runner received cancellation signal");
+                    break;
+                }
+                res = tracker.join_next() => {
+                    match res {
+                        Some(Ok(Err(e))) => {
+                            error!("A server ingress listener terminated with error: {:?}", e);
+                            if exit_err.is_none() {
+                                exit_err = Some(e);
+                            }
+                            cancel_token.cancel();
+                            break;
+                        }
+                        Some(Err(join_err)) => {
+                            error!("A server ingress listener panicked: {:?}", join_err);
+                            if exit_err.is_none() {
+                                exit_err = Some(TunnelError::Internal(format!("Listener panic: {:?}", join_err)));
+                            }
+                            cancel_token.cancel();
+                            break;
+                        }
+                        Some(Ok(Ok(()))) => {
+                            if tracker.is_empty() {
+                                break;
+                            }
+                        }
+                        None => {
+                            break;
+                        }
                     }
-                    Some(Err(join_err)) => {
-                        error!("A server ingress listener panicked: {:?}", join_err);
-                        exit_err = Some(TunnelError::Internal(format!("Listener panic: {:?}", join_err)));
-                        cancel_token.cancel();
-                    }
-                    _ => {}
                 }
             }
         }

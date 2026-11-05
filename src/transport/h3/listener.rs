@@ -46,11 +46,18 @@ impl H3Listener {
 
         let is_quic_listener = listen_addr.starts_with("quic://");
         let mut rustls_server = server_rustls_config;
-        rustls_server.alpn_protocols = if is_quic_listener {
-            vec![b"micro-tunnel-quic".to_vec()]
+        if is_quic_listener {
+            if !rustls_server.alpn_protocols.iter().any(|p| p == b"micro-tunnel-quic") {
+                rustls_server.alpn_protocols.push(b"micro-tunnel-quic".to_vec());
+            }
         } else {
-            vec![b"h3".to_vec(), b"micro-tunnel-quic".to_vec()]
-        };
+            if !rustls_server.alpn_protocols.iter().any(|p| p == b"h3") {
+                rustls_server.alpn_protocols.push(b"h3".to_vec());
+            }
+            if !rustls_server.alpn_protocols.iter().any(|p| p == b"micro-tunnel-quic") {
+                rustls_server.alpn_protocols.push(b"micro-tunnel-quic".to_vec());
+            }
+        }
 
         let quic_server_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_server)
             .map_err(|e| {

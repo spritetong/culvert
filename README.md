@@ -92,14 +92,14 @@ micro-tunnel [OPTIONS]
 | :--- | :---: | :--- | :--- | :--- |
 | `--config` | `-c` | `<PATH>` | Path to the YAML configuration file | `config.yaml` |
 | `--worker-threads` | `-w` | `<NUM>` | Override number of Tokio runtime worker threads (`1` for single-threaded runtime) | Auto-detect CPU cores |
-| `--check` | | | Validate configuration syntax, schema, and semantics without starting daemon | |
+| `--check` | | | Pre-flight dry-run: validate schema, TLS certs, DNS resolution, and listener interface bindability | |
 | `--help` | `-h` | | Print command-line help message | |
 | `--version` | `-V` | | Print version information | |
 
 #### Example CLI Commands
 
 ```bash
-# Validate configuration file without starting services
+# Validate configuration file without starting services (performs pre-flight including DNS and port bindability checks)
 ./micro-tunnel --check -c /etc/micro-tunnel/config.yaml
 
 # Run with default config.yaml
@@ -124,6 +124,7 @@ Configures structured log output using Tokio `tracing`.
 ```yaml
 log:
   level: "info"      # Log verbosity level: "trace", "debug", "info", "warn", "error" (default: "info")
+                     # Note: RUST_LOG environment variable takes precedence over log.level if set.
   output: "stdout"    # Output destination: "stdout" or "stderr" (default: "stdout")
   no_color: false     # Set to true to disable ANSI terminal colors (default: false)
 ```

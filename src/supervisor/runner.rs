@@ -84,24 +84,40 @@ impl TunnelSupervisor {
 
         // Wait for cancellation signal or worker termination
         let mut exit_err: Option<TunnelError> = None;
-        tokio::select! {
-            biased;
-            _ = self.cancel_token.cancelled() => {
-                info!("Supervisor received shutdown signal.");
-            }
-            res = tracker.join_next() => {
-                match res {
-                    Some(Ok(Err(e))) => {
-                        error!("A tunnel worker terminated with an error: {:?}", e);
-                        exit_err = Some(e);
-                        self.cancel_token.cancel();
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.cancel_token.cancelled() => {
+                    info!("Supervisor received shutdown signal.");
+                    break;
+                }
+                res = tracker.join_next() => {
+                    match res {
+                        Some(Ok(Err(e))) => {
+                            error!("A tunnel worker terminated with an error: {:?}", e);
+                            if exit_err.is_none() {
+                                exit_err = Some(e);
+                            }
+                            self.cancel_token.cancel();
+                            break;
+                        }
+                        Some(Err(join_err)) => {
+                            error!("A tunnel worker panicked: {:?}", join_err);
+                            if exit_err.is_none() {
+                                exit_err = Some(TunnelError::Internal(format!("Worker panic: {:?}", join_err)));
+                            }
+                            self.cancel_token.cancel();
+                            break;
+                        }
+                        Some(Ok(Ok(()))) => {
+                            if tracker.is_empty() {
+                                break;
+                            }
+                        }
+                        None => {
+                            break;
+                        }
                     }
-                    Some(Err(join_err)) => {
-                        error!("A tunnel worker panicked: {:?}", join_err);
-                        exit_err = Some(TunnelError::Internal(format!("Worker panic: {:?}", join_err)));
-                        self.cancel_token.cancel();
-                    }
-                    _ => {}
                 }
             }
         }

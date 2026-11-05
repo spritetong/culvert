@@ -30,23 +30,13 @@ use micro_tunnel::transport::TransportRegistry;
 use micro_tunnel::transport::ws::WsTransportDriver;
 use micro_tunnel::tunnel::{run_forward_tunnel, run_reverse_tunnel};
 
-use std::sync::atomic::{AtomicU16, Ordering};
 
-/// Helper to get an available random ephemeral port from Suite 1 partition [20000, 25500).
+/// Helper to get an available random ephemeral port assigned by the OS.
 fn get_available_port() -> u16 {
-    static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
-    let base = 20000 + (std::process::id() as u16 % 100) * 50;
-    for _ in 0..200 {
-        let offset = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let port = base.wrapping_add(offset);
-        if (1024..65535).contains(&port)
-            && let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port))
-        {
-            drop(listener);
-            return port;
-        }
-    }
-    panic!("Failed to find an available port in Suite 1 partition [20000, 25500)");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    port
 }
 
 /// In-memory or temporary PKI credentials bundle generated via rcgen.

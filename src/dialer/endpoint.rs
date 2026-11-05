@@ -102,7 +102,8 @@ impl EndpointContext {
                 .or_else(|| global_app.dns.as_ref().and_then(|d| d.cache_capacity)),
         };
 
-        let dns_resolver: Arc<dyn DnsResolver> = Arc::new(CachedDnsResolver::new(effective_dns));
+        let dns_resolver: Arc<dyn DnsResolver> =
+            Arc::new(CachedDnsResolver::try_new(effective_dns)?);
 
         // Resolve effective Dialer options
         let effective_dialer = DialerConfig {

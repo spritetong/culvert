@@ -11,7 +11,7 @@
 相较于传统隧道工具（如 `wstunnel`、`frp`、`Xray`），Micro-Tunnel 遵循严格的减法哲学：
 * **零内嵌证书申请管理 (No ACME)**：服务端不管理任何 ACME 证书申请逻辑，不监听公网 80/443。外部流量全部由 Caddy 终结并由 Caddy 自动签发和续签合规证书，后端服务仅监听 Unix Domain Socket (UDS) 或受限本地回环。服务端崩溃或版本升级绝不影响公网域名接入点。
 * **单配置全栈纳管 (Unified Server & Tunnel Coexistence)**：支持在同一配置文件中同时声明 `server` 入口与多条 `tunnels` 实例，节点可兼具 Ingress 汇聚与中继客户端双重角色。
-* **按需可选轻量鉴权 (Optional Token Authentication)**：支持高熵预共享密钥（PSK）校验，同时支持 token 省略或置空免密模式，便于与 Caddy / Nginx 等前置反代鉴权或受信内网环境无缝对接。
+* **按需可选轻量鉴权 (Optional Token Authentication)**：支持高熵预共享密钥（PSK）校验，同时支持 token 省略或设为 null 免密模式（严格拒绝空字符串 ""），便于与 Caddy / Nginx 等前置反代鉴权或受信内网环境无缝对接。
 * **彻底摒弃脆弱的多路复用分帧 (Native Streams & Decoupled 0-RTT Pool)**：
   * HTTP/3 下直接依托 QUIC 原生流隔离（Stream ID 隔离），单流丢包重传不阻塞其他流；
   * WSS 下采用 1:1 双工流与解耦预热连接池模型，消除私有应用层分帧带来的 CPU 二次打包开销与 TCP 队头阻塞。
@@ -75,7 +75,7 @@
   * 支持数组声明多个 Listen URLs，服务端自动启动对应的异构协议监听。
   * **Path 路由伪装**：客户端发起请求的 URI Path 必须与服务端精确匹配；不匹配时直接以标准 **HTTP 404 Not Found** 响应，防范未授权扫描。
 * **FR-2.2 可选 Token 鉴权 (Optional Auth)**：
-  * Server 与 Tunnel 的 `token` 字段均为可选。未配置或置空时跳过鉴权，方便内网通信或前置由 Caddy/Nginx 执行鉴权。
+  * Server 与 Tunnel 的 `token` 字段均为可选。未配置或设为 null 时跳过鉴权（空字符串 "" 会在加载期被拒绝），方便内网通信或前置由 Caddy/Nginx 执行鉴权。
 * **FR-2.3 标准化 URL 与复合 Endpoint 解析**：
   * 支持统一解析各种端点 URL：如 `ws://...`、`wss://...`、`https://...`、`h3://...`、`quic://...`、`uds://...`、`unix://...`（其中 `uds`/`unix` 仅支持 Unix 平台）。
   * 支持将 `endpoint` 配置为简易 URL 字符串，或绑定独立上下文的高级对象结构。
@@ -135,7 +135,7 @@
 
 ```yaml
 log:
-  level: "info"
+  level: "info"         # 日志级别 (支持 trace/debug/info/warn/error；注意：环境变量 RUST_LOG 优先级高于本字段)
   output: "stdout"
   no_color: false
 
@@ -169,7 +169,7 @@ server:
     - "wss://0.0.0.0:8443/tunnel"
     - "h3://0.0.0.0:8443/tunnel"
     - "ws://127.0.0.1:8080/tunnel"
-  token: "SECURE_PRESHARED_TOKEN"   # 可选，省略或置空为免密模式
+  token: "SECURE_PRESHARED_TOKEN"   # 可选，省略或设为 null 为免密模式（空字符串 "" 会被拒绝）
   default_target: "127.0.0.1:5201"  # 可选，缺省目标地址
   # TLS 证书文件 (可选，未指定时 wss/h3/quic 自动生成内存自签名证书以实现开箱即用零配置启动)
   # certificate: "/path/to/server.crt"

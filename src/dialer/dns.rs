@@ -49,23 +49,20 @@ pub struct CachedDnsResolver {
 }
 
 impl CachedDnsResolver {
-    /// Creates a new `CachedDnsResolver` with the provided configuration.
-    pub fn new(config: DnsConfig) -> Self {
+    /// Creates a new `CachedDnsResolver` with the provided configuration, returning an error on invalid configuration.
+    pub fn try_new(config: DnsConfig) -> Result<Self, TunnelError> {
         let capacity = config.cache_capacity.unwrap_or(DEFAULT_DNS_CACHE_CAPACITY);
         let mut name_servers = Vec::new();
         let mut has_system_resolver = false;
 
         if let Some(ref resolvers) = config.resolvers {
             for resolver in resolvers {
-                match Self::parse_resolver(resolver) {
-                    Ok(ParsedDnsServer::System) => {
+                match Self::parse_resolver(resolver)? {
+                    ParsedDnsServer::System => {
                         has_system_resolver = true;
                     }
-                    Ok(ParsedDnsServer::NameServer(ns)) => {
+                    ParsedDnsServer::NameServer(ns) => {
                         name_servers.push(ns);
-                    }
-                    Err(e) => {
-                        warn!(resolver = ?resolver, error = ?e, "Failed to parse DNS resolver, skipping");
                     }
                 }
             }
@@ -105,13 +102,18 @@ impl CachedDnsResolver {
             None
         };
 
-        Self {
+        Ok(Self {
             config,
             cache: RwLock::new(HashMap::with_capacity(capacity)),
             capacity,
             hickory_resolver,
             has_system_resolver,
-        }
+        })
+    }
+
+    /// Creates a new `CachedDnsResolver` with the provided configuration.
+    pub fn new(config: DnsConfig) -> Self {
+        Self::try_new(config).expect("invalid DNS configuration")
     }
 
     /// Parses a DNS resolver configuration into a `ParsedDnsServer`.

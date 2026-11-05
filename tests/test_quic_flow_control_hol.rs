@@ -15,25 +15,20 @@ use micro_tunnel::transport::h3::H3Connector;
 use micro_tunnel::transport::h3::listener::H3Listener;
 use micro_tunnel::transport::{TargetAddr, TransportConnector, TransportListener};
 
-use std::sync::atomic::{AtomicU16, Ordering};
 
-/// Helper to get an available ephemeral port from Suite 7 partition [60500, 65000).
+/// Helper to get an available ephemeral port from the OS that is free for both TCP and UDP.
 fn get_ephemeral_port() -> u16 {
-    static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
-    let base = 60500 + (std::process::id() as u16 % 80) * 50;
-    for _ in 0..200 {
-        let offset = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let port = base.wrapping_add(offset);
-        if (1024..65535).contains(&port)
-            && let Ok(u) = std::net::UdpSocket::bind(("127.0.0.1", port))
-            && let Ok(t) = std::net::TcpListener::bind(("127.0.0.1", port))
-        {
+    for _ in 0..100 {
+        let t = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral TCP port");
+        let port = t.local_addr().unwrap().port();
+        if let Ok(u) = std::net::UdpSocket::bind(("127.0.0.1", port)) {
             drop(u);
             drop(t);
             return port;
         }
+        drop(t);
     }
-    panic!("Failed to find an available port in Suite 7 partition [60500, 65000)");
+    panic!("Failed to find an available dual TCP/UDP ephemeral port");
 }
 
 /// Helper to generate a test PKI certificate and ServerConfig for QUIC.

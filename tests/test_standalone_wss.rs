@@ -4,7 +4,6 @@
 //! Test standalone direct WSS termination with self-signed certificate fallback.
 //! All comments and docstrings must be in English.
 
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -15,22 +14,12 @@ use micro_tunnel::config::model::{
 };
 use micro_tunnel::supervisor::TunnelSupervisor;
 
-/// Helper to get an available random ephemeral port from Suite 3 partition [34000, 39500).
+/// Helper to get an available random ephemeral port assigned by the OS.
 fn get_available_port() -> u16 {
-    static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
-    for _ in 0..1000 {
-        let offset = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let port = 34000 + (offset % 5500);
-        if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) {
-            drop(listener);
-            return port;
-        }
-    }
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    port
 }
 
 fn spawn_echo_server(cancel_token: CancellationToken) -> (tokio::task::JoinHandle<()>, u16) {

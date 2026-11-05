@@ -57,8 +57,17 @@ impl TransportDriver for WsTransportDriver {
             None => (None, None),
         };
 
-        let alpn = tls.and_then(|t| t.alpn.as_ref()).map(|list| {
-            list.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>()
+        let alpn = tls.and_then(|t| t.alpn.as_ref()).and_then(|list| {
+            let filtered: Vec<Vec<u8>> = list
+                .iter()
+                .filter(|s| *s != "h3" && *s != "micro-tunnel-quic")
+                .map(|s| s.as_bytes().to_vec())
+                .collect();
+            if filtered.is_empty() {
+                None
+            } else {
+                Some(filtered)
+            }
         });
 
         let tls_acceptor = if is_wss {

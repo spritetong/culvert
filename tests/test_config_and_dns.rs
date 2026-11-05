@@ -335,3 +335,65 @@ server:
     assert!(res.is_err());
     assert!(res.unwrap_err().to_string().contains("dialer.connect_timeout must be greater than 0"));
 }
+
+#[tokio::test]
+async fn test_empty_server_listen_with_tunnels_does_not_exit_prematurely() {
+    let yaml = r#"
+server:
+  listen: []
+tunnels:
+  - tag: "client-only-tunnel"
+    endpoint: "ws://127.0.0.1:59999/tunnel"
+    retry:
+      delay: "1s"
+      max_retries: 5
+    mappings:
+      - mode: "forward"
+        listen: "127.0.0.1:59998"
+        target: "127.0.0.1:59997"
+"#;
+    let config = ConfigLoader::from_yaml_str(yaml).expect("Failed to parse config with empty server listen");
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let shutdown_token = cancel_token.clone();
+
+    let supervisor = micro_tunnel::supervisor::TunnelSupervisor::new(config, cancel_token);
+
+    // Cancel after 300ms
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        shutdown_token.cancel();
+    });
+
+    let start = std::time::Instant::now();
+    let res = supervisor.run().await;
+    let elapsed = start.elapsed();
+
+    // Verify it did not exit immediately in 16ms, but stayed alive until cancel_token was triggered
+    assert!(elapsed >= std::time::Duration::from_millis(250), "Supervisor exited too quickly: {:?}", elapsed);
+    assert!(res.is_ok(), "Supervisor should exit cleanly on cancellation: {:?}", res);
+}
+
+#[test]
+fn test_cached_dns_resolver_try_new_rejects_missing_server() {
+    use micro_tunnel::dialer::dns::CachedDnsResolver;
+    use micro_tunnel::config::model::{DnsConfig, DnsResolverConfig, DnsServerConfig};
+
+    let dns_cfg = DnsConfig {
+        strategy: None,
+        resolvers: Some(vec![DnsResolverConfig::Detailed(DnsServerConfig {
+            r#type: "https".to_string(),
+            server: None,
+            port: None,
+            path: None,
+            tls: None,
+        })]),
+        cache_capacity: Some(100),
+    };
+
+    let res = CachedDnsResolver::try_new(dns_cfg);
+    match res {
+        Err(e) => assert!(e.to_string().contains("Missing 'server' field")),
+        Ok(_) => panic!("Expected error for missing server field"),
+    }
+}
+
