@@ -332,7 +332,7 @@ async fn test_wss_forward_tunnel_with_custom_ca_and_sni() {
             dialer: None,
             tls: Some(TlsConfig {
                 server_name: Some("tunnel.secure.io".to_string()),
-                insecure: false, // Strict CA validation!
+                insecure: Some(false), // Strict CA validation!
                 ca_certificate: Some(pki.ca_cert_path.clone()),
                 ..Default::default()
             }),
@@ -448,7 +448,7 @@ async fn test_wss_forward_tunnel_insecure_mode() {
             dialer: None,
             tls: Some(TlsConfig {
                 server_name: Some("untrusted.host".to_string()),
-                insecure: true, // Should skip all cert validation!
+                insecure: Some(true), // Should skip all cert validation!
                 ..Default::default()
             }),
         },
@@ -562,7 +562,7 @@ async fn test_wss_mtls_mutual_authentication() {
             dialer: None,
             tls: Some(TlsConfig {
                 server_name: Some("localhost".to_string()),
-                insecure: false,
+                insecure: Some(false),
                 ca_certificate: Some(pki.ca_cert_path.clone()),
                 client_certificate: Some(pki.client_cert_path.clone()),
                 client_key: Some(pki.client_key_path.clone()),
@@ -681,7 +681,7 @@ async fn test_wss_reverse_tunnel_e2e() {
             dialer: None,
             tls: Some(TlsConfig {
                 server_name: Some("localhost".to_string()),
-                insecure: false,
+                insecure: Some(false),
                 ca_certificate: Some(pki.ca_cert_path.clone()),
                 ..Default::default()
             }),

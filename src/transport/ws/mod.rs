@@ -37,7 +37,7 @@ impl TransportDriver for WsTransportDriver {
             endpoint.clone(),
             auth_token,
             mode,
-        )))
+        )?))
     }
 
     fn build_listener(
@@ -57,7 +57,7 @@ impl TransportDriver for WsTransportDriver {
             None => (None, None),
         };
 
-        let tls_acceptor = if is_wss || cert_str.is_some() || key_str.is_some() {
+        let tls_acceptor = if is_wss {
             let server_rustls = crate::dialer::tls::TlsConfigBuilder::build_server_config(
                 cert_str, key_str, None, min_v, max_v,
             )?;
@@ -93,7 +93,7 @@ mod tests {
         let ep_cfg = EndpointConfig::Simple("http://127.0.0.1:29876/ws".to_string());
         let ep_ctx = EndpointContext::build(&ep_cfg, &app_cfg).unwrap();
 
-        let connector = WsConnector::new(ep_ctx, auth_token, TunnelMode::Forward);
+        let connector = WsConnector::new(ep_ctx, auth_token, TunnelMode::Forward).unwrap();
         let target = TargetAddr::Domain("127.0.0.1".to_string(), 80);
 
         let listener_handle = tokio::spawn(async move {

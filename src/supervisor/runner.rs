@@ -47,6 +47,19 @@ impl TunnelSupervisor {
 
     /// Spawns and manages all configured tunnels until cancelled or interrupted.
     pub async fn run(&self) -> Result<(), TunnelError> {
+        let has_server = self
+            .config
+            .server
+            .as_ref()
+            .is_some_and(|s| !s.listen.is_empty());
+        let has_tunnels = !self.config.tunnels.is_empty();
+        if !has_server && !has_tunnels {
+            return Err(TunnelError::Config(
+                "No server listeners and no tunnels are configured. Configuration must not be empty."
+                    .to_string(),
+            ));
+        }
+
         let mut tracker: TaskTracker<Result<(), TunnelError>> =
             TaskTracker::new(self.cancel_token.clone());
 
@@ -77,21 +90,35 @@ impl TunnelSupervisor {
             "All configured tunnels successfully spawned"
         );
 
-        // Wait for cancellation signal
+        // Wait for cancellation signal or worker termination
+        let mut exit_err: Option<TunnelError> = None;
         tokio::select! {
             biased;
             _ = self.cancel_token.cancelled() => {
                 info!("Supervisor received shutdown signal.");
             }
             res = tracker.join_next() => {
-                if let Some(Ok(Err(e))) = res {
-                    error!("A tunnel worker terminated with an error: {:?}", e);
+                match res {
+                    Some(Ok(Err(e))) => {
+                        error!("A tunnel worker terminated with an error: {:?}", e);
+                        exit_err = Some(e);
+                        self.cancel_token.cancel();
+                    }
+                    Some(Err(join_err)) => {
+                        error!("A tunnel worker panicked: {:?}", join_err);
+                        exit_err = Some(TunnelError::Internal(format!("Worker panic: {:?}", join_err)));
+                        self.cancel_token.cancel();
+                    }
+                    _ => {}
                 }
             }
         }
 
         // Graceful termination of all remaining tunnels (never aborts)
         tracker.shutdown_and_wait().await;
+        if let Some(e) = exit_err {
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -125,6 +152,15 @@ impl TunnelSupervisor {
                     break;
                 }
                 Err(e) => {
+                    if e.is_permanent() {
+                        error!(
+                            tag = %config.tag,
+                            "Permanent tunnel execution error encountered, aborting without retry: {:?}",
+                            e
+                        );
+                        return Err(e);
+                    }
+
                     attempts += 1;
                     if let Some(max) = max_retries
                         && attempts >= max

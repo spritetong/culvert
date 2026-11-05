@@ -11,6 +11,7 @@ use http_body_util::Empty;
 use hyper::body::Bytes;
 use rustls::pki_types::ServerName;
 use std::future::Future;
+use std::sync::Arc;
 
 use crate::config::model::TunnelMode;
 use crate::core::error::TunnelError;
@@ -39,18 +40,30 @@ pub struct WsConnector {
     pub endpoint: EndpointContext,
     pub auth_token: Option<String>,
     pub mode: TunnelMode,
+    pub tls_connector: Option<Arc<tokio_rustls::TlsConnector>>,
 }
 
 impl WsConnector {
-    /// Creates a new `WsConnector`.
-    pub fn new(endpoint: EndpointContext, auth_token: impl Into<String>, mode: TunnelMode) -> Self {
+    /// Creates a new `WsConnector`. Pre-builds the TLS connector if TLS is enabled.
+    pub fn new(
+        endpoint: EndpointContext,
+        auth_token: impl Into<String>,
+        mode: TunnelMode,
+    ) -> Result<Self, TunnelError> {
         let tok: String = auth_token.into();
         let auth_token = if tok.is_empty() { None } else { Some(tok) };
-        Self {
+        let tls_connector = if let Some(ref tls_cfg) = endpoint.tls_config {
+            let conn = TlsConfigBuilder::build_connector(tls_cfg)?;
+            Some(Arc::new(conn))
+        } else {
+            None
+        };
+        Ok(Self {
             endpoint,
             auth_token,
             mode,
-        }
+            tls_connector,
+        })
     }
 
     async fn connect_internal(
@@ -66,10 +79,13 @@ impl WsConnector {
         let raw_stream = self.endpoint.dialer.dial(host, port).await?;
 
         // 2. Perform TLS handshake if TLS is configured for this endpoint (e.g. wss://)
-        let tls_stream: Box<dyn TunnelStream> = if let Some(ref tls_cfg) = self.endpoint.tls_config
-        {
-            let connector = TlsConfigBuilder::build_connector(tls_cfg)?;
-            let sni = tls_cfg.server_name.as_deref().unwrap_or(host.as_str());
+        let tls_stream: Box<dyn TunnelStream> = if let Some(ref connector) = self.tls_connector {
+            let sni = self
+                .endpoint
+                .tls_config
+                .as_ref()
+                .and_then(|t| t.server_name.as_deref())
+                .unwrap_or(host.as_str());
 
             let server_name = ServerName::try_from(sni.to_string())
                 .map_err(|e| TunnelError::Tls(format!("Invalid SNI server name: {}", e)))?;

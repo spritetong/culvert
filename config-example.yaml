@@ -31,7 +31,7 @@ dialer:
 # Global default TLS settings
 tls:
   insecure: false
-  alpn: ["h3", "http/1.1"]
+  # alpn: ["h3", "http/1.1"]  # Optional: custom ALPN negotiation identifiers
 
 # Server Ingress configuration (can coexist with tunnels in same config!)
 server:
@@ -78,6 +78,3 @@ tunnels:
       - mode: "forward"
         listen: "127.0.0.1:18080"
         target: "10.0.0.8:8080"
-    multiplex:
-      enabled: false  # Note: MUX engine is in preview and not yet wired into the production path
-      max_streams: 128

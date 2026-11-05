@@ -99,7 +99,7 @@ tunnels:
 
     // Verify TLS
     let tls = app_config.tls.as_ref().unwrap();
-    assert!(!tls.insecure);
+    assert!(!tls.is_insecure());
     assert_eq!(
         tls.alpn.as_ref().unwrap(),
         &vec!["h3".to_string(), "http/1.1".to_string()]
@@ -142,7 +142,7 @@ tunnels:
         t1_tls.server_name.as_deref(),
         Some("custom-camouflage.example.com")
     );
-    assert!(t1_tls.insecure);
+    assert!(t1_tls.is_insecure());
 
     // Tunnel 2: simple endpoint inheriting global defaults
     let t2 = &app_config.tunnels[1];
@@ -256,6 +256,8 @@ async fn test_standard_dns_resolvers() {
 
     // 3. YAML parsing with standard structured resolvers: [{ type: "https", server: "1.1.1.1", tls: { server_name: "cloudflare-dns.com" } }]
     let yaml = r#"
+server:
+  listen: ["ws://127.0.0.1:8080"]
 dns:
   strategy: "ipv4_only"
   resolvers:

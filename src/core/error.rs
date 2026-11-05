@@ -61,3 +61,17 @@ pub enum TunnelError {
     #[error("Internal error: {0}")]
     Internal(String),
 }
+
+impl TunnelError {
+    /// Determines whether the error is permanent (fatal configuration, bad credentials, unsupported scheme, etc.)
+    /// such that repeated automatic retries are futile.
+    pub fn is_permanent(&self) -> bool {
+        matches!(
+            self,
+            TunnelError::Config(_)
+                | TunnelError::UnsupportedScheme(_)
+                | TunnelError::AuthFailed
+                | TunnelError::Tls(_)
+        )
+    }
+}

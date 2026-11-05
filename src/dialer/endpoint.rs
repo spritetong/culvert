@@ -127,11 +127,20 @@ impl EndpointContext {
 
         // Resolve effective TLS options based purely on whether endpoint scheme is TLS-based
         let is_tls_scheme = matches!(endpoint.scheme.as_str(), "https" | "wss" | "h3" | "quic");
+        if !is_tls_scheme && endpoint_tls.is_some() {
+            return Err(TunnelError::Config(format!(
+                "Endpoint '{}' uses non-TLS scheme '{}', but 'tls' options are configured. Use a TLS scheme (e.g. wss://, h3://) or remove the 'tls' block.",
+                raw_url, endpoint.scheme
+            )));
+        }
+
         let effective_tls = if is_tls_scheme {
-            let mut tls = endpoint_tls
-                .cloned()
-                .or_else(|| global_app.tls.clone())
-                .unwrap_or_default();
+            let mut tls = match (global_app.tls.as_ref(), endpoint_tls) {
+                (Some(g), Some(e)) => g.merge(Some(e)),
+                (Some(g), None) => g.clone(),
+                (None, Some(e)) => e.clone(),
+                (None, None) => crate::config::model::TlsConfig::default(),
+            };
             if tls.server_name.is_none() {
                 tls.server_name = Some(endpoint.host.clone());
             }

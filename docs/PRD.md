@@ -66,7 +66,7 @@
 * **FR-1.2 WSS 兼容回退传输**：
   * 基于高性能 `fastwebsockets` 实现标准 WebSocket（TCP 443）全双工二进制帧传输。
   * 支持 AVX2/NEON 硬件 SIMD 掩码加速，当 UDP 受阻时自动平滑降级至 WSS。
-* **FR-1.3 IPC 极速互联 (UDS)**：
+* **FR-1.3 IPC 极速互联 (UDS，仅限 Unix/Linux)**：
   * 服务端与 Caddy 之间严格走 Unix Domain Socket (`/run/tunnel.sock`)，免去内核网络协议栈封包、校验和计算与端口耗尽风险。
 
 ### 3.2 统一 URL 解析、Server 显式协议与 Endpoint 专属绑定
@@ -83,8 +83,8 @@
   * 支持多种主流 DNS 协议类型：
     * `system://0.0.0.0`：系统 libc 本地解析；
     * `dns://1.1.1.1`：标准 UDP DNS 解析；
-    * `dns+https://1.1.1.1?sni=cloudflare-dns.com`：DNS over HTTPS (DoH)；
-    * `dns+tls://8.8.8.8?sni=dns.google`：DNS over TLS (DoT)。
+    * `https://1.1.1.1?sni=cloudflare-dns.com`：DNS over HTTPS (DoH)；
+    * `tls://8.8.8.8?sni=dns.google`：DNS over TLS (DoT)。
   * 支持独立策略：
     * `prefer_ipv4`（默认优先解析与连接 IPv4）
     * `prefer_ipv6`（优先 IPv6）
@@ -93,7 +93,7 @@
 * **FR-2.5 Endpoint 专属细粒度 TLS 参数控制 (Rustls 原生高级覆盖)**：
   * `server_name`：独立覆盖 SNI 校验域名，支持 CDN 前置路由伪装与多租户分流。
   * `alpn`：独立指定应用层协议协商列表（如 `["h3"]` 或 `["http/1.1"]`）。
-  * `insecure` / `skip_cert_verify`：针对特定端点开启自签证书跳过校验。
+  * `insecure`：针对特定端点开启自签证书跳过校验。
   * `ca_certificate`：独立加载端点专用的自定义 CA 根证书。
   * `client_certificate` & `client_key`：独立配置 mTLS 双向认证证书与私钥。
   * `min_version` / `max_version`：显式约束 TLS 最低与最高版本（如 `1.2`, `1.3`）。
@@ -147,8 +147,8 @@ dns:
   strategy: "prefer_ipv4"
   resolvers:
     - "dns://1.1.1.1"
-    - "dns+https://1.1.1.1?sni=cloudflare-dns.com"
-    - "dns+tls://8.8.8.8?sni=dns.google"
+    - "https://1.1.1.1?sni=cloudflare-dns.com"
+    - "tls://8.8.8.8?sni=dns.google"
     - "system://0.0.0.0"
 
 # 全局默认套接字拨号参数
@@ -159,7 +159,6 @@ dialer:
 
 # 全局默认 TLS 参数
 tls:
-  enabled: true
   insecure: false
   alpn: ["h3", "http/1.1"]
 
@@ -211,13 +210,16 @@ tunnels:
       dns:
         strategy: "prefer_ipv6"
       tls:
-        enabled: true
-        server_name: "db-edge.example.com"
+              server_name: "db-edge.example.com"
         alpn: ["h3"]
         ca_certificate: "/etc/ssl/certs/custom_ca.pem"
         client_certificate: "/etc/ssl/certs/client.crt"
         client_key: "/etc/ssl/certs/client.key"
         min_version: "1.3"
+    mappings:
+      - mode: "forward"
+        listen: "127.0.0.1:18080"
+        target: "10.0.0.8:8080"
 ```
 
 ---

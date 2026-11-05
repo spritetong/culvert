@@ -126,7 +126,7 @@ impl TlsConfigBuilder {
 
         let builder = ClientConfig::builder_with_protocol_versions(versions);
 
-        let builder = if config.insecure {
+        let builder = if config.is_insecure() {
             builder
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoVerifyVerifier))
@@ -135,33 +135,42 @@ impl TlsConfigBuilder {
         };
 
         // Configure client authentication (mTLS) if client certificate & key are provided
-        let mut client_config = if let (Some(cert_path), Some(key_path)) =
-            (&config.client_certificate, &config.client_key)
-        {
-            let cert_file = File::open(cert_path).map_err(|e| {
-                TunnelError::Tls(format!("Failed to open client cert {:?}: {}", cert_path, e))
-            })?;
-            let mut cert_reader = BufReader::new(cert_file);
-            let client_certs: Vec<CertificateDer<'static>> =
-                rustls_pemfile::certs(&mut cert_reader)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| TunnelError::Tls(format!("Invalid client cert: {}", e)))?;
-
-            let key_file = File::open(key_path).map_err(|e| {
-                TunnelError::Tls(format!("Failed to open client key {:?}: {}", key_path, e))
-            })?;
-            let mut key_reader = BufReader::new(key_file);
-            let key = rustls_pemfile::private_key(&mut key_reader)
-                .map_err(|e| TunnelError::Tls(format!("Failed to read client key: {}", e)))?
-                .ok_or_else(|| {
-                    TunnelError::Tls("No private key found in client key file".to_string())
+        let mut client_config = match (&config.client_certificate, &config.client_key) {
+            (Some(cert_path), Some(key_path)) => {
+                let cert_file = File::open(cert_path).map_err(|e| {
+                    TunnelError::Tls(format!("Failed to open client cert {:?}: {}", cert_path, e))
                 })?;
+                let mut cert_reader = BufReader::new(cert_file);
+                let client_certs: Vec<CertificateDer<'static>> =
+                    rustls_pemfile::certs(&mut cert_reader)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| TunnelError::Tls(format!("Invalid client cert: {}", e)))?;
 
-            builder
-                .with_client_auth_cert(client_certs, key)
-                .map_err(|e| TunnelError::Tls(format!("Failed to configure mTLS: {}", e)))?
-        } else {
-            builder.with_no_client_auth()
+                let key_file = File::open(key_path).map_err(|e| {
+                    TunnelError::Tls(format!("Failed to open client key {:?}: {}", key_path, e))
+                })?;
+                let mut key_reader = BufReader::new(key_file);
+                let key = rustls_pemfile::private_key(&mut key_reader)
+                    .map_err(|e| TunnelError::Tls(format!("Failed to read client key: {}", e)))?
+                    .ok_or_else(|| {
+                        TunnelError::Tls("No private key found in client key file".to_string())
+                    })?;
+
+                builder
+                    .with_client_auth_cert(client_certs, key)
+                    .map_err(|e| TunnelError::Tls(format!("Failed to configure mTLS: {}", e)))?
+            }
+            (Some(_), None) => {
+                return Err(TunnelError::Tls(
+                    "client_certificate is specified but client_key is missing for mTLS".to_string(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(TunnelError::Tls(
+                    "client_key is specified but client_certificate is missing for mTLS".to_string(),
+                ));
+            }
+            (None, None) => builder.with_no_client_auth(),
         };
 
         if let Some(alpn_list) = &config.alpn {
@@ -216,6 +225,10 @@ impl TlsConfigBuilder {
                 })?;
 
             Ok((certs, key))
+        } else if cert_path.is_some() || key_path.is_some() {
+            Err(TunnelError::Tls(
+                "Both server certificate and private key must be provided together".to_string(),
+            ))
         } else {
             // Generate an ephemeral self-signed certificate for zero-configuration fallback
             let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];

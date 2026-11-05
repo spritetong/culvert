@@ -265,18 +265,32 @@ impl ServerRunner {
             });
         }
 
+        let mut exit_err: Option<TunnelError> = None;
         tokio::select! {
             _ = cancel_token.cancelled() => {
                 info!("Server ingress runner received cancellation signal");
             }
             res = tracker.join_next() => {
-                if let Some(Ok(Err(e))) = res {
-                    error!("A server ingress listener terminated with error: {:?}", e);
+                match res {
+                    Some(Ok(Err(e))) => {
+                        error!("A server ingress listener terminated with error: {:?}", e);
+                        exit_err = Some(e);
+                        cancel_token.cancel();
+                    }
+                    Some(Err(join_err)) => {
+                        error!("A server ingress listener panicked: {:?}", join_err);
+                        exit_err = Some(TunnelError::Internal(format!("Listener panic: {:?}", join_err)));
+                        cancel_token.cancel();
+                    }
+                    _ => {}
                 }
             }
         }
 
         tracker.shutdown_and_wait().await;
+        if let Some(e) = exit_err {
+            return Err(e);
+        }
         Ok(())
     }
 

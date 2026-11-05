@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Top-level application configuration structure.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default)]
     pub log: LogConfig,
@@ -91,7 +92,7 @@ impl ServerListenSpec {
                 })
             }
             other => Err(crate::core::error::TunnelError::Config(format!(
-                "Unsupported server protocol scheme '{}' in URL '{}'. Supported schemes: ws, wss, h3, quic, uds",
+                "Unsupported server protocol scheme '{}' in URL '{}'. Supported schemes: ws, wss, h3, quic, https, uds",
                 other, raw
             ))),
         }
@@ -115,11 +116,23 @@ where
     }
 }
 
+fn serialize_one_or_many<S>(vec: &[String], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    vec.serialize(serializer)
+}
+
 /// Server configuration for running as an ingress listener on VPS or cloud host.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Ingress listening URLs (e.g. "ws://0.0.0.0:8080/tunnel", ["ws://...", "h3://..."]).
-    #[serde(default, deserialize_with = "deserialize_one_or_many")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_one_or_many",
+        serialize_with = "serialize_one_or_many"
+    )]
     pub listen: Vec<String>,
 
     /// Authentication token for validating incoming tunnels. Optional.
@@ -155,19 +168,24 @@ impl ServerConfig {
 
     /// Returns the effective `TlsConfig` for server termination, merging explicit fields.
     pub fn effective_tls(&self, global_tls: Option<&TlsConfig>) -> Option<TlsConfig> {
-        let base = self.tls.clone().or_else(|| global_tls.cloned());
+        let merged = match (global_tls, self.tls.as_ref()) {
+            (Some(g), Some(s)) => Some(g.merge(Some(s))),
+            (Some(g), None) => Some(g.clone()),
+            (None, Some(s)) => Some(s.clone()),
+            (None, None) => None,
+        };
 
         if self.certificate.is_some() || self.key.is_some() {
-            let mut cfg = base.unwrap_or_default();
-            if cfg.certificate.is_none() {
-                cfg.certificate = self.certificate.as_ref().map(PathBuf::from);
+            let mut cfg = merged.unwrap_or_default();
+            if let Some(ref c) = self.certificate {
+                cfg.certificate = Some(PathBuf::from(c));
             }
-            if cfg.key.is_none() {
-                cfg.key = self.key.as_ref().map(PathBuf::from);
+            if let Some(ref k) = self.key {
+                cfg.key = Some(PathBuf::from(k));
             }
             Some(cfg)
         } else {
-            base
+            merged
         }
     }
 
@@ -181,7 +199,8 @@ impl ServerConfig {
 }
 
 /// Logging configuration options.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LogConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
@@ -223,8 +242,7 @@ pub enum DnsStrategy {
 }
 
 /// Configuration for an individual DNS resolver backend.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(untagged)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub enum DnsResolverConfig {
     Detailed(DnsServerConfig),
     Simple(String),
@@ -248,8 +266,52 @@ impl From<DnsServerConfig> for DnsResolverConfig {
     }
 }
 
+impl<'de> Deserialize<'de> for DnsResolverConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct DnsResolverConfigVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for DnsResolverConfigVisitor {
+            type Value = DnsResolverConfig;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a DNS resolver URL string or a structured DNS server map")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<DnsResolverConfig, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(DnsResolverConfig::Simple(value.to_string()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<DnsResolverConfig, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(DnsResolverConfig::Simple(value))
+            }
+
+            fn visit_map<M>(self, map: M) -> Result<DnsResolverConfig, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                let cfg = DnsServerConfig::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                Ok(DnsResolverConfig::Detailed(cfg))
+            }
+        }
+
+        deserializer.deserialize_any(DnsResolverConfigVisitor)
+    }
+}
+
 /// Structured DNS server configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct DnsServerConfig {
     /// DNS transport protocol type: "https", "tls", "udp", "dns", "tcp", "system".
     #[serde(rename = "type")]
@@ -274,6 +336,7 @@ pub struct DnsServerConfig {
 
 /// TLS settings for DNS-over-HTTPS or DNS-over-TLS.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct DnsTlsConfig {
     /// Expected SNI hostname for TLS verification (e.g. "cloudflare-dns.com").
     #[serde(default)]
@@ -285,7 +348,8 @@ pub struct DnsTlsConfig {
 }
 
 /// DNS resolver configuration.
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DnsConfig {
     pub strategy: Option<DnsStrategy>,
 
@@ -295,7 +359,8 @@ pub struct DnsConfig {
 }
 
 /// Socket dialing and TCP tuning options.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DialerConfig {
     #[serde(with = "humantime_serde_opt", default)]
     pub connect_timeout: Option<Duration>,
@@ -308,7 +373,7 @@ pub struct DialerConfig {
 }
 
 mod humantime_serde_opt {
-    use serde::{Deserialize, Deserializer};
+    use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
@@ -318,7 +383,6 @@ mod humantime_serde_opt {
         let opt = Option::<String>::deserialize(deserializer)?;
         match opt {
             Some(s) => {
-                // If it's a raw number of seconds or a duration string like "5s"
                 if let Ok(secs) = s.parse::<u64>() {
                     Ok(Some(Duration::from_secs(secs)))
                 } else {
@@ -339,17 +403,28 @@ mod humantime_serde_opt {
             None => Ok(None),
         }
     }
+
+    pub fn serialize<S>(opt: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match opt {
+            Some(d) => serializer.serialize_str(&format!("{}s", d.as_secs())),
+            None => serializer.serialize_none(),
+        }
+    }
 }
 
 /// Advanced TLS connection and verification options.
-#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// Override the SNI server name in the ClientHello.
     pub server_name: Option<String>,
 
     /// Skip certificate chain validation (for self-signed or test certificates).
     #[serde(default)]
-    pub insecure: bool,
+    pub insecure: Option<bool>,
 
     /// List of ALPN protocol negotiation identifiers (e.g. ["h3", "http/1.1"]).
     pub alpn: Option<Vec<String>>,
@@ -378,6 +453,44 @@ pub struct TlsConfig {
     pub max_version: Option<String>,
 }
 
+impl TlsConfig {
+    /// Determines whether certificate chain verification is skipped.
+    pub fn is_insecure(&self) -> bool {
+        self.insecure.unwrap_or(false)
+    }
+
+    /// Merges an override TLS configuration over this base configuration field-by-field.
+    pub fn merge(&self, r#override: Option<&TlsConfig>) -> Self {
+        let Some(over) = r#override else {
+            return self.clone();
+        };
+        Self {
+            server_name: over.server_name.clone().or_else(|| self.server_name.clone()),
+            insecure: over.insecure.or(self.insecure),
+            alpn: over.alpn.clone().or_else(|| self.alpn.clone()),
+            ca_certificate: over
+                .ca_certificate
+                .clone()
+                .or_else(|| self.ca_certificate.clone()),
+            client_certificate: over
+                .client_certificate
+                .clone()
+                .or_else(|| self.client_certificate.clone()),
+            client_key: over.client_key.clone().or_else(|| self.client_key.clone()),
+            certificate: over.certificate.clone().or_else(|| self.certificate.clone()),
+            key: over.key.clone().or_else(|| self.key.clone()),
+            min_version: over
+                .min_version
+                .clone()
+                .or_else(|| self.min_version.clone()),
+            max_version: over
+                .max_version
+                .clone()
+                .or_else(|| self.max_version.clone()),
+        }
+    }
+}
+
 /// Operational mode of the tunnel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -387,7 +500,8 @@ pub enum TunnelMode {
 }
 
 /// Individual bidirectional port mapping definition.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PortMappingConfig {
     #[serde(default = "default_mapping_mode")]
     pub mode: TunnelMode,
@@ -400,9 +514,14 @@ fn default_mapping_mode() -> TunnelMode {
 }
 
 /// Tunnel retry configuration.
-#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TunnelRetryConfig {
-    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_duration",
+        serialize_with = "serialize_optional_duration"
+    )]
     pub delay: Option<Duration>,
     pub max_retries: Option<usize>,
 }
@@ -442,8 +561,19 @@ where
     }
 }
 
+fn serialize_optional_duration<S>(opt: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match opt {
+        Some(d) => serializer.serialize_str(&format!("{}s", d.as_secs())),
+        None => serializer.serialize_none(),
+    }
+}
+
 /// Configuration for an individual tunnel instance.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TunnelConfig {
     pub tag: String,
     pub endpoint: EndpointConfig,
@@ -476,7 +606,8 @@ impl TunnelConfig {
 }
 
 /// Stream multiplexing configuration (sing-box style generic layer over any transport).
-#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct MultiplexConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -495,8 +626,7 @@ fn default_mux_max_streams() -> usize {
 }
 
 /// Endpoint definition supporting either a simple URL or detailed context.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 pub enum EndpointConfig {
     Simple(String),
@@ -518,8 +648,100 @@ impl EndpointConfig {
     }
 }
 
+impl Serialize for EndpointConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            EndpointConfig::Simple(s) => serializer.serialize_str(s),
+            EndpointConfig::Detailed {
+                url,
+                dns,
+                dialer,
+                tls,
+            } => {
+                use serde::ser::SerializeStruct;
+                let mut state = serializer.serialize_struct("EndpointConfig", 4)?;
+                state.serialize_field("url", url)?;
+                if let Some(d) = dns {
+                    state.serialize_field("dns", d)?;
+                }
+                if let Some(dl) = dialer {
+                    state.serialize_field("dialer", dl)?;
+                }
+                if let Some(t) = tls {
+                    state.serialize_field("tls", t)?;
+                }
+                state.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EndpointConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct EndpointConfigVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for EndpointConfigVisitor {
+            type Value = EndpointConfig;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a URL string or an endpoint map containing 'url'")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<EndpointConfig, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(EndpointConfig::Simple(value.to_string()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<EndpointConfig, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(EndpointConfig::Simple(value))
+            }
+
+            fn visit_map<M>(self, map: M) -> Result<EndpointConfig, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct DetailedHelper {
+                    url: String,
+                    #[serde(default)]
+                    dns: Option<DnsConfig>,
+                    #[serde(default)]
+                    dialer: Option<DialerConfig>,
+                    #[serde(default)]
+                    tls: Option<TlsConfig>,
+                }
+
+                let helper = DetailedHelper::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                Ok(EndpointConfig::Detailed {
+                    url: helper.url,
+                    dns: helper.dns,
+                    dialer: helper.dialer,
+                    tls: helper.tls,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(EndpointConfigVisitor)
+    }
+}
+
 /// Failover configuration for dynamic seamless transport migration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct FailoverConfig {
     #[serde(default)]
     pub enabled: bool,

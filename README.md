@@ -92,12 +92,16 @@ micro-tunnel [OPTIONS]
 | :--- | :---: | :--- | :--- | :--- |
 | `--config` | `-c` | `<PATH>` | Path to the YAML configuration file | `config.yaml` |
 | `--worker-threads` | `-w` | `<NUM>` | Override number of Tokio runtime worker threads (`1` for single-threaded runtime) | Auto-detect CPU cores |
+| `--check` | | | Validate configuration syntax, schema, and semantics without starting daemon | |
 | `--help` | `-h` | | Print command-line help message | |
 | `--version` | `-V` | | Print version information | |
 
 #### Example CLI Commands
 
 ```bash
+# Validate configuration file without starting services
+./micro-tunnel --check -c /etc/micro-tunnel/config.yaml
+
 # Run with default config.yaml
 ./micro-tunnel
 
@@ -178,7 +182,6 @@ dns:
 | `port` | Integer | Custom upstream port (optional; defaults to standard port: 443 for https, 853 for tls, 53 for udp/tcp) |
 | `path` | String | URL path for DoH (optional; e.g. `"/dns-query"`) |
 | `tls.server_name` | String | Expected TLS SNI domain for DoH/DoT validation (e.g. `"cloudflare-dns.com"`) |
-| `tls.insecure` | Boolean | Skip TLS verification for encrypted DNS (default: `false`) |
 
 ---
 
@@ -191,7 +194,7 @@ dialer:
   connect_timeout: "5s"     # Socket connection timeout (e.g., "5s", "500ms", or raw seconds: 5)
   tcp_keepalive: "15s"      # TCP keepalive interval (e.g., "15s", "30s")
   tcp_nodelay: true         # Disable Nagle's algorithm for low-latency transmission (default: true)
-  bind_interface: "eth0"    # Bind outbound traffic to a specific local network interface or IP (optional)
+  bind_interface: "eth0"    # Bind outbound traffic to network interface (Linux only via SO_BINDTODEVICE)
 ```
 
 ---

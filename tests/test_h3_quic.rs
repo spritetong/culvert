@@ -163,7 +163,7 @@ async fn test_h3_transport_handshake_and_bidirectional_transfer() {
         dns: None,
         dialer: None,
         tls: Some(TlsConfig {
-            insecure: true, // Accept self-signed test cert
+            insecure: Some(true), // Accept self-signed test cert
             server_name: Some("localhost".to_string()),
             ..Default::default()
         }),
@@ -216,7 +216,7 @@ async fn test_h3_transport_auth_failure() {
         dns: None,
         dialer: None,
         tls: Some(TlsConfig {
-            insecure: true,
+            insecure: Some(true),
             server_name: Some("localhost".to_string()),
             ..Default::default()
         }),
@@ -267,7 +267,7 @@ async fn test_quic_raw_stream_bidirectional_transfer() {
         dns: None,
         dialer: None,
         tls: Some(TlsConfig {
-            insecure: true,
+            insecure: Some(true),
             server_name: Some("localhost".to_string()),
             ..Default::default()
         }),
@@ -336,7 +336,7 @@ async fn test_h3_stream_multiplexing_over_single_quic_connection() {
         dns: None,
         dialer: None,
         tls: Some(TlsConfig {
-            insecure: true,
+            insecure: Some(true),
             server_name: Some("localhost".to_string()),
             ..Default::default()
         }),
@@ -414,7 +414,7 @@ async fn test_h3_tunnel_pool_prewarm_and_activation_end_to_end() {
     // 3. Setup client AppConfig with forward tunnel using pool_size: 4
     let app_config = micro_tunnel::config::model::AppConfig {
         tls: Some(TlsConfig {
-            insecure: true,
+            insecure: Some(true),
             server_name: Some("localhost".to_string()),
             ..Default::default()
         }),
@@ -513,7 +513,7 @@ async fn test_quic_raw_tunnel_pool_prewarm_and_activation_end_to_end() {
     // 3. Setup client AppConfig with forward tunnel using raw QUIC and pool_size: 4
     let app_config = micro_tunnel::config::model::AppConfig {
         tls: Some(TlsConfig {
-            insecure: true,
+            insecure: Some(true),
             server_name: Some("localhost".to_string()),
             ..Default::default()
         }),
@@ -640,7 +640,7 @@ async fn test_quic_raw_forward_stress_throughput() {
     // 3. Setup client AppConfig with forward tunnel
     let app_config = micro_tunnel::config::model::AppConfig {
         tls: Some(TlsConfig {
-            insecure: true,
+            insecure: Some(true),
             server_name: Some("localhost".to_string()),
             ..Default::default()
         }),
@@ -739,7 +739,7 @@ async fn test_h3_concurrent_forward_stress() {
     // 3. Setup client AppConfig with forward tunnel using pool_size: 4
     let app_config = micro_tunnel::config::model::AppConfig {
         tls: Some(TlsConfig {
-            insecure: true,
+            insecure: Some(true),
             server_name: Some("localhost".to_string()),
             ..Default::default()
         }),
@@ -864,7 +864,7 @@ async fn test_h3_sibling_streams_survive_sibling_abort() {
         dns: None,
         dialer: None,
         tls: Some(TlsConfig {
-            insecure: true,
+            insecure: Some(true),
             server_name: Some("localhost".to_string()),
             ..Default::default()
         }),
@@ -926,7 +926,7 @@ async fn test_h3_stream_liveness_detects_closed_connection() {
         dns: None,
         dialer: None,
         tls: Some(TlsConfig {
-            insecure: true,
+            insecure: Some(true),
             server_name: Some("localhost".to_string()),
             ..Default::default()
         }),
@@ -1001,7 +1001,7 @@ async fn test_h3_connector_recovers_after_server_restart() {
         dns: None,
         dialer: None,
         tls: Some(TlsConfig {
-            insecure: true,
+            insecure: Some(true),
             server_name: Some("localhost".to_string()),
             ..Default::default()
         }),

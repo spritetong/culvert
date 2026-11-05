@@ -18,7 +18,7 @@ Micro-Tunnel 专为与现代边缘网关（如 **Caddy**）协同工作设计。
 +---------------------------------------------------------------------------------------+
 |                    端点上下文绑定与拨号层 (Endpoint Context & Dialer)                   |
 |   * EndpointContext: 每个 Endpoint 独立绑定其专属的 DNS、Dialer 与高级 TLS 配置          |
-|   * DnsResolver: wstunnel 兼容 scheme (system://, dns://, dns+https://, dns+tls://)    |
+|   * DnsResolver: wstunnel 兼容 scheme (system://, dns://, https://, tls://)    |
 |   * TlsConfig: 覆盖 SNI 伪装 (server_name), ALPN 协商, 自定义 CA, mTLS, TLS 版本约束   |
 |   * Unified Dialer: 单端点定制 connect_timeout, keepalive, nodelay 与 bind_interface  |
 +---------------------------------------------------------------------------------------+
@@ -82,8 +82,8 @@ pub struct EndpointContext {
 ### 2.2 灵活的 DNS Resolver 与协议支持 (`dialer::dns`)
 全面兼容 `wstunnel` 的 DNS Resolver 规范，支持多种协议前缀：
 * `dns://<IP>`：基于标准 UDP 端口 53 进行查询；
-* `dns+https://<IP>?sni=<domain>`：基于 DNS over HTTPS (DoH) 查询，支持指定 SNI 防伪造；
-* `dns+tls://<IP>?sni=<domain>`：基于 DNS over TLS (DoT) 查询；
+* `https://<IP>?sni=<domain>`：基于 DNS over HTTPS (DoH) 查询，支持指定 SNI 防伪造；
+* `tls://<IP>?sni=<domain>`：基于 DNS over TLS (DoT) 查询；
 * `system://0.0.0.0`：走本地系统 libc `getaddrinfo` 解析。
 
 结合 sing-box 的 DNS 策略控制，解决跨国网络中的 IPv4/IPv6 路由劣化与 DNS 污染问题：
@@ -131,7 +131,6 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct TlsConfig {
     #[serde(default)]
-    pub enabled: bool,
     /// 覆盖 SNI 校验域名 (支持 Web 伪装、CDN 穿透或多虚拟主机分流)
     pub server_name: Option<String>,
     /// 调试或自签场景跳过证书链合法性检查
@@ -195,8 +194,8 @@ dns:
   strategy: "prefer_ipv4"
   resolvers:
     - "dns://1.1.1.1"
-    - "dns+https://1.1.1.1?sni=cloudflare-dns.com"
-    - "dns+tls://8.8.8.8?sni=dns.google"
+    - "https://1.1.1.1?sni=cloudflare-dns.com"
+    - "tls://8.8.8.8?sni=dns.google"
     - "system://0.0.0.0"
 
 # 全局默认套接字拨号参数
@@ -207,7 +206,6 @@ dialer:
 
 # 全局默认 TLS 参数
 tls:
-  enabled: true
   insecure: false
   alpn: ["h3", "http/1.1"]
 
@@ -259,13 +257,16 @@ tunnels:
       dns:
         strategy: "prefer_ipv6"
       tls:
-        enabled: true
-        server_name: "db-edge.example.com"
+              server_name: "db-edge.example.com"
         alpn: ["h3"]
         ca_certificate: "/etc/ssl/certs/custom_ca.pem"
         client_certificate: "/etc/ssl/certs/client.crt"
         client_key: "/etc/ssl/certs/client.key"
         min_version: "1.3"
+    mappings:
+      - mode: "forward"
+        listen: "127.0.0.1:18080"
+        target: "10.0.0.8:8080"
 ```
 
 ### 3.1 实体反序列化模型与继承策略 (`config::model`)

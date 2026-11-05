@@ -30,6 +30,10 @@ struct Cli {
     /// Override the number of Tokio worker threads.
     #[arg(short = 'w', long)]
     worker_threads: Option<usize>,
+
+    /// Check and validate configuration syntax and semantics without starting the daemon.
+    #[arg(long)]
+    check: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -39,21 +43,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!(
-                "Failed to load configuration file '{:?}': {:?}",
+                "Configuration error in '{:?}': {}",
                 cli.config, e
             );
             std::process::exit(1);
         }
     };
 
-    // Initialize structured logging respecting LogConfig
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&app_config.log.level));
+    if cli.check {
+        println!(
+            "Configuration check succeeded: '{:?}' is valid.",
+            cli.config
+        );
+        return Ok(());
+    }
 
-    tracing_subscriber::fmt()
+    // Initialize structured logging respecting LogConfig
+    let filter = match app_config.log.level.to_lowercase().as_str() {
+        "trace" => tracing::Level::TRACE,
+        "debug" => tracing::Level::DEBUG,
+        "info" => tracing::Level::INFO,
+        "warn" => tracing::Level::WARN,
+        "error" => tracing::Level::ERROR,
+        _ => tracing::Level::INFO,
+    };
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(filter.as_str()));
+
+    let fmt_builder = tracing_subscriber::fmt()
         .with_env_filter(env_filter)
-        .with_ansi(!app_config.log.no_color)
-        .init();
+        .with_ansi(!app_config.log.no_color);
+
+    if app_config.log.output.eq_ignore_ascii_case("stderr") {
+        fmt_builder.with_writer(std::io::stderr).init();
+    } else {
+        fmt_builder.with_writer(std::io::stdout).init();
+    }
 
     info!(config = ?cli.config, "Loaded micro-tunnel configuration");
 
