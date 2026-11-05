@@ -114,7 +114,6 @@ async fn test_quic_flow_control_hol_blocking_prevention() {
         dns: None,
         dialer: None,
         tls: Some(TlsConfig {
-            enabled: true,
             insecure: true,
             server_name: Some("localhost".to_string()),
             ..Default::default()

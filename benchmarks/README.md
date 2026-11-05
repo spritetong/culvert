@@ -85,17 +85,13 @@ You can test different transport protocols and features by modifying `benchmarks
 
 ### Scenario A: Raw WebSocket (`ws://`) - Baseline High Throughput
 ```yaml
-tls:
-  enabled: false
-...
-endpoint: "ws://127.0.0.1:8443/tunnel"
+endpoint: "ws://127.0.0.1:8080/tunnel"
 ```
 *Evaluates baseline frame parsing and async proxy throughput without TLS encryption overhead (achieves ~5 Gbps on loopback).*
 
 ### Scenario B: Encrypted WebSocket (`wss://`)
 ```yaml
 tls:
-  enabled: true
   insecure: true
 ...
 endpoint: "wss://127.0.0.1:8443/tunnel"

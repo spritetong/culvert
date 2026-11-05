@@ -21,7 +21,6 @@ dialer:
   tcp_nodelay: true
 
 tls:
-  enabled: true # Set to true when using wss:// with a TLS server/proxy
   insecure: true # Accept self-signed certificates during benchmarks
   # alpn: ["h3", "http/1.1"] # Omit to allow h3/quic/wss to auto-select proper ALPN negotiation
 
@@ -31,10 +30,11 @@ tunnels:
   # Local traffic to 127.0.0.1:15201 is tunneled to remote target 127.0.0.1:5201
   # ----------------------------------------------------------------------------
   - tag: "bench-forward-tunnel"
-    mode: "forward"
-    listen: "127.0.0.1:15201"
-    target: "127.0.0.1:5201"
     token: "bench_secret_token_123456"
+    mappings:
+      - mode: "forward"
+        listen: "127.0.0.1:15201"
+        target: "127.0.0.1:5201"
 
     # Replace with server IP / domain:
     #   - "ws://127.0.0.1:8443/tunnel"

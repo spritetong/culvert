@@ -125,17 +125,20 @@ impl EndpointContext {
             Arc::clone(&dns_resolver),
         ));
 
-        // Resolve effective TLS options
-        let mut effective_tls = endpoint_tls.cloned().or_else(|| global_app.tls.clone());
-
-        // Automatically infer TLS if scheme is https/wss/h3/quic and not explicitly disabled
-        if matches!(endpoint.scheme.as_str(), "https" | "wss" | "h3" | "quic") {
-            let tls = effective_tls.get_or_insert_with(TlsConfig::default);
-            tls.enabled = true;
+        // Resolve effective TLS options based purely on whether endpoint scheme is TLS-based
+        let is_tls_scheme = matches!(endpoint.scheme.as_str(), "https" | "wss" | "h3" | "quic");
+        let effective_tls = if is_tls_scheme {
+            let mut tls = endpoint_tls
+                .cloned()
+                .or_else(|| global_app.tls.clone())
+                .unwrap_or_default();
             if tls.server_name.is_none() {
                 tls.server_name = Some(endpoint.host.clone());
             }
-        }
+            Some(tls)
+        } else {
+            None
+        };
 
         Ok(Self {
             endpoint,

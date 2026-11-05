@@ -92,7 +92,6 @@ async fn test_standalone_wss_server_self_signed_direct_termination() {
             dns: None,
             dialer: None,
             tls: Some(TlsConfig {
-                enabled: true,
                 insecure: true, // Accepts self-signed cert
                 server_name: Some("localhost".to_string()),
                 ..Default::default()

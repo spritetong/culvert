@@ -191,9 +191,10 @@ dialer:
 ### 4. TLS Settings (`tls`)
 Global default TLS configuration for outbound client connections and fallback server termination.
 
+> **Note**: TLS activation is strictly determined by the URL scheme (`wss://`, `https://`, `h3://`, `quic://` vs unencrypted `ws://`, `uds://`). The `tls` configuration block specifies cryptographic parameters (SNI, certificates, versions) without any ambiguous `enabled` flag, avoiding implicit protocol conversions between `ws://` and `wss://`.
+
 ```yaml
 tls:
-  enabled: true                        # Enable TLS / HTTPS / WSS
   server_name: "tunnel.example.com"    # Override SNI hostname in TLS ClientHello
   insecure: false                      # Skip remote certificate verification (default: false)
   alpn: ["h3", "http/1.1"]             # Application-Layer Protocol Negotiation list
@@ -307,7 +308,6 @@ tunnels:
         connect_timeout: "10s"
         tcp_keepalive: "30s"
       tls:
-        enabled: true
         server_name: "fronting-camouflage.com" # SNI domain fronting override
         insecure: false
         ca_certificate: "/path/to/custom-ca.pem"

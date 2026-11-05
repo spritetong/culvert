@@ -192,23 +192,23 @@ impl CachedDnsResolver {
     /// Extracts host and optional port from a string like "1.1.1.1:53" or "[::1]:53".
     fn extract_host_and_port(raw: &str) -> (String, Option<u16>) {
         let clean = raw.trim();
-        if clean.starts_with('[') {
-            if let Some(closing) = clean.find(']') {
-                let host = clean[1..closing].to_string();
-                let port = if let Some(colon) = clean[closing..].find(':') {
-                    clean[closing + colon + 1..].parse::<u16>().ok()
-                } else {
-                    None
-                };
-                return (host, port);
-            }
+        if clean.starts_with('[')
+            && let Some(closing) = clean.find(']')
+        {
+            let host = clean[1..closing].to_string();
+            let port = if let Some(colon) = clean[closing..].find(':') {
+                clean[closing + colon + 1..].parse::<u16>().ok()
+            } else {
+                None
+            };
+            return (host, port);
         }
-        if let Some(colon) = clean.rfind(':') {
-            if clean.matches(':').count() == 1 {
-                let host = clean[..colon].to_string();
-                let port = clean[colon + 1..].parse::<u16>().ok();
-                return (host, port);
-            }
+        if let Some(colon) = clean.rfind(':')
+            && clean.matches(':').count() == 1
+        {
+            let host = clean[..colon].to_string();
+            let port = clean[colon + 1..].parse::<u16>().ok();
+            return (host, port);
         }
         (clean.to_string(), None)
     }
@@ -221,10 +221,9 @@ impl CachedDnsResolver {
         }
         let addr_str = format!("{}:53", clean_host);
         match addr_str.to_socket_addrs() {
-            Ok(mut addrs) => addrs
-                .next()
-                .map(|sa| sa.ip())
-                .ok_or_else(|| TunnelError::Config(format!("No IP found for DNS host '{}'", clean_host))),
+            Ok(mut addrs) => addrs.next().map(|sa| sa.ip()).ok_or_else(|| {
+                TunnelError::Config(format!("No IP found for DNS host '{}'", clean_host))
+            }),
             Err(e) => Err(TunnelError::Config(format!(
                 "Invalid or unresolvable DNS server address '{}': {}",
                 clean_host, e
@@ -466,7 +465,8 @@ mod tests {
         }
 
         // 2. DNS over HTTPS (DoH) using standard URL scheme
-        let doh = CachedDnsResolver::parse_server("https://1.1.1.1?sni=cloudflare-dns.com").unwrap();
+        let doh =
+            CachedDnsResolver::parse_server("https://1.1.1.1?sni=cloudflare-dns.com").unwrap();
         match doh {
             ParsedDnsServer::NameServer(ns) => {
                 assert_eq!(ns.ip, IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
@@ -535,7 +535,9 @@ tls:
         }
 
         // 7. Verify non-standard "dns+" schemes are rejected
-        assert!(CachedDnsResolver::parse_server("dns+https://1.1.1.1?sni=cloudflare-dns.com").is_err());
+        assert!(
+            CachedDnsResolver::parse_server("dns+https://1.1.1.1?sni=cloudflare-dns.com").is_err()
+        );
         assert!(CachedDnsResolver::parse_server("dns+tls://8.8.8.8?sni=dns.google").is_err());
     }
 

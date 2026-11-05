@@ -36,7 +36,6 @@ dialer:
   bind_interface: "eth0"
 
 tls:
-  enabled: true
   insecure: false
   alpn:
     - "h3"
@@ -61,7 +60,6 @@ tunnels:
       dns:
         strategy: "ipv4_only"
       tls:
-        enabled: true
         server_name: "custom-camouflage.example.com"
         insecure: true
       dialer:
@@ -101,7 +99,6 @@ tunnels:
 
     // Verify TLS
     let tls = app_config.tls.as_ref().unwrap();
-    assert!(tls.enabled);
     assert!(!tls.insecure);
     assert_eq!(
         tls.alpn.as_ref().unwrap(),

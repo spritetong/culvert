@@ -30,7 +30,6 @@ dialer:
 
 # Global default TLS settings
 tls:
-  enabled: true
   insecure: false
   alpn: ["h3", "http/1.1"]
 

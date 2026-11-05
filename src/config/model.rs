@@ -119,10 +119,7 @@ where
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ServerConfig {
     /// Ingress listening URLs (e.g. "ws://0.0.0.0:8080/tunnel", ["ws://...", "h3://..."]).
-    #[serde(
-        default,
-        deserialize_with = "deserialize_one_or_many"
-    )]
+    #[serde(default, deserialize_with = "deserialize_one_or_many")]
     pub listen: Vec<String>,
 
     /// Authentication token for validating incoming tunnels. Optional.
@@ -168,7 +165,6 @@ impl ServerConfig {
             if cfg.key.is_none() {
                 cfg.key = self.key.as_ref().map(PathBuf::from);
             }
-            cfg.enabled = true;
             Some(cfg)
         } else {
             base
@@ -346,11 +342,8 @@ mod humantime_serde_opt {
 }
 
 /// Advanced TLS connection and verification options.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
 pub struct TlsConfig {
-    #[serde(default)]
-    pub enabled: bool,
-
     /// Override the SNI server name in the ClientHello.
     pub server_name: Option<String>,
 

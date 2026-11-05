@@ -97,7 +97,7 @@ impl H3Connector {
         // otherwise a couple of unread streams pin the whole connection's
         // receive_window and head-of-line block every other stream (quinn docs
         // explicitly warn about this). 4MiB x 32 concurrent stalled streams
-        // still fits inside the 128MiB connection window.        
+        // still fits inside the 128MiB connection window.
         transport_config.stream_receive_window(quinn::VarInt::from_u32(4 * 1024 * 1024));
         transport_config.receive_window(quinn::VarInt::from_u32(128 * 1024 * 1024));
         transport_config.send_window(128 * 1024 * 1024);

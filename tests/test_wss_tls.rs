@@ -21,8 +21,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
 use micro_tunnel::config::model::{
-    AppConfig, EndpointConfig, PortMappingConfig, ServerConfig, TlsConfig, TunnelConfig,
-    TunnelMode,
+    AppConfig, EndpointConfig, PortMappingConfig, ServerConfig, TlsConfig, TunnelConfig, TunnelMode,
 };
 use micro_tunnel::dialer::endpoint::EndpointContext;
 use micro_tunnel::server::ServerRunner;
@@ -332,7 +331,6 @@ async fn test_wss_forward_tunnel_with_custom_ca_and_sni() {
             dns: None,
             dialer: None,
             tls: Some(TlsConfig {
-                enabled: true,
                 server_name: Some("tunnel.secure.io".to_string()),
                 insecure: false, // Strict CA validation!
                 ca_certificate: Some(pki.ca_cert_path.clone()),
@@ -449,7 +447,6 @@ async fn test_wss_forward_tunnel_insecure_mode() {
             dns: None,
             dialer: None,
             tls: Some(TlsConfig {
-                enabled: true,
                 server_name: Some("untrusted.host".to_string()),
                 insecure: true, // Should skip all cert validation!
                 ..Default::default()
@@ -564,7 +561,6 @@ async fn test_wss_mtls_mutual_authentication() {
             dns: None,
             dialer: None,
             tls: Some(TlsConfig {
-                enabled: true,
                 server_name: Some("localhost".to_string()),
                 insecure: false,
                 ca_certificate: Some(pki.ca_cert_path.clone()),
@@ -684,7 +680,6 @@ async fn test_wss_reverse_tunnel_e2e() {
             dns: None,
             dialer: None,
             tls: Some(TlsConfig {
-                enabled: true,
                 server_name: Some("localhost".to_string()),
                 insecure: false,
                 ca_certificate: Some(pki.ca_cert_path.clone()),
@@ -775,7 +770,6 @@ async fn test_wss_server_tls_version_enforcement() {
 
     // 2. Client restricted to TLS 1.2 only must fail to handshake
     let client_tls_12 = TlsConfig {
-        enabled: true,
         server_name: Some("localhost".to_string()),
         ca_certificate: Some(pki.ca_cert_path.clone()),
         max_version: Some("1.2".to_string()),
@@ -802,7 +796,6 @@ async fn test_wss_server_tls_version_enforcement() {
 
     // 3. Client allowing TLS 1.3 must succeed
     let client_tls_13 = TlsConfig {
-        enabled: true,
         server_name: Some("localhost".to_string()),
         ca_certificate: Some(pki.ca_cert_path.clone()),
         min_version: Some("1.3".to_string()),
@@ -877,7 +870,6 @@ async fn test_wss_server_inherits_global_tls_config() {
 
     // 2. Client restricted to TLS 1.2 only must fail because server inherited min_version: 1.3
     let client_tls_12 = TlsConfig {
-        enabled: true,
         server_name: Some("localhost".to_string()),
         ca_certificate: Some(pki.ca_cert_path.clone()),
         max_version: Some("1.2".to_string()),
@@ -904,7 +896,6 @@ async fn test_wss_server_inherits_global_tls_config() {
 
     // 3. Client using TLS 1.3 must succeed
     let client_tls_13 = TlsConfig {
-        enabled: true,
         server_name: Some("localhost".to_string()),
         ca_certificate: Some(pki.ca_cert_path.clone()),
         min_version: Some("1.3".to_string()),

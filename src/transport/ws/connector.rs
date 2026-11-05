@@ -65,25 +65,21 @@ impl WsConnector {
         // 1. Establish underlying raw TCP stream
         let raw_stream = self.endpoint.dialer.dial(host, port).await?;
 
-        // 2. Perform TLS handshake if TLS is enabled for this endpoint
+        // 2. Perform TLS handshake if TLS is configured for this endpoint (e.g. wss://)
         let tls_stream: Box<dyn TunnelStream> = if let Some(ref tls_cfg) = self.endpoint.tls_config
         {
-            if tls_cfg.enabled {
-                let connector = TlsConfigBuilder::build_connector(tls_cfg)?;
-                let sni = tls_cfg.server_name.as_deref().unwrap_or(host.as_str());
+            let connector = TlsConfigBuilder::build_connector(tls_cfg)?;
+            let sni = tls_cfg.server_name.as_deref().unwrap_or(host.as_str());
 
-                let server_name = ServerName::try_from(sni.to_string())
-                    .map_err(|e| TunnelError::Tls(format!("Invalid SNI server name: {}", e)))?;
+            let server_name = ServerName::try_from(sni.to_string())
+                .map_err(|e| TunnelError::Tls(format!("Invalid SNI server name: {}", e)))?;
 
-                let tls_conn = connector
-                    .connect(server_name, raw_stream)
-                    .await
-                    .map_err(|e| TunnelError::Tls(format!("TLS handshake failed: {}", e)))?;
+            let tls_conn = connector
+                .connect(server_name, raw_stream)
+                .await
+                .map_err(|e| TunnelError::Tls(format!("TLS handshake failed: {}", e)))?;
 
-                Box::new(BufferedTlsStream::new(tls_conn))
-            } else {
-                raw_stream
-            }
+            Box::new(BufferedTlsStream::new(tls_conn))
         } else {
             raw_stream
         };
