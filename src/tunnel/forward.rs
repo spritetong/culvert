@@ -16,6 +16,16 @@ use crate::dialer::endpoint::EndpointContext;
 use crate::pool::ReplenishingStreamPool;
 use crate::transport::{TargetAddr, TransportConnector, TransportRegistry};
 
+struct ActiveStreamGuard(Option<Arc<ReplenishingStreamPool>>);
+
+impl Drop for ActiveStreamGuard {
+    fn drop(&mut self) {
+        if let Some(ref p) = self.0 {
+            p.on_stream_closed();
+        }
+    }
+}
+
 /// Helper to parse target address string.
 pub fn parse_target_addr(target_str: &str) -> Result<TargetAddr, TunnelError> {
     if let Ok(sa) = target_str.parse() {
@@ -110,16 +120,13 @@ pub async fn run_forward_mapping(
 
                             match remote_res {
                                 Ok(mut remote_stream) => {
+                                    let _stream_guard = ActiveStreamGuard(pool_for_close.clone());
+
                                     if pool_clone.is_some() {
                                         let activation_pkt = ReplenishingStreamPool::encode_activation(Some(&target));
                                         let write_act_res = tokio::select! {
                                             biased;
-                                            _ = conn_token.cancelled() => {
-                                                if let Some(ref p) = pool_for_close {
-                                                    p.on_stream_closed();
-                                                }
-                                                return;
-                                            }
+                                            _ = conn_token.cancelled() => return,
                                             res = async {
                                                 remote_stream.write_all(&activation_pkt).await?;
                                                 remote_stream.flush().await?;
@@ -129,9 +136,6 @@ pub async fn run_forward_mapping(
 
                                         if let Err(e) = write_act_res {
                                             error!("Failed to write stream activation packet: {:?}", e);
-                                            if let Some(ref p) = pool_for_close {
-                                                p.on_stream_closed();
-                                            }
                                             return;
                                         }
                                     }
@@ -141,9 +145,6 @@ pub async fn run_forward_mapping(
                                         remote_stream,
                                         conn_token,
                                     ).await;
-                                    if let Some(ref p) = pool_for_close {
-                                        p.on_stream_closed();
-                                    }
                                 }
                                 Err(e) => {
                                     error!("Failed to open remote tunnel stream: {:?}", e);

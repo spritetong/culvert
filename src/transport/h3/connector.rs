@@ -90,9 +90,9 @@ impl H3Connector {
         transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(2)));
         transport_config.max_concurrent_bidi_streams(quinn::VarInt::from_u32(10_000));
         transport_config.max_concurrent_uni_streams(quinn::VarInt::from_u32(10_000));
-        transport_config.stream_receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
-        transport_config.receive_window(quinn::VarInt::from_u32(32 * 1024 * 1024));
-        transport_config.send_window(32 * 1024 * 1024);
+        transport_config.stream_receive_window(quinn::VarInt::from_u32(4 * 1024 * 1024));
+        transport_config.receive_window(quinn::VarInt::from_u32(128 * 1024 * 1024));
+        transport_config.send_window(128 * 1024 * 1024);
         client_config.transport_config(Arc::new(transport_config));
 
         let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
@@ -392,7 +392,9 @@ impl H3Connector {
         {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                self.invalidate_h3_session_if_same(session_id_val);
+                if !session.is_alive() || session.conn.close_reason().is_some() {
+                    self.invalidate_h3_session_if_same(session_id_val);
+                }
                 return Err(TunnelError::ControlProtocol(format!(
                     "Failed to send H3 request: {:?}",
                     e
@@ -412,7 +414,9 @@ impl H3Connector {
             {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
-                    self.invalidate_h3_session_if_same(session_id_val);
+                    if !session.is_alive() || session.conn.close_reason().is_some() {
+                        self.invalidate_h3_session_if_same(session_id_val);
+                    }
                     return Err(TunnelError::ControlProtocol(format!(
                         "Failed to receive H3 response: {:?}",
                         e

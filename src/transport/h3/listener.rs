@@ -61,9 +61,9 @@ impl H3Listener {
         transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(2)));
         transport_config.max_concurrent_bidi_streams(quinn::VarInt::from_u32(10_000));
         transport_config.max_concurrent_uni_streams(quinn::VarInt::from_u32(10_000));
-        transport_config.stream_receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
-        transport_config.receive_window(quinn::VarInt::from_u32(32 * 1024 * 1024));
-        transport_config.send_window(32 * 1024 * 1024);
+        transport_config.stream_receive_window(quinn::VarInt::from_u32(4 * 1024 * 1024));
+        transport_config.receive_window(quinn::VarInt::from_u32(128 * 1024 * 1024));
+        transport_config.send_window(128 * 1024 * 1024);
         server_config.transport_config(Arc::new(transport_config));
 
         let quinn_endpoint =

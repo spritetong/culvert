@@ -223,11 +223,26 @@ impl H3TunnelStream {
                     break;
                 }
             }
-            if result.is_ok()
-                && let Err(e) = send_stream.finish_stream().await
-            {
-                debug!("H3 finish_stream failed: {:?}", e);
-                result = Err(e);
+            if result.is_ok() {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    send_stream.finish_stream(),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        debug!("H3 finish_stream failed: {:?}", e);
+                        result = Err(e);
+                    }
+                    Err(_) => {
+                        debug!("H3 finish_stream timed out");
+                        result = Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "H3 finish_stream timed out",
+                        ));
+                    }
+                }
             }
             let _ = tx_shutdown.send(result);
         });
@@ -348,6 +363,17 @@ impl AsyncWrite for H3TunnelStream {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.shutdown_done {
             return Poll::Ready(Ok(()));
+        }
+
+        if let Some(ref conn) = self.conn
+            && let Some(reason) = conn.close_reason()
+        {
+            self.shutdown_done = true;
+            self.shutdown_rx.take();
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                format!("Underlying QUIC connection closed: {:?}", reason),
+            )));
         }
 
         if self.tx_outbound.is_some() {
