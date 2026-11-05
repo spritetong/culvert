@@ -16,25 +16,38 @@ use crate::core::stream::{BufferedTlsStream, TunnelStream};
 pub async fn wait_for_shutdown_signal() {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigint = match signal(SignalKind::interrupt()) {
-        Ok(s) => s,
+        Ok(s) => Some(s),
         Err(e) => {
             tracing::error!("Failed to install SIGINT handler: {:?}", e);
-            return;
+            None
         }
     };
     let mut sigterm = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
+        Ok(s) => Some(s),
         Err(e) => {
             tracing::error!("Failed to install SIGTERM handler: {:?}", e);
-            return;
+            None
         }
     };
 
+    // A failed registration must never look like a received signal: that would
+    // shut the daemon down immediately (or force-exit on the re-armed waiter).
+    // Park that branch forever and keep listening on the other one.
     tokio::select! {
-        _ = sigint.recv() => {
+        _ = async {
+            match sigint.as_mut() {
+                Some(s) => { let _ = s.recv().await; }
+                None => std::future::pending::<()>().await,
+            }
+        } => {
             tracing::info!("Received SIGINT signal. Initiating graceful shutdown...");
         }
-        _ = sigterm.recv() => {
+        _ = async {
+            match sigterm.as_mut() {
+                Some(s) => { let _ = s.recv().await; }
+                None => std::future::pending::<()>().await,
+            }
+        } => {
             tracing::info!("Received SIGTERM signal. Initiating graceful shutdown...");
         }
     }

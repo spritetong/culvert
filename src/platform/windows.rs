@@ -16,8 +16,15 @@ use crate::core::stream::TunnelStream;
 
 /// Waits for shutdown signal (Ctrl+C on Windows).
 pub async fn wait_for_shutdown_signal() {
-    if let Ok(()) = tokio::signal::ctrl_c().await {
-        tracing::info!("Received termination signal (Ctrl+C). Initiating shutdown...");
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => {
+            tracing::info!("Received termination signal (Ctrl+C). Initiating shutdown...");
+        }
+        Err(e) => {
+            // Never mistake a handler failure for a received signal.
+            tracing::error!("Failed to install Ctrl+C handler: {:?}", e);
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -42,14 +49,12 @@ pub fn configure_tcp_keepalive(ka: socket2::TcpKeepalive) -> socket2::TcpKeepali
     ka
 }
 
-/// Cleans up a Windows Unix Domain Socket by unblocking any pending accept and deleting the file.
 /// Windows Unix Domain Socket (AF_UNIX) listener.
 pub struct PlatformUdsListener {
     rx: tokio::sync::mpsc::Receiver<uds_windows::UnixStream>,
     closed: Arc<AtomicBool>,
     path: PathBuf,
     thread: Option<std::thread::JoinHandle<()>>,
-    listener: Arc<uds_windows::UnixListener>,
 }
 
 impl PlatformUdsListener {
@@ -67,13 +72,12 @@ impl PlatformUdsListener {
         let closed = Arc::new(AtomicBool::new(false));
 
         let l = Arc::new(listener);
-        let l_for_thread = l.clone();
         let closed_clone = closed.clone();
         let thread = std::thread::Builder::new()
             .name("micro-tunnel-windows-uds".to_string())
             .spawn(move || {
                 while !closed_clone.load(Ordering::SeqCst) {
-                    match l_for_thread.accept() {
+                    match l.accept() {
                         Ok((stream, _)) => {
                             if closed_clone.load(Ordering::SeqCst) {
                                 break;
@@ -92,7 +96,6 @@ impl PlatformUdsListener {
             closed,
             path: path.to_path_buf(),
             thread: Some(thread),
-            listener: l,
         })
     }
 
@@ -115,17 +118,16 @@ impl PlatformUdsListener {
 impl Drop for PlatformUdsListener {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::SeqCst);
-        let raw = std::os::windows::io::AsRawSocket::as_raw_socket(&*self.listener);
-        unsafe {
-            unsafe extern "system" {
-                fn closesocket(s: usize) -> i32;
-            }
-            let _ = closesocket(raw as usize);
-        }
+        // A loopback connect is the only reliable way to wake a thread parked in
+        // accept() on a Windows AF_UNIX socket. Calling closesocket() from this
+        // thread neither guarantees that wake-up nor is safe here: the listener
+        // Arc still owns the same SOCKET and closes it once when the thread exits.
+        let _ = uds_windows::UnixStream::connect(&self.path);
         let _ = std::fs::remove_file(&self.path);
-        if let Some(handle) = self.thread.take() {
-            let _ = handle.join();
-        }
+        // Detach instead of joining. Drop can run on a Tokio worker during
+        // shutdown, and a blocked accept()/blocking_send() would hang the whole
+        // process. The worker exits as soon as it observes `closed`.
+        drop(self.thread.take());
     }
 }
 

@@ -6,6 +6,7 @@
 
 use clap::Parser;
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -17,6 +18,9 @@ use mimalloc::MiMalloc;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+
+/// Upper bound for graceful shutdown. Once exceeded, the daemon exits hard.
+const SHUTDOWN_HARD_DEADLINE: Duration = Duration::from_secs(10);
 
 /// High-performance lightweight HTTP/3 & WSS bidirectional TCP tunnel system.
 #[derive(Parser, Debug)]
@@ -119,11 +123,7 @@ async fn run_daemon(
     let cancel_token = CancellationToken::new();
 
     // Listen for graceful shutdown signals (SIGINT / SIGTERM / Ctrl+C)
-    let shutdown_token = cancel_token.clone();
-    tokio::spawn(async move {
-        micro_tunnel::platform::wait_for_shutdown_signal().await;
-        shutdown_token.cancel();
-    });
+    spawn_shutdown_handler(cancel_token.clone());
 
     let supervisor = TunnelSupervisor::new(app_config, cancel_token);
 
@@ -134,4 +134,27 @@ async fn run_daemon(
 
     info!("Micro-tunnel daemon exited cleanly.");
     Ok(())
+}
+
+/// Termination signals are handled in two stages: the first one starts graceful
+/// shutdown, a second signal (or the hard deadline) forces an immediate exit.
+///
+/// The signal stream must be re-armed: Tokio leaves the OS signal handler
+/// installed after the first stream is dropped, so subsequent Ctrl+C would be
+/// swallowed and the process could look stuck if any shutdown layer stalls.
+fn spawn_shutdown_handler(cancel_token: CancellationToken) {
+    tokio::spawn(async move {
+        micro_tunnel::platform::wait_for_shutdown_signal().await;
+        cancel_token.cancel();
+
+        tokio::select! {
+            _ = micro_tunnel::platform::wait_for_shutdown_signal() => {
+                tracing::warn!("Second termination signal received; forcing immediate exit");
+            }
+            _ = tokio::time::sleep(SHUTDOWN_HARD_DEADLINE) => {
+                tracing::warn!("Graceful shutdown exceeded hard deadline; forcing exit");
+            }
+        }
+        std::process::exit(130);
+    });
 }

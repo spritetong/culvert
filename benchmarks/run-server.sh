@@ -19,11 +19,13 @@ if [ ! -f "${BIN_PATH}" ]; then
     cargo build --release
 fi
 
-# Check and optionally start iperf3
+# Check and optionally start iperf3. Match a server command line only: a running
+# `iperf3 -c` client has the same process name but is not a backend listener.
 if command -v iperf3 >/dev/null 2>&1; then
-    if ! pgrep -x "iperf3" >/dev/null 2>&1; then
+    if ! pgrep -f "iperf3.*-s" >/dev/null 2>&1; then
         echo "[*] Starting iperf3 server on port 5201..."
-        iperf3 -s -p 5201 -D || true
+        # Detach stdio so the daemon cannot hold the terminal open after exec.
+        iperf3 -s -p 5201 -D </dev/null >/dev/null 2>&1 || true
     fi
 fi
 
