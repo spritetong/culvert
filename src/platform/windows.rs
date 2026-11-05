@@ -43,17 +43,13 @@ pub fn configure_tcp_keepalive(ka: socket2::TcpKeepalive) -> socket2::TcpKeepali
 }
 
 /// Cleans up a Windows Unix Domain Socket by unblocking any pending accept and deleting the file.
-fn cleanup_windows_uds(p: &Path) {
-    let _ = uds_windows::UnixStream::connect(p);
-    let _ = std::fs::remove_file(p);
-}
-
 /// Windows Unix Domain Socket (AF_UNIX) listener.
 pub struct PlatformUdsListener {
     rx: tokio::sync::mpsc::Receiver<uds_windows::UnixStream>,
     closed: Arc<AtomicBool>,
     path: PathBuf,
     thread: Option<std::thread::JoinHandle<()>>,
+    listener: Arc<uds_windows::UnixListener>,
 }
 
 impl PlatformUdsListener {
@@ -71,12 +67,13 @@ impl PlatformUdsListener {
         let closed = Arc::new(AtomicBool::new(false));
 
         let l = Arc::new(listener);
+        let l_for_thread = l.clone();
         let closed_clone = closed.clone();
         let thread = std::thread::Builder::new()
             .name("micro-tunnel-windows-uds".to_string())
             .spawn(move || {
                 while !closed_clone.load(Ordering::SeqCst) {
-                    match l.accept() {
+                    match l_for_thread.accept() {
                         Ok((stream, _)) => {
                             if closed_clone.load(Ordering::SeqCst) {
                                 break;
@@ -95,6 +92,7 @@ impl PlatformUdsListener {
             closed,
             path: path.to_path_buf(),
             thread: Some(thread),
+            listener: l,
         })
     }
 
@@ -117,7 +115,14 @@ impl PlatformUdsListener {
 impl Drop for PlatformUdsListener {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::SeqCst);
-        cleanup_windows_uds(&self.path);
+        let raw = std::os::windows::io::AsRawSocket::as_raw_socket(&*self.listener);
+        unsafe {
+            unsafe extern "system" {
+                fn closesocket(s: usize) -> i32;
+            }
+            let _ = closesocket(raw as usize);
+        }
+        let _ = std::fs::remove_file(&self.path);
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }

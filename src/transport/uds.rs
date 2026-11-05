@@ -104,73 +104,66 @@ impl TransportDriver for UdsTransportDriver {
         };
 
         let clean_path = normalize_uds_path(socket_path);
-        Ok(Box::new(UdsListener::new(
-            clean_path.to_string_lossy(),
-            auth_token,
-            path,
-            tls_acceptor,
-        )))
+        let listener =
+            UdsListener::bind(clean_path.to_string_lossy(), auth_token, path, tls_acceptor)?;
+
+        // If chmod query parameter was supplied in socket_path URL, apply it immediately
+        if let Some(q_idx) = socket_path.find('?') {
+            for param in socket_path[q_idx + 1..].split('&') {
+                if let Some(val) = param.strip_prefix("chmod=") {
+                    let mode = if val.starts_with("0o") || val.starts_with("0O") {
+                        u32::from_str_radix(&val[2..], 8).ok()
+                    } else if val.starts_with('0') && val.len() > 1 {
+                        u32::from_str_radix(val, 8).ok()
+                    } else {
+                        val.parse::<u32>().ok()
+                    };
+                    if let Some(m) = mode {
+                        let _ = crate::platform::set_socket_permissions(&clean_path, m);
+                    }
+                }
+            }
+        }
+
+        Ok(Box::new(listener))
     }
 }
 
 pub struct UdsListener {
-    socket_path: String,
-    auth_token: Option<String>,
-    path: Option<String>,
-    tls_acceptor: Option<TlsAcceptor>,
-    incoming_rx: Option<mpsc::Receiver<AcceptedResult>>,
     cancel_token: CancellationToken,
-    server_task: Option<tokio::task::JoinHandle<()>>,
+    incoming_rx: mpsc::Receiver<AcceptedResult>,
+    server_task: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for UdsListener {
     fn drop(&mut self) {
         self.cancel_token.cancel();
-        if let Some(task) = self.server_task.take() {
-            task.abort();
-        }
+        self.server_task.abort();
     }
 }
 
 impl UdsListener {
-    pub fn new(
+    pub fn bind(
         socket_path: impl Into<String>,
         auth_token: Option<impl Into<String>>,
-        path: Option<impl Into<String>>,
+        http_path: Option<impl Into<String>>,
         tls_acceptor: Option<TlsAcceptor>,
-    ) -> Self {
-        Self {
-            socket_path: socket_path.into(),
-            auth_token: auth_token.map(|t| t.into()),
-            path: path.map(|p| p.into()),
-            tls_acceptor,
-            incoming_rx: None,
-            cancel_token: CancellationToken::new(),
-            server_task: None,
-        }
-    }
-
-    async fn ensure_started(&mut self) -> Result<(), TunnelError> {
-        if self.incoming_rx.is_some() {
-            return Ok(());
-        }
-
-        let path = normalize_uds_path(&self.socket_path);
+    ) -> Result<Self, TunnelError> {
+        let socket_path_str = socket_path.into();
+        let path = normalize_uds_path(&socket_path_str);
         let mut listener = PlatformUdsListener::bind(&path).map_err(TunnelError::Io)?;
 
         let (tx, rx) = mpsc::channel(128);
-        self.incoming_rx = Some(rx);
-
-        let auth_token = Arc::new(self.auth_token.clone());
-        let expected_path = Arc::new(self.path.clone());
-        let tls_acceptor = self.tls_acceptor.clone();
-        let cancel_token = self.cancel_token.clone();
+        let auth_token = Arc::new(auth_token.map(|t| t.into()));
+        let expected_path = Arc::new(http_path.map(|p| p.into()));
+        let cancel_token = CancellationToken::new();
+        let cancel_loop = cancel_token.clone();
 
         let task = tokio::spawn(async move {
             let mut conn_tasks = tokio::task::JoinSet::new();
             loop {
                 let stream = tokio::select! {
-                    _ = cancel_token.cancelled() => break,
+                    _ = cancel_loop.cancelled() => break,
                     Some(_) = conn_tasks.join_next(), if !conn_tasks.is_empty() => continue,
                     res = listener.accept() => match res {
                         Ok((conn, _addr)) => conn,
@@ -182,7 +175,7 @@ impl UdsListener {
                 let token = Arc::clone(&auth_token);
                 let path = Arc::clone(&expected_path);
                 let acceptor = tls_acceptor.clone();
-                let cancel_conn = cancel_token.child_token();
+                let cancel_conn = cancel_loop.child_token();
 
                 conn_tasks.spawn(async move {
                     tokio::select! {
@@ -297,8 +290,20 @@ impl UdsListener {
             while conn_tasks.join_next().await.is_some() {}
         });
 
-        self.server_task = Some(task);
-        Ok(())
+        Ok(Self {
+            cancel_token,
+            incoming_rx: rx,
+            server_task: task,
+        })
+    }
+
+    pub fn new(
+        socket_path: impl Into<String>,
+        auth_token: Option<impl Into<String>>,
+        http_path: Option<impl Into<String>>,
+        tls_acceptor: Option<TlsAcceptor>,
+    ) -> Result<Self, TunnelError> {
+        Self::bind(socket_path, auth_token, http_path, tls_acceptor)
     }
 }
 
@@ -307,14 +312,9 @@ impl TransportListener for UdsListener {
         &'a mut self,
     ) -> BoxFuture<'a, Result<(Box<dyn TunnelStream>, StreamMetadata), TunnelError>> {
         Box::pin(async move {
-            self.ensure_started().await?;
-            if let Some(ref mut rx) = self.incoming_rx {
-                tokio::select! {
-                    _ = self.cancel_token.cancelled() => Err(TunnelError::Shutdown),
-                    item = rx.recv() => item.unwrap_or(Err(TunnelError::Shutdown)),
-                }
-            } else {
-                Err(TunnelError::Shutdown)
+            tokio::select! {
+                _ = self.cancel_token.cancelled() => Err(TunnelError::Shutdown),
+                item = self.incoming_rx.recv() => item.unwrap_or(Err(TunnelError::Shutdown)),
             }
         })
     }
@@ -469,7 +469,8 @@ mod tests {
         let sock_path = tmp.path().join("uds_transport.sock");
         let sock_str = sock_path.to_string_lossy().to_string();
 
-        let mut listener = UdsListener::new(&sock_str, Some("test_token"), None::<String>, None);
+        let mut listener =
+            UdsListener::new(&sock_str, Some("test_token"), None::<String>, None).unwrap();
 
         let srv_task = tokio::spawn(async move {
             let (stream, meta) = listener.accept().await.unwrap();
@@ -489,5 +490,26 @@ mod tests {
         let _client_stream = connector.connect(&target, None).await.unwrap();
 
         let _srv_stream = srv_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_uds_listener_chmod_applied() {
+        let tmp = tempdir().unwrap();
+        let sock_path = tmp.path().join("uds_chmod.sock");
+        let sock_str = sock_path.to_string_lossy().to_string();
+
+        let driver = UdsTransportDriver;
+        let url = format!("ws+unix://{}?chmod=0o660", sock_str);
+        let listener = driver.build_listener(&url, None, None, None);
+        assert!(listener.is_ok());
+
+        assert!(sock_path.exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(&sock_path).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o660);
+        }
     }
 }

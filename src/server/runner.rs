@@ -91,7 +91,7 @@ impl ServerRunner {
 
                 if let Some(mode) = spec_clone.chmod
                     && let Err(e) = crate::platform::set_socket_permissions(
-                        std::path::Path::new(&spec_clone.bind_addr),
+                        &crate::platform::normalize_uds_path(&spec_clone.bind_addr),
                         mode,
                     )
                 {
