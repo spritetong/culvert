@@ -61,21 +61,18 @@ Micro-Tunnel 专为与现代边缘网关（如 **Caddy**）协同工作设计。
 
 ```rust
 use std::sync::Arc;
+use crate::config::model::TlsConfig;
 use crate::dialer::dns::DnsResolver;
-use crate::dialer::tls::TlsConfig;
+use crate::dialer::endpoint::Endpoint;
 use crate::dialer::unified::Dialer;
 
-/// 运行时解析就绪的端点上下文
+/// 运行时解析就绪的端点上下文（全局配置与端点专属配置合并后的结果）
 #[derive(Clone)]
 pub struct EndpointContext {
-    pub scheme: String,       // "wss", "https", "h3", "tcp", "uds"
-    pub host: String,         // 目标域名、IP 或套接字路径
-    pub port: u16,            // 端口
-    pub path: String,         // 路径 (如 "/ws", "/tunnel")
-    pub query: Option<String>,
+    pub endpoint: Endpoint,               // 已解析的 URL：scheme / host / port / path
     pub dns_resolver: Arc<dyn DnsResolver>,
-    pub tls_config: Option<TlsConfig>,
     pub dialer: Arc<dyn Dialer>,
+    pub tls_config: Option<TlsConfig>,
 }
 ```
 
@@ -106,7 +103,7 @@ pub enum DnsStrategy {
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct DnsConfig {
     pub strategy: Option<DnsStrategy>,
-    pub resolvers: Option<Vec<String>>,
+    pub resolvers: Option<Vec<DnsResolverConfig>>,
     pub cache_capacity: Option<usize>,
 }
 
@@ -122,13 +119,14 @@ pub trait DnsResolver: Send + Sync {
   * `ipv4_only`：仅发送 A 记录查询，彻底过滤 IPv6，杜绝无路由黑洞；
   * `ipv6_only`：仅发送 AAAA 记录查询。
 
-### 2.3 高级 TLS 配置规范 (`dialer::tls`)
-基于 `rustls` 构建，支持为每一个 Endpoint 独立定制高级 TLS 特性：
+### 2.3 高级 TLS 配置规范 (`config::model::TlsConfig`)
+基于 `rustls` 构建（`dialer::tls::TlsConfigBuilder` 负责把它编译成 client/server 配置），支持为每一个 Endpoint 独立定制高级 TLS 特性：
 
 ```rust
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, serde::Deserialize, Default)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     #[serde(default)]
     /// 覆盖 SNI 校验域名 (支持 Web 伪装、CDN 穿透或多虚拟主机分流)
@@ -143,6 +141,9 @@ pub struct TlsConfig {
     /// 客户端 mTLS 证书与私钥路径
     pub client_certificate: Option<PathBuf>,
     pub client_key: Option<PathBuf>,
+    /// 服务端 TLS 终止证书与私钥路径（未配置时回退到自签证书）
+    pub certificate: Option<PathBuf>,
+    pub key: Option<PathBuf>,
     /// TLS 版本约束 (例如: "1.2", "1.3")
     pub min_version: Option<String>,
     pub max_version: Option<String>,
@@ -150,17 +151,22 @@ pub struct TlsConfig {
 ```
 
 ### 2.4 端点专属 Dialer (`dialer::unified`)
+
+拨号参数结构定义于 `config::model::DialerConfig`（`humantime_serde_opt` 负责 `Duration` 字段的 `serde`）：
+
 ```rust
 use std::time::Duration;
 use crate::core::stream::{BoxFuture, TunnelStream};
 use crate::core::error::TunnelError;
 use crate::dialer::endpoint::EndpointContext;
 
-#[derive(Debug, Clone, serde::Deserialize, Default)]
-pub struct DialerOptions {
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DialerConfig {
     pub connect_timeout: Option<Duration>,
     pub tcp_keepalive: Option<Duration>,
     pub tcp_nodelay: Option<bool>,
+    /// 仅 Linux 的 SO_BINDTODEVICE；其他平台配置该项会在加载期报错
     pub bind_interface: Option<String>,
 }
 
@@ -272,29 +278,37 @@ tunnels:
 ### 3.1 实体反序列化模型与继承策略 (`config::model`)
 
 ```rust
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use crate::dialer::dns::DnsConfig;
-use crate::dialer::tls::TlsConfig;
-use crate::dialer::unified::DialerOptions;
+// 以下结构均定义于 config::model，彼此同模块可见。
 
 /// 解析就绪的 Server Listen 规格，显式拆解协议与 Path
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerListenSpec {
     pub scheme: String,
+    /// URL 中的 host:port 原样字符串（UDS 时为 socket 路径）
     pub bind_addr: String,
     pub path: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
-    #[serde(default, alias = "listens", deserialize_with = "deserialize_one_or_many")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_one_or_many",
+        serialize_with = "serialize_one_or_many"
+    )]
     pub listen: Vec<String>,
     pub token: Option<String>,
     pub default_target: Option<String>,
+    pub certificate: Option<String>,
+    pub key: Option<String>,
+    pub tls: Option<TlsConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PortMappingConfig {
     #[serde(default = "default_mapping_mode")]
     pub mode: TunnelMode,
@@ -302,55 +316,68 @@ pub struct PortMappingConfig {
     pub target: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TunnelRetryConfig {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_duration",
+        serialize_with = "serialize_optional_duration"
+    )]
     pub delay: Option<Duration>,
     pub max_retries: Option<usize>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// 单个隧道实例配置
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TunnelConfig {
     pub tag: String,
     pub endpoint: EndpointConfig,
     pub token: Option<String>,
+    #[serde(default)]
     pub pool_size: Option<usize>,
+    pub failover: Option<FailoverConfig>,
+    pub multiplex: Option<MultiplexConfig>,
     pub retry: Option<TunnelRetryConfig>,
+    #[serde(default)]
     pub mappings: Vec<PortMappingConfig>,
 }
-```
+
+/// 顶层配置
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default)]
     pub log: LogConfig,
     pub dns: Option<DnsConfig>,
-    pub dialer: Option<DialerOptions>,
+    pub dialer: Option<DialerConfig>,
     pub tls: Option<TlsConfig>,
+    pub server: Option<ServerConfig>,
+    pub worker_threads: Option<usize>,
+    #[serde(default)]
     pub tunnels: Vec<TunnelConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct TunnelConfig {
-    pub tag: String,
-    pub mode: TunnelMode,
-    pub listen: String,
-    pub target: String,
-    pub token: String,
-    pub endpoint: EndpointConfig,
-    pub failover: Option<FailoverConfig>,
-}
-
-/// 端点配置：支持直接写纯字符串 URL，或展开为对象结构
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+/// 端点配置：支持直接写纯字符串 URL，或展开为对象结构（手写 Deserialize / Serialize）
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EndpointConfig {
     Simple(String),
     Detailed {
         url: String,
         dns: Option<DnsConfig>,
+        dialer: Option<DialerConfig>,
         tls: Option<TlsConfig>,
-        dialer: Option<DialerOptions>,
     },
 }
 ```
+
+补充说明：
+
+- 上述配置结构均带 `#[serde(deny_unknown_fields)]`，未知字段在加载期直接报错；`ConfigLoader::validate` 再补一层字段级语义校验（token 长度、DNS、TLS 文件、PEM 格式、隧道映射等）。
+- `failover` / `multiplex` 虽在模型中声明，但数据路径尚未接入；`ConfigLoader::validate` 会拒绝显式配置并要求删除该段。
+- `ServerListenSpec::parse` 只按标准 URL 拆出 `scheme` / `host:port` / `path`；`bind_addr` 就是 URL 中 `host:port` 的原样字符串，不做通配、回环别名或协议族归一化。真实地址冲突由运行期绑定时由系统报告。
+- `ServerConfig.listen` 既可写单个字符串，也可写数组（`deserialize_one_or_many`）。
 
 ---
 
@@ -763,7 +790,7 @@ impl RelayEngine {
 
 ### 8.4 模块化与封装要求
 * **通用全局函数中心化**：公用网络辅助函数、Socket 选项微调（TCP_NODELAY、SO_KEEPALIVE 等）、Buffer 分配器统一归纳至 `src/common/` 模块。
-* **配置与常量中心化**：全局魔数、协议头键名、默认超时阈值（如心跳间隔 15s、配对超时 5s、缓冲区尺寸 64KB）统一收拢于 `src/constants.rs`。
+* **配置与常量中心化**：全局魔数、协议头键名、默认超时阈值（如心跳间隔 15s、配对超时 5s、缓冲区尺寸 64KB）统一收拢于 `src/consts.rs`。
 * **面向对象领域封装**：对于功能相关的自由函数（Free Functions），严禁散落在文件内，必须按内聚性封装进对应的结构体及 `impl` 块。
 
 ### 8.5 全局统一英文注释

@@ -493,7 +493,7 @@ cargo bench
 ./benchmarks/run-bench.sh 127.0.0.1 15201 8 10
 
 # Run end-to-end throughput tests (Windows PowerShell)
-.\benchmarks\run-bench.ps1 -TargetHost 127.0.0.1 -TargetPort 15201 -ParallelStreams 8 -DurationSecs 10
+.\benchmarks\run-bench.ps1 -TargetHost 127.0.0.1 -TargetPort 15201 -Streams 8 -DurationSec 10
 ```
 
 ### Performance Characteristics
