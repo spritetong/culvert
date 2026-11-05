@@ -40,10 +40,7 @@ pub struct ServerListenSpec {
 impl ServerListenSpec {
     /// Returns true if this listener uses Unix Domain Sockets.
     pub fn is_uds(&self) -> bool {
-        self.scheme == "uds"
-            || self.scheme == "unix"
-            || self.scheme == "ws+uds"
-            || self.scheme == "ws+unix"
+        self.scheme == "ws+unix" || self.scheme == "wss+unix"
     }
 
     pub fn parse(raw: &str) -> Result<Self, crate::core::error::TunnelError> {
@@ -54,7 +51,7 @@ impl ServerListenSpec {
             (s.to_lowercase(), r)
         } else {
             return Err(crate::core::error::TunnelError::Config(format!(
-                "Invalid server listen URL '{}'. Protocol scheme must be explicitly specified (e.g. ws://0.0.0.0:8080/tunnel, h3://0.0.0.0:8443/tunnel, uds:///tmp/tunnel.sock). Implicit protocol is not supported.",
+                "Invalid server listen URL '{}'. Protocol scheme must be explicitly specified (e.g. ws://0.0.0.0:8080/tunnel, h3://0.0.0.0:8443/tunnel, ws+unix:///tmp/tunnel.sock). Implicit protocol is not supported.",
                 raw
             )));
         };
@@ -103,7 +100,7 @@ impl ServerListenSpec {
                     chmod: None,
                 })
             }
-            "uds" | "unix" | "ws+uds" | "ws+unix" => {
+            "ws+unix" | "wss+unix" => {
                 let (path_part, query_part) = if let Some(q_idx) = rest.find('?') {
                     (&rest[..q_idx], Some(&rest[q_idx + 1..]))
                 } else {
@@ -145,255 +142,17 @@ impl ServerListenSpec {
                 }
 
                 Ok(Self {
-                    scheme: "uds".to_string(),
+                    scheme,
                     bind_addr: socket_path_str,
                     path: http_path,
                     chmod,
                 })
             }
             other => Err(crate::core::error::TunnelError::Config(format!(
-                "Unsupported server protocol scheme '{}' in URL '{}'. Supported schemes: ws, wss, h3, quic, https, uds, unix, ws+uds, ws+unix",
+                "Unsupported server protocol scheme '{}' in URL '{}'. Supported schemes: ws, wss, https, h3, quic, ws+unix, wss+unix",
                 other, raw
             ))),
         }
-    }
-}
-
-/// Structured server listener configuration supporting orthogonal transport and protocol specification.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct StructuredListenConfig {
-    /// Transport medium: "uds" / "unix" / "tcp" (optional, auto-inferred if omitted).
-    #[serde(default)]
-    pub transport: Option<String>,
-
-    /// Application protocol: "ws", "wss", "h3", etc. (default: "ws").
-    #[serde(default = "default_listen_protocol")]
-    pub protocol: String,
-
-    /// Socket file path for UDS (e.g. "/run/tunnel.sock" or "C:/temp/tunnel.sock").
-    #[serde(default)]
-    pub socket: Option<String>,
-
-    /// Network bind address for TCP (e.g. "0.0.0.0:8080") or socket path.
-    #[serde(default)]
-    pub bind: Option<String>,
-
-    /// HTTP URI path for WebSocket/HTTP routing (e.g. "/tunnel").
-    #[serde(default)]
-    pub path: Option<String>,
-
-    /// Optional file permission mode for UDS socket on Unix (e.g. 0o660).
-    #[serde(default)]
-    pub chmod: Option<u32>,
-}
-
-fn default_listen_protocol() -> String {
-    "ws".to_string()
-}
-
-impl StructuredListenConfig {
-    pub fn to_spec(&self) -> Result<ServerListenSpec, crate::core::error::TunnelError> {
-        let protocol = self.protocol.to_lowercase();
-        let transport = self.transport.as_deref().map(|t| t.to_lowercase());
-
-        let is_uds = transport.as_deref() == Some("uds")
-            || transport.as_deref() == Some("unix")
-            || self.socket.is_some()
-            || self
-                .bind
-                .as_deref()
-                .map(crate::platform::is_uds_path)
-                .unwrap_or(false);
-
-        if is_uds {
-            let socket_str = self
-                .socket
-                .as_deref()
-                .or(self.bind.as_deref())
-                .ok_or_else(|| {
-                    crate::core::error::TunnelError::Config(
-                        "UDS structured listen configuration requires 'socket' or 'bind' path"
-                            .to_string(),
-                    )
-                })?;
-
-            let norm_path = crate::platform::normalize_uds_path(socket_str);
-            let path_str = norm_path.to_string_lossy().to_string();
-            if path_str.is_empty() || path_str == "/" {
-                return Err(crate::core::error::TunnelError::Config(format!(
-                    "Invalid socket path '{}' in structured listen config",
-                    socket_str
-                )));
-            }
-
-            let http_path = self.path.as_deref().map(|p| {
-                if !p.starts_with('/') {
-                    format!("/{}", p)
-                } else {
-                    p.to_string()
-                }
-            });
-
-            Ok(ServerListenSpec {
-                scheme: "uds".to_string(),
-                bind_addr: path_str,
-                path: http_path,
-                chmod: self.chmod,
-            })
-        } else {
-            let bind_str = self.bind.as_deref().ok_or_else(|| {
-                crate::core::error::TunnelError::Config(
-                    "TCP structured listen configuration requires 'bind' (e.g. '0.0.0.0:8080')"
-                        .to_string(),
-                )
-            })?;
-
-            let (_, port_str) = bind_str.rsplit_once(':').ok_or_else(|| {
-                crate::core::error::TunnelError::Config(format!(
-                    "Invalid TCP bind address '{}': missing port (expected '<host>:<port>')",
-                    bind_str
-                ))
-            })?;
-
-            let port: u16 = port_str.parse().map_err(|_| {
-                crate::core::error::TunnelError::Config(format!(
-                    "Invalid TCP bind address '{}': invalid port '{}' (must be 1-65535)",
-                    bind_str, port_str
-                ))
-            })?;
-
-            if port == 0 {
-                return Err(crate::core::error::TunnelError::Config(format!(
-                    "Invalid TCP bind address '{}': port must not be 0",
-                    bind_str
-                )));
-            }
-
-            let http_path = self.path.as_deref().map(|p| {
-                if !p.starts_with('/') {
-                    format!("/{}", p)
-                } else {
-                    p.to_string()
-                }
-            });
-
-            Ok(ServerListenSpec {
-                scheme: protocol,
-                bind_addr: bind_str.to_string(),
-                path: http_path,
-                chmod: None,
-            })
-        }
-    }
-}
-
-/// Server listen entry supporting either standard URL strings or structured orthogonal configurations.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(untagged)]
-pub enum ServerListenConfig {
-    Url(String),
-    Structured(StructuredListenConfig),
-}
-
-impl<'de> Deserialize<'de> for ServerListenConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct ServerListenConfigVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for ServerListenConfigVisitor {
-            type Value = ServerListenConfig;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter
-                    .write_str("a server listening URL string or a structured listen config map")
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<ServerListenConfig, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(ServerListenConfig::Url(value.to_string()))
-            }
-
-            fn visit_string<E>(self, value: String) -> Result<ServerListenConfig, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(ServerListenConfig::Url(value))
-            }
-
-            fn visit_map<M>(self, map: M) -> Result<ServerListenConfig, M::Error>
-            where
-                M: serde::de::MapAccess<'de>,
-            {
-                let cfg = StructuredListenConfig::deserialize(
-                    serde::de::value::MapAccessDeserializer::new(map),
-                )?;
-                Ok(ServerListenConfig::Structured(cfg))
-            }
-        }
-
-        deserializer.deserialize_any(ServerListenConfigVisitor)
-    }
-}
-
-impl ServerListenConfig {
-    pub fn parse_spec(&self) -> Result<ServerListenSpec, crate::core::error::TunnelError> {
-        match self {
-            Self::Url(url) => ServerListenSpec::parse(url),
-            Self::Structured(s) => s.to_spec(),
-        }
-    }
-}
-
-impl From<String> for ServerListenConfig {
-    fn from(s: String) -> Self {
-        ServerListenConfig::Url(s)
-    }
-}
-
-impl From<&str> for ServerListenConfig {
-    fn from(s: &str) -> Self {
-        ServerListenConfig::Url(s.to_string())
-    }
-}
-
-impl From<StructuredListenConfig> for ServerListenConfig {
-    fn from(s: StructuredListenConfig) -> Self {
-        ServerListenConfig::Structured(s)
-    }
-}
-
-impl PartialEq<&str> for ServerListenConfig {
-    fn eq(&self, other: &&str) -> bool {
-        match self {
-            ServerListenConfig::Url(u) => u == *other,
-            _ => false,
-        }
-    }
-}
-
-impl PartialEq<String> for ServerListenConfig {
-    fn eq(&self, other: &String) -> bool {
-        match self {
-            ServerListenConfig::Url(u) => u == other,
-            _ => false,
-        }
-    }
-}
-
-impl PartialEq<ServerListenConfig> for String {
-    fn eq(&self, other: &ServerListenConfig) -> bool {
-        other == self
-    }
-}
-
-impl PartialEq<ServerListenConfig> for &str {
-    fn eq(&self, other: &ServerListenConfig) -> bool {
-        other == self
     }
 }
 
@@ -427,13 +186,13 @@ where
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
-    /// Ingress listening URLs or structured configurations.
+    /// Ingress listening URLs (e.g. "ws://0.0.0.0:8080/tunnel", ["ws://...", "ws+unix:///run/a.sock"]).
     #[serde(
         default,
         deserialize_with = "deserialize_one_or_many",
         serialize_with = "serialize_one_or_many"
     )]
-    pub listen: Vec<ServerListenConfig>,
+    pub listen: Vec<String>,
 
     /// Authentication token for validating incoming tunnels. Optional.
     pub token: Option<String>,
@@ -455,11 +214,11 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    pub fn new<I, S>(listen: I, token: Option<String>, default_target: Option<String>) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<ServerListenConfig>,
-    {
+    pub fn new(
+        listen: impl IntoIterator<Item = impl Into<String>>,
+        token: Option<String>,
+        default_target: Option<String>,
+    ) -> Self {
         Self {
             listen: listen.into_iter().map(Into::into).collect(),
             token,
@@ -495,8 +254,8 @@ impl ServerConfig {
 
     pub fn parse_specs(&self) -> Result<Vec<ServerListenSpec>, crate::core::error::TunnelError> {
         let mut specs = Vec::new();
-        for item in &self.listen {
-            specs.push(item.parse_spec()?);
+        for url in &self.listen {
+            specs.push(ServerListenSpec::parse(url)?);
         }
         Ok(specs)
     }

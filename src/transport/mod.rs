@@ -32,7 +32,7 @@ impl std::fmt::Display for TargetAddr {
         match self {
             TargetAddr::Ip(addr) => write!(f, "{}", addr),
             TargetAddr::Domain(host, port) => write!(f, "{}:{}", host, port),
-            TargetAddr::Path(path) => write!(f, "{}", path.display()),
+            TargetAddr::Path(path) => write!(f, "unix://{}", path.display()),
         }
     }
 }

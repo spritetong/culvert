@@ -149,10 +149,13 @@ impl ConfigLoader {
 
             let specs = server.parse_specs()?;
 
-            // Reject TLS cert configuration if all server listeners are plaintext ws:// or uds://
-            let any_tls_listener = specs
-                .iter()
-                .any(|s| matches!(s.scheme.as_str(), "wss" | "h3" | "quic" | "https"));
+            // Reject TLS cert configuration if all server listeners are plaintext (ws:// or ws+unix://)
+            let any_tls_listener = specs.iter().any(|s| {
+                matches!(
+                    s.scheme.as_str(),
+                    "wss" | "h3" | "quic" | "https" | "wss+unix"
+                )
+            });
             let has_server_certs = server.certificate.is_some()
                 || server.key.is_some()
                 || server
@@ -161,7 +164,7 @@ impl ConfigLoader {
                     .is_some_and(|t| t.certificate.is_some() || t.key.is_some());
             if !any_tls_listener && has_server_certs {
                 return Err(TunnelError::Config(
-                    "Server is configured with TLS certificates, but all server.listen URLs use plaintext schemes ('ws://' or 'uds://'). Use 'wss://' or remove certificate settings.".to_string(),
+                    "Server is configured with TLS certificates, but all server.listen URLs use plaintext schemes ('ws://' or 'ws+unix://'). Use a TLS scheme ('wss://', 'h3://', 'wss+unix://') or remove certificate settings.".to_string(),
                 ));
             }
         }
@@ -253,14 +256,14 @@ impl ConfigLoader {
             for mapping in &tunnel.mappings {
                 let _ = crate::tunnel::forward::parse_target_addr(&mapping.listen).map_err(|_| {
                     TunnelError::Config(format!(
-                        "tunnel '{}': invalid listen address '{}' in mapping. Expected 'host:port', 'ip:port', or socket path",
+                        "tunnel '{}': invalid listen address '{}' in mapping. Expected 'ip:port', 'hostname:port', or 'unix://path'",
                         tunnel.tag, mapping.listen
                     ))
                 })?;
 
                 let _ = crate::tunnel::forward::parse_target_addr(&mapping.target).map_err(|_| {
                     TunnelError::Config(format!(
-                        "tunnel '{}': invalid target address '{}' in mapping. Expected 'host:port', 'ip:port', or socket path",
+                        "tunnel '{}': invalid target address '{}' in mapping. Expected 'ip:port', 'hostname:port', or 'unix://path'",
                         tunnel.tag, mapping.target
                     ))
                 })?;
@@ -277,22 +280,26 @@ impl ConfigLoader {
 
             // Endpoint validation
             let ep = crate::dialer::endpoint::Endpoint::parse(tunnel.endpoint.url())?;
-            let is_tls = matches!(ep.scheme.as_str(), "https" | "wss" | "h3" | "quic");
+            let is_tls = matches!(
+                ep.scheme.as_str(),
+                "https" | "wss" | "h3" | "quic" | "wss+unix"
+            );
             let is_supported = matches!(
                 ep.scheme.as_str(),
-                "ws" | "wss" | "h3" | "quic" | "https" | "uds" | "unix"
+                "ws" | "wss" | "h3" | "quic" | "https" | "ws+unix" | "wss+unix"
             );
             if !is_supported {
                 return Err(TunnelError::Config(format!(
-                    "tunnel '{}': unsupported endpoint scheme '{}'. Supported schemes: ws, wss, h3, quic, https, uds, unix",
+                    "tunnel '{}': unsupported endpoint scheme '{}'. Supported schemes: ws, wss, https, h3, quic, ws+unix, wss+unix",
                     tunnel.tag, ep.scheme
                 )));
             }
 
-            if (ep.scheme == "uds" || ep.scheme == "unix") && (ep.path.is_empty() || ep.path == "/")
+            if (ep.scheme == "ws+unix" || ep.scheme == "wss+unix")
+                && (ep.path.is_empty() || ep.path == "/")
             {
                 return Err(TunnelError::Config(format!(
-                    "tunnel '{}': Unix Domain Socket endpoint URL must include a socket file path (e.g. uds:///run/tunnel.sock)",
+                    "tunnel '{}': Unix Domain Socket endpoint URL must include a socket file path (e.g. ws+unix:///run/tunnel.sock)",
                     tunnel.tag
                 )));
             }
@@ -947,7 +954,7 @@ server:
         let yaml = r#"
 tunnels:
   - tag: "uds-no-path"
-    endpoint: "uds://"
+    endpoint: "ws+unix://"
     mappings:
       - mode: "forward"
         listen: "127.0.0.1:10050"
@@ -989,15 +996,38 @@ tunnels:
     fn test_accept_server_uds_url() {
         let yaml = r#"
 server:
-  listen: "uds:///tmp/tunnel.sock"
+  listen: "ws+unix:///tmp/tunnel.sock?path=/ws&chmod=0o660"
 "#;
         let res = ConfigLoader::from_yaml_str(yaml);
         assert!(res.is_ok());
         let cfg = res.unwrap();
         let specs = cfg.server.unwrap().parse_specs().unwrap();
         assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].scheme, "uds");
+        assert_eq!(specs[0].scheme, "ws+unix");
+        assert_eq!(specs[0].path.as_deref(), Some("/ws"));
+        assert_eq!(specs[0].chmod, Some(0o660));
         assert!(specs[0].is_uds());
+    }
+
+    #[test]
+    fn test_reject_removed_uds_and_unix_schemes() {
+        let yaml1 = r#"
+server:
+  listen: "uds:///tmp/tunnel.sock"
+"#;
+        assert!(ConfigLoader::from_yaml_str(yaml1).is_err());
+
+        let yaml2 = r#"
+server:
+  listen: "unix:///tmp/tunnel.sock"
+"#;
+        assert!(ConfigLoader::from_yaml_str(yaml2).is_err());
+
+        let yaml3 = r#"
+server:
+  listen: "ws+uds:///tmp/tunnel.sock"
+"#;
+        assert!(ConfigLoader::from_yaml_str(yaml3).is_err());
     }
 
     #[test]
@@ -1008,14 +1038,14 @@ tunnels:
     endpoint: "ws://127.0.0.1:8080/tunnel"
     mappings:
       - mode: "forward"
-        listen: "/tmp/forward_listen.sock"
+        listen: "unix:///tmp/forward_listen.sock"
         target: "127.0.0.1:8080"
       - mode: "forward"
         listen: "127.0.0.1:18080"
-        target: "/tmp/forward_target.sock"
+        target: "unix:///tmp/forward_target.sock"
       - mode: "reverse"
-        listen: "/tmp/reverse_listen.sock"
-        target: "/tmp/reverse_target.sock"
+        listen: "unix:///tmp/reverse_listen.sock"
+        target: "unix:///tmp/reverse_target.sock"
 "#;
         let res = ConfigLoader::from_yaml_str(yaml);
         assert!(res.is_ok());

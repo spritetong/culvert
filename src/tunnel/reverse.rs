@@ -321,7 +321,7 @@ mod tests {
         }
 
         fn protocol_scheme(&self) -> &'static str {
-            "mock"
+            "ws"
         }
     }
 
@@ -329,7 +329,7 @@ mod tests {
 
     impl TransportDriver for MockSilentDriver {
         fn schemes(&self) -> &[&'static str] {
-            &["mock"]
+            &["ws"]
         }
 
         fn build_connector(
@@ -361,7 +361,7 @@ mod tests {
         let cancel_token = CancellationToken::new();
         let cancel_clone = cancel_token.clone();
 
-        let ep_cfg = EndpointConfig::Simple("mock://127.0.0.1:8080".to_string());
+        let ep_cfg = EndpointConfig::Simple("ws://127.0.0.1:8080".to_string());
         let app_cfg = AppConfig::default();
         let ep_ctx = EndpointContext::build(&ep_cfg, &app_cfg).unwrap();
 

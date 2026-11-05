@@ -388,7 +388,7 @@ async fn test_h3_tunnel_pool_prewarm_and_activation_end_to_end() {
     let session_mgr = Arc::new(micro_tunnel::session::SessionManager::new());
 
     let server_config = micro_tunnel::config::model::ServerConfig {
-        listen: vec![format!("h3://{}/tunnel", server_h3_listen).into()],
+        listen: vec![format!("h3://{}/tunnel", server_h3_listen)],
         token: None, // Optional token / no token
         default_target: Some(format!("127.0.0.1:{}", echo_port)),
         ..Default::default()
@@ -488,7 +488,7 @@ async fn test_quic_raw_tunnel_pool_prewarm_and_activation_end_to_end() {
     let session_mgr = Arc::new(micro_tunnel::session::SessionManager::new());
 
     let server_config = micro_tunnel::config::model::ServerConfig {
-        listen: vec![format!("quic://{}/raw", server_quic_listen).into()],
+        listen: vec![format!("quic://{}/raw", server_quic_listen)],
         token: None,
         default_target: Some(format!("127.0.0.1:{}", echo_port)),
         ..Default::default()
@@ -615,7 +615,7 @@ async fn test_quic_raw_forward_stress_throughput() {
     let session_mgr = Arc::new(micro_tunnel::session::SessionManager::new());
 
     let server_config = micro_tunnel::config::model::ServerConfig {
-        listen: vec![format!("quic://{}/raw", server_quic_listen).into()],
+        listen: vec![format!("quic://{}/raw", server_quic_listen)],
         token: None,
         default_target: Some(format!("127.0.0.1:{}", sink_port)),
         ..Default::default()
@@ -714,7 +714,7 @@ async fn test_h3_concurrent_forward_stress() {
     let session_mgr = Arc::new(micro_tunnel::session::SessionManager::new());
 
     let server_config = micro_tunnel::config::model::ServerConfig {
-        listen: vec![format!("h3://{}/tunnel", server_h3_listen).into()],
+        listen: vec![format!("h3://{}/tunnel", server_h3_listen)],
         token: None,
         default_target: Some(format!("127.0.0.1:{}", echo_port)),
         ..Default::default()

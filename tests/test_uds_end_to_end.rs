@@ -23,9 +23,9 @@ async fn test_e2e_server_uds_url_and_mappings() {
     let target_backend_sock = tmp.path().join("backend.sock");
     let forward_listen_sock = tmp.path().join("fwd_listen.sock");
 
-    let server_sock_url = format!("uds://{}", server_sock.display());
-    let target_sock_path = target_backend_sock.to_string_lossy().to_string();
-    let forward_sock_path = forward_listen_sock.to_string_lossy().to_string();
+    let server_sock_url = format!("ws+unix://{}", server_sock.display());
+    let target_sock_path = format!("unix://{}", target_backend_sock.display());
+    let forward_sock_path = format!("unix://{}", forward_listen_sock.display());
 
     // 1. Start a mock local backend listening on target_backend_sock
     let mut backend_listener = PlatformUdsListener::bind(&target_backend_sock).unwrap();
@@ -50,7 +50,7 @@ async fn test_e2e_server_uds_url_and_mappings() {
         dialer: None,
         tls: None,
         server: Some(ServerConfig {
-            listen: vec![server_sock_url.clone().into()],
+            listen: vec![server_sock_url.clone()],
             token: Some("secret123".to_string()),
             default_target: None,
             tls: None,
@@ -111,9 +111,9 @@ async fn test_e2e_reverse_mapping_uds() {
     let rev_external_sock = tmp.path().join("rev_external.sock");
     let rev_target_sock = tmp.path().join("rev_target.sock");
 
-    let server_sock_url = format!("uds://{}", server_sock.display());
-    let rev_external_str = rev_external_sock.to_string_lossy().to_string();
-    let rev_target_str = rev_target_sock.to_string_lossy().to_string();
+    let server_sock_url = format!("ws+unix://{}", server_sock.display());
+    let rev_external_str = format!("unix://{}", rev_external_sock.display());
+    let rev_target_str = format!("unix://{}", rev_target_sock.display());
 
     // 1. Start local target backend service for reverse tunnel
     let mut backend_listener = PlatformUdsListener::bind(&rev_target_sock).unwrap();
@@ -139,7 +139,7 @@ async fn test_e2e_reverse_mapping_uds() {
         dialer: None,
         tls: None,
         server: Some(ServerConfig {
-            listen: vec![server_sock_url.clone().into()],
+            listen: vec![server_sock_url.clone()],
             token: Some("rev_secret".to_string()),
             default_target: None,
             tls: None,
@@ -197,15 +197,18 @@ async fn test_e2e_reverse_mapping_uds() {
 }
 
 #[tokio::test]
-async fn test_e2e_server_structured_uds_listen() {
+async fn test_e2e_server_ws_unix_with_query_path() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("trace")
+        .try_init();
     let temp_dir = tempfile::tempdir().unwrap();
-    let server_sock = temp_dir.path().join("server_structured.sock");
+    let server_sock = temp_dir.path().join("server_custom.sock");
     let target_sock = temp_dir.path().join("target_backend.sock");
     let fwd_listen_sock = temp_dir.path().join("fwd_listen.sock");
 
     let server_sock_str = server_sock.to_string_lossy().to_string();
-    let target_sock_str = target_sock.to_string_lossy().to_string();
-    let fwd_listen_str = fwd_listen_sock.to_string_lossy().to_string();
+    let target_sock_str = format!("unix://{}", target_sock.display());
+    let fwd_listen_str = format!("unix://{}", fwd_listen_sock.display());
 
     // 1. Target backend UDS service
     let mut target_listener = PlatformUdsListener::bind(&target_sock).unwrap();
@@ -219,16 +222,12 @@ async fn test_e2e_server_structured_uds_listen() {
         }
     });
 
-    // 2. Client connects with composite scheme and query path: ws+uds:///path?path=/custom-path
-    let client_endpoint = format!("ws+uds://{}?path=/custom-path", server_sock_str);
-
-    let structured_listen = micro_tunnel::config::model::StructuredListenConfig {
-        transport: Some("uds".to_string()),
-        protocol: "ws".to_string(),
-        socket: Some(server_sock_str.clone()),
-        path: Some("/custom-path".to_string()),
-        ..Default::default()
-    };
+    // 2. Client connects with ws+unix scheme and query path: ws+unix:///path?path=/custom-path
+    let server_listen_url = format!(
+        "ws+unix://{}?path=/custom-path&chmod=0o660",
+        server_sock_str
+    );
+    let client_endpoint = format!("ws+unix://{}?path=/custom-path", server_sock_str);
 
     let config = AppConfig {
         log: LogConfig {
@@ -241,9 +240,7 @@ async fn test_e2e_server_structured_uds_listen() {
         dialer: None,
         tls: None,
         server: Some(ServerConfig {
-            listen: vec![micro_tunnel::config::model::ServerListenConfig::Structured(
-                structured_listen,
-            )],
+            listen: vec![server_listen_url],
             token: Some("token123".to_string()),
             default_target: None,
             tls: None,
@@ -251,7 +248,7 @@ async fn test_e2e_server_structured_uds_listen() {
             key: None,
         }),
         tunnels: vec![TunnelConfig {
-            tag: "structured-uds-tunnel".to_string(),
+            tag: "ws-unix-tunnel".to_string(),
             endpoint: EndpointConfig::Simple(client_endpoint),
             token: Some("token123".to_string()),
             pool_size: Some(2),
@@ -274,24 +271,25 @@ async fn test_e2e_server_structured_uds_listen() {
     });
 
     // Connect to local forward UDS listener which dials through UDS tunnel to UDS target
-    let mut visitor = None;
+    let mut connected = false;
     for _ in 0..50 {
         if fwd_listen_sock.exists()
-            && let Ok(s) = connect_uds(&fwd_listen_sock).await
+            && let Ok(mut visitor) = connect_uds(&fwd_listen_sock).await
+            && visitor.write_all(b"ping").await.is_ok()
+            && visitor.flush().await.is_ok()
         {
-            visitor = Some(s);
-            break;
+            let mut reply = [0u8; 4];
+            if visitor.read_exact(&mut reply).await.is_ok() && &reply == b"pong" {
+                connected = true;
+                break;
+            }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let mut visitor = visitor.expect("Failed to connect to forward UDS listen socket");
-
-    visitor.write_all(b"ping").await.unwrap();
-    visitor.flush().await.unwrap();
-
-    let mut reply = [0u8; 4];
-    visitor.read_exact(&mut reply).await.unwrap();
-    assert_eq!(&reply, b"pong");
+    assert!(
+        connected,
+        "Failed to connect and relay through UDS tunnel with query path"
+    );
 
     backend_task.await.unwrap();
     cancel_token.cancel();

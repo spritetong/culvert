@@ -461,56 +461,119 @@ server:
 }
 
 #[test]
-fn test_structured_server_listen_configs_yaml() {
+fn test_supported_schemes_server_and_client() {
     let yaml = r#"
 server:
   listen:
-    - transport: "uds"
-      protocol: "ws"
-      socket: "/run/tunnel.sock"
-      path: "/tunnel-ws"
-      chmod: 0o660
-    - transport: "tcp"
-      protocol: "ws"
-      bind: "0.0.0.0:9090"
-      path: "/ws"
-    - "ws+unix:///run/app.sock?path=/api/ws&chmod=0o664"
     - "ws://127.0.0.1:8080/plain"
+    - "wss://0.0.0.0:8443/secure"
+    - "https://[::1]:8443/h3"
+    - "h3://0.0.0.0:9443/h3quic"
+    - "quic://0.0.0.0:9444/rawquic"
+    - "ws+unix:///run/app.sock?path=/api/ws&chmod=0o660"
+    - "wss+unix:///run/secure_app.sock?path=/api/wss&chmod=0o640"
+tunnels:
+  - tag: "ws-tunnel"
+    endpoint: "ws://127.0.0.1:8080/plain"
+    mappings:
+      - mode: "forward"
+        listen: "127.0.0.1:10001"
+        target: "127.0.0.1:80"
+  - tag: "ws-unix-tunnel"
+    endpoint: "ws+unix:///run/app.sock?path=/api/ws"
+    mappings:
+      - mode: "forward"
+        listen: "unix:///run/local_fwd.sock"
+        target: "unix:///run/local_backend.sock"
 "#;
-    let config =
-        ConfigLoader::from_yaml_str(yaml).expect("Failed to parse structured server config");
+    let config = ConfigLoader::from_yaml_str(yaml).expect("Failed to parse valid config");
     let server = config.server.expect("Server config should be present");
     let specs = server.parse_specs().expect("Failed to parse server specs");
 
-    assert_eq!(specs.len(), 4);
+    assert_eq!(specs.len(), 7);
+    assert_eq!(specs[0].scheme, "ws");
+    assert_eq!(specs[1].scheme, "wss");
+    assert_eq!(specs[2].scheme, "https");
+    assert_eq!(specs[3].scheme, "h3");
+    assert_eq!(specs[4].scheme, "quic");
+    assert_eq!(specs[5].scheme, "ws+unix");
+    assert_eq!(specs[5].path.as_deref(), Some("/api/ws"));
+    assert_eq!(specs[5].chmod, Some(0o660));
+    assert_eq!(specs[6].scheme, "wss+unix");
+    assert_eq!(specs[6].path.as_deref(), Some("/api/wss"));
+    assert_eq!(specs[6].chmod, Some(0o640));
 
-    // 1. Structured UDS
-    assert_eq!(specs[0].scheme, "uds");
+    // Client endpoints
+    assert_eq!(config.tunnels.len(), 2);
+    let ep1 =
+        micro_tunnel::dialer::endpoint::Endpoint::parse(config.tunnels[0].endpoint.url()).unwrap();
+    assert_eq!(ep1.scheme, "ws");
+    let ep2 =
+        micro_tunnel::dialer::endpoint::Endpoint::parse(config.tunnels[1].endpoint.url()).unwrap();
+    assert_eq!(ep2.scheme, "ws+unix");
+}
+
+#[test]
+fn test_mapping_address_three_formats() {
+    use micro_tunnel::transport::TargetAddr;
+    use micro_tunnel::tunnel::forward::parse_target_addr;
+
+    // 1. ip:port (port is required)
+    let t1 = parse_target_addr("127.0.0.1:8080").unwrap();
+    assert_eq!(t1, TargetAddr::Ip("127.0.0.1:8080".parse().unwrap()));
+
+    let t2 = parse_target_addr("[::1]:8080").unwrap();
+    assert_eq!(t2, TargetAddr::Ip("[::1]:8080".parse().unwrap()));
+
+    // Port cannot be omitted for IP addresses
+    assert!(parse_target_addr("127.0.0.1").is_err());
+    assert!(parse_target_addr("::1").is_err());
+    assert!(parse_target_addr("[::1]").is_err());
+
+    // 2. hostname:port (port is required)
+    let t3 = parse_target_addr("localhost:8080").unwrap();
+    assert_eq!(t3, TargetAddr::Domain("localhost".to_string(), 8080));
+
+    let t4 = parse_target_addr("example.com:443").unwrap();
+    assert_eq!(t4, TargetAddr::Domain("example.com".to_string(), 443));
+
+    // Port cannot be omitted for hostnames
+    assert!(parse_target_addr("localhost").is_err());
+    assert!(parse_target_addr("example.com").is_err());
+
+    // 3. unix://path
+    let t5 = parse_target_addr("unix:///run/tunnel.sock").unwrap();
     assert_eq!(
-        specs[0].bind_addr,
-        std::path::Path::new("/run/tunnel.sock").to_string_lossy()
+        t5,
+        TargetAddr::Path(std::path::PathBuf::from("/run/tunnel.sock"))
     );
-    assert_eq!(specs[0].path.as_deref(), Some("/tunnel-ws"));
-    assert_eq!(specs[0].chmod, Some(0o660));
 
-    // 2. Structured TCP
-    assert_eq!(specs[1].scheme, "ws");
-    assert_eq!(specs[1].bind_addr, "0.0.0.0:9090");
-    assert_eq!(specs[1].path.as_deref(), Some("/ws"));
-    assert_eq!(specs[1].chmod, None);
-
-    // 3. Composite ws+unix URL with query parameters
-    assert_eq!(specs[2].scheme, "uds");
+    let t6 = parse_target_addr("unix://./local.sock").unwrap();
     assert_eq!(
-        specs[2].bind_addr,
-        std::path::Path::new("/run/app.sock").to_string_lossy()
+        t6,
+        TargetAddr::Path(std::path::PathBuf::from("./local.sock"))
     );
-    assert_eq!(specs[2].path.as_deref(), Some("/api/ws"));
-    assert_eq!(specs[2].chmod, Some(0o664));
 
-    // 4. Standard ws URL string
-    assert_eq!(specs[3].scheme, "ws");
-    assert_eq!(specs[3].bind_addr, "127.0.0.1:8080");
-    assert_eq!(specs[3].path.as_deref(), Some("/plain"));
-    assert_eq!(specs[3].chmod, None);
+    // Rejections: UDS without unix:// prefix must be rejected to prevent hostname conflict
+    assert!(parse_target_addr("/run/tunnel.sock").is_err());
+    assert!(parse_target_addr(r"C:\temp\tunnel.sock").is_err());
+}
+
+#[test]
+fn test_reject_removed_schemes() {
+    // uds:// and unix:// are removed in favor of ws+unix:// and wss+unix://
+    assert!(ConfigLoader::from_yaml_str("server:\n  listen: 'uds:///run/a.sock'\n").is_err());
+    assert!(ConfigLoader::from_yaml_str("server:\n  listen: 'unix:///run/a.sock'\n").is_err());
+    assert!(ConfigLoader::from_yaml_str("server:\n  listen: 'ws+uds:///run/a.sock'\n").is_err());
+
+    let client_yaml = r#"
+tunnels:
+  - tag: "uds-test"
+    endpoint: "uds:///run/a.sock"
+    mappings:
+      - mode: "forward"
+        listen: "127.0.0.1:8080"
+        target: "127.0.0.1:80"
+"#;
+    assert!(ConfigLoader::from_yaml_str(client_yaml).is_err());
 }

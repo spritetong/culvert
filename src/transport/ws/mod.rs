@@ -103,7 +103,7 @@ mod tests {
         let mut listener = WsListener::new("127.0.0.1:29876", Some(auth_token), Some("/ws"), None);
 
         let app_cfg = AppConfig::default();
-        let ep_cfg = EndpointConfig::Simple("http://127.0.0.1:29876/ws".to_string());
+        let ep_cfg = EndpointConfig::Simple("ws://127.0.0.1:29876/ws".to_string());
         let ep_ctx = EndpointContext::build(&ep_cfg, &app_cfg).unwrap();
 
         let connector = WsConnector::new(ep_ctx, auth_token, TunnelMode::Forward).unwrap();

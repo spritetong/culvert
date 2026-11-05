@@ -76,7 +76,7 @@ async fn test_high_volume_duplex_stream_integrity() {
     let session_mgr = Arc::new(SessionManager::new());
 
     let server_config = ServerConfig {
-        listen: vec![format!("ws://{}/ws", server_ws_listen).into()],
+        listen: vec![format!("ws://{}/ws", server_ws_listen)],
         token: Some(auth_token.to_string()),
         default_target: None,
         ..Default::default()
@@ -220,7 +220,7 @@ async fn test_stream_half_close_and_draining() {
     let session_mgr = Arc::new(SessionManager::new());
 
     let server_config = ServerConfig {
-        listen: vec![format!("ws://{}/ws", server_ws_listen).into()],
+        listen: vec![format!("ws://{}/ws", server_ws_listen)],
         token: Some(auth_token.to_string()),
         default_target: None,
         ..Default::default()
@@ -313,7 +313,7 @@ async fn test_pool_prewarm_and_reuse() {
     let session_mgr = Arc::new(SessionManager::new());
 
     let server_config = ServerConfig {
-        listen: vec![format!("ws://{}/ws", server_ws_listen).into()],
+        listen: vec![format!("ws://{}/ws", server_ws_listen)],
         token: Some(auth_token.to_string()),
         default_target: None,
         ..Default::default()
@@ -409,7 +409,7 @@ async fn test_pool_resilience_after_disconnect_and_high_churn() {
     let session_mgr = Arc::new(SessionManager::new());
 
     let server_config = ServerConfig {
-        listen: vec![format!("ws://{}/ws", server_ws_listen).into()],
+        listen: vec![format!("ws://{}/ws", server_ws_listen)],
         token: Some(auth_token.to_string()),
         default_target: None,
         ..Default::default()

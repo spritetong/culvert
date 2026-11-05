@@ -41,14 +41,11 @@ tls:
 
 # Server Ingress configuration (can coexist with tunnels in same config!)
 server:
-  # Structured configurations or explicit scheme URL(s) with path routing support:
+  # Supported schemes: ws, wss, https, h3, quic, ws+unix, wss+unix
+  # Server listen and client endpoint use the exact same URL format.
   listen:
-    - transport: "uds"
-      protocol: "ws"
-      socket: "/run/tunnel.sock"
-      path: "/tunnel"
-      chmod: 0o660
-    - "ws+unix:///run/tunnel2.sock?path=/tunnel"
+    - "ws+unix:///run/tunnel.sock?path=/tunnel&chmod=0o660"
+    - "wss+unix:///run/tunnel2.sock?path=/tunnel"
     - "wss://0.0.0.0:8443/tunnel"
     - "h3://0.0.0.0:8443/tunnel"
     - "ws://127.0.0.1:8080/tunnel"
@@ -77,6 +74,11 @@ tunnels:
       - mode: "forward"
         listen: "127.0.0.1:13306"
         target: "10.0.0.5:3306"
+      # Forward mapping to Unix domain socket: local 18000 -> remote unix socket
+      # Mappings support 3 formats: ip:port, hostname:port, unix://path
+      - mode: "forward"
+        listen: "127.0.0.1:18000"
+        target: "unix:///var/run/docker.sock"
       # Reverse mapping: remote 2222 -> local 22 (SSH)
       - mode: "reverse"
         listen: "0.0.0.0:2222"

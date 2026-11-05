@@ -10,16 +10,19 @@ use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use rustls::pki_types::ServerName;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::model::TunnelMode;
 use crate::core::error::TunnelError;
-use crate::core::stream::{BoxFuture, TunnelStream};
+use crate::core::stream::{BoxFuture, BufferedTlsStream, TunnelStream};
 use crate::dialer::endpoint::EndpointContext;
+use crate::dialer::tls::TlsConfigBuilder;
 use crate::platform::{PlatformUdsListener, connect_uds, normalize_uds_path};
 use crate::transport::ws::model::WsHandshakeHeaders;
 use crate::transport::ws::stream::WsTunnelStream;
@@ -47,7 +50,7 @@ pub struct UdsTransportDriver;
 
 impl TransportDriver for UdsTransportDriver {
     fn schemes(&self) -> &[&'static str] {
-        &["uds", "unix", "ws+uds", "ws+unix"]
+        &["ws+unix", "wss+unix"]
     }
 
     fn build_connector(
@@ -60,7 +63,7 @@ impl TransportDriver for UdsTransportDriver {
             endpoint.clone(),
             auth_token,
             mode,
-        )))
+        )?))
     }
 
     fn build_listener(
@@ -68,13 +71,44 @@ impl TransportDriver for UdsTransportDriver {
         socket_path: &str,
         auth_token: Option<&str>,
         path: Option<&str>,
-        _tls: Option<&crate::config::model::TlsConfig>,
+        tls: Option<&crate::config::model::TlsConfig>,
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
+        let is_wss = socket_path.starts_with("wss+unix://");
+        let cert_str = tls
+            .and_then(|t| t.certificate.as_ref())
+            .and_then(|p| p.to_str());
+        let key_str = tls.and_then(|t| t.key.as_ref()).and_then(|p| p.to_str());
+        let (min_v, max_v) = match tls {
+            Some(t) => (t.min_version.as_deref(), t.max_version.as_deref()),
+            None => (None, None),
+        };
+        let alpn = tls.and_then(|t| t.alpn.as_ref()).and_then(|list| {
+            let filtered: Vec<Vec<u8>> = list
+                .iter()
+                .filter(|s| *s != "h3" && *s != "micro-tunnel-quic")
+                .map(|s| s.as_bytes().to_vec())
+                .collect();
+            if filtered.is_empty() {
+                None
+            } else {
+                Some(filtered)
+            }
+        });
+
+        let tls_acceptor = if is_wss {
+            let server_rustls =
+                TlsConfigBuilder::build_server_config(cert_str, key_str, alpn, min_v, max_v)?;
+            Some(TlsAcceptor::from(Arc::new(server_rustls)))
+        } else {
+            None
+        };
+
         let clean_path = normalize_uds_path(socket_path);
         Ok(Box::new(UdsListener::new(
             clean_path.to_string_lossy(),
             auth_token,
             path,
+            tls_acceptor,
         )))
     }
 }
@@ -83,6 +117,7 @@ pub struct UdsListener {
     socket_path: String,
     auth_token: Option<String>,
     path: Option<String>,
+    tls_acceptor: Option<TlsAcceptor>,
     incoming_rx: Option<mpsc::Receiver<AcceptedResult>>,
     cancel_token: CancellationToken,
     server_task: Option<tokio::task::JoinHandle<()>>,
@@ -102,11 +137,13 @@ impl UdsListener {
         socket_path: impl Into<String>,
         auth_token: Option<impl Into<String>>,
         path: Option<impl Into<String>>,
+        tls_acceptor: Option<TlsAcceptor>,
     ) -> Self {
         Self {
             socket_path: socket_path.into(),
             auth_token: auth_token.map(|t| t.into()),
             path: path.map(|p| p.into()),
+            tls_acceptor,
             incoming_rx: None,
             cancel_token: CancellationToken::new(),
             server_task: None,
@@ -126,6 +163,7 @@ impl UdsListener {
 
         let auth_token = Arc::new(self.auth_token.clone());
         let expected_path = Arc::new(self.path.clone());
+        let tls_acceptor = self.tls_acceptor.clone();
         let cancel_token = self.cancel_token.clone();
 
         let task = tokio::spawn(async move {
@@ -143,13 +181,30 @@ impl UdsListener {
                 let tx = tx.clone();
                 let token = Arc::clone(&auth_token);
                 let path = Arc::clone(&expected_path);
+                let acceptor = tls_acceptor.clone();
                 let cancel_conn = cancel_token.child_token();
 
                 conn_tasks.spawn(async move {
                     tokio::select! {
                         _ = cancel_conn.cancelled() => {}
                         _ = async {
-                            let io = TokioIo::new(stream);
+                            let io_stream: Box<dyn TunnelStream> = if let Some(tls) = acceptor {
+                                match tokio::time::timeout(Duration::from_secs(10), tls.accept(stream)).await {
+                                    Ok(Ok(tls_stream)) => Box::new(BufferedTlsStream::new(tls_stream)),
+                                    Ok(Err(e)) => {
+                                        tracing::debug!("UDS WSS server TLS handshake failed: {:?}", e);
+                                        return;
+                                    }
+                                    Err(_) => {
+                                        tracing::debug!("UDS WSS server TLS handshake timed out");
+                                        return;
+                                    }
+                                }
+                            } else {
+                                stream
+                            };
+
+                            let io = TokioIo::new(io_stream);
                             let service_cancel = cancel_conn.clone();
                             let service = service_fn(move |mut req: Request<Incoming>| {
                                 let tx = tx.clone();
@@ -269,17 +324,31 @@ pub struct UdsConnector {
     endpoint: EndpointContext,
     auth_token: Option<String>,
     mode: TunnelMode,
+    tls_connector: Option<Arc<TlsConnector>>,
 }
 
 impl UdsConnector {
-    pub fn new(endpoint: EndpointContext, auth_token: impl Into<String>, mode: TunnelMode) -> Self {
+    pub fn new(
+        endpoint: EndpointContext,
+        auth_token: impl Into<String>,
+        mode: TunnelMode,
+    ) -> Result<Self, TunnelError> {
         let tok: String = auth_token.into();
         let auth_token = if tok.is_empty() { None } else { Some(tok) };
-        Self {
+        let is_wss = endpoint.endpoint.scheme == "wss+unix";
+        let tls_connector = if is_wss {
+            let tls_cfg = endpoint.tls_config.clone().unwrap_or_default();
+            let conn = TlsConfigBuilder::build_connector(&tls_cfg)?;
+            Some(Arc::new(conn))
+        } else {
+            None
+        };
+        Ok(Self {
             endpoint,
             auth_token,
             mode,
-        }
+            tls_connector,
+        })
     }
 
     async fn connect_internal(
@@ -289,7 +358,25 @@ impl UdsConnector {
         pool_idle: bool,
     ) -> Result<Box<dyn TunnelStream>, TunnelError> {
         let socket_path = normalize_uds_path(&self.endpoint.endpoint.path);
-        let stream = connect_uds(&socket_path).await.map_err(TunnelError::Io)?;
+        let raw_stream = connect_uds(&socket_path).await.map_err(TunnelError::Io)?;
+
+        let stream: Box<dyn TunnelStream> = if let Some(ref connector) = self.tls_connector {
+            let sni = self
+                .endpoint
+                .tls_config
+                .as_ref()
+                .and_then(|t| t.server_name.as_deref())
+                .unwrap_or("localhost");
+            let server_name = ServerName::try_from(sni.to_string())
+                .map_err(|e| TunnelError::Tls(e.to_string()))?;
+            let tls_stream = connector
+                .connect(server_name, raw_stream)
+                .await
+                .map_err(|e| TunnelError::Tls(e.to_string()))?;
+            Box::new(BufferedTlsStream::new(tls_stream))
+        } else {
+            raw_stream
+        };
 
         // Perform client HTTP upgrade over Unix socket
         let uri = if let Some(ref q) = self.endpoint.endpoint.query {
@@ -363,9 +450,10 @@ impl TransportConnector for UdsConnector {
     }
 
     fn protocol_scheme(&self) -> &'static str {
-        match self.endpoint.endpoint.scheme.as_str() {
-            "unix" | "ws+unix" => "unix",
-            _ => "uds",
+        if self.endpoint.endpoint.scheme == "wss+unix" {
+            "wss+unix"
+        } else {
+            "ws+unix"
         }
     }
 }
@@ -381,7 +469,7 @@ mod tests {
         let sock_path = tmp.path().join("uds_transport.sock");
         let sock_str = sock_path.to_string_lossy().to_string();
 
-        let mut listener = UdsListener::new(&sock_str, Some("test_token"), None::<String>);
+        let mut listener = UdsListener::new(&sock_str, Some("test_token"), None::<String>, None);
 
         let srv_task = tokio::spawn(async move {
             let (stream, meta) = listener.accept().await.unwrap();
@@ -392,10 +480,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let app_cfg = crate::config::model::AppConfig::default();
-        let ep_cfg = crate::config::model::EndpointConfig::Simple(format!("uds://{}", sock_str));
+        let ep_cfg =
+            crate::config::model::EndpointConfig::Simple(format!("ws+unix://{}", sock_str));
         let ep_ctx = EndpointContext::build(&ep_cfg, &app_cfg).unwrap();
 
-        let connector = UdsConnector::new(ep_ctx, "test_token", TunnelMode::Forward);
+        let connector = UdsConnector::new(ep_ctx, "test_token", TunnelMode::Forward).unwrap();
         let target = TargetAddr::Domain("127.0.0.1".to_string(), 80);
         let _client_stream = connector.connect(&target, None).await.unwrap();
 

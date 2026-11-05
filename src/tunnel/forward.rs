@@ -27,9 +27,37 @@ impl Drop for ActiveStreamGuard {
     }
 }
 
-/// Helper to parse target address string.
+/// Helper to validate if a string conforms to a valid hostname / domain name.
+fn is_valid_hostname(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    for label in host.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return false;
+        }
+        if !label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Helper to parse target address string supporting three formats:
+/// 1. ip:port (e.g. 127.0.0.1:8080, [::1]:8080)
+/// 2. hostname:port (e.g. localhost:8080, example.com:443)
+/// 3. unix://path (e.g. unix:///run/tunnel.sock, unix://C:/temp/tunnel.sock)
+///
+/// Port number cannot be omitted for IP and hostname addresses.
 pub fn parse_target_addr(target_str: &str) -> Result<TargetAddr, TunnelError> {
-    if crate::platform::is_uds_path(target_str) {
+    let target_str = target_str.trim();
+    if target_str.starts_with("unix://") {
         let path = crate::platform::normalize_uds_path(target_str);
         if path.as_os_str().is_empty() {
             return Err(TunnelError::Config(format!(
@@ -40,21 +68,54 @@ pub fn parse_target_addr(target_str: &str) -> Result<TargetAddr, TunnelError> {
         return Ok(TargetAddr::Path(path));
     }
 
-    if let Ok(sa) = target_str.parse() {
-        Ok(TargetAddr::Ip(sa))
-    } else {
-        let parts: Vec<&str> = target_str.rsplitn(2, ':').collect();
-        if parts.len() != 2 {
+    // Must be ip:port or hostname:port. Port number cannot be omitted.
+    if let Some((host, port_str)) = target_str.rsplit_once(':') {
+        let is_bracketed = host.starts_with('[') && host.ends_with(']');
+        if host.contains(':') && !is_bracketed {
             return Err(TunnelError::Config(format!(
-                "Invalid target: {}",
+                "Invalid mapping address '{}'. IPv6 addresses with port must be enclosed in brackets (e.g. '[::1]:8080')",
                 target_str
             )));
         }
-        let port: u16 = parts[0]
-            .parse()
-            .map_err(|_| TunnelError::Config("Invalid target port".to_string()))?;
-        Ok(TargetAddr::Domain(parts[1].to_string(), port))
+
+        let clean_host = if is_bracketed {
+            &host[1..host.len() - 1]
+        } else {
+            host
+        };
+
+        if clean_host.is_empty() {
+            return Err(TunnelError::Config(format!(
+                "Invalid mapping address '{}': missing host",
+                target_str
+            )));
+        }
+
+        let port = port_str.parse::<u16>().map_err(|_| {
+            TunnelError::Config(format!(
+                "Invalid mapping address '{}': invalid port '{}'",
+                target_str, port_str
+            ))
+        })?;
+
+        if port == 0 {
+            return Err(TunnelError::Config(format!(
+                "Invalid mapping address '{}': port must not be 0",
+                target_str
+            )));
+        }
+
+        if let Ok(ip) = clean_host.parse::<std::net::IpAddr>() {
+            return Ok(TargetAddr::Ip(std::net::SocketAddr::new(ip, port)));
+        } else if is_valid_hostname(clean_host) {
+            return Ok(TargetAddr::Domain(clean_host.to_string(), port));
+        }
     }
+
+    Err(TunnelError::Config(format!(
+        "Invalid mapping address '{}'. Expected 'ip:port', 'hostname:port', or 'unix://path'",
+        target_str
+    )))
 }
 
 /// Runs a single forward mapping listener and forwards inbound connections to remote peer.

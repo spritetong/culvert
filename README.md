@@ -143,7 +143,7 @@ worker_threads: 4     # Number of Tokio worker threads.
 
 Global DNS resolution settings. Can be overridden per-endpoint.
 
-`micro-tunnel` supports standard structured resolver configuration as well as standard URL schemes (non-standard `dns+` schemes like `dns+https://` or `dns+tls://` are removed).
+`micro-tunnel` supports standard structured resolver configuration as well as standard URL schemes.
 
 ```yaml
 dns:
@@ -204,7 +204,7 @@ dialer:
 
 Global default TLS configuration for outbound client connections and fallback server termination.
 
-> **Note**: TLS activation is strictly determined by the URL scheme (`wss://`, `https://`, `h3://`, `quic://` vs unencrypted `ws://`, `uds://`). The `tls` configuration block specifies cryptographic parameters (SNI, certificates, versions) without any ambiguous `enabled` flag, avoiding implicit protocol conversions between `ws://` and `wss://`.
+> **Note**: TLS activation is strictly determined by the URL scheme (`wss://`, `https://`, `h3://`, `quic://`, `wss+unix://` vs unencrypted `ws://`, `ws+unix://`). The `tls` configuration block specifies cryptographic parameters (SNI, certificates, versions).
 
 ```yaml
 tls:
@@ -226,37 +226,31 @@ tls:
 
 Configures `micro-tunnel` as an ingress gateway on a cloud VPS or host.
 
-> **Note**: In a typical setup behind Caddy or Nginx, configure `listen` to a Unix Domain Socket (`uds:///run/tunnel.sock`, `ws+unix:///run/tunnel.sock`, or structured `transport: uds`) or loopback (`ws://127.0.0.1:8080/tunnel`).
+> **Note**: In a typical setup behind Caddy or Nginx, configure `listen` to a Unix Domain Socket (`ws+unix:///run/tunnel.sock`) or loopback (`ws://127.0.0.1:8080/tunnel`).
 
-`listen` supports both **structured orthogonal configurations** (recommended for decoupled transport, protocol, path, and permission settings) and **URL string formats** (including composite schemes).
+`listen` takes a URL string or a list of URL strings. Both `server.listen` and client `tunnel.endpoint` share the exact same URL specification and supported schemes.
 
-#### Structured & URL Listen Configuration
+#### Server Listen Configuration
 
 ```yaml
 server:
-  # Ingress listeners: supports structured objects, composite URLs, or simple URL strings.
-  # Can be a single item or an array of listeners.
+  # Ingress listeners: URL string or list of URL strings.
+  # Supported schemes: ws, wss, https, h3, quic, ws+unix, wss+unix
   listen:
-    # 1. Structured UDS Listener (Decoupled transport and application protocol)
-    - transport: "uds"                  # Transport medium: "uds" / "unix" or "tcp"
-      protocol: "ws"                    # Application protocol: "ws", "wss", "h3", etc. (default: "ws")
-      socket: "/run/tunnel.sock"        # UDS socket path (e.g. "/run/tunnel.sock" or "C:/temp/tunnel.sock")
-      path: "/tunnel"                   # HTTP request path routing (e.g. "/tunnel")
-      chmod: 0o660                      # Socket file permissions on Unix (octal literal)
+    # 1. Plaintext WebSocket over Unix Domain Socket (IPC behind Caddy/Nginx)
+    - "ws+unix:///run/tunnel.sock?path=/tunnel&chmod=0o660"
 
-    # 2. Structured TCP Listener
-    - transport: "tcp"
-      protocol: "ws"
-      bind: "127.0.0.1:8080"            # Network bind address: "<host>:<port>"
-      path: "/tunnel"
+    # 2. TLS-encrypted WebSocket over Unix Domain Socket
+    - "wss+unix:///run/tunnel-tls.sock?path=/tunnel"
 
-    # 3. Composite URI Scheme (with optional query parameters)
-    - "ws+unix:///run/app.sock?path=/tunnel&chmod=0o660"
+    # 3. Plaintext WebSocket over TCP
+    - "ws://127.0.0.1:8080/tunnel"
 
-    # 4. Standard URI Strings
-    - "uds:///run/tunnel.sock"           # Ultra-fast zero-network-stack IPC behind Caddy
-    - "wss://0.0.0.0:8443/tunnel"        # Direct standalone WSS (TLS terminated by micro-tunnel)
-    - "h3://0.0.0.0:8443/tunnel"         # Direct standalone HTTP/3 over QUIC/UDP
+    # 4. Standalone WSS (TLS terminated by micro-tunnel)
+    - "wss://0.0.0.0:8443/tunnel"
+
+    # 5. Standalone HTTP/3 over QUIC/UDP
+    - "h3://0.0.0.0:8443/tunnel"
 
   # Pre-shared authentication token (PSK).
   # Optional: omit or set to null for unauthenticated mode (empty string "" is rejected).
@@ -264,10 +258,11 @@ server:
   token: "SECRET_PRESHARED_TOKEN"
 
   # Fallback target address when the client does not specify one.
+  # Supports 3 formats: ip:port, hostname:port, or unix://path
   default_target: "127.0.0.1:5201"
 
-  # Optional direct TLS termination certificates (used for wss/h3 if not behind a reverse proxy).
-  # If omitted on wss/h3, a temporary self-signed certificate is automatically generated.
+  # Optional direct TLS termination certificates (used for wss/h3/wss+unix if not behind a reverse proxy).
+  # If omitted on TLS schemes, a temporary self-signed certificate is automatically generated.
   certificate: "/etc/ssl/server.crt"
   key: "/etc/ssl/server.key"
 
@@ -276,24 +271,25 @@ server:
     min_version: "1.3"
 ```
 
-#### Server Scheme & Specification Reference
+#### Supported Schemes Reference (Server `listen` & Client `endpoint`)
 
-| Scheme / Transport | Description | Example Specification |
+Both `server.listen` and `tunnel.endpoint` support the exact same set of 7 URL schemes:
+
+| Scheme | Transport / Protocol | Description & Example |
 | :--- | :--- | :--- |
-| `ws` | Unencrypted WebSocket over TCP | `ws://127.0.0.1:8080/tunnel` |
-| `wss` | TLS-encrypted WebSocket over TCP | `wss://0.0.0.0:8443/tunnel` |
-| `https` | HTTP/3 bidirectional stream over QUIC/UDP (alias for h3) | `https://0.0.0.0:8443/tunnel` |
-| `h3` | HTTP/3 bidirectional stream over QUIC/UDP | `h3://0.0.0.0:8443/tunnel` |
+| `ws` | WebSocket over TCP (Plaintext) | `ws://127.0.0.1:8080/tunnel` |
+| `wss` | WebSocket over TCP (TLS) | `wss://0.0.0.0:8443/tunnel` |
+| `https` | HTTP/3 over QUIC/UDP (alias for `h3`) | `https://0.0.0.0:8443/tunnel` |
+| `h3` | HTTP/3 over QUIC/UDP | `h3://0.0.0.0:8443/tunnel` |
 | `quic` | Raw QUIC bidirectional stream | `quic://0.0.0.0:8443/tunnel` |
-| `uds` / `unix` | Unix Domain Socket (WebSocket over UDS) | `uds:///run/tunnel.sock` or `uds://C:/temp/tunnel.sock` |
-| `ws+uds` / `ws+unix` | Composite UDS URI scheme with optional query path and chmod | `ws+unix:///run/tunnel.sock?path=/tunnel&chmod=0o660` |
-| Structured (`transport: uds`) | Decoupled orthogonal UDS configuration | `{ transport: "uds", socket: "...", path: "/ws", chmod: 0o660 }` |
+| `ws+unix` | WebSocket over Unix Domain Socket (Plaintext) | `ws+unix:///run/tunnel.sock?path=/tunnel&chmod=0o660` |
+| `wss+unix` | WebSocket over Unix Domain Socket (TLS) | `wss+unix:///run/tunnel.sock?path=/tunnel` |
 
 > [!NOTE]
 > **Cross-Platform Unix Domain Socket (UDS) Support**:
-> Unix Domain Sockets (`uds`, `unix`, `ws+uds`, `ws+unix`) are natively supported on **both Linux/macOS and Windows** (Windows 10 17063+ / Windows 11 / Windows Server 2019+ via WinSock `AF_UNIX`).
-> - On Linux / macOS, file permissions mode can be configured via `chmod: 0o660` or URL query parameter `?chmod=0o660`.
-> - On Windows, filesystem socket paths such as `C:/temp/tunnel.sock` or `uds://C:/temp/tunnel.sock` are fully supported with zero thread leaks and complete Tokio cancel-safety.
+> Unix Domain Sockets (`ws+unix`, `wss+unix`) are natively supported on **both Linux/macOS and Windows** (Windows 10 17063+ / Windows 11 / Windows Server 2019+ via WinSock `AF_UNIX`).
+> - On Linux / macOS, file permissions mode can be configured via URL query parameter `?chmod=0o660`.
+> - On Windows, filesystem socket paths such as `ws+unix://C:/temp/tunnel.sock` or `ws+unix://./local.sock` are fully supported with zero thread leaks and complete Tokio cancel-safety.
 > - For `h3` and `https` listeners, `"h3"` is prioritized at index 0 of ALPN negotiation per RFC 7301 / RFC 9114 so standard HTTP/3 clients always negotiate `h3`. Custom `tls.alpn` options serve as fallback identifiers for raw QUIC or specialized non-browser clients.
 
 > [!IMPORTANT]
@@ -335,11 +331,12 @@ tunnels:
         target: "127.0.0.1:22"
 
       # UDS Mapping: Forward or reverse over Unix Domain Socket (Linux, macOS, and Windows)
+      # Mappings support 3 formats: ip:port, hostname:port, and unix://path (port cannot be omitted; unix:// avoids hostname collision)
       - mode: "forward"
         listen: "127.0.0.1:18080"
-        target: "/run/internal_service.sock"    # target can be a UDS socket path
+        target: "unix:///run/internal_service.sock"
       - mode: "reverse"
-        listen: "/run/public_api.sock"          # listen can be a UDS socket path
+        listen: "unix:///run/public_api.sock"
         target: "127.0.0.1:8080"
 ```
 
@@ -385,7 +382,7 @@ log:
   level: "info"
 
 server:
-  listen: "uds:///run/micro-tunnel.sock"
+  listen: "ws+unix:///run/micro-tunnel.sock"
   token: "MY_SECURE_TOKEN_32_BYTES_OR_MORE"
   default_target: "127.0.0.1:5201"
 ```

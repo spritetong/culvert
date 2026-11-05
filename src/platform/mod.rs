@@ -23,49 +23,22 @@ use crate::core::stream::TunnelStream;
 use crate::transport::TargetAddr;
 
 /// Checks if a given address string represents a Unix Domain Socket path or URL.
+/// Supports "unix://path", "ws+unix://path", and "wss+unix://path".
 pub fn is_uds_path(s: &str) -> bool {
     let trimmed = s.trim();
-    if trimmed.starts_with("uds://")
-        || trimmed.starts_with("unix://")
-        || trimmed.starts_with("ws+uds://")
+    trimmed.starts_with("unix://")
         || trimmed.starts_with("ws+unix://")
-    {
-        return true;
-    }
-    if trimmed.ends_with(".sock") {
-        return true;
-    }
-    if trimmed.starts_with('/')
-        || trimmed.starts_with("./")
-        || trimmed.starts_with("../")
-        || trimmed.starts_with('\\')
-        || trimmed.starts_with(".\\")
-        || trimmed.starts_with("..\\")
-    {
-        return true;
-    }
-    // Windows drive letter check: e.g. "C:\" or "C:/" or "c:\"
-    let bytes = trimmed.as_bytes();
-    if bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/')
-    {
-        return true;
-    }
-    false
+        || trimmed.starts_with("wss+unix://")
 }
 
 /// Normalizes a UDS path or URL string into a standard OS filesystem PathBuf.
 pub fn normalize_uds_path(s: &str) -> PathBuf {
     let trimmed = s.trim();
-    let rest = if let Some(stripped) = trimmed.strip_prefix("uds://") {
-        stripped
-    } else if let Some(stripped) = trimmed.strip_prefix("unix://") {
-        stripped
-    } else if let Some(stripped) = trimmed.strip_prefix("ws+uds://") {
+    let rest = if let Some(stripped) = trimmed.strip_prefix("unix://") {
         stripped
     } else if let Some(stripped) = trimmed.strip_prefix("ws+unix://") {
+        stripped
+    } else if let Some(stripped) = trimmed.strip_prefix("wss+unix://") {
         stripped
     } else {
         trimmed
@@ -101,14 +74,24 @@ pub enum GenericListener {
 
 impl GenericListener {
     /// Binds to either a TCP address or a Unix Domain Socket path.
+    /// Supports: ip:port, hostname:port, and unix://path. Port must not be omitted.
     pub async fn bind(addr: &str) -> Result<Self, TunnelError> {
-        if is_uds_path(addr) {
-            let path = normalize_uds_path(addr);
-            let listener = PlatformUdsListener::bind(&path).map_err(TunnelError::Io)?;
-            Ok(GenericListener::Uds(listener))
-        } else {
-            let listener = TcpListener::bind(addr).await.map_err(TunnelError::Io)?;
-            Ok(GenericListener::Tcp(listener))
+        let target = crate::tunnel::forward::parse_target_addr(addr)?;
+        match target {
+            TargetAddr::Path(path) => {
+                let listener = PlatformUdsListener::bind(&path).map_err(TunnelError::Io)?;
+                Ok(GenericListener::Uds(listener))
+            }
+            TargetAddr::Ip(sa) => {
+                let listener = TcpListener::bind(sa).await.map_err(TunnelError::Io)?;
+                Ok(GenericListener::Tcp(listener))
+            }
+            TargetAddr::Domain(host, port) => {
+                let listener = TcpListener::bind((host.as_str(), port))
+                    .await
+                    .map_err(TunnelError::Io)?;
+                Ok(GenericListener::Tcp(listener))
+            }
         }
     }
 
@@ -163,15 +146,15 @@ mod tests {
 
     #[test]
     fn test_is_uds_path() {
-        assert!(is_uds_path("uds:///tmp/test.sock"));
         assert!(is_uds_path("unix:///tmp/test.sock"));
-        assert!(is_uds_path("test.sock"));
-        assert!(is_uds_path("./relative.sock"));
-        assert!(is_uds_path("/var/run/my.sock"));
-        assert!(is_uds_path(r"C:\temp\my.sock"));
-        assert!(is_uds_path("C:/temp/my.sock"));
-        assert!(is_uds_path(r".\my.sock"));
+        assert!(is_uds_path("ws+unix:///tmp/test.sock"));
+        assert!(is_uds_path("wss+unix:///tmp/test.sock"));
+        assert!(is_uds_path("unix://C:/temp/my.sock"));
+        assert!(is_uds_path("unix://./relative.sock"));
 
+        assert!(!is_uds_path("/var/run/my.sock"));
+        assert!(!is_uds_path("test.sock"));
+        assert!(!is_uds_path("./local.sock"));
         assert!(!is_uds_path("127.0.0.1:8080"));
         assert!(!is_uds_path("0.0.0.0:443"));
         assert!(!is_uds_path("[::1]:8080"));
@@ -181,20 +164,20 @@ mod tests {
 
     #[test]
     fn test_normalize_uds_path() {
-        let p1 = normalize_uds_path("uds:///tmp/test.sock");
+        let p1 = normalize_uds_path("unix:///tmp/test.sock");
         assert_eq!(p1, PathBuf::from("/tmp/test.sock"));
 
-        let p2 = normalize_uds_path("unix:///tmp/test.sock");
+        let p2 = normalize_uds_path("ws+unix:///tmp/test.sock");
         assert_eq!(p2, PathBuf::from("/tmp/test.sock"));
 
-        let p3 = normalize_uds_path("uds://C:/temp/test.sock");
-        assert_eq!(p3, PathBuf::from("C:/temp/test.sock"));
+        let p3 = normalize_uds_path("wss+unix:///tmp/test.sock");
+        assert_eq!(p3, PathBuf::from("/tmp/test.sock"));
 
-        let p4 = normalize_uds_path("uds:///C:/temp/test.sock");
+        let p4 = normalize_uds_path("unix://C:/temp/test.sock");
         assert_eq!(p4, PathBuf::from("C:/temp/test.sock"));
 
-        let p5 = normalize_uds_path("./local.sock");
-        assert_eq!(p5, PathBuf::from("./local.sock"));
+        let p5 = normalize_uds_path("unix:///C:/temp/test.sock");
+        assert_eq!(p5, PathBuf::from("C:/temp/test.sock"));
     }
 
     #[tokio::test]
@@ -228,7 +211,7 @@ mod tests {
     async fn test_generic_listener_and_target_connect() {
         let temp_dir = tempfile::tempdir().unwrap();
         let sock_path = temp_dir.path().join("generic_test.sock");
-        let sock_str = sock_path.to_string_lossy().to_string();
+        let sock_str = format!("unix://{}", sock_path.display());
 
         let mut listener = GenericListener::bind(&sock_str).await.unwrap();
 

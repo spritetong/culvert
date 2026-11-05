@@ -64,7 +64,7 @@ async fn test_standalone_wss_server_self_signed_direct_termination() {
     // 1. Configure Server with standalone wss:// without providing cert/key files -> auto self-signed
     let mut app_config = AppConfig {
         server: Some(ServerConfig {
-            listen: vec![format!("wss://127.0.0.1:{}/tunnel", server_wss_port).into()],
+            listen: vec![format!("wss://127.0.0.1:{}/tunnel", server_wss_port)],
             token: Some("secret_wss_token".to_string()),
             default_target: None,
             certificate: None, // No file provided: triggers self-signed fallback

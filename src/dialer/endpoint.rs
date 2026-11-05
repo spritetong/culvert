@@ -34,7 +34,7 @@ impl Endpoint {
             )));
         };
 
-        if scheme == "uds" || scheme == "unix" || scheme == "ws+uds" || scheme == "ws+unix" {
+        if scheme == "ws+unix" || scheme == "wss+unix" {
             let path_raw = &url_str[scheme.len() + 3..];
             let (path_part, query_part) = if let Some(q_idx) = path_raw.find('?') {
                 (&path_raw[..q_idx], Some(path_raw[q_idx + 1..].to_string()))
@@ -55,6 +55,13 @@ impl Endpoint {
             });
         }
 
+        if !matches!(scheme.as_str(), "ws" | "wss" | "https" | "h3" | "quic") {
+            return Err(TunnelError::Config(format!(
+                "Unsupported endpoint scheme '{}' in URL '{}'. Supported schemes: ws, wss, https, h3, quic, ws+unix, wss+unix",
+                scheme, url_str
+            )));
+        }
+
         let parsed = Url::parse(url_str)?;
         let host = parsed
             .host_str()
@@ -65,7 +72,7 @@ impl Endpoint {
 
         let port = parsed.port().unwrap_or(match scheme.as_str() {
             "https" | "wss" | "h3" | "quic" => 443,
-            "http" | "ws" => 80,
+            "ws" => 80,
             _ => 0,
         });
 
@@ -156,7 +163,10 @@ impl EndpointContext {
         ));
 
         // Resolve effective TLS options based purely on whether endpoint scheme is TLS-based
-        let is_tls_scheme = matches!(endpoint.scheme.as_str(), "https" | "wss" | "h3" | "quic");
+        let is_tls_scheme = matches!(
+            endpoint.scheme.as_str(),
+            "https" | "wss" | "h3" | "quic" | "wss+unix"
+        );
         if !is_tls_scheme && endpoint_tls.is_some() {
             return Err(TunnelError::Config(format!(
                 "Endpoint '{}' uses non-TLS scheme '{}', but 'tls' options are configured. Use a TLS scheme (e.g. wss://, h3://) or remove the 'tls' block.",
