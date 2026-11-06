@@ -20,6 +20,7 @@ use crate::consts::{
 use crate::control::stream::{ControlMessage, FramedControlStream};
 use crate::core::error::TunnelError;
 use crate::core::relay::RelayEngine;
+use crate::core::stream::{activity_now_ms, heartbeat_timing};
 use crate::dialer::endpoint::EndpointContext;
 use crate::transport::{TargetAddr, TransportConnector, TransportRegistry};
 
@@ -140,8 +141,12 @@ pub async fn run_reverse_mapping(
         let hb_interval = endpoint_ctx.heartbeat_interval();
         let idle_timeout = endpoint_ctx.idle_timeout();
         let mut heartbeat = interval(hb_interval);
-        let rx_timeout = tokio::time::sleep(idle_timeout);
-        tokio::pin!(rx_timeout);
+        // Liveness is pure activity: any RX or real TX refreshes the deadline.
+        // Probe PINGs are deliberately excluded, otherwise our own keepalives
+        // would keep a silently dead peer marked alive forever.
+        let mut last_activity_ms = activity_now_ms();
+        let idle_deadline = tokio::time::sleep(idle_timeout);
+        tokio::pin!(idle_deadline);
 
         // Main event loop handling incoming connection alerts from remote server
         loop {
@@ -152,25 +157,39 @@ pub async fn run_reverse_mapping(
                     break;
                 }
                 Some(_) = conn_tracker.join_next(), if !conn_tracker.is_empty() => {}
-                _ = &mut rx_timeout => {
+                _ = &mut idle_deadline => {
                     warn!(
                         tag = %tag,
                         idle_timeout = ?idle_timeout,
-                        "Reverse control channel idle timeout: no packets received from server. Reconnecting..."
+                        "Reverse control channel idle timeout: no inbound or outbound activity. Reconnecting..."
                     );
                     break;
                 }
                 _ = heartbeat.tick() => {
-                    let Some(send_ping) = ctrl_stream.send(ControlMessage::Ping).cancel_with(&cancel_token).await else {
-                        break;
-                    };
-                    if let Err(e) = send_ping {
-                        warn!(tag = %tag, "Failed to send heartbeat ping: {:?}", e);
-                        break;
+                    // Recent TX/RX already proves liveness; a probe would be pure
+                    // overhead. PING only exists to provoke RX and never proves
+                    // anything by itself, so it must not refresh the clock.
+                    let (send_probe, _) = heartbeat_timing(
+                        Some(last_activity_ms),
+                        activity_now_ms(),
+                        hb_interval,
+                        idle_timeout,
+                    );
+                    if send_probe {
+                        let Some(send_ping) = ctrl_stream.send(ControlMessage::Ping).cancel_with(&cancel_token).await else {
+                            break;
+                        };
+                        if let Err(e) = send_ping {
+                            warn!(tag = %tag, "Failed to send heartbeat ping: {:?}", e);
+                            break;
+                        }
                     }
                 }
                 msg_opt = ctrl_stream.next() => {
-                    rx_timeout.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+                    // ANY inbound frame counts, including Ping/Pong. PONG is not
+                    // load-bearing for liveness: it is merely one possible RX.
+                    last_activity_ms = activity_now_ms();
+                    idle_deadline.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
                     match msg_opt {
                         Some(Ok(msg)) => match msg {
                             ControlMessage::NewConnection { session_id, client_addr } => {
@@ -224,6 +243,7 @@ pub async fn run_reverse_mapping(
                                         data_stream,
                                         token,
                                         hb_interval,
+                                        idle_timeout,
                                     ).await;
                                 });
                             }
@@ -231,6 +251,8 @@ pub async fn run_reverse_mapping(
                                 tracing::trace!(tag = %tag, "Heartbeat pong received");
                             }
                             ControlMessage::Ping => {
+                                // Optional echo: it only exists to give the peer
+                                // some RX. Correctness never depends on a PONG.
                                 let Some(res) = ctrl_stream.send(ControlMessage::Pong).cancel_with(&cancel_token).await else {
                                     break;
                                 };

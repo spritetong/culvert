@@ -8,11 +8,50 @@
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Type alias for heap-pinned, sendable future without `async_trait` macro dependency.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+static ACTIVITY_ORIGIN: OnceLock<Instant> = OnceLock::new();
+
+/// Monotonic millisecond clock shared by every stream activity tracker and heartbeat loop.
+///
+/// Uses `Instant` rather than wall-clock time so NTP adjustments cannot move a
+/// connection's liveness deadline backwards.
+#[inline]
+pub fn activity_now_ms() -> u64 {
+    ACTIVITY_ORIGIN
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+/// Heartbeat decision for one stream at one tick.
+///
+/// Returns `(send_probe, expired)`. A transport without an activity clock keeps
+/// its old behaviour: probes are still driven (for local liveness checks) but no
+/// idle deadline is applied by the caller.
+#[inline]
+pub fn heartbeat_timing(
+    activity: Option<u64>,
+    now_ms: u64,
+    heartbeat_interval: Duration,
+    idle_timeout: Duration,
+) -> (bool, bool) {
+    match activity {
+        None => (true, false),
+        Some(last) => {
+            let elapsed = now_ms.saturating_sub(last);
+            let hb_ms = heartbeat_interval.as_millis().max(1) as u64;
+            let idle_ms = idle_timeout.as_millis().max(1) as u64;
+            (elapsed >= hb_ms, elapsed >= idle_ms)
+        }
+    }
+}
 
 /// Connection heartbeat and liveness status reported by idle streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,8 +90,20 @@ pub trait TunnelStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {
     /// Non-blocking hook to transmit a protocol-level ping/heartbeat frame.
     ///
     /// Transports without protocol-level ping (e.g. raw TCP) default to `Poll::Ready(Ok(()))`.
+    /// A probe is only a means of provoking inbound traffic: it must never be
+    /// recorded as outbound activity.
     fn poll_send_ping(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
+    }
+
+    /// Timestamp of the last inbound frame or real outbound frame, in the
+    /// [`activity_now_ms`] clock. Any RX counts, including Ping/Pong/control
+    /// frames; keepalive probes must not count as TX.
+    ///
+    /// `None` means this transport has no application-level activity clock and
+    /// callers must rely on [`TunnelStream::poll_check_alive`] alone.
+    fn last_activity_ms(&self) -> Option<u64> {
+        None
     }
 
     /// Non-blocking hook to inspect stream liveness (non-destructive read/peek).
@@ -89,6 +140,10 @@ impl TunnelStream for Box<dyn TunnelStream> {
 
     fn poll_send_ping(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         (**self).poll_send_ping(cx)
+    }
+
+    fn last_activity_ms(&self) -> Option<u64> {
+        (**self).last_activity_ms()
     }
 
     fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
@@ -238,6 +293,31 @@ mod tests {
     use super::*;
     use std::future::poll_fn;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+    #[test]
+    fn test_heartbeat_timing_gates_probes_on_activity() {
+        let now = 60_000u64;
+        let hb = Duration::from_secs(5);
+        let idle = Duration::from_secs(30);
+
+        // Recent TX or RX: no probe, no deadline.
+        assert_eq!(
+            heartbeat_timing(Some(now - 1_000), now, hb, idle),
+            (false, false)
+        );
+        // Genuinely idle: one probe, still alive.
+        assert_eq!(
+            heartbeat_timing(Some(now - 6_000), now, hb, idle),
+            (true, false)
+        );
+        // Silent past the idle deadline: expire.
+        assert_eq!(
+            heartbeat_timing(Some(now - 31_000), now, hb, idle),
+            (true, true)
+        );
+        // Transports without an activity clock keep driving local checks only.
+        assert_eq!(heartbeat_timing(None, now, hb, idle), (true, false));
+    }
 
     #[tokio::test]
     async fn test_buffered_tls_stream_non_destructive_check_alive() {

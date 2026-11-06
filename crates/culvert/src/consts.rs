@@ -116,12 +116,6 @@ pub const POOL_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 // 3. Heartbeats, Intervals & Backoff Parameters
 // =============================================================================
 
-/// Maximum consecutive unanswered WebSocket ping frames before declaring connection dead.
-///
-/// Following wstunnel standard (3 unanswered pings), this provides reliable dead-peer
-/// detection through multi-tier reverse proxies while tolerating transient packet loss.
-pub const DEFAULT_WS_MAX_UNANSWERED_PINGS: u32 = 3;
-
 /// Default heartbeat interval for idle connection pool and control streams.
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 

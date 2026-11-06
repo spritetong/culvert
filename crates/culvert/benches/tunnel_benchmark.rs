@@ -16,6 +16,7 @@ use tokio::runtime::Runtime;
 use tokio_util::codec::{Decoder, Encoder};
 use tokio_util::sync::CancellationToken;
 
+use culvert::consts::{DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_IDLE_TIMEOUT};
 use culvert::control::stream::ControlMessage;
 use culvert::core::error::TunnelError;
 use culvert::core::relay::RelayEngine;
@@ -227,6 +228,8 @@ fn bench_pool_acquisition(c: &mut Criterion) {
         target,
         16,
         cancel_token.clone(),
+        DEFAULT_HEARTBEAT_INTERVAL,
+        DEFAULT_IDLE_TIMEOUT,
     ));
 
     // Warm up pool

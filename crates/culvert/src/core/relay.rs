@@ -11,9 +11,12 @@ use std::task::Poll;
 use tokio::io::ReadBuf;
 use tokio_util::sync::CancellationToken;
 
-use crate::consts::{DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_RELAY_DRAIN_TIMEOUT, RELAY_BUFFER_SIZE};
+use crate::consts::{
+    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_IDLE_TIMEOUT, DEFAULT_RELAY_DRAIN_TIMEOUT,
+    RELAY_BUFFER_SIZE,
+};
 use crate::core::error::TunnelError;
-use crate::core::stream::{HeartbeatStatus, TunnelStream};
+use crate::core::stream::{HeartbeatStatus, TunnelStream, activity_now_ms, heartbeat_timing};
 
 /// Directional transfer state for one half of the duplex relay.
 struct TransferState {
@@ -71,16 +74,27 @@ impl RelayEngine {
         stream_b: Box<dyn TunnelStream>,
         cancel_token: CancellationToken,
     ) -> Result<(u64, u64), TunnelError> {
-        Self::relay_with_heartbeat(stream_a, stream_b, cancel_token, DEFAULT_HEARTBEAT_INTERVAL)
-            .await
+        Self::relay_with_heartbeat(
+            stream_a,
+            stream_b,
+            cancel_token,
+            DEFAULT_HEARTBEAT_INTERVAL,
+            DEFAULT_IDLE_TIMEOUT,
+        )
+        .await
     }
 
-    /// Copies data bidirectionally while driving periodic heartbeats and monitoring cancellation.
+    /// Copies data bidirectionally while driving activity-gated probes and monitoring cancellation.
+    ///
+    /// A PING is only emitted when neither direction has moved anything for one
+    /// `heartbeat_interval`; any RX (including a PING) or real TX counts as activity.
+    /// PONG is never awaited. A stream that stays silent for `idle_timeout` is dead.
     pub async fn relay_with_heartbeat(
         mut stream_a: Box<dyn TunnelStream>,
         mut stream_b: Box<dyn TunnelStream>,
         cancel_token: CancellationToken,
         heartbeat_interval: std::time::Duration,
+        idle_timeout: std::time::Duration,
     ) -> Result<(u64, u64), TunnelError> {
         let mut a_to_b = TransferState::new(RELAY_BUFFER_SIZE);
         let mut b_to_a = TransferState::new(RELAY_BUFFER_SIZE);
@@ -106,16 +120,43 @@ impl RelayEngine {
                 }
             }
 
-            // Periodic heartbeat ping & liveness check
+            // Activity-gated probe & liveness check
             if heartbeat_timer.as_mut().poll(cx).is_ready() {
                 heartbeat_timer
                     .as_mut()
                     .reset(tokio::time::Instant::now() + heartbeat_interval);
 
-                if let Poll::Ready(Err(e)) = stream_a.poll_send_ping(cx) {
+                let now_ms = activity_now_ms();
+                let (probe_a, expired_a) = heartbeat_timing(
+                    stream_a.last_activity_ms(),
+                    now_ms,
+                    heartbeat_interval,
+                    idle_timeout,
+                );
+                let (probe_b, expired_b) = heartbeat_timing(
+                    stream_b.last_activity_ms(),
+                    now_ms,
+                    heartbeat_interval,
+                    idle_timeout,
+                );
+
+                if expired_a {
+                    return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Relay stream A idle timeout: no inbound or outbound activity",
+                    ))));
+                }
+                if expired_b {
+                    return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Relay stream B idle timeout: no inbound or outbound activity",
+                    ))));
+                }
+
+                if probe_a && let Poll::Ready(Err(e)) = stream_a.poll_send_ping(cx) {
                     return Poll::Ready(Err(TunnelError::Io(e)));
                 }
-                if let Poll::Ready(Err(e)) = stream_b.poll_send_ping(cx) {
+                if probe_b && let Poll::Ready(Err(e)) = stream_b.poll_send_ping(cx) {
                     return Poll::Ready(Err(TunnelError::Io(e)));
                 }
 
@@ -560,6 +601,7 @@ mod tests {
             Box::new(dead_stream),
             cancel,
             std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(200),
         )
         .await;
 
@@ -574,5 +616,88 @@ mod tests {
             other => panic!("Expected Io(TimedOut), got: {:?}", other),
         }
         assert!(pings.load(Ordering::SeqCst) > 0, "Ping must have been sent");
+    }
+
+    #[tokio::test]
+    async fn test_relay_suppresses_probes_while_activity_is_recent() {
+        struct AlwaysActive {
+            pings: Arc<AtomicUsize>,
+        }
+
+        impl tokio::io::AsyncRead for AlwaysActive {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+        }
+
+        impl tokio::io::AsyncWrite for AlwaysActive {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        impl TunnelStream for AlwaysActive {
+            fn last_activity_ms(&self) -> Option<u64> {
+                Some(activity_now_ms())
+            }
+
+            fn poll_send_ping(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                self.pings.fetch_add(1, Ordering::SeqCst);
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_check_alive(&mut self, _cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+                Poll::Ready(HeartbeatStatus::Alive)
+            }
+        }
+
+        let pings = Arc::new(AtomicUsize::new(0));
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        let pings_in = Arc::clone(&pings);
+        let handle = tokio::spawn(async move {
+            RelayEngine::relay_with_heartbeat(
+                Box::new(AlwaysActive {
+                    pings: Arc::clone(&pings_in),
+                }),
+                Box::new(AlwaysActive { pings: pings_in }),
+                cancel,
+                std::time::Duration::from_millis(10),
+                std::time::Duration::from_millis(500),
+            )
+            .await
+        });
+
+        // Many heartbeat ticks elapse, but neither side emits a single probe
+        // because activity is continuously fresh.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        trigger.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(3), handle)
+            .await
+            .expect("relay did not shut down after cancellation")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            pings.load(Ordering::SeqCst),
+            0,
+            "TX/RX activity must suppress keepalive probes"
+        );
     }
 }

@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -24,7 +24,9 @@ use crate::consts::{
     POOL_MAX_CAPACITY, POOL_MAX_CONCURRENT_CONNECTS,
 };
 use crate::core::error::TunnelError;
-use crate::core::stream::{BoxFuture, HeartbeatStatus, TunnelStream};
+use crate::core::stream::{
+    BoxFuture, HeartbeatStatus, TunnelStream, activity_now_ms, heartbeat_timing,
+};
 use crate::transport::{TargetAddr, TransportConnector};
 
 /// Statistics for monitoring connection pool performance.
@@ -173,8 +175,17 @@ impl ReplenishingStreamPool {
         target: TargetAddr,
         target_size: usize,
         cancel_token: CancellationToken,
+        heartbeat_interval: Duration,
+        idle_timeout: Duration,
     ) -> Self {
-        Self::spawn_actor(connector, Some(target), target_size, cancel_token)
+        Self::spawn_actor(
+            connector,
+            Some(target),
+            target_size,
+            cancel_token,
+            heartbeat_interval,
+            idle_timeout,
+        )
     }
 
     /// Creates and immediately activates a shared `ReplenishingStreamPool` that connects idle streams
@@ -183,8 +194,17 @@ impl ReplenishingStreamPool {
         connector: Arc<dyn TransportConnector>,
         target_size: usize,
         cancel_token: CancellationToken,
+        heartbeat_interval: Duration,
+        idle_timeout: Duration,
     ) -> Self {
-        Self::spawn_actor(connector, None, target_size, cancel_token)
+        Self::spawn_actor(
+            connector,
+            None,
+            target_size,
+            cancel_token,
+            heartbeat_interval,
+            idle_timeout,
+        )
     }
 
     fn spawn_actor(
@@ -192,6 +212,8 @@ impl ReplenishingStreamPool {
         default_target: Option<TargetAddr>,
         target_size: usize,
         cancel_token: CancellationToken,
+        heartbeat_interval: Duration,
+        idle_timeout: Duration,
     ) -> Self {
         let (tx_cmd, mut rx_cmd) = mpsc::channel::<PoolCommand>(POOL_COMMAND_QUEUE_SIZE);
         let stats = Arc::new(Mutex::new(PoolStats::default()));
@@ -272,21 +294,32 @@ impl ReplenishingStreamPool {
 
                     // Branch D: drive idle stream liveness and in-flight heartbeat ping progress
                     let sweep_now = Instant::now();
+                    let now_ms = activity_now_ms();
                     let mut i = 0;
                     let mut evicted_any = false;
                     while i < idle_streams.len() {
                         let mut is_dead = false;
                         let managed = &mut idle_streams[i];
+                        let (probe, expired) = heartbeat_timing(
+                            managed.stream.last_activity_ms(),
+                            now_ms,
+                            heartbeat_interval,
+                            idle_timeout,
+                        );
 
-                        if let Poll::Ready(HeartbeatStatus::Dead) =
+                        if expired {
+                            is_dead = true;
+                        } else if let Poll::Ready(HeartbeatStatus::Dead) =
                             managed.stream.poll_check_alive(cx)
                         {
                             is_dead = true;
                         } else {
                             match managed.state {
                                 HeartbeatState::Idle(last_check) => {
-                                    if sweep_now.duration_since(last_check)
-                                        >= POOL_HEARTBEAT_INTERVAL
+                                    // Only a genuinely quiet stream needs a probe.
+                                    if probe
+                                        && sweep_now.duration_since(last_check)
+                                            >= POOL_HEARTBEAT_INTERVAL
                                     {
                                         match managed.stream.poll_send_ping(cx) {
                                             Poll::Ready(Ok(())) => {
@@ -414,16 +447,24 @@ impl ReplenishingStreamPool {
                                 let mut acquired: Option<Box<dyn TunnelStream>> = None;
 
                                 while let Some(mut managed) = idle_streams.pop_front() {
-                                    let mut dead = false;
-                                    let _ = std::future::poll_fn(|cx| {
-                                        if let Poll::Ready(HeartbeatStatus::Dead) =
-                                            managed.stream.poll_check_alive(cx)
-                                        {
-                                            dead = true;
-                                        }
-                                        Poll::Ready(())
-                                    })
-                                    .await;
+                                    let (_, expired) = heartbeat_timing(
+                                        managed.stream.last_activity_ms(),
+                                        activity_now_ms(),
+                                        heartbeat_interval,
+                                        idle_timeout,
+                                    );
+                                    let mut dead = expired;
+                                    if !dead {
+                                        let _ = std::future::poll_fn(|cx| {
+                                            if let Poll::Ready(HeartbeatStatus::Dead) =
+                                                managed.stream.poll_check_alive(cx)
+                                            {
+                                                dead = true;
+                                            }
+                                            Poll::Ready(())
+                                        })
+                                        .await;
+                                    }
 
                                     if !dead {
                                         acquired = Some(managed.stream);
@@ -594,6 +635,7 @@ impl ReplenishingStreamPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consts::{DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_IDLE_TIMEOUT};
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
@@ -642,7 +684,13 @@ mod tests {
         });
 
         let cancel_token = CancellationToken::new();
-        let _pool = ReplenishingStreamPool::new_shared(connector, 4, cancel_token.clone());
+        let _pool = ReplenishingStreamPool::new_shared(
+            connector,
+            4,
+            cancel_token.clone(),
+            DEFAULT_HEARTBEAT_INTERVAL,
+            DEFAULT_IDLE_TIMEOUT,
+        );
 
         // Sleep 400ms. In the buggy implementation without backoff, 400ms with instant failures
         // resulted in >100,000 reconnect attempts. With 200ms base backoff, call count must be <= 3.
@@ -689,7 +737,13 @@ mod tests {
     async fn test_connection_pool_reactor_replenish_and_acquire() {
         let connector = Arc::new(MockSuccessfulConnector);
         let cancel_token = CancellationToken::new();
-        let pool = ReplenishingStreamPool::new_shared(connector, 2, cancel_token.clone());
+        let pool = ReplenishingStreamPool::new_shared(
+            connector,
+            2,
+            cancel_token.clone(),
+            DEFAULT_HEARTBEAT_INTERVAL,
+            DEFAULT_IDLE_TIMEOUT,
+        );
 
         // Wait a short moment for background replenishment to reach target_size 2
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -711,7 +765,13 @@ mod tests {
         let connector = Arc::new(MockSuccessfulConnector);
         let cancel_token = CancellationToken::new();
         // target_size 0: no automatic background idle replenishment
-        let pool = ReplenishingStreamPool::new_shared(connector, 0, cancel_token.clone());
+        let pool = ReplenishingStreamPool::new_shared(
+            connector,
+            0,
+            cancel_token.clone(),
+            DEFAULT_HEARTBEAT_INTERVAL,
+            DEFAULT_IDLE_TIMEOUT,
+        );
 
         // Spawn a task waiting on acquire
         let pool_clone = pool.clone();
@@ -749,7 +809,13 @@ mod tests {
     async fn test_on_stream_closed_never_underflows_active_count() {
         let connector = Arc::new(MockSuccessfulConnector);
         let cancel_token = CancellationToken::new();
-        let pool = ReplenishingStreamPool::new_shared(connector, 0, cancel_token.clone());
+        let pool = ReplenishingStreamPool::new_shared(
+            connector,
+            0,
+            cancel_token.clone(),
+            DEFAULT_HEARTBEAT_INTERVAL,
+            DEFAULT_IDLE_TIMEOUT,
+        );
 
         // Duplicate close notifications used to wrap the counter to usize::MAX.
         pool.on_stream_closed();

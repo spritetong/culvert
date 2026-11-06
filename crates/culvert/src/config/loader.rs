@@ -10,6 +10,7 @@ use crate::core::error::TunnelError;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 /// Configuration loader utility.
 pub struct ConfigLoader;
@@ -102,14 +103,6 @@ impl ConfigLoader {
                     "dialer.idle_timeout must be greater than 0".to_string(),
                 ));
             }
-            if let (Some(hb), Some(it)) = (d.heartbeat_interval, d.idle_timeout)
-                && it <= hb
-            {
-                return Err(TunnelError::Config(
-                    "dialer.idle_timeout must be greater than dialer.heartbeat_interval"
-                        .to_string(),
-                ));
-            }
             if let Some(ref iface) = d.bind_interface {
                 crate::platform::validate_bind_interface(iface)?;
             }
@@ -152,15 +145,6 @@ impl ConfigLoader {
                     "server.idle_timeout must be greater than 0".to_string(),
                 ));
             }
-            if let (Some(hb), Some(it)) = (server.heartbeat_interval, server.idle_timeout)
-                && it <= hb
-            {
-                return Err(TunnelError::Config(
-                    "server.idle_timeout must be greater than server.heartbeat_interval"
-                        .to_string(),
-                ));
-            }
-
             if let Some(ref dt) = server.default_target {
                 crate::tunnel::forward::parse_target_addr(dt).map_err(|_| {
                     TunnelError::Config(format!(
@@ -395,14 +379,6 @@ impl ConfigLoader {
                             tunnel.tag
                         )));
                     }
-                    if let (Some(hb), Some(it)) = (dl.heartbeat_interval, dl.idle_timeout)
-                        && it <= hb
-                    {
-                        return Err(TunnelError::Config(format!(
-                            "tunnel '{}': dialer.idle_timeout must be greater than dialer.heartbeat_interval",
-                            tunnel.tag
-                        )));
-                    }
                     if let Some(ref iface) = dl.bind_interface {
                         crate::platform::validate_bind_interface(iface)?;
                     }
@@ -413,6 +389,82 @@ impl ConfigLoader {
             crate::dialer::endpoint::EndpointContext::build(&tunnel.endpoint, config)?;
         }
 
+        // 8. Effective heartbeat/idle timing validation (post-merge).
+        //
+        // Runtime timers are built from effective values, never from the raw
+        // optional fields. Checking only the explicitly configured pair lets
+        // `idle_timeout <= heartbeat_interval` through (e.g. a lone
+        // `server.idle_timeout: 10s` with the default 15s heartbeat, or a
+        // tunnel-level idle_timeout merged with a global heartbeat_interval).
+        // Then the first probe coincides with the idle deadline and healthy
+        // connections disconnect themselves.
+        let default_hb = crate::consts::DEFAULT_HEARTBEAT_INTERVAL;
+        let default_it = crate::consts::DEFAULT_IDLE_TIMEOUT;
+
+        if let Some(ref d) = config.dialer {
+            Self::validate_effective_timing(
+                "",
+                "dialer.idle_timeout",
+                "dialer.heartbeat_interval",
+                d.heartbeat_interval.unwrap_or(default_hb),
+                d.idle_timeout.unwrap_or(default_it),
+            )?;
+        }
+
+        if let Some(ref s) = config.server {
+            Self::validate_effective_timing(
+                "",
+                "server.idle_timeout",
+                "server.heartbeat_interval",
+                s.heartbeat_interval.unwrap_or(default_hb),
+                s.idle_timeout.unwrap_or(default_it),
+            )?;
+        }
+
+        for tunnel in &config.tunnels {
+            let ep_dialer = match &tunnel.endpoint {
+                crate::config::model::EndpointConfig::Detailed { dialer, .. } => dialer.as_ref(),
+                crate::config::model::EndpointConfig::Simple(_) => None,
+            };
+            let hb = ep_dialer
+                .and_then(|d| d.heartbeat_interval)
+                .or_else(|| config.dialer.as_ref().and_then(|d| d.heartbeat_interval))
+                .unwrap_or(default_hb);
+            let it = ep_dialer
+                .and_then(|d| d.idle_timeout)
+                .or_else(|| config.dialer.as_ref().and_then(|d| d.idle_timeout))
+                .unwrap_or(default_it);
+            Self::validate_effective_timing(
+                &format!("tunnel '{}'", tunnel.tag),
+                "dialer.idle_timeout",
+                "dialer.heartbeat_interval",
+                hb,
+                it,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Validates one effective (defaulted + globally merged) heartbeat pair.
+    fn validate_effective_timing(
+        scope: &str,
+        idle_field: &str,
+        heartbeat_field: &str,
+        heartbeat_interval: Duration,
+        idle_timeout: Duration,
+    ) -> Result<(), TunnelError> {
+        if idle_timeout <= heartbeat_interval {
+            let prefix = if scope.is_empty() {
+                String::new()
+            } else {
+                format!("{}: ", scope)
+            };
+            return Err(TunnelError::Config(format!(
+                "{}{} must be greater than {} (effective idle_timeout={:?}, heartbeat_interval={:?})",
+                prefix, idle_field, heartbeat_field, idle_timeout, heartbeat_interval
+            )));
+        }
         Ok(())
     }
 

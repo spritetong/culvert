@@ -13,21 +13,21 @@ use fastwebsockets::{
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::consts::DEFAULT_WS_MAX_UNANSWERED_PINGS;
-use crate::core::stream::{BoxFuture, HeartbeatStatus, TunnelStream};
+use crate::core::stream::{BoxFuture, HeartbeatStatus, TunnelStream, activity_now_ms};
 
-/// Tracks WebSocket application-level keep-alive health across multi-tier proxies.
+/// Activity clock for a WebSocket stream, shared between the read and write halves.
 ///
-/// Records unanswered consecutive ping frames and resets whenever ANY incoming frame
-/// (Pong, Ping, Binary, or Text) arrives from the remote peer.
+/// Health is defined purely as "something moved in either direction". PING and
+/// PONG are optional probes used only to provoke inbound traffic; no counter,
+/// matching, or PONG dependency exists here. `fetch_max` keeps the clock
+/// monotonic even when RX and TX race on different tasks.
 #[derive(Debug)]
 pub struct WsLivenessTracker {
-    unanswered_pings: AtomicU32,
-    last_rx_epoch_ms: AtomicU64,
+    last_activity_ms: AtomicU64,
 }
 
 impl Default for WsLivenessTracker {
@@ -37,47 +37,35 @@ impl Default for WsLivenessTracker {
 }
 
 impl WsLivenessTracker {
-    /// Creates a fresh liveness tracker initialized to current timestamp and 0 unanswered pings.
+    /// Creates a tracker whose activity clock starts at the current instant.
     pub fn new() -> Self {
         Self {
-            unanswered_pings: AtomicU32::new(0),
-            last_rx_epoch_ms: AtomicU64::new(Self::now_ms()),
+            last_activity_ms: AtomicU64::new(activity_now_ms()),
         }
     }
 
-    #[inline]
-    fn now_ms() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
-    }
-
-    /// Records receipt of an incoming packet/frame from the remote peer.
-    /// Resets consecutive unanswered pings and updates the last RX timestamp.
+    /// Records any inbound frame, including Ping, Pong and Close.
     #[inline]
     pub fn record_rx(&self) {
-        self.unanswered_pings.store(0, Ordering::Release);
-        self.last_rx_epoch_ms
-            .store(Self::now_ms(), Ordering::Release);
+        self.touch();
     }
 
-    /// Records transmission of an outbound Ping frame.
+    /// Records a real outbound data frame. Keepalive probes must NOT call this.
     #[inline]
-    pub fn record_ping_sent(&self) {
-        self.unanswered_pings.fetch_add(1, Ordering::SeqCst);
+    pub fn record_tx(&self) {
+        self.touch();
     }
 
-    /// Returns the number of consecutive pings sent without any RX response.
     #[inline]
-    pub fn unanswered_pings(&self) -> u32 {
-        self.unanswered_pings.load(Ordering::Acquire)
+    fn touch(&self) {
+        self.last_activity_ms
+            .fetch_max(activity_now_ms(), Ordering::Relaxed);
     }
 
-    /// Checks whether the connection is dead due to exceeding maximum unanswered pings.
+    /// Last observed inbound or outbound activity in the `activity_now_ms` clock.
     #[inline]
-    pub fn is_dead(&self, max_unanswered_pings: u32) -> bool {
-        self.unanswered_pings() >= max_unanswered_pings
+    pub fn last_activity_ms(&self) -> u64 {
+        self.last_activity_ms.load(Ordering::Relaxed)
     }
 }
 
@@ -139,7 +127,11 @@ impl WsTunnelStream {
         let (r, w) = tokio::io::split(stream);
         let (mut rx, mut tx) =
             after_handshake_split(Box::new(r) as DynRead, Box::new(w) as DynWrite, role);
-        rx.set_auto_pong(true);
+        // Let Ping/Pong flow through `read_frame` as ordinary frames so that ANY
+        // inbound frame refreshes the activity clock. With auto_pong enabled the
+        // library loops internally on Ping and the read future never returns,
+        // hiding inbound control traffic and trapping the obligated Pong.
+        rx.set_auto_pong(false);
         rx.set_auto_close(false);
         tx.set_writev(true);
 
@@ -275,6 +267,16 @@ impl AsyncRead for WsTunnelStream {
                                     };
                                     break Ok((OpCode::Close, payload));
                                 }
+                                OpCode::Ping => {
+                                    // Optional, cheap echo: its only purpose is to give the
+                                    // probing peer an RX event. Liveness never depends on
+                                    // PONG being sent or received, so break immediately and
+                                    // let the caller flush it instead of accumulating
+                                    // obligated frames inside this in-flight future.
+                                    obligated
+                                        .push(Frame::pong(Payload::Owned(frame.payload.to_vec())));
+                                    break Ok((frame.opcode, Bytes::new()));
+                                }
                                 _ => {
                                     budget = budget.saturating_sub(1);
                                     if budget == 0 {
@@ -394,6 +396,7 @@ impl AsyncWrite for WsTunnelStream {
         match std::mem::replace(&mut self.write_state, WriteState::Failed) {
             WriteState::Idle(mut tx) => {
                 let len = buf.len();
+                self.liveness.record_tx();
                 let payload = buf.to_vec();
                 let mut fut = Box::pin(async move {
                     let res = tx.write_frame(Frame::binary(Payload::Owned(payload))).await;
@@ -576,6 +579,7 @@ impl TunnelStream for WsTunnelStream {
                 // chunk is uniquely owned (the normal relay path) and only copies
                 // for shared/sliced buffers. Converting via `buf.as_ref()` always
                 // copied the whole payload a second time.
+                self.liveness.record_tx();
                 let payload = bytes::BytesMut::from(buf);
                 let mut fut = Box::pin(async move {
                     let res = tx.write_frame(Frame::binary(Payload::Bytes(payload))).await;
@@ -639,7 +643,8 @@ impl TunnelStream for WsTunnelStream {
         loop {
             match std::mem::replace(&mut self.write_state, WriteState::Failed) {
                 WriteState::Idle(mut tx) => {
-                    self.liveness.record_ping_sent();
+                    // A probe is not outbound data: deliberately not recorded as TX,
+                    // otherwise a dead peer could keep the activity clock fresh forever.
                     let mut fut = Box::pin(async move {
                         let res = tx
                             .write_frame(Frame::new(
@@ -705,10 +710,11 @@ impl TunnelStream for WsTunnelStream {
         }
     }
 
+    fn last_activity_ms(&self) -> Option<u64> {
+        Some(self.liveness.last_activity_ms())
+    }
+
     fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
-        if self.liveness.is_dead(DEFAULT_WS_MAX_UNANSWERED_PINGS) {
-            return Poll::Ready(HeartbeatStatus::Dead);
-        }
         match &mut self.read_state {
             ReadState::Eof | ReadState::Failed => Poll::Ready(HeartbeatStatus::Dead),
             ReadState::Buffered { .. } => Poll::Ready(HeartbeatStatus::Alive),
@@ -725,13 +731,7 @@ impl TunnelStream for WsTunnelStream {
                     // The state is now `Reading` with a registered waker, so the
                     // next liveness check (or the relay's own poll_read) will
                     // consume and preserve the frame normally.
-                    Poll::Pending => {
-                        if self.liveness.is_dead(DEFAULT_WS_MAX_UNANSWERED_PINGS) {
-                            Poll::Ready(HeartbeatStatus::Dead)
-                        } else {
-                            Poll::Ready(HeartbeatStatus::Alive)
-                        }
-                    }
+                    Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
                     Poll::Ready(Ok(())) => match self.read_state {
                         ReadState::Eof | ReadState::Failed => Poll::Ready(HeartbeatStatus::Dead),
                         _ => Poll::Ready(HeartbeatStatus::Alive),
@@ -781,13 +781,7 @@ impl TunnelStream for WsTunnelStream {
                     }
                     Poll::Ready(HeartbeatStatus::Alive)
                 }
-                Poll::Pending => {
-                    if self.liveness.is_dead(DEFAULT_WS_MAX_UNANSWERED_PINGS) {
-                        Poll::Ready(HeartbeatStatus::Dead)
-                    } else {
-                        Poll::Ready(HeartbeatStatus::Alive)
-                    }
-                }
+                Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
             },
         }
     }
@@ -963,8 +957,8 @@ mod tests {
             written_len: 0,
         };
 
-        // Client sends a Ping frame (which triggers an obligated Pong frame on server)
-        // followed by a data frame so server's read completes its loop.
+        // Client sends a Ping frame (which makes the server enqueue an optional
+        // echo Pong) followed by a data frame so server's read completes its loop.
         tx.write_frame(Frame::new(
             true,
             OpCode::Ping,
@@ -1090,45 +1084,97 @@ mod tests {
     }
 
     #[test]
-    fn test_ws_liveness_tracker_basic() {
+    fn test_ws_liveness_tracker_is_a_monotonic_activity_clock() {
         let tracker = WsLivenessTracker::new();
-        assert_eq!(tracker.unanswered_pings(), 0);
-        assert!(!tracker.is_dead(3));
+        let t0 = tracker.last_activity_ms();
 
-        tracker.record_ping_sent();
-        assert_eq!(tracker.unanswered_pings(), 1);
-        assert!(!tracker.is_dead(3));
-
-        tracker.record_ping_sent();
-        tracker.record_ping_sent();
-        assert_eq!(tracker.unanswered_pings(), 3);
-        assert!(tracker.is_dead(3));
-
-        // Receipt of any incoming frame resets unanswered pings
+        std::thread::sleep(std::time::Duration::from_millis(10));
         tracker.record_rx();
-        assert_eq!(tracker.unanswered_pings(), 0);
-        assert!(!tracker.is_dead(3));
+        let t1 = tracker.last_activity_ms();
+        assert!(t1 > t0, "any inbound frame must refresh the activity clock");
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        tracker.record_tx();
+        let t2 = tracker.last_activity_ms();
+        assert!(
+            t2 > t1,
+            "a real outbound frame must refresh the activity clock"
+        );
+
+        // No PING/PONG counter exists: health is derived by callers from the
+        // elapsed time since this timestamp.
+        assert_eq!(t2, tracker.last_activity_ms());
     }
 
     #[tokio::test]
-    async fn test_ws_liveness_dead_detection_on_unanswered_pings() {
+    async fn test_ws_probes_do_not_refresh_activity_or_kill_stream() {
         use std::future::poll_fn;
 
         let (raw_client, _raw_server) = duplex(65536);
         let mut client = WsTunnelStream::new(raw_client, Role::Client);
 
-        // Initially alive
-        let status = poll_fn(|cx| client.poll_check_alive(cx)).await;
-        assert_eq!(status, HeartbeatStatus::Alive);
+        let before = client.last_activity_ms().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        // Send 3 pings with zero response from server
-        for _ in 0..DEFAULT_WS_MAX_UNANSWERED_PINGS {
-            let res = poll_fn(|cx| client.poll_send_ping(cx)).await;
-            assert!(res.is_ok());
+        // Arbitrarily many unanswered probes must never mark the stream dead and
+        // must never count as outbound activity.
+        for _ in 0..5 {
+            poll_fn(|cx| client.poll_send_ping(cx)).await.unwrap();
         }
+        assert_eq!(
+            client.last_activity_ms().unwrap(),
+            before,
+            "keepalive probes must not extend the liveness deadline"
+        );
+        assert_eq!(
+            poll_fn(|cx| client.poll_check_alive(cx)).await,
+            HeartbeatStatus::Alive,
+            "PONG is optional and must not be load-bearing for liveness"
+        );
+    }
 
-        // Must now be detected as Dead!
-        let status = poll_fn(|cx| client.poll_check_alive(cx)).await;
-        assert_eq!(status, HeartbeatStatus::Dead);
+    #[tokio::test]
+    async fn test_ws_inbound_ping_counts_as_rx_without_pong_dependency() {
+        use std::future::poll_fn;
+
+        let (raw_client, raw_server) = duplex(65536);
+        let (r, w) = tokio::io::split(raw_client);
+        let (_rx, mut tx) = after_handshake_split(
+            Box::new(r) as DynRead,
+            Box::new(w) as DynWrite,
+            Role::Client,
+        );
+        let mut server = WsTunnelStream::new(raw_server, Role::Server);
+
+        let before = server.last_activity_ms().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tx.write_frame(Frame::new(
+            true,
+            OpCode::Ping,
+            None,
+            Payload::Owned(b"probe".to_vec()),
+        ))
+        .await
+        .unwrap();
+
+        let mut refreshed = false;
+        for _ in 0..32 {
+            assert_eq!(
+                poll_fn(|cx| server.poll_check_alive(cx)).await,
+                HeartbeatStatus::Alive
+            );
+            if server.last_activity_ms().unwrap() > before {
+                refreshed = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(refreshed, "an inbound PING must be recorded as RX activity");
+
+        // This end never received a PONG at all; health must still be Alive.
+        assert_eq!(
+            poll_fn(|cx| server.poll_check_alive(cx)).await,
+            HeartbeatStatus::Alive
+        );
     }
 }

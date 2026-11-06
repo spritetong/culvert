@@ -648,3 +648,66 @@ server:
             .contains("server.idle_timeout must be greater than server.heartbeat_interval")
     );
 }
+
+#[test]
+fn test_reject_effective_idle_timeout_not_exceeding_heartbeat_interval() {
+    // Only idle_timeout is set; the default 15s heartbeat makes the effective
+    // pair invalid. Validating raw `Option` pairs would miss this.
+    let server_only_idle = r#"
+server:
+  listen: "ws://127.0.0.1:8080/tunnel"
+  idle_timeout: "10s"
+"#;
+    let err = ConfigLoader::from_yaml_str(server_only_idle).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("server.idle_timeout must be greater than server.heartbeat_interval"),
+        "unexpected error: {err}"
+    );
+
+    // Only heartbeat_interval is set; the default 30s idle timeout is <= 30s.
+    let dialer_only_hb = r#"
+dialer:
+  heartbeat_interval: "30s"
+
+server:
+  listen: "ws://127.0.0.1:8080/tunnel"
+"#;
+    let err = ConfigLoader::from_yaml_str(dialer_only_hb).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("dialer.idle_timeout must be greater than dialer.heartbeat_interval"),
+        "unexpected error: {err}"
+    );
+
+    // Global heartbeat merged with a tunnel-level idle_timeout.
+    let merged = r#"
+dialer:
+  heartbeat_interval: "40s"
+  idle_timeout: "90s"
+
+server:
+  listen: "ws://127.0.0.1:8080/tunnel"
+
+tunnels:
+  - tag: "merged-timing"
+    endpoint:
+      url: "ws://127.0.0.1:8080/tunnel"
+      dialer:
+        idle_timeout: "30s"
+    mappings:
+      - mode: "forward"
+        listen: "127.0.0.1:18080"
+        target: "127.0.0.1:8080"
+"#;
+    let err = ConfigLoader::from_yaml_str(merged).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("tunnel 'merged-timing'"),
+        "unexpected error: {msg}"
+    );
+    assert!(
+        msg.contains("dialer.idle_timeout must be greater than dialer.heartbeat_interval"),
+        "unexpected error: {msg}"
+    );
+}

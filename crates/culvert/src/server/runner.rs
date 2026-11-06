@@ -271,6 +271,7 @@ impl ServerRunner {
                                                     stream,
                                                     conn_token,
                                                     hb_interval,
+                                                    idle_timeout,
                                                 ).await;
                                             }
 
@@ -435,19 +436,22 @@ impl ServerRunner {
 
         info!(addr = %listen_addr, "Server bound reverse port successfully. Waiting for external traffic...");
         let mut local_tracker = TaskTracker::<()>::new(cancel_token.clone());
-        let rx_timeout = tokio::time::sleep(idle_timeout);
-        tokio::pin!(rx_timeout);
+        // Activity-based deadline: inbound control frames AND real outbound
+        // notifications (NewConnection / Pong) both prove the channel is in use.
+        // A probe PING never refreshes it.
+        let idle_deadline = tokio::time::sleep(idle_timeout);
+        tokio::pin!(idle_deadline);
 
         loop {
             tokio::select! {
                 biased;
                 _ = cancel_token.cancelled() => break,
                 Some(_) = local_tracker.join_next(), if !local_tracker.is_empty() => {}
-                _ = &mut rx_timeout => {
+                _ = &mut idle_deadline => {
                     warn!(
                         addr = %listen_addr,
                         idle_timeout = ?idle_timeout,
-                        "Reverse control channel idle timeout: no packets received from client. Closing reverse listener."
+                        "Reverse control channel idle timeout: no inbound or outbound activity. Closing reverse listener."
                     );
                     break;
                 }
@@ -486,6 +490,14 @@ impl ServerRunner {
                                 continue;
                             }
 
+                            // Real TX is activity too. A busy reverse port with a
+                            // quiet client must not be declared dead: the client
+                            // suppresses its probe PING while it keeps receiving
+                            // NewConnection notifications from us.
+                            idle_deadline
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + idle_timeout);
+
                             // Spawn pairing relay task
                             let session_mgr_clone = Arc::clone(&session_mgr);
                             let session_id_clone = session_id.clone();
@@ -499,6 +511,7 @@ impl ServerRunner {
                                             data_stream,
                                             token,
                                             heartbeat_interval,
+                                            idle_timeout,
                                         ).await;
                                     }
                                     _ => {
@@ -515,9 +528,15 @@ impl ServerRunner {
                     }
                 }
                 msg_opt = ctrl_stream.next() => {
-                    rx_timeout.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+                    // ANY inbound frame counts, including Ping/Pong; no PONG
+                    // counter and no dependency on a specific reply.
+                    idle_deadline
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + idle_timeout);
                     match msg_opt {
                         Some(Ok(ControlMessage::Ping)) => {
+                            // Optional echo to give the peer some RX; correctness
+                            // never depends on a PONG.
                             let Some(res) = ctrl_stream.send(ControlMessage::Pong).cancel_with(&cancel_token).await else {
                                 break;
                             };

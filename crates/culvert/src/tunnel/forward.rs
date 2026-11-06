@@ -158,6 +158,7 @@ pub async fn run_forward_mapping(
     };
 
     let hb_interval = endpoint_ctx.heartbeat_interval();
+    let idle_timeout = endpoint_ctx.idle_timeout();
 
     loop {
         tokio::select! {
@@ -176,6 +177,8 @@ pub async fn run_forward_mapping(
                         let connector_clone = shared_connector.clone();
                         let pool_for_close = pool.clone();
 
+                        // `Duration` is `Copy`; the `move` task captures its own
+                        // values without shadowing the loop-scoped originals.
                         conn_tracker.spawn_with_cancel(move |conn_token| async move {
                             let acquire_fut = async {
                                 if let Some(ref p) = pool_clone {
@@ -219,6 +222,7 @@ pub async fn run_forward_mapping(
                                         remote_stream,
                                         conn_token,
                                         hb_interval,
+                                        idle_timeout,
                                     ).await;
                                 }
                                 Err(e) => {
@@ -264,6 +268,8 @@ pub async fn run_forward_tunnel(
             connector,
             size,
             cancel_token.clone(),
+            endpoint_ctx.heartbeat_interval(),
+            endpoint_ctx.idle_timeout(),
         )))
     } else {
         None

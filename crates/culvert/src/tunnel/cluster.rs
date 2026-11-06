@@ -44,6 +44,8 @@ pub async fn run_tunnel_cluster(
             connector,
             size,
             cancel_token.clone(),
+            endpoint_ctx.heartbeat_interval(),
+            endpoint_ctx.idle_timeout(),
         )))
     } else {
         None
