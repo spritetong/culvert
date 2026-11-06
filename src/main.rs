@@ -124,8 +124,6 @@ async fn run_daemon(
     let cancel_token = CancellationToken::new();
 
     // Listen for graceful shutdown signals (SIGINT / SIGTERM / Ctrl+C)
-    spawn_shutdown_handler(cancel_token.clone());
-
     let watchdog = spawn_shutdown_handler(cancel_token.clone());
 
     let supervisor = TunnelSupervisor::new(app_config, cancel_token);
@@ -178,6 +176,19 @@ impl ShutdownWatchdog {
         }
         // The watchdog has already received `Done`, so this join returns at
         // once instead of blocking a Tokio worker.
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for ShutdownWatchdog {
+    fn drop(&mut self) {
+        let _ = self.tx.send(WatchdogEvent::Done);
+        self.signal_cancel.cancel();
+        if let Some(task) = self.signal_task.take() {
+            task.abort();
+        }
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -269,5 +280,15 @@ mod tests {
             !cancel.is_cancelled(),
             "no termination signal was received, so cancellation must not fire"
         );
+    }
+
+    /// Dropping the watchdog without calling `finish()` must still disarm and
+    /// join the OS thread, rather than leaking an active watchdog.
+    #[tokio::test]
+    async fn watchdog_is_joined_on_drop() {
+        let cancel = CancellationToken::new();
+        let watchdog = spawn_shutdown_handler(cancel.clone());
+        drop(watchdog);
+        assert!(!cancel.is_cancelled());
     }
 }
