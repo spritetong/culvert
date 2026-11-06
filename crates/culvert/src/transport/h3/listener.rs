@@ -608,10 +608,11 @@ impl TransportListener for H3Listener {
     ) -> BoxFuture<'a, Result<(Box<dyn TunnelStream>, StreamMetadata), TunnelError>> {
         Box::pin(async move {
             tokio::select! {
+                biased;
                 _ = self.cancel_token.cancelled() => Err(TunnelError::Shutdown),
                 item = self.rx_streams.recv() => match item {
                     Some((stream, meta)) => Ok((stream, meta)),
-                    None => Err(TunnelError::SessionClosed),
+                    None => Err(TunnelError::Shutdown),
                 },
             }
         })

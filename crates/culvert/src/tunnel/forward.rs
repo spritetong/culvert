@@ -232,7 +232,9 @@ pub async fn run_forward_mapping(
                         });
                     }
                     Err(e) => {
-                        error!(tag = %tag, "Listener accept failed: {:?}", e);
+                        if !cancel_token.is_cancelled() && !matches!(e, TunnelError::Shutdown) {
+                            error!(tag = %tag, "Listener accept failed: {:?}", e);
+                        }
                     }
                 }
             }

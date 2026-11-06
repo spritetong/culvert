@@ -96,7 +96,18 @@ impl ClientRunner {
                 }
                 res = tracker.join_next() => {
                     match res {
+                        Some(Ok(Err(TunnelError::Shutdown))) => {
+                            if tracker.is_empty() {
+                                break;
+                            }
+                        }
                         Some(Ok(Err(e))) => {
+                            if cancel_token.is_cancelled() {
+                                if tracker.is_empty() {
+                                    break;
+                                }
+                                continue;
+                            }
                             error!("A client tunnel worker terminated with an error: {:?}", e);
                             if exit_err.is_none() {
                                 exit_err = Some(e);
@@ -105,6 +116,12 @@ impl ClientRunner {
                             break;
                         }
                         Some(Err(join_err)) => {
+                            if cancel_token.is_cancelled() {
+                                if tracker.is_empty() {
+                                    break;
+                                }
+                                continue;
+                            }
                             error!("A client tunnel worker panicked: {:?}", join_err);
                             if exit_err.is_none() {
                                 exit_err = Some(TunnelError::Internal(format!("Worker panic: {:?}", join_err)));
@@ -126,7 +143,9 @@ impl ClientRunner {
         }
 
         tracker.shutdown_and_wait().await;
-        if let Some(e) = exit_err {
+        if let Some(e) = exit_err
+            && !matches!(e, TunnelError::Shutdown)
+        {
             return Err(e);
         }
         Ok(())
@@ -159,6 +178,13 @@ impl ClientRunner {
             {
                 Ok(()) => {
                     info!(tag = %config.tag, "Tunnel exited cleanly");
+                    break;
+                }
+                Err(TunnelError::Shutdown) => {
+                    info!(tag = %config.tag, "Tunnel shutdown cleanly");
+                    break;
+                }
+                Err(_) if token.is_cancelled() => {
                     break;
                 }
                 Err(e) => {

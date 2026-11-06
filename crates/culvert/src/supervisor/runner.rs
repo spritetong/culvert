@@ -92,7 +92,18 @@ impl TunnelSupervisor {
                 }
                 res = tracker.join_next() => {
                     match res {
+                        Some(Ok(Err(TunnelError::Shutdown))) => {
+                            if tracker.is_empty() {
+                                break;
+                            }
+                        }
                         Some(Ok(Err(e))) => {
+                            if self.cancel_token.is_cancelled() {
+                                if tracker.is_empty() {
+                                    break;
+                                }
+                                continue;
+                            }
                             error!("A tunnel worker terminated with an error: {:?}", e);
                             if exit_err.is_none() {
                                 exit_err = Some(e);
@@ -101,6 +112,12 @@ impl TunnelSupervisor {
                             break;
                         }
                         Some(Err(join_err)) => {
+                            if self.cancel_token.is_cancelled() {
+                                if tracker.is_empty() {
+                                    break;
+                                }
+                                continue;
+                            }
                             error!("A tunnel worker panicked: {:?}", join_err);
                             if exit_err.is_none() {
                                 exit_err = Some(TunnelError::Internal(format!("Worker panic: {:?}", join_err)));
@@ -123,7 +140,9 @@ impl TunnelSupervisor {
 
         // Graceful termination of all remaining tunnels (never aborts)
         tracker.shutdown_and_wait().await;
-        if let Some(e) = exit_err {
+        if let Some(e) = exit_err
+            && !matches!(e, TunnelError::Shutdown)
+        {
             return Err(e);
         }
         Ok(())

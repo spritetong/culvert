@@ -149,6 +149,7 @@ impl ServerRunner {
 
                 loop {
                     tokio::select! {
+                        biased;
                         _ = token.cancelled() => break,
                         Some(_) = conn_tracker.join_next(), if !conn_tracker.is_empty() => {}
                         accept_res = listener.accept() => {
@@ -297,6 +298,14 @@ impl ServerRunner {
                                         }
                                     });
                                 }
+                                Err(TunnelError::Shutdown) => {
+                                    // Graceful shutdown requested; terminate the accept loop cleanly.
+                                    break;
+                                }
+                                Err(_) if token.is_cancelled() => {
+                                    // Shutdown in progress; ignore accept termination errors.
+                                    break;
+                                }
                                 Err(e) => {
                                     error!(
                                         scheme = %spec_clone.scheme,
@@ -318,6 +327,8 @@ impl ServerRunner {
                 conn_tracker.shutdown_and_wait().await;
                 listener.shutdown().await;
                 match accept_err {
+                    Some(TunnelError::Shutdown) => Ok(()),
+                    Some(_) if token.is_cancelled() => Ok(()),
                     Some(e) => Err(e),
                     None => Ok(()),
                 }
@@ -334,7 +345,18 @@ impl ServerRunner {
                 }
                 res = tracker.join_next() => {
                     match res {
+                        Some(Ok(Err(TunnelError::Shutdown))) => {
+                            if tracker.is_empty() {
+                                break;
+                            }
+                        }
                         Some(Ok(Err(e))) => {
+                            if cancel_token.is_cancelled() {
+                                if tracker.is_empty() {
+                                    break;
+                                }
+                                continue;
+                            }
                             error!("A server ingress listener terminated with error: {:?}", e);
                             if exit_err.is_none() {
                                 exit_err = Some(e);
@@ -343,6 +365,12 @@ impl ServerRunner {
                             break;
                         }
                         Some(Err(join_err)) => {
+                            if cancel_token.is_cancelled() {
+                                if tracker.is_empty() {
+                                    break;
+                                }
+                                continue;
+                            }
                             error!("A server ingress listener panicked: {:?}", join_err);
                             if exit_err.is_none() {
                                 exit_err = Some(TunnelError::Internal(format!("Listener panic: {:?}", join_err)));
@@ -364,7 +392,9 @@ impl ServerRunner {
         }
 
         tracker.shutdown_and_wait().await;
-        if let Some(e) = exit_err {
+        if let Some(e) = exit_err
+            && !matches!(e, TunnelError::Shutdown)
+        {
             return Err(e);
         }
         Ok(())
@@ -522,7 +552,9 @@ impl ServerRunner {
                             });
                         }
                         Err(e) => {
-                            warn!(addr = %listen_addr, "Error accepting visitor on reverse port: {:?}", e);
+                            if !cancel_token.is_cancelled() && !matches!(e, TunnelError::Shutdown) {
+                                warn!(addr = %listen_addr, "Error accepting visitor on reverse port: {:?}", e);
+                            }
                             break;
                         }
                     }
@@ -622,6 +654,39 @@ mod tests {
         assert!(
             res.is_ok(),
             "handle_reverse_control did not time out on silent client within idle_timeout!"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_server_runner_graceful_shutdown_returns_ok() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let cancel_token = CancellationToken::new();
+        let server_config = ServerConfig {
+            listen: vec![format!("ws://127.0.0.1:{}/test", port)],
+            token: None,
+            default_target: None,
+            ..Default::default()
+        };
+        let runner = ServerRunner::from_config(server_config);
+        let cancel_clone = cancel_token.clone();
+        let handle = tokio::spawn(async move {
+            runner.run(cancel_clone).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel_token.cancel();
+
+        let res = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(res.is_ok(), "ServerRunner hung on shutdown");
+        let run_res = res.unwrap().expect("ServerRunner task panicked");
+        assert!(
+            run_res.is_ok(),
+            "ServerRunner should exit with Ok(()) on shutdown, got: {:?}",
+            run_res
         );
     }
 }

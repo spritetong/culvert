@@ -78,4 +78,9 @@ impl TunnelError {
                 | TunnelError::Tls(_)
         )
     }
+
+    /// Determines whether the error indicates a requested graceful shutdown.
+    pub fn is_shutdown(&self) -> bool {
+        matches!(self, TunnelError::Shutdown)
+    }
 }

@@ -319,13 +319,12 @@ impl TransportListener for WsListener {
 
             if let Some(ref mut rx) = self.incoming_rx {
                 tokio::select! {
+                    biased;
                     _ = self.cancel_token.cancelled() => Err(TunnelError::Shutdown),
                     item = rx.recv() => item.unwrap_or(Err(TunnelError::Shutdown)),
                 }
             } else {
-                Err(TunnelError::Internal(
-                    "WsListener not initialized".to_string(),
-                ))
+                Err(TunnelError::Shutdown)
             }
         })
     }

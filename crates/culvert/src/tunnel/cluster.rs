@@ -104,7 +104,10 @@ pub async fn run_tunnel_cluster(
             info!(tag = %config.tag, "Tunnel cluster received cancellation signal");
         }
         res = tracker.join_next() => {
-            if let Some(Ok(Err(e))) = res {
+            if let Some(Ok(Err(e))) = res
+                && !matches!(e, TunnelError::Shutdown)
+                && !cancel_token.is_cancelled()
+            {
                 error!(tag = %config.tag, "A port mapping in cluster failed: {:?}", e);
                 exit_err = Some(e);
             }
@@ -112,7 +115,9 @@ pub async fn run_tunnel_cluster(
     }
 
     tracker.shutdown_and_wait().await;
-    if let Some(e) = exit_err {
+    if let Some(e) = exit_err
+        && !matches!(e, TunnelError::Shutdown)
+    {
         return Err(e);
     }
     Ok(())

@@ -417,6 +417,7 @@ impl TransportListener for UdsListener {
                 return Err(TunnelError::Shutdown);
             };
             tokio::select! {
+                biased;
                 _ = self.cancel_token.cancelled() => Err(TunnelError::Shutdown),
                 item = rx.recv() => item.unwrap_or(Err(TunnelError::Shutdown)),
             }
