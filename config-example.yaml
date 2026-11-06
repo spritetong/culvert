@@ -34,7 +34,7 @@ dns:
 
 # Global default dialer settings
 dialer:
-  connect_timeout: "5s"
+  connect_timeout: "10s"
   tcp_keepalive: "15s"
   tcp_nodelay: true
 

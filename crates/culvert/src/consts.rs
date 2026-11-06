@@ -64,7 +64,11 @@ pub const TOKEN_MAX_LEN: usize = 256;
 // =============================================================================
 
 /// Default timeout for outbound connection dialing.
-pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// 10 seconds provides adequate headroom for dual-stack Happy Eyeballs races (RFC 8305)
+/// and up to 2-3 TCP SYN retransmissions on lossy/cellular weak networks before failing,
+/// avoiding premature connection teardown while remaining responsive.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Upper bound for graceful shutdown. Once exceeded, the daemon exits hard.
 pub const DEFAULT_SHUTDOWN_HARD_DEADLINE: Duration = Duration::from_secs(10);
@@ -73,16 +77,25 @@ pub const DEFAULT_SHUTDOWN_HARD_DEADLINE: Duration = Duration::from_secs(10);
 pub const DEFAULT_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 /// Default timeout to wait for a reverse data stream pairing handshake.
-pub const DEFAULT_SESSION_PAIR_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// 10 seconds accommodates WAN latency, TLS/QUIC handshake roundtrips, and transient
+/// packet retransmissions when a NATed client establishes a paired reverse data channel.
+pub const DEFAULT_SESSION_PAIR_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Standard timeout for TLS accept, WebSocket upgrade, and QUIC/H3 inbound handshakes.
-pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// 15 seconds ensures multi-roundtrip handshakes (TCP SYN + TLS 1.3 + HTTP/1.1 101 Upgrade)
+/// do not abort prematurely under jittery or high-RTT weak network conditions.
+pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Timeout for reading the activation packet and dynamic target payload on the server.
 pub const DEFAULT_ACTIVATION_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bounded drain period to flush in-flight relay tails on cancellation.
-pub const DEFAULT_RELAY_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+///
+/// 500 milliseconds covers 1-2 cross-border round-trip times (RTT) to ensure trailing
+/// FIN / close frames and buffered bytes flush properly before hard abort.
+pub const DEFAULT_RELAY_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Timeout for finishing an HTTP/3 send stream upon shutdown.
 pub const DEFAULT_H3_FINISH_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
@@ -94,7 +107,10 @@ pub const DEFAULT_H3_REQUEST_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 pub const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Timeout for ping frame acknowledgement or liveness probe completion in the connection pool.
-pub const POOL_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(3);
+///
+/// 5 seconds avoids false-positive dead-connection classification caused by temporary
+/// packet loss or TCP/QUIC retransmission delay under weak network conditions.
+pub const POOL_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 
 // =============================================================================
 // 3. Heartbeats, Intervals & Backoff Parameters
@@ -163,10 +179,16 @@ pub const POOL_DUMMY_HOST: &str = "pool.idle";
 // =============================================================================
 
 /// Quinn transport max idle timeout.
-pub const DEFAULT_QUIC_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(8);
+///
+/// RFC 9000 Section 10.1 recommends at least 30 seconds for max idle timeout.
+/// 30 seconds protects against premature disconnects during cellular handover or Wi-Fi roaming.
+pub const DEFAULT_QUIC_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Quinn transport keep-alive probe interval.
-pub const DEFAULT_QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(2);
+///
+/// Probing every 5 seconds keeps stateful NAT / firewall UDP pinholes alive without
+/// incurring excessive cellular battery or bandwidth overhead.
+pub const DEFAULT_QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Maximum concurrent bidirectional streams allowed on a QUIC connection.
 pub const DEFAULT_QUIC_MAX_CONCURRENT_BIDI_STREAMS: u32 = 10_000;
@@ -185,7 +207,10 @@ pub const DEFAULT_QUIC_RECEIVE_WINDOW: u32 = 128 * 1024 * 1024;
 pub const DEFAULT_QUIC_SEND_WINDOW: u64 = 128 * 1024 * 1024;
 
 /// Duration without received UDP datagrams while transmitting before a QUIC connection is deemed unresponsive.
-pub const DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD: Duration = Duration::from_secs(4);
+///
+/// 10 seconds prevents false-positive failover or disconnect triggers on high-jitter,
+/// packet-lossy, or bufferbloated mobile/satellite connections.
+pub const DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD: Duration = Duration::from_secs(10);
 
 // =============================================================================
 // 6. DNS Parameters & Default Network Ports

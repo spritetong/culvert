@@ -209,7 +209,7 @@ dns:
 
 # 全局默认套接字拨号参数
 dialer:
-  connect_timeout: "5s"
+  connect_timeout: "10s"
   tcp_keepalive: "15s"
   tcp_nodelay: true
 

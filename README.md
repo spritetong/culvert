@@ -282,8 +282,8 @@ Low-level TCP socket configuration for outbound dialing. Can be overridden per-e
 
 ```yaml
 dialer:
-  connect_timeout: "5s"     # Socket connection timeout (e.g., "5s", "500ms", or raw seconds: 5)
-  tcp_keepalive: "15s"      # TCP keepalive interval (e.g., "15s", "30s")
+  connect_timeout: "10s"    # Socket connection timeout (e.g., "10s", "500ms", or raw seconds: 10; default: 10s)
+  tcp_keepalive: "15s"      # TCP keepalive interval (e.g., "15s", "30s"; default: 15s)
   tcp_nodelay: true         # Disable Nagle's algorithm for low-latency transmission (default: true)
   bind_interface: "eth0"    # Bind outbound traffic to network interface (Linux only via SO_BINDTODEVICE)
 ```

@@ -91,10 +91,13 @@ impl WsConnector {
             let server_name = ServerName::try_from(sni.to_string())
                 .map_err(|e| TunnelError::Tls(format!("Invalid SNI server name: {}", e)))?;
 
-            let tls_conn = connector
-                .connect(server_name, raw_stream)
-                .await
-                .map_err(|e| TunnelError::TlsHandshake(format!("TLS handshake failed: {}", e)))?;
+            let tls_conn = tokio::time::timeout(
+                crate::consts::DEFAULT_HANDSHAKE_TIMEOUT,
+                connector.connect(server_name, raw_stream),
+            )
+            .await
+            .map_err(|_| TunnelError::ConnectTimeout(crate::consts::DEFAULT_HANDSHAKE_TIMEOUT))?
+            .map_err(|e| TunnelError::TlsHandshake(format!("TLS handshake failed: {}", e)))?;
 
             Box::new(BufferedTlsStream::new(tls_conn))
         } else {
@@ -127,11 +130,15 @@ impl WsConnector {
         })?;
 
         // 4. Execute client-side WebSocket upgrade
-        let (ws, _response) = handshake::client(&TokioSpawnExecutor, req, tls_stream)
-            .await
-            .map_err(|e| {
-                TunnelError::ControlProtocol(format!("WebSocket client handshake failed: {}", e))
-            })?;
+        let (ws, _response) = tokio::time::timeout(
+            crate::consts::DEFAULT_HANDSHAKE_TIMEOUT,
+            handshake::client(&TokioSpawnExecutor, req, tls_stream),
+        )
+        .await
+        .map_err(|_| TunnelError::ConnectTimeout(crate::consts::DEFAULT_HANDSHAKE_TIMEOUT))?
+        .map_err(|e| {
+            TunnelError::ControlProtocol(format!("WebSocket client handshake failed: {}", e))
+        })?;
 
         // 5. Wrap upgraded stream as a dynamic TunnelStream
         let tunnel_stream = WsTunnelStream::new(ws.into_inner(), Role::Client);
