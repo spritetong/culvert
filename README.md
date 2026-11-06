@@ -492,7 +492,9 @@ tunnel.yourdomain.com {
 
     # Reverse proxy WebSocket and HTTP traffic to culvert via Unix Domain Socket
     handle @tunnel {
-        reverse_proxy unix//run/culvert.sock
+        reverse_proxy unix//run/culvert.sock {
+            # stream_timeout defaults to 0 (unlimited), keeping tunnel streams alive indefinitely
+        }
     }
 
     # Optional camouflage / decoy website on root
