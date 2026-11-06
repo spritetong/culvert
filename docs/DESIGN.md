@@ -1,10 +1,10 @@
-# Micro-Tunnel 详细技术方案设计规范 (DESIGN.md)
+# Culvert 详细技术方案设计规范 (DESIGN.md)
 
 ---
 
 ## 1. 整体架构与分层设计
 
-Micro-Tunnel 专为与现代边缘网关（如 **Caddy**）协同工作设计。架构遵循分层解耦、动态分发（Dynamic Dispatch）、零冗余与声明式纳管原则，整体架构分为 7 大核心模块：
+Culvert 专为与现代边缘网关（如 **Caddy**）协同工作设计。架构遵循分层解耦、动态分发（Dynamic Dispatch）、零冗余与声明式纳管原则，整体架构分为 7 大核心模块：
 
 ```
 +---------------------------------------------------------------------------------------+
@@ -187,7 +187,7 @@ pub trait Dialer: Send + Sync {
 
 ```yaml
 # ==================================================
-# Micro-Tunnel 声明式主配置文件 (config-example.yaml)
+# Culvert 声明式主配置文件 (config-example.yaml)
 # ==================================================
 
 log:
@@ -801,10 +801,10 @@ impl RelayEngine {
 ## 9. 项目源代码目录结构规划
 
 ```
-micro-tunnel/
+culvert/
 ├── Cargo.toml
 ├── docs/
-│   ├── micro_tunnel.md         # 原始需求与设计背景
+│   ├── culvert.md         # 原始需求与设计背景
 │   ├── PRD.md                  # 产品需求说明书
 │   └── DESIGN.md               # 详细技术方案与规范 (本文档)
 └── src/

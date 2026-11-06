@@ -1,6 +1,7 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+// Copyright (c) 2026 Sprite Tong <spritetong@gmail.com>
+// SPDX-License-Identifier: MPL-2.0
+// culvert is licensed under the Mozilla Public License Version 2.0.
+
 //! Integration tests for duplex data transfer, graceful half-close draining,
 //! and connection pool pre-warming / reuse.
 //! All comments and docstrings must be in English.
@@ -11,15 +12,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
-use micro_tunnel::config::model::{
+use culvert::config::model::{
     AppConfig, EndpointConfig, PortMappingConfig, ServerConfig, TunnelConfig, TunnelMode,
 };
-use micro_tunnel::dialer::endpoint::EndpointContext;
-use micro_tunnel::server::ServerRunner;
-use micro_tunnel::session::SessionManager;
-use micro_tunnel::transport::TransportRegistry;
-use micro_tunnel::transport::ws::WsTransportDriver;
-use micro_tunnel::tunnel::run_forward_tunnel;
+use culvert::dialer::endpoint::EndpointContext;
+use culvert::server::ServerRunner;
+use culvert::session::SessionManager;
+use culvert::transport::TransportRegistry;
+use culvert::transport::ws::WsTransportDriver;
+use culvert::tunnel::run_forward_tunnel;
 
 /// Helper to get an available random ephemeral port assigned by the OS.
 fn get_available_port() -> u16 {

@@ -1,4 +1,4 @@
-# Micro-Tunnel: 轻量级 HTTP/3 & WSS TCP 隧道技术方案与需求规格说明书
+# Culvert: 轻量级 HTTP/3 & WSS TCP 隧道技术方案与需求规格说明书
 
 > [!WARNING]
 > **Deprecated Design Document**: This document represents an early architectural draft and contains legacy specifications that have been superseded. For current, authoritative design, architecture, and configuration specifications, refer to [README.md](../README.md), [DESIGN.md](DESIGN.md), and [PRD.md](PRD.md).
@@ -14,7 +14,7 @@
 * **协议冗余与状态机失控**：在标准 TCP 基础上引入应用层多路复用（Yamux/Smux），一旦发生丢包仍无法避免内核 TCP 队头阻塞；同时其裸 TCP 连接池缺乏协议感知，在 NAT 丢包或超时后极易借出僵死连接。
 
 ### 1.2 核心设计原则（Philosophy & Non-Goals）
-本系统（Micro-Tunnel）专为**「作为 Caddy 边缘反向代理的内部下游服务」**设计，遵循极简与正交解耦哲学：
+本系统（Culvert）专为**「作为 Caddy 边缘反向代理的内部下游服务」**设计，遵循极简与正交解耦哲学：
 
 1. **绝对依托正规 Web 掩体（GFW 友好）**：
    公网仅暴露由标准 Caddy 托管的 TCP 443 与 UDP 443，对外展现合规的 Web PKI 证书与标准 HTTP/3、WSS 流量，天然免疫主动探测与启发式审查。
@@ -61,7 +61,7 @@
                             │ (明文 HTTP/1.1 / h2c 全双工流) │
                             ▼                               │
 +-------------------------------------------------------+   │
-| 内部后端服务: Micro-Tunnel Server                     |   │
+| 内部后端服务: Culvert Server                     |   │
 |   * 仅监听 UDS，无证书、无 TLS 开销                   |   │
 |   * 校验 X-Tunnel-Auth 鉴权头                         |   │
 |   * 解析目标地址，在内网发起 TCP 握手                 |   │
@@ -303,6 +303,6 @@ sudo sysctl -w net.core.somaxconn=4096
 2. **连接池防脏数据污染测试**：
    在客户端主动切断上层 TCP 传输瞬间，Target 端持续灌入大流量，验证 Draining 状态机是否正确排空所有在途数据，放回池中的连接在下一次借出时是否绝对干净。
 3. **服务端热重启容灾测试**：
-   在大文件持续传输过程中强行 `systemctl restart micro-tunnel-server`，验证 Caddy 是否正确返回错误流，Client 是否立即 Fail-fast 释放本地连接，无僵死进程。
+   在大文件持续传输过程中强行 `systemctl restart culvert-server`，验证 Caddy 是否正确返回错误流，Client 是否立即 Fail-fast 释放本地连接，无僵死进程。
 4. **网络漫游迁移测试**：
    客户端在通过 QUIC 传输时，将物理网卡从 Wi-Fi 切换至手机热点，验证基于 QUIC Connection ID 的连接是否保持不中断。

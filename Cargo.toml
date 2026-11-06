@@ -1,15 +1,15 @@
 [package]
-name = "micro-tunnel"
+name = "culvert"
 version = "0.1.0"
 edition = "2024"
 authors = ["Sprite Tong <spritetong@gmail.com>"]
-repository = "https://github.com/spritetong/micro-tunnel"
+repository = "https://github.com/spritetong/culvert"
 license = "MPL-2.0"
 description = "High-performance, lightweight, production-ready bidirectional TCP tunneling system engineered to pair seamlessly with modern edge reverse proxies"
 readme = "README.md"
 
 [[bin]]
-name = "micro-tunnel"
+name = "culvert"
 path = "src/main.rs"
 
 [profile.release]

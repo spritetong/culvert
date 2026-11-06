@@ -1,7 +1,8 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
-//! Entry point for the micro-tunnel daemon.
+// Copyright (c) 2026 Sprite Tong <spritetong@gmail.com>
+// SPDX-License-Identifier: MPL-2.0
+// culvert is licensed under the Mozilla Public License Version 2.0.
+
+//! Entry point for the culvert daemon.
 //! All comments and docstrings must be in English.
 
 use clap::Parser;
@@ -10,10 +11,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use micro_tunnel::common::CancelFutureExt;
-use micro_tunnel::config::ConfigLoader;
-use micro_tunnel::consts::{DEFAULT_SHUTDOWN_HARD_DEADLINE, WATCHDOG_THREAD_NAME};
-use micro_tunnel::supervisor::TunnelSupervisor;
+use culvert::common::CancelFutureExt;
+use culvert::config::ConfigLoader;
+use culvert::consts::{DEFAULT_SHUTDOWN_HARD_DEADLINE, WATCHDOG_THREAD_NAME};
+use culvert::supervisor::TunnelSupervisor;
 
 use mimalloc::MiMalloc;
 
@@ -22,7 +23,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 /// High-performance lightweight HTTP/3 & WSS bidirectional TCP tunnel system.
 #[derive(Parser, Debug)]
-#[command(name = "micro-tunnel", version, about, long_about = None)]
+#[command(name = "culvert", version, about, long_about = None)]
 struct Cli {
     /// Path to the YAML configuration file.
     #[arg(short, long, default_value = "config.yaml")]
@@ -78,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fmt_builder.with_writer(std::io::stdout).init();
     }
 
-    info!(config = ?cli.config, "Loaded micro-tunnel configuration");
+    info!(config = ?cli.config, "Loaded culvert configuration");
 
     let threads = cli.worker_threads.or(app_config.worker_threads);
 
@@ -116,9 +117,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_daemon(
-    app_config: micro_tunnel::config::model::AppConfig,
+    app_config: culvert::config::model::AppConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    micro_tunnel::common::task::reset_shutdown_deadline();
+    culvert::common::task::reset_shutdown_deadline();
     let cancel_token = CancellationToken::new();
 
     // Listen for graceful shutdown signals (SIGINT / SIGTERM / Ctrl+C)
@@ -132,7 +133,7 @@ async fn run_daemon(
         std::process::exit(1);
     }
 
-    info!("Micro-tunnel daemon exited cleanly.");
+    info!("Culvert daemon exited cleanly.");
     // Disarm the hard deadline and await the watchdog thread. Without this,
     // the watchdog would force-exit 10s after the first signal even on a
     // perfectly clean shutdown.
@@ -233,7 +234,7 @@ fn spawn_shutdown_handler(cancel_token: CancellationToken) -> ShutdownWatchdog {
     let signal_cancel = CancellationToken::new();
     let signal_stop = signal_cancel.clone();
     let signal_task = tokio::spawn(async move {
-        let Some(_) = micro_tunnel::platform::wait_for_shutdown_signal()
+        let Some(_) = culvert::platform::wait_for_shutdown_signal()
             .cancel_with(&signal_stop)
             .await
         else {
@@ -244,7 +245,7 @@ fn spawn_shutdown_handler(cancel_token: CancellationToken) -> ShutdownWatchdog {
 
         // Re-arm signal waiting: Tokio keeps the OS handler installed after
         // the first stream is dropped, so later signals would be swallowed.
-        let Some(_) = micro_tunnel::platform::wait_for_shutdown_signal()
+        let Some(_) = culvert::platform::wait_for_shutdown_signal()
             .cancel_with(&signal_stop)
             .await
         else {

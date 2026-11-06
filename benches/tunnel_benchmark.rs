@@ -1,7 +1,8 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
-//! High-performance benchmarks for micro-tunnel components.
+// Copyright (c) 2026 Sprite Tong <spritetong@gmail.com>
+// SPDX-License-Identifier: MPL-2.0
+// culvert is licensed under the Mozilla Public License Version 2.0.
+
+//! High-performance benchmarks for culvert components.
 //! All comments and docstrings must be in English.
 
 use bytes::{Bytes, BytesMut};
@@ -15,14 +16,14 @@ use tokio::runtime::Runtime;
 use tokio_util::codec::{Decoder, Encoder};
 use tokio_util::sync::CancellationToken;
 
-use micro_tunnel::control::stream::ControlMessage;
-use micro_tunnel::core::error::TunnelError;
-use micro_tunnel::core::relay::RelayEngine;
-use micro_tunnel::core::stream::{BoxFuture, TunnelStream};
-use micro_tunnel::mux::{MuxCodec, MuxFrame, MuxSession};
-use micro_tunnel::pool::ReplenishingStreamPool;
-use micro_tunnel::transport::ws::stream::WsTunnelStream;
-use micro_tunnel::transport::{TargetAddr, TransportConnector};
+use culvert::control::stream::ControlMessage;
+use culvert::core::error::TunnelError;
+use culvert::core::relay::RelayEngine;
+use culvert::core::stream::{BoxFuture, TunnelStream};
+use culvert::mux::{MuxCodec, MuxFrame, MuxSession};
+use culvert::pool::ReplenishingStreamPool;
+use culvert::transport::ws::stream::WsTunnelStream;
+use culvert::transport::{TargetAddr, TransportConnector};
 
 /// Benchmark MessagePack control serialization performance.
 fn bench_messagepack_serialization(c: &mut Criterion) {

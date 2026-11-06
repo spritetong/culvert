@@ -1,6 +1,7 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+// Copyright (c) 2026 Sprite Tong <spritetong@gmail.com>
+// SPDX-License-Identifier: MPL-2.0
+// culvert is licensed under the Mozilla Public License Version 2.0.
+
 //! HTTP/3 and QUIC ingress transport listener implementation.
 //! All comments and docstrings must be in English.
 
@@ -126,7 +127,7 @@ impl H3Listener {
             } else {
                 rustls_server.alpn_protocols.insert(0, ALPN_H3.to_vec());
             }
-            // Retain micro-tunnel-quic fallback so raw QUIC clients can still negotiate
+            // Retain culvert-quic fallback so raw QUIC clients can still negotiate
             if !rustls_server.alpn_protocols.iter().any(|p| p == ALPN_QUIC) {
                 rustls_server.alpn_protocols.push(ALPN_QUIC.to_vec());
             }

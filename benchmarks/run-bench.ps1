@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Sprite Tong <spritetong@gmail.com>
+# SPDX-License-Identifier: MPL-2.0
+# culvert is licensed under the Mozilla Public License Version 2.0.
+
 # PowerShell: Run Traffic Benchmark against the Tunnel
 param(
     [string]$TargetHost = "127.0.0.1",
@@ -9,7 +13,7 @@ param(
 )
 
 Write-Host "==================================================================" -ForegroundColor Cyan
-Write-Host " Micro-Tunnel Performance Benchmark Driver" -ForegroundColor Cyan
+Write-Host " Culvert Performance Benchmark Driver" -ForegroundColor Cyan
 Write-Host " Target Tunnel Endpoint: ${TargetHost}:${TargetPort}" -ForegroundColor Yellow
 Write-Host "==================================================================" -ForegroundColor Cyan
 
@@ -29,7 +33,7 @@ try {
 
 if (-not $isReachable) {
     Write-Host "[!] Error: Unable to connect to target endpoint ${TargetHost}:${TargetPort}." -ForegroundColor Red
-    Write-Host "    Please ensure the micro-tunnel client is running (e.g. .\benchmarks\run-client.ps1)" -ForegroundColor Yellow
+    Write-Host "    Please ensure the culvert client is running (e.g. .\benchmarks\run-client.ps1)" -ForegroundColor Yellow
     exit 1
 }
 
@@ -69,7 +73,7 @@ using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace MicroTunnelBench {
+namespace CulvertBench {
     public class BenchResult {
         public double ElapsedSeconds;
         public long BytesTransferred;
@@ -153,12 +157,12 @@ namespace MicroTunnelBench {
 }
 '@
 
-if (-not ([System.Management.Automation.PSTypeName]'MicroTunnelBench.BenchDriver').Type) {
+if (-not ([System.Management.Automation.PSTypeName]'CulvertBench.BenchDriver').Type) {
     Add-Type -TypeDefinition $Code -Language CSharp
 }
 
 $TotalBytes = [int64]$DataSizeMB * 1024 * 1024
-$result = [MicroTunnelBench.BenchDriver]::Run($TargetHost, $TargetPort, $Streams, $TotalBytes)
+$result = [CulvertBench.BenchDriver]::Run($TargetHost, $TargetPort, $Streams, $TotalBytes)
 
 if ($result.BytesTransferred -eq 0 -or $result.SuccessfulStreams -eq 0) {
     Write-Host "[-] Benchmark failed: 0 bytes transferred across all streams." -ForegroundColor Red

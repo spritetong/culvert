@@ -1,4 +1,8 @@
-# PowerShell: Start Micro-Tunnel Benchmark Server
+# Copyright (c) 2026 Sprite Tong <spritetong@gmail.com>
+# SPDX-License-Identifier: MPL-2.0
+# culvert is licensed under the Mozilla Public License Version 2.0.
+
+# PowerShell: Start Culvert Benchmark Server
 param(
     [string]$Config = "$PSScriptRoot/server-bench.yaml",
     [switch]$StartIperf,
@@ -10,9 +14,9 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Resolve-Path "$PSScriptRoot/.."
 Set-Location $ProjectRoot
 
-$BinPath = "$ProjectRoot/target/release/micro-tunnel.exe"
+$BinPath = "$ProjectRoot/target/release/culvert.exe"
 if (-not (Test-Path $BinPath)) {
-    Write-Host "[*] Compiling micro-tunnel in release mode..." -ForegroundColor Cyan
+    Write-Host "[*] Compiling culvert in release mode..." -ForegroundColor Cyan
     cargo build --release
 }
 
@@ -56,7 +60,7 @@ using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace MicroTunnelBench {
+namespace CulvertBench {
     public class DiscardServer {
         private TcpListener _listener;
         private CancellationTokenSource _cts;
@@ -98,10 +102,10 @@ namespace MicroTunnelBench {
     }
 }
 '@
-            if (-not ([System.Management.Automation.PSTypeName]'MicroTunnelBench.DiscardServer').Type) {
+            if (-not ([System.Management.Automation.PSTypeName]'CulvertBench.DiscardServer').Type) {
                 Add-Type -TypeDefinition $SinkCode -Language CSharp
             }
-            $sinkServer = [MicroTunnelBench.DiscardServer]::new()
+            $sinkServer = [CulvertBench.DiscardServer]::new()
             $sinkServer.Start("127.0.0.1", 5201)
             Start-Sleep -Milliseconds 100
         }
@@ -109,7 +113,7 @@ namespace MicroTunnelBench {
 }
 
 try {
-    Write-Host "[*] Starting micro-tunnel server with config: $Config" -ForegroundColor Cyan
+    Write-Host "[*] Starting culvert server with config: $Config" -ForegroundColor Cyan
     & $BinPath -c $Config
 } finally {
     if ($sinkServer) {

@@ -1,6 +1,7 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+// Copyright (c) 2026 Sprite Tong <spritetong@gmail.com>
+// SPDX-License-Identifier: MPL-2.0
+// culvert is licensed under the Mozilla Public License Version 2.0.
+
 //! WebSocket adapter exposing `TunnelStream` (`AsyncRead + AsyncWrite`).
 //! All comments and docstrings must be in English.
 
@@ -715,7 +716,7 @@ mod tests {
         let mut client = WsTunnelStream::new(raw_client, Role::Client);
         let mut server = WsTunnelStream::new(raw_server, Role::Server);
 
-        let msg = b"hello micro-tunnel over fastwebsockets!";
+        let msg = b"hello culvert over fastwebsockets!";
         client.write_all(msg).await.unwrap();
         client.flush().await.unwrap();
 

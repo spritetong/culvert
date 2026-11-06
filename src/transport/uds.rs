@@ -1,6 +1,7 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+// Copyright (c) 2026 Sprite Tong <spritetong@gmail.com>
+// SPDX-License-Identifier: MPL-2.0
+// culvert is licensed under the Mozilla Public License Version 2.0.
+
 //! Unix Domain Socket transport for reverse proxy (Caddy/Nginx) IPC and local tunnel endpoints.
 //! All comments and docstrings must be in English.
 
@@ -108,7 +109,7 @@ impl TransportDriver for UdsTransportDriver {
         let alpn = tls.and_then(|t| t.alpn.as_ref()).and_then(|list| {
             let filtered: Vec<Vec<u8>> = list
                 .iter()
-                .filter(|s| *s != "h3" && *s != "micro-tunnel-quic")
+                .filter(|s| *s != "h3" && *s != "culvert-quic")
                 .map(|s| s.as_bytes().to_vec())
                 .collect();
             if filtered.is_empty() {

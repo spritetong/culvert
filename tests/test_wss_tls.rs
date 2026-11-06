@@ -1,6 +1,7 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+// Copyright (c) 2026 Sprite Tong <spritetong@gmail.com>
+// SPDX-License-Identifier: MPL-2.0
+// culvert is licensed under the Mozilla Public License Version 2.0.
+
 //! Comprehensive integration tests for WSS (WebSocket over TLS 1.3 / Rustls).
 //! Covers SNI override, self-signed/insecure mode, custom CA verification, and mTLS.
 //! All comments and docstrings must be in English.
@@ -20,15 +21,15 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
-use micro_tunnel::config::model::{
+use culvert::config::model::{
     AppConfig, EndpointConfig, PortMappingConfig, ServerConfig, TlsConfig, TunnelConfig, TunnelMode,
 };
-use micro_tunnel::dialer::endpoint::EndpointContext;
-use micro_tunnel::server::ServerRunner;
-use micro_tunnel::session::SessionManager;
-use micro_tunnel::transport::TransportRegistry;
-use micro_tunnel::transport::ws::WsTransportDriver;
-use micro_tunnel::tunnel::{run_forward_tunnel, run_reverse_tunnel};
+use culvert::dialer::endpoint::EndpointContext;
+use culvert::server::ServerRunner;
+use culvert::session::SessionManager;
+use culvert::transport::TransportRegistry;
+use culvert::transport::ws::WsTransportDriver;
+use culvert::tunnel::{run_forward_tunnel, run_reverse_tunnel};
 
 /// Helper to get an available random ephemeral port assigned by the OS.
 fn get_available_port() -> u16 {
@@ -66,7 +67,7 @@ mod tempfile_dummy {
         pub fn new() -> Self {
             let id = PKI_COUNTER.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "micro_tunnel_pki_{}_{}",
+                "culvert_pki_{}_{}",
                 std::process::id(),
                 id
             ));
@@ -94,7 +95,7 @@ fn generate_test_pki() -> TestPki {
     // 1. Generate Root CA
     let mut ca_params = CertificateParams::default();
     let mut ca_dn = DistinguishedName::new();
-    ca_dn.push(DnType::CommonName, "MicroTunnel Root CA");
+    ca_dn.push(DnType::CommonName, "Culvert Root CA");
     ca_params.distinguished_name = ca_dn;
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let ca_key = KeyPair::generate().unwrap();
@@ -272,7 +273,7 @@ async fn test_wss_forward_tunnel_with_custom_ca_and_sni() {
     // 1. Echo server with held-listener handoff
     let (echo_handle, echo_port) = spawn_echo_server(cancel_token.clone());
 
-    // 2. Micro-tunnel ServerRunner (backend plain listener)
+    // 2. Culvert ServerRunner (backend plain listener)
     let mut registry = TransportRegistry::new();
     registry.register(WsTransportDriver);
     let registry = Arc::new(registry);
@@ -621,7 +622,7 @@ async fn test_wss_reverse_tunnel_e2e() {
     // 1. Local Echo Server with held-listener handoff
     let (echo_handle, local_echo_port) = spawn_echo_server(cancel_token.clone());
 
-    // 2. Micro-tunnel ServerRunner
+    // 2. Culvert ServerRunner
     let mut registry = TransportRegistry::new();
     registry.register(WsTransportDriver);
     let registry = Arc::new(registry);
@@ -777,7 +778,7 @@ async fn test_wss_server_tls_version_enforcement() {
         .create_connector(&ep_ctx, None, TunnelMode::Forward)
         .unwrap();
 
-    let target = micro_tunnel::transport::TargetAddr::Domain("127.0.0.1".into(), 80);
+    let target = culvert::transport::TargetAddr::Domain("127.0.0.1".into(), 80);
     let connect_res_12 = connector_12.connect(&target, None).await;
     assert!(
         connect_res_12.is_err(),
@@ -877,7 +878,7 @@ async fn test_wss_server_inherits_global_tls_config() {
         .create_connector(&ep_ctx, None, TunnelMode::Forward)
         .unwrap();
 
-    let target = micro_tunnel::transport::TargetAddr::Domain("127.0.0.1".into(), 80);
+    let target = culvert::transport::TargetAddr::Domain("127.0.0.1".into(), 80);
     let connect_res_12 = connector_12.connect(&target, None).await;
     assert!(
         connect_res_12.is_err(),

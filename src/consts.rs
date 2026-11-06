@@ -1,6 +1,7 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+// Copyright (c) 2026 Sprite Tong <spritetong@gmail.com>
+// SPDX-License-Identifier: MPL-2.0
+// culvert is licensed under the Mozilla Public License Version 2.0.
+
 //! Centralized constants, defaults, and configuration parameters across all modules.
 //! All comments and docstrings must be in English.
 
@@ -222,10 +223,10 @@ pub const ALPN_H3: &[u8] = b"h3";
 pub const ALPN_H3_STR: &str = "h3";
 
 /// ALPN identifier for raw multiplexed QUIC streams (bytes).
-pub const ALPN_QUIC: &[u8] = b"micro-tunnel-quic";
+pub const ALPN_QUIC: &[u8] = b"culvert-quic";
 
 /// ALPN identifier for raw multiplexed QUIC streams (str).
-pub const ALPN_QUIC_STR: &str = "micro-tunnel-quic";
+pub const ALPN_QUIC_STR: &str = "culvert-quic";
 
 /// URI scheme identifier for standard WebSocket.
 pub const SCHEME_WS: &str = "ws";
@@ -338,4 +339,4 @@ pub const DEFAULT_LOG_OUTPUT: &str = "stdout";
 pub const WATCHDOG_THREAD_NAME: &str = "shutdown-watchdog";
 
 /// Thread name for the Windows UDS accept worker thread.
-pub const WINDOWS_UDS_THREAD_NAME: &str = "micro-tunnel-windows-uds";
+pub const WINDOWS_UDS_THREAD_NAME: &str = "culvert-windows-uds";

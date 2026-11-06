@@ -1,17 +1,17 @@
-# micro-tunnel
+# culvert
 
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL_2.0-blue.svg)](https://opensource.org/licenses/MPL-2.0)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 
-**micro-tunnel** is a high-performance, lightweight, production-ready bidirectional TCP tunneling system engineered to pair seamlessly with modern edge reverse proxies (such as **Caddy** or **Nginx**).
+**culvert** is a high-performance, lightweight, production-ready bidirectional TCP tunneling system engineered to pair seamlessly with modern edge reverse proxies (such as **Caddy** or **Nginx**).
 
-Designed as a modern, clean replacement for tools like `wstunnel`, `micro-tunnel` eliminates protocol bloat, complex frame encapsulation state machines, and unnecessary internal certificate managers. It delivers near-bare-metal throughput and microsecond latency over HTTP/3 (QUIC) and WebSocket (WSS) while disguising traffic behind standard HTTPS ports.
+Designed as a modern, clean replacement for tools like `wstunnel`, `culvert` eliminates protocol bloat, complex frame encapsulation state machines, and unnecessary internal certificate managers. It delivers near-bare-metal throughput and microsecond latency over HTTP/3 (QUIC) and WebSocket (WSS) while disguising traffic behind standard HTTPS ports.
 
 ---
 
 ## Key Highlights & Design Philosophy
 
-- **Zero ACME Bloat**: `micro-tunnel` delegates public ACME certificates to reverse proxies like Caddy. The server ingress listens on Unix Domain Sockets (UDS) or internal loopback with zero public TLS certificate renewal complexity. (Direct standalone TLS termination with auto-generated or custom certificates is also supported).
+- **Zero ACME Bloat**: `culvert` delegates public ACME certificates to reverse proxies like Caddy. The server ingress listens on Unix Domain Sockets (UDS) or internal loopback with zero public TLS certificate renewal complexity. (Direct standalone TLS termination with auto-generated or custom certificates is also supported).
 - **Native QUIC & High-Speed WebSocket**:
   - **HTTP/3**: Multiplexes tunnels directly over native QUIC streams. Packet loss on one connection never blocks other streams (zero TCP Head-of-Line blocking).
   - **WSS**: Built on `fastwebsockets` with AVX2/NEON SIMD-accelerated masking.
@@ -29,7 +29,7 @@ Designed as a modern, clean replacement for tools like `wstunnel`, `micro-tunnel
 flowchart LR
     subgraph ClientHost["Client Host (Local Network / Behind NAT)"]
         App["App / Client"]
-        MTClient["micro-tunnel Client"]
+        CulvertClient["culvert Client"]
         LocalSvc["Local Service\n(e.g., SSH :22)"]
     end
 
@@ -38,21 +38,21 @@ flowchart LR
     end
 
     subgraph ServerHost["Server Host (Cloud VPS / Gateway)"]
-        MTServer["micro-tunnel Server Ingress\n(UDS / Loopback)"]
+        CulvertServer["culvert Server Ingress\n(UDS / Loopback)"]
         RemoteSvc["Remote Service\n(e.g., MySQL :3306)"]
         PublicPort["Public Port\n(e.g., :2222)"]
     end
 
     %% Forward Tunnel Traffic
-    App -->|Connect :13306| MTClient
-    MTClient -->|"WSS / HTTP/3 (POST /tunnel)"| Caddy
-    Caddy -->|"Proxy (UDS / TCP)"| MTServer
-    MTServer -->|Dial| RemoteSvc
+    App -->|Connect :13306| CulvertClient
+    CulvertClient -->|"WSS / HTTP/3 (POST /tunnel)"| Caddy
+    Caddy -->|"Proxy (UDS / TCP)"| CulvertServer
+    CulvertServer -->|Dial| RemoteSvc
 
     %% Reverse Tunnel Traffic
-    PublicPort -->|External User| MTServer
-    MTServer -.->|"Reverse Stream"| MTClient
-    MTClient -->|Forward| LocalSvc
+    PublicPort -->|External User| CulvertServer
+    CulvertServer -.->|"Reverse Stream"| CulvertClient
+    CulvertClient -->|Forward| LocalSvc
 ```
 
 ---
@@ -68,14 +68,14 @@ flowchart LR
 
 ```bash
 # Clone the repository
-git clone https://github.com/spritetong/micro-tunnel.git
-cd micro-tunnel
+git clone https://github.com/spritetong/culvert.git
+cd culvert
 
 # Build optimized release binary
 cargo build --release
 
 # The compiled binary is located at:
-./target/release/micro-tunnel
+./target/release/culvert
 ```
 
 ---
@@ -83,7 +83,7 @@ cargo build --release
 ## Command-Line Usage
 
 ```bash
-micro-tunnel [OPTIONS]
+culvert [OPTIONS]
 ```
 
 ### Options
@@ -100,13 +100,13 @@ micro-tunnel [OPTIONS]
 
 ```bash
 # Validate configuration file without starting services
-./micro-tunnel --check -c /etc/micro-tunnel/config.yaml
+./culvert --check -c /etc/culvert/config.yaml
 
 # Run with default config.yaml
-./micro-tunnel
+./culvert
 
 # Run with a custom config path and 2 worker threads
-./micro-tunnel -c /etc/micro-tunnel/server.yaml -w 2
+./culvert -c /etc/culvert/server.yaml -w 2
 ```
 
 ---
@@ -143,7 +143,7 @@ worker_threads: 4     # Number of Tokio worker threads.
 
 Global DNS resolution settings. Can be overridden per-endpoint.
 
-`micro-tunnel` supports standard structured resolver configuration as well as standard URL schemes.
+`culvert` supports standard structured resolver configuration as well as standard URL schemes.
 
 ```yaml
 dns:
@@ -224,7 +224,7 @@ tls:
 
 ### 5. Server Ingress (`server`)
 
-Configures `micro-tunnel` as an ingress gateway on a cloud VPS or host.
+Configures `culvert` as an ingress gateway on a cloud VPS or host.
 
 > **Note**: In a typical setup behind Caddy or Nginx, configure `listen` to a Unix Domain Socket (`ws+unix:///run/tunnel.sock`) or loopback (`ws://127.0.0.1:8080/tunnel`).
 
@@ -246,7 +246,7 @@ server:
     # 3. Plaintext WebSocket over TCP
     - "ws://127.0.0.1:8080/tunnel"
 
-    # 4. Standalone WSS (TLS terminated by micro-tunnel)
+    # 4. Standalone WSS (TLS terminated by culvert)
     - "wss://0.0.0.0:8443/tunnel"
 
     # 5. Standalone HTTP/3 over QUIC/UDP
@@ -373,16 +373,16 @@ tunnels:
 
 ### Recipe 1: Production Server Behind Caddy Reverse Proxy (Recommended)
 
-Let Caddy handle public HTTPS, HTTP/3, and automated Let's Encrypt certificates. Micro-tunnel listens securely over Unix Domain Sockets.
+Let Caddy handle public HTTPS, HTTP/3, and automated Let's Encrypt certificates. Culvert listens securely over Unix Domain Sockets.
 
-#### `server.yaml` (micro-tunnel configuration)
+#### `server.yaml` (culvert configuration)
 
 ```yaml
 log:
   level: "info"
 
 server:
-  listen: "ws+unix:///run/micro-tunnel.sock"
+  listen: "ws+unix:///run/culvert.sock"
   token: "MY_SECURE_TOKEN_32_BYTES_OR_MORE"
   default_target: "127.0.0.1:5201"
 ```
@@ -391,12 +391,12 @@ server:
 
 ```caddy
 tunnel.yourdomain.com {
-    # Match micro-tunnel path
+    # Match culvert path
     @tunnel path /tunnel*
 
-    # Reverse proxy WebSocket and HTTP traffic to micro-tunnel via Unix Domain Socket
+    # Reverse proxy WebSocket and HTTP traffic to culvert via Unix Domain Socket
     handle @tunnel {
-        reverse_proxy unix//run/micro-tunnel.sock
+        reverse_proxy unix//run/culvert.sock
     }
 
     # Optional camouflage / decoy website on root
@@ -466,7 +466,7 @@ Anyone connecting to `vps-ip:2222` is transparently routed back to your home mac
 
 ### Recipe 4: Standalone High-Speed HTTP/3 Direct Ingress
 
-Run `micro-tunnel` directly without a reverse proxy, leveraging HTTP/3 over UDP port `8443`.
+Run `culvert` directly without a reverse proxy, leveraging HTTP/3 over UDP port `8443`.
 
 #### `server.yaml`
 
@@ -510,7 +510,7 @@ tunnels:
 
 ## Benchmarks & Performance
 
-`micro-tunnel` comes equipped with automated Criterion micro-benchmarks and end-to-end `iperf3` benchmark suites.
+`culvert` comes equipped with automated Criterion micro-benchmarks and end-to-end `iperf3` benchmark suites.
 
 ### Running Benchmarks
 

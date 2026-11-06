@@ -1,16 +1,17 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+// Copyright (c) 2026 Sprite Tong <spritetong@gmail.com>
+// SPDX-License-Identifier: MPL-2.0
+// culvert is licensed under the Mozilla Public License Version 2.0.
+
 //! Comprehensive test suite for YAML configuration parsing and DNS Resolver strategies.
 //! All comments and docstrings must be in English.
 
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
-use micro_tunnel::config::loader::ConfigLoader;
-use micro_tunnel::config::model::{DnsConfig, DnsStrategy, TunnelMode};
-use micro_tunnel::dialer::dns::{CachedDnsResolver, DnsResolver};
-use micro_tunnel::dialer::endpoint::EndpointContext;
+use culvert::config::loader::ConfigLoader;
+use culvert::config::model::{DnsConfig, DnsStrategy, TunnelMode};
+use culvert::dialer::dns::{CachedDnsResolver, DnsResolver};
+use culvert::dialer::endpoint::EndpointContext;
 
 #[test]
 fn test_complex_yaml_config_parsing() {
@@ -382,7 +383,7 @@ tunnels:
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let shutdown_token = cancel_token.clone();
 
-    let supervisor = micro_tunnel::supervisor::TunnelSupervisor::new(config, cancel_token);
+    let supervisor = culvert::supervisor::TunnelSupervisor::new(config, cancel_token);
 
     // Cancel after 300ms
     tokio::spawn(async move {
@@ -409,8 +410,8 @@ tunnels:
 
 #[test]
 fn test_cached_dns_resolver_try_new_rejects_missing_server() {
-    use micro_tunnel::config::model::{DnsConfig, DnsResolverConfig, DnsServerConfig};
-    use micro_tunnel::dialer::dns::CachedDnsResolver;
+    use culvert::config::model::{DnsConfig, DnsResolverConfig, DnsServerConfig};
+    use culvert::dialer::dns::CachedDnsResolver;
 
     let dns_cfg = DnsConfig {
         strategy: None,
@@ -506,17 +507,17 @@ tunnels:
     // Client endpoints
     assert_eq!(config.tunnels.len(), 2);
     let ep1 =
-        micro_tunnel::dialer::endpoint::Endpoint::parse(config.tunnels[0].endpoint.url()).unwrap();
+        culvert::dialer::endpoint::Endpoint::parse(config.tunnels[0].endpoint.url()).unwrap();
     assert_eq!(ep1.scheme, "ws");
     let ep2 =
-        micro_tunnel::dialer::endpoint::Endpoint::parse(config.tunnels[1].endpoint.url()).unwrap();
+        culvert::dialer::endpoint::Endpoint::parse(config.tunnels[1].endpoint.url()).unwrap();
     assert_eq!(ep2.scheme, "ws+unix");
 }
 
 #[test]
 fn test_mapping_address_three_formats() {
-    use micro_tunnel::transport::TargetAddr;
-    use micro_tunnel::tunnel::forward::parse_target_addr;
+    use culvert::transport::TargetAddr;
+    use culvert::tunnel::forward::parse_target_addr;
 
     // 1. ip:port (port is required)
     let t1 = parse_target_addr("127.0.0.1:8080").unwrap();

@@ -1,6 +1,7 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+// Copyright (c) 2026 Sprite Tong <spritetong@gmail.com>
+// SPDX-License-Identifier: MPL-2.0
+// culvert is licensed under the Mozilla Public License Version 2.0.
+
 //! End-to-end integration tests for WebSocket tunnels.
 //! All comments and docstrings must be in English.
 
@@ -10,16 +11,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
-use micro_tunnel::config::model::{
+use culvert::config::model::{
     AppConfig, EndpointConfig, PortMappingConfig, ServerConfig, TunnelConfig, TunnelMode,
 };
-use micro_tunnel::dialer::endpoint::EndpointContext;
-use micro_tunnel::server::ServerRunner;
-use micro_tunnel::session::SessionManager;
-use micro_tunnel::supervisor::TunnelSupervisor;
-use micro_tunnel::transport::TransportRegistry;
-use micro_tunnel::transport::ws::WsTransportDriver;
-use micro_tunnel::tunnel::{run_forward_tunnel, run_reverse_tunnel};
+use culvert::dialer::endpoint::EndpointContext;
+use culvert::server::ServerRunner;
+use culvert::session::SessionManager;
+use culvert::supervisor::TunnelSupervisor;
+use culvert::transport::TransportRegistry;
+use culvert::transport::ws::WsTransportDriver;
+use culvert::tunnel::{run_forward_tunnel, run_reverse_tunnel};
 
 /// Helper to get an available random ephemeral port assigned by the OS.
 fn get_available_port() -> u16 {
@@ -129,7 +130,7 @@ async fn test_forward_tunnel_ws_e2e() {
         .await
         .expect("Failed to connect to client forward listen port");
 
-    let payload = b"Hello micro-tunnel forward WebSocket!";
+    let payload = b"Hello culvert forward WebSocket!";
     stream
         .write_all(payload)
         .await
@@ -225,7 +226,7 @@ async fn test_reverse_tunnel_ws_e2e() {
         .await
         .expect("Failed to connect to reverse listener port on server");
 
-    let payload = b"Hello micro-tunnel reverse WebSocket!";
+    let payload = b"Hello culvert reverse WebSocket!";
     visitor_stream
         .write_all(payload)
         .await

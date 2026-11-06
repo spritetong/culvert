@@ -1,6 +1,7 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+// Copyright (c) 2026 Sprite Tong <spritetong@gmail.com>
+// SPDX-License-Identifier: MPL-2.0
+// culvert is licensed under the Mozilla Public License Version 2.0.
+
 //! End-to-end integration tests for full-featured UDS support across server, endpoints, and mappings.
 //! All comments and docstrings must be in English.
 
@@ -9,9 +10,9 @@ use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
-use micro_tunnel::config::model::*;
-use micro_tunnel::platform::*;
-use micro_tunnel::supervisor::TunnelSupervisor;
+use culvert::config::model::*;
+use culvert::platform::*;
+use culvert::supervisor::TunnelSupervisor;
 
 #[tokio::test]
 async fn test_e2e_server_uds_url_and_mappings() {
@@ -38,7 +39,7 @@ async fn test_e2e_server_uds_url_and_mappings() {
         stream.flush().await.unwrap();
     });
 
-    // 2. Configure micro-tunnel: server listens on UDS, forward mapping listens on UDS and forwards to backend UDS
+    // 2. Configure culvert: server listens on UDS, forward mapping listens on UDS and forwards to backend UDS
     let config = AppConfig {
         log: LogConfig {
             level: "debug".to_string(),
@@ -126,7 +127,7 @@ async fn test_e2e_reverse_mapping_uds() {
         stream.flush().await.unwrap();
     });
 
-    // 2. Configure micro-tunnel with reverse mapping:
+    // 2. Configure culvert with reverse mapping:
     // Server listens on `rev_external_str` (UDS) and client connects to `rev_target_str` (UDS)
     let config = AppConfig {
         log: LogConfig {

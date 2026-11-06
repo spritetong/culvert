@@ -1,6 +1,7 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+// Copyright (c) 2026 Sprite Tong <spritetong@gmail.com>
+// SPDX-License-Identifier: MPL-2.0
+// culvert is licensed under the Mozilla Public License Version 2.0.
+
 //! Comprehensive integration test suite for HTTP/3 and raw QUIC transport.
 //! All comments and docstrings must be in English.
 
@@ -8,14 +9,14 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use micro_tunnel::config::model::{
+use culvert::config::model::{
     AppConfig, EndpointConfig, PortMappingConfig, TlsConfig, TunnelMode,
 };
-use micro_tunnel::core::error::TunnelError;
-use micro_tunnel::dialer::endpoint::EndpointContext;
-use micro_tunnel::transport::h3::H3Connector;
-use micro_tunnel::transport::h3::listener::H3Listener;
-use micro_tunnel::transport::{TargetAddr, TransportConnector, TransportListener};
+use culvert::core::error::TunnelError;
+use culvert::dialer::endpoint::EndpointContext;
+use culvert::transport::h3::H3Connector;
+use culvert::transport::h3::listener::H3Listener;
+use culvert::transport::{TargetAddr, TransportConnector, TransportListener};
 
 /// Helper to get an available ephemeral port from the OS that is free for both TCP and UDP.
 fn get_ephemeral_port() -> u16 {
@@ -382,18 +383,18 @@ async fn test_h3_tunnel_pool_prewarm_and_activation_end_to_end() {
     let client_listen = format!("127.0.0.1:{}", client_listen_port);
 
     // 1. Setup server with H3 listener and self-signed cert, no token, path "/tunnel" (echo server started via handoff)
-    let mut server_registry = micro_tunnel::transport::TransportRegistry::new();
-    server_registry.register(micro_tunnel::transport::h3::H3TransportDriver);
+    let mut server_registry = culvert::transport::TransportRegistry::new();
+    server_registry.register(culvert::transport::h3::H3TransportDriver);
     let server_registry = Arc::new(server_registry);
-    let session_mgr = Arc::new(micro_tunnel::session::SessionManager::new());
+    let session_mgr = Arc::new(culvert::session::SessionManager::new());
 
-    let server_config = micro_tunnel::config::model::ServerConfig {
+    let server_config = culvert::config::model::ServerConfig {
         listen: vec![format!("h3://{}/tunnel", server_h3_listen)],
         token: None, // Optional token / no token
         default_target: Some(format!("127.0.0.1:{}", echo_port)),
         ..Default::default()
     };
-    let server_runner = micro_tunnel::server::ServerRunner::new(
+    let server_runner = culvert::server::ServerRunner::new(
         server_config,
         Arc::clone(&server_registry),
         Arc::clone(&session_mgr),
@@ -407,13 +408,13 @@ async fn test_h3_tunnel_pool_prewarm_and_activation_end_to_end() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // 3. Setup client AppConfig with forward tunnel using pool_size: 4
-    let app_config = micro_tunnel::config::model::AppConfig {
+    let app_config = culvert::config::model::AppConfig {
         tls: Some(TlsConfig {
             insecure: Some(true),
             server_name: Some("localhost".to_string()),
             ..Default::default()
         }),
-        tunnels: vec![micro_tunnel::config::model::TunnelConfig {
+        tunnels: vec![culvert::config::model::TunnelConfig {
             tag: "bench-h3-pool".to_string(),
             token: None,
             endpoint: EndpointConfig::Simple(format!("h3://{}/tunnel", server_h3_listen)),
@@ -431,7 +432,7 @@ async fn test_h3_tunnel_pool_prewarm_and_activation_end_to_end() {
     };
 
     let c_cancel = cancel_token.clone();
-    let supervisor = micro_tunnel::supervisor::TunnelSupervisor::new(app_config, c_cancel);
+    let supervisor = culvert::supervisor::TunnelSupervisor::new(app_config, c_cancel);
     let client_handle = tokio::spawn(async move {
         let _ = supervisor.run().await;
     });
@@ -482,18 +483,18 @@ async fn test_quic_raw_tunnel_pool_prewarm_and_activation_end_to_end() {
     let client_listen = format!("127.0.0.1:{}", client_listen_port);
 
     // 1. Setup server with raw QUIC listener and self-signed cert (echo server started via handoff)
-    let mut server_registry = micro_tunnel::transport::TransportRegistry::new();
-    server_registry.register(micro_tunnel::transport::h3::H3TransportDriver);
+    let mut server_registry = culvert::transport::TransportRegistry::new();
+    server_registry.register(culvert::transport::h3::H3TransportDriver);
     let server_registry = Arc::new(server_registry);
-    let session_mgr = Arc::new(micro_tunnel::session::SessionManager::new());
+    let session_mgr = Arc::new(culvert::session::SessionManager::new());
 
-    let server_config = micro_tunnel::config::model::ServerConfig {
+    let server_config = culvert::config::model::ServerConfig {
         listen: vec![format!("quic://{}/raw", server_quic_listen)],
         token: None,
         default_target: Some(format!("127.0.0.1:{}", echo_port)),
         ..Default::default()
     };
-    let server_runner = micro_tunnel::server::ServerRunner::new(
+    let server_runner = culvert::server::ServerRunner::new(
         server_config,
         Arc::clone(&server_registry),
         Arc::clone(&session_mgr),
@@ -506,13 +507,13 @@ async fn test_quic_raw_tunnel_pool_prewarm_and_activation_end_to_end() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // 3. Setup client AppConfig with forward tunnel using raw QUIC and pool_size: 4
-    let app_config = micro_tunnel::config::model::AppConfig {
+    let app_config = culvert::config::model::AppConfig {
         tls: Some(TlsConfig {
             insecure: Some(true),
             server_name: Some("localhost".to_string()),
             ..Default::default()
         }),
-        tunnels: vec![micro_tunnel::config::model::TunnelConfig {
+        tunnels: vec![culvert::config::model::TunnelConfig {
             tag: "bench-quic-pool".to_string(),
             token: None,
             endpoint: EndpointConfig::Simple(format!("quic://{}/raw", server_quic_listen)),
@@ -530,7 +531,7 @@ async fn test_quic_raw_tunnel_pool_prewarm_and_activation_end_to_end() {
     };
 
     let c_cancel = cancel_token.clone();
-    let supervisor = micro_tunnel::supervisor::TunnelSupervisor::new(app_config, c_cancel);
+    let supervisor = culvert::supervisor::TunnelSupervisor::new(app_config, c_cancel);
     let client_handle = tokio::spawn(async move {
         let _ = supervisor.run().await;
     });
@@ -609,18 +610,18 @@ async fn test_quic_raw_forward_stress_throughput() {
     });
 
     // 2. Setup server with raw QUIC listener
-    let mut server_registry = micro_tunnel::transport::TransportRegistry::new();
-    server_registry.register(micro_tunnel::transport::h3::H3TransportDriver);
+    let mut server_registry = culvert::transport::TransportRegistry::new();
+    server_registry.register(culvert::transport::h3::H3TransportDriver);
     let server_registry = Arc::new(server_registry);
-    let session_mgr = Arc::new(micro_tunnel::session::SessionManager::new());
+    let session_mgr = Arc::new(culvert::session::SessionManager::new());
 
-    let server_config = micro_tunnel::config::model::ServerConfig {
+    let server_config = culvert::config::model::ServerConfig {
         listen: vec![format!("quic://{}/raw", server_quic_listen)],
         token: None,
         default_target: Some(format!("127.0.0.1:{}", sink_port)),
         ..Default::default()
     };
-    let server_runner = micro_tunnel::server::ServerRunner::new(
+    let server_runner = culvert::server::ServerRunner::new(
         server_config,
         Arc::clone(&server_registry),
         Arc::clone(&session_mgr),
@@ -633,13 +634,13 @@ async fn test_quic_raw_forward_stress_throughput() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // 3. Setup client AppConfig with forward tunnel
-    let app_config = micro_tunnel::config::model::AppConfig {
+    let app_config = culvert::config::model::AppConfig {
         tls: Some(TlsConfig {
             insecure: Some(true),
             server_name: Some("localhost".to_string()),
             ..Default::default()
         }),
-        tunnels: vec![micro_tunnel::config::model::TunnelConfig {
+        tunnels: vec![culvert::config::model::TunnelConfig {
             tag: "bench-quic-stress".to_string(),
             token: None,
             endpoint: EndpointConfig::Simple(format!("quic://{}/raw", server_quic_listen)),
@@ -657,7 +658,7 @@ async fn test_quic_raw_forward_stress_throughput() {
     };
 
     let c_cancel = cancel_token.clone();
-    let supervisor = micro_tunnel::supervisor::TunnelSupervisor::new(app_config, c_cancel);
+    let supervisor = culvert::supervisor::TunnelSupervisor::new(app_config, c_cancel);
     let client_handle = tokio::spawn(async move {
         let _ = supervisor.run().await;
     });
@@ -708,18 +709,18 @@ async fn test_h3_concurrent_forward_stress() {
     let client_listen = format!("127.0.0.1:{}", client_listen_port);
 
     // 1. Setup server with H3 listener (echo server started via handoff)
-    let mut server_registry = micro_tunnel::transport::TransportRegistry::new();
-    server_registry.register(micro_tunnel::transport::h3::H3TransportDriver);
+    let mut server_registry = culvert::transport::TransportRegistry::new();
+    server_registry.register(culvert::transport::h3::H3TransportDriver);
     let server_registry = Arc::new(server_registry);
-    let session_mgr = Arc::new(micro_tunnel::session::SessionManager::new());
+    let session_mgr = Arc::new(culvert::session::SessionManager::new());
 
-    let server_config = micro_tunnel::config::model::ServerConfig {
+    let server_config = culvert::config::model::ServerConfig {
         listen: vec![format!("h3://{}/tunnel", server_h3_listen)],
         token: None,
         default_target: Some(format!("127.0.0.1:{}", echo_port)),
         ..Default::default()
     };
-    let server_runner = micro_tunnel::server::ServerRunner::new(
+    let server_runner = culvert::server::ServerRunner::new(
         server_config,
         Arc::clone(&server_registry),
         Arc::clone(&session_mgr),
@@ -732,13 +733,13 @@ async fn test_h3_concurrent_forward_stress() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // 3. Setup client AppConfig with forward tunnel using pool_size: 4
-    let app_config = micro_tunnel::config::model::AppConfig {
+    let app_config = culvert::config::model::AppConfig {
         tls: Some(TlsConfig {
             insecure: Some(true),
             server_name: Some("localhost".to_string()),
             ..Default::default()
         }),
-        tunnels: vec![micro_tunnel::config::model::TunnelConfig {
+        tunnels: vec![culvert::config::model::TunnelConfig {
             tag: "bench-h3-conc".to_string(),
             token: None,
             endpoint: EndpointConfig::Simple(format!("h3://{}/tunnel", server_h3_listen)),
@@ -756,7 +757,7 @@ async fn test_h3_concurrent_forward_stress() {
     };
 
     let c_cancel = cancel_token.clone();
-    let supervisor = micro_tunnel::supervisor::TunnelSupervisor::new(app_config, c_cancel);
+    let supervisor = culvert::supervisor::TunnelSupervisor::new(app_config, c_cancel);
     let client_handle = tokio::spawn(async move {
         let _ = supervisor.run().await;
     });
@@ -940,7 +941,7 @@ async fn test_h3_stream_liveness_detects_closed_connection() {
     let mut cx = std::task::Context::from_waker(&waker);
     assert_eq!(
         stream.poll_check_alive(&mut cx),
-        std::task::Poll::Ready(micro_tunnel::core::stream::HeartbeatStatus::Alive)
+        std::task::Poll::Ready(culvert::core::stream::HeartbeatStatus::Alive)
     );
     assert!(stream.poll_send_ping(&mut cx).is_ready());
 
@@ -953,7 +954,7 @@ async fn test_h3_stream_liveness_detects_closed_connection() {
     let alive_status = stream.poll_check_alive(&mut cx);
     assert_eq!(
         alive_status,
-        std::task::Poll::Ready(micro_tunnel::core::stream::HeartbeatStatus::Dead)
+        std::task::Poll::Ready(culvert::core::stream::HeartbeatStatus::Dead)
     );
 }
 

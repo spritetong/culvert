@@ -1,6 +1,7 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+// Copyright (c) 2026 Sprite Tong <spritetong@gmail.com>
+// SPDX-License-Identifier: MPL-2.0
+// culvert is licensed under the Mozilla Public License Version 2.0.
+
 //! Core stream abstractions and type-erased dynamic trait objects.
 //! All comments and docstrings must be in English.
 
@@ -65,7 +66,7 @@ pub trait TunnelStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {
     ///
     /// Every in-tree transport implements a FIN: TCP/QUIC use the transport FIN,
     /// Mux uses a FIN frame, and WebSocket uses an in-band zero-length binary FIN
-    /// understood by both micro-tunnel peers. A transport that can only tear down
+    /// understood by both culvert peers. A transport that can only tear down
     /// the whole connection must override this to return false.
     fn supports_half_close(&self) -> bool {
         true

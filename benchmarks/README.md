@@ -1,6 +1,6 @@
-# Micro-Tunnel Benchmark & Stress-Testing Suite
+# Culvert Benchmark & Stress-Testing Suite
 
-This directory contains configurations, startup scripts, and driver tools to evaluate the performance, throughput, concurrency, and latency of `micro-tunnel`.
+This directory contains configurations, startup scripts, and driver tools to evaluate the performance, throughput, concurrency, and latency of `culvert`.
 
 ---
 
@@ -11,14 +11,14 @@ This directory contains configurations, startup scripts, and driver tools to eva
 (iperf3 / wrk / .NET driver)
        │ (TCP on 127.0.0.1:15201)
        ▼
-[micro-tunnel Client]
+[culvert Client]
   - Pre-warmed Pool (pool_size: 16)
   - Optional Frame Multiplexing (sing-box smux)
   - Mimalloc allocator
        │
        │ (ws://, wss://, h3://, quic:// over :8443)
        ▼
-[micro-tunnel Server]
+[culvert Server]
   - Token-authenticated Handshake
   - Fast-path Splice / Zero-copy Stream Copy
        │ (TCP to 127.0.0.1:5201)
@@ -131,7 +131,7 @@ endpoint: "quic://127.0.0.1:8443/raw"
 ws tunnel  : [SUM] 0.00-10.15 sec  1.08 GBytes   914 Mbits/sec  receiver (98.6% of wire rate)
 direct tcp : [SUM] 0.00-10.11 sec  1.09 GBytes   927 Mbits/sec  receiver
 ```
-*Micro-tunnel delivers near-native raw TCP speed with negligible encapsulation overhead.*
+*Culvert delivers near-native raw TCP speed with negligible encapsulation overhead.*
 
 ### Loopback / High-Bandwidth Test
 ```

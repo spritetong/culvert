@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Sprite Tong <spritetong@gmail.com>
+# SPDX-License-Identifier: MPL-2.0
+# culvert is licensed under the Mozilla Public License Version 2.0.
+
 # ==============================================================================
-# Micro-Tunnel Benchmark Execution Script (Linux / macOS)
+# Culvert Benchmark Execution Script (Linux / macOS)
 # ==============================================================================
 
 set -euo pipefail
@@ -11,7 +15,7 @@ PARALLEL_STREAMS="${3:-4}"
 DURATION_SECS="${4:-10}"
 
 echo "================================================================================"
-echo " Starting Micro-Tunnel Benchmark (Linux / macOS)"
+echo " Starting Culvert Benchmark (Linux / macOS)"
 echo " Target: ${TARGET_HOST}:${TARGET_PORT} | Streams: ${PARALLEL_STREAMS} | Duration: ${DURATION_SECS}s"
 echo "================================================================================"
 

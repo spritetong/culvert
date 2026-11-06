@@ -1,6 +1,7 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+// Copyright (c) 2026 Sprite Tong <spritetong@gmail.com>
+// SPDX-License-Identifier: MPL-2.0
+// culvert is licensed under the Mozilla Public License Version 2.0.
+
 //! HTTP/3 and QUIC transport connector implementation.
 //! All comments and docstrings must be in English.
 
@@ -656,7 +657,7 @@ mod tests {
             .with_no_client_auth()
             .with_single_cert(cert_chain, private_key)
             .unwrap();
-        server_crypto.alpn_protocols = vec![b"micro-tunnel-quic".to_vec()];
+        server_crypto.alpn_protocols = vec![b"culvert-quic".to_vec()];
         let server_config = quinn::ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap(),
         ));
@@ -671,7 +672,7 @@ mod tests {
         let mut client_crypto = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        client_crypto.alpn_protocols = vec![b"micro-tunnel-quic".to_vec()];
+        client_crypto.alpn_protocols = vec![b"culvert-quic".to_vec()];
         let client_config = quinn::ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).unwrap(),
         ));

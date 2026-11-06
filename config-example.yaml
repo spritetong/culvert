@@ -1,7 +1,11 @@
+# Copyright (c) 2026 Sprite Tong <spritetong@gmail.com>
+# SPDX-License-Identifier: MPL-2.0
+# culvert is licensed under the Mozilla Public License Version 2.0.
+
 # ==============================================================================
-# Micro-Tunnel Configuration Example
+# Culvert Configuration Example
 # Validate with:
-#   micro-tunnel --check -c config-example.yaml
+#   culvert --check -c config-example.yaml
 # ==============================================================================
 
 log:

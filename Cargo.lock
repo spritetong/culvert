@@ -445,6 +445,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "culvert"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "criterion",
+ "dashmap",
+ "fastwebsockets",
+ "futures-core",
+ "futures-sink",
+ "futures-util",
+ "h3",
+ "h3-quinn",
+ "hickory-resolver",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "mimalloc",
+ "parking_lot 0.13.0",
+ "quinn",
+ "rcgen",
+ "ring",
+ "rmp-serde",
+ "rustls",
+ "rustls-pemfile",
+ "scopeguard",
+ "serde",
+ "serde_yaml",
+ "socket2",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uds_windows",
+ "url",
+ "webpki-roots",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "dashmap"
 version = "6.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1262,51 +1307,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "micro-tunnel"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "clap",
- "criterion",
- "dashmap",
- "fastwebsockets",
- "futures-core",
- "futures-sink",
- "futures-util",
- "h3",
- "h3-quinn",
- "hickory-resolver",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "mimalloc",
- "parking_lot 0.13.0",
- "quinn",
- "rcgen",
- "ring",
- "rmp-serde",
- "rustls",
- "rustls-pemfile",
- "scopeguard",
- "serde",
- "serde_yaml",
- "socket2",
- "subtle",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-rustls",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "uds_windows",
- "url",
- "webpki-roots",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

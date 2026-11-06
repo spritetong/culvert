@@ -1,6 +1,7 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+// Copyright (c) 2026 Sprite Tong <spritetong@gmail.com>
+// SPDX-License-Identifier: MPL-2.0
+// culvert is licensed under the Mozilla Public License Version 2.0.
+
 //! Test verifying that large unread streams do not cause connection-level
 //! head-of-line (HOL) blocking for healthy sibling streams under QUIC flow control.
 //! All comments and docstrings must be in English.
@@ -9,11 +10,11 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::oneshot;
 
-use micro_tunnel::config::model::{AppConfig, EndpointConfig, TlsConfig, TunnelMode};
-use micro_tunnel::dialer::endpoint::EndpointContext;
-use micro_tunnel::transport::h3::H3Connector;
-use micro_tunnel::transport::h3::listener::H3Listener;
-use micro_tunnel::transport::{TargetAddr, TransportConnector, TransportListener};
+use culvert::config::model::{AppConfig, EndpointConfig, TlsConfig, TunnelMode};
+use culvert::dialer::endpoint::EndpointContext;
+use culvert::transport::h3::H3Connector;
+use culvert::transport::h3::listener::H3Listener;
+use culvert::transport::{TargetAddr, TransportConnector, TransportListener};
 
 /// Helper to get an available ephemeral port from the OS that is free for both TCP and UDP.
 fn get_ephemeral_port() -> u16 {
