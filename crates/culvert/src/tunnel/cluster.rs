@@ -89,6 +89,7 @@ pub async fn run_tunnel_cluster(
                         token,
                         endpoint,
                         registry,
+                        config.pool_size,
                         token_cancel,
                     )
                     .await

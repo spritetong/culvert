@@ -384,7 +384,8 @@ For each accepted `(stream, StreamMetadata)`:
 | :--- | :--- |
 | `Forward` | Resolve the target, dial it, relay. |
 | `Reverse` with `session_id` | Fulfill a pending reverse session in `SessionManager`. |
-| `Reverse` without `session_id` | Run the reverse control channel handler. |
+| `Reverse` with `pool_idle` | Enqueue idle stream into the corresponding reverse listener's inbound pool via `SessionManager`. |
+| `Reverse` (control) | Run the reverse control channel handler. |
 
 Forward target resolution order:
 
@@ -399,25 +400,39 @@ If none is available the stream is closed with a log message. Dialing uses
 ### 6.1 Activation packet
 
 ```
-0xA5 | length: u16 big-endian | UTF-8 target string
+0xA5 | length: u16 big-endian | UTF-8 target string (Forward mode only)
 ```
 
-Produced by `ReplenishingStreamPool::encode_activation` on the client, written
-before any application data. The server reads the magic byte, then the length
-and payload with a 10-second timeout, rejects lengths `>= 512`, parses the
-string with `parse_target_addr`, and only then dials the target. An invalid
-magic byte or a closed idle stream terminates that connection.
+- In **Forward mode**: Produced by `ReplenishingStreamPool::encode_activation` on
+  the client, written before any application data. The server reads the magic
+  byte, then the length and payload with a 10-second timeout, rejects lengths
+  `>= 512`, parses the string with `parse_target_addr`, and only then dials the
+  target. An invalid magic byte or a closed idle stream terminates that connection.
+- In **Reverse mode**: The server sends a single `0xA5` byte directly down the
+  popped idle reverse stream to trigger activation on the client. Target address
+  is already statically configured on the client.
 
-### 6.2 Reverse control channel
+### 6.2 Reverse control channel & Inbound Pool
 
 `handle_reverse_control` wraps the accepted stream in `FramedControlStream`,
-reads `RegisterReverse`, binds the requested listener on the server, replies
-`RegisterAck`, and then for each inbound connection allocates a session id
-(`REVERSE_SESSION_COUNTER`), registers a oneshot receiver in `SessionManager`,
-and sends `NewConnection`. The paired data stream is delivered by
-`SessionManager::fulfill`; pairing is bounded by
-`DEFAULT_SESSION_PAIR_TIMEOUT` (10 s). Both sides then relay. The control loop
-also handles `Ping`/`Pong` and reconnect with exponential backoff.
+reads `RegisterReverse`, binds the requested listener on the server, registers
+an `inbound_pool` with `SessionManager` for this listener, replies
+`RegisterAck`, and starts accepting inbound connections.
+
+For each inbound connection on the reverse listener:
+
+1. **Fast path (0-RTT Pool)**: Server checks the listener's `inbound_pool`.
+   If an idle stream is available, the server writes `0xA5` directly to it and
+   immediately relays with the inbound visitor stream without any control
+   messages.
+2. **Fallback path (On-demand Signaling)**: If the pool is empty or not
+   configured, the server allocates a session id (`REVERSE_SESSION_COUNTER`),
+   registers a oneshot receiver in `SessionManager`, and sends `NewConnection`.
+   The paired data stream is delivered by `SessionManager::fulfill`; pairing is
+   bounded by `DEFAULT_SESSION_PAIR_TIMEOUT` (10 s). Both sides then relay.
+
+The control loop also handles `Ping`/`Pong` and reconnect with exponential
+backoff.
 
 `FramedControlStream` is a `tokio_util::codec::LengthDelimitedCodec` over any
 `AsyncRead + AsyncWrite` stream, implementing `Stream<Item =
@@ -445,7 +460,16 @@ flushed first. Both streams are then passed to `RelayEngine`. An
 
 `run_reverse_mapping` opens the control channel with dummy target
 `control:0`, sends `RegisterReverse`, awaits `RegisterAck`, and then loops on
-control messages. On `NewConnection` it spawns a task that dials the local
+control messages.
+
+When `pool_size` is configured, an inbound pool worker loop is spawned that
+maintains `pool_size` pre-warmed idle streams connected to the server
+(`mode = Reverse`, `pool_idle = true`, `target = listen_addr`). Each stream
+blocks waiting for the `0xA5` activation byte from the server. Upon reading
+`0xA5`, it immediately dials the local `mappings.target`, starts relaying via
+`RelayEngine`, and replenishes an idle stream to the server in the background.
+
+On `NewConnection` (the signaling fallback path), it continues to dial the local
 `mappings.target`, opens a `reverse-data` stream with the session id, and
 relays. Reconnect backoff starts at 500 ms, doubles up to 30 s, and resets
 after 30 s of stable operation.
@@ -528,12 +552,20 @@ this loop and in the pool reactor is deliberately retained.
 
 ---
 
-## 10. Session Pairing
+## 10. Session Pairing and Inbound Pools
 
-`SessionManager` holds a `DashMap<String, oneshot::Sender<Box<dyn
-TunnelStream>>>`. The server calls `register(session_id)` when a connection
-arrives on a reverse listener, waits up to 10 s, and the reverse data stream is
-delivered by `fulfill(session_id, stream)`. `remove` clears timed-out entries.
+`SessionManager` manages two dispatch tables:
+
+1. **On-demand Sessions**: A `DashMap<String, oneshot::Sender<Box<dyn TunnelStream>>>`.
+   When no idle stream is available, the server calls `register(session_id)`,
+   waits up to 10 s, and the reverse data stream is delivered by
+   `fulfill(session_id, stream)`. `remove` clears timed-out entries.
+2. **Reverse Inbound Pools**: A `DashMap<String, Arc<Mutex<VecDeque<Box<dyn TunnelStream>>>>>`
+   keyed by the reverse listener canonical key (e.g. port or UDS path). Pre-warmed
+   reverse streams (`mode = Reverse`, `pool_idle = true`, `target = listen_addr`)
+   are enqueued via `push_idle_stream`. The reverse listener pops streams via
+   `pop_idle_stream` to perform 0-RTT pairing with incoming visitor connections.
+
 Errors are `SessionNotFound`, `SessionClosed`, and `SessionPairTimeout`.
 
 ---

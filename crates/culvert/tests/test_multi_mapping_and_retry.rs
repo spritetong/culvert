@@ -208,3 +208,88 @@ async fn test_path_mismatch_rejection() {
         "Timeout waiting for handles to exit after cancellation in test_path_mismatch_rejection",
     );
 }
+
+#[tokio::test]
+async fn test_cluster_mixed_forward_and_reverse_with_pool_e2e() {
+    let cancel_token = CancellationToken::new();
+
+    let (echo_fwd_handle, echo_fwd_port) = spawn_echo_server(cancel_token.clone());
+    let (echo_rev_handle, echo_rev_port) = spawn_echo_server(cancel_token.clone());
+    let server_ws_port = get_available_port();
+    let fwd_listen_port = get_available_port();
+    let rev_listen_port = get_available_port();
+
+    let mut app_config = AppConfig {
+        server: Some(ServerConfig {
+            listen: vec![format!("ws://127.0.0.1:{}/cluster_ws", server_ws_port)],
+            token: Some("cluster_mixed_pool_secret".to_string()),
+            default_target: None,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    app_config.tunnels.push(TunnelConfig {
+        tag: "mixed-cluster".to_string(),
+        endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/cluster_ws", server_ws_port)),
+        token: Some("cluster_mixed_pool_secret".to_string()),
+        pool_size: Some(4), // Outbound pool for forward, Inbound pool for reverse
+        failover: None,
+        multiplex: None,
+        retry: None,
+        mappings: vec![
+            PortMappingConfig {
+                mode: TunnelMode::Forward,
+                listen: format!("127.0.0.1:{}", fwd_listen_port),
+                target: format!("127.0.0.1:{}", echo_fwd_port),
+            },
+            PortMappingConfig {
+                mode: TunnelMode::Reverse,
+                listen: format!("127.0.0.1:{}", rev_listen_port),
+                target: format!("127.0.0.1:{}", echo_rev_port),
+            },
+        ],
+    });
+
+    let supervisor = TunnelSupervisor::new(app_config, cancel_token.clone());
+    let sup_handle = tokio::spawn(async move {
+        let _ = supervisor.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 1. Test Forward mapping (client listen -> remote echo)
+    for i in 1..=3 {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", fwd_listen_port))
+            .await
+            .expect("Failed to connect forward listen port");
+        let msg = format!("FWD TEST {}", i);
+        stream.write_all(msg.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; msg.len()];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, msg.as_bytes());
+    }
+
+    // 2. Test Reverse mapping (server listen -> local echo)
+    for i in 1..=3 {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", rev_listen_port))
+            .await
+            .expect("Failed to connect reverse listen port on server");
+        let msg = format!("REV TEST {}", i);
+        stream.write_all(msg.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; msg.len()];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, msg.as_bytes());
+    }
+
+    // Clean shutdown
+    cancel_token.cancel();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (r1, r2, r3) = tokio::join!(echo_fwd_handle, echo_rev_handle, sup_handle);
+        r1.expect("echo_fwd handle panicked");
+        r2.expect("echo_rev handle panicked");
+        r3.expect("sup handle panicked");
+    })
+    .await
+    .expect("Timeout waiting for handles to exit in test_cluster_mixed_forward_and_reverse_with_pool_e2e");
+}

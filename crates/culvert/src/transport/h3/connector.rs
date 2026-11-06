@@ -410,7 +410,7 @@ impl H3Connector {
         let mode_str = match self.mode {
             TunnelMode::Forward => TUNNEL_MODE_FORWARD,
             TunnelMode::Reverse => {
-                if session_id.is_some() {
+                if session_id.is_some() || pool_idle {
                     TUNNEL_MODE_REVERSE_DATA
                 } else {
                     TUNNEL_MODE_REVERSE_CTRL

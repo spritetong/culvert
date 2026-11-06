@@ -283,6 +283,11 @@ impl ServerRunner {
                                                     if let Err(e) = session_mgr.fulfill(&session_id, stream) {
                                                         warn!(session = %session_id, "Failed to fulfill reverse session: {:?}", e);
                                                     }
+                                                } else if metadata.pool_idle {
+                                                    // Pre-warmed idle reverse stream arrival: push into inbound pool
+                                                    if !session_mgr.push_idle_stream(metadata.target.as_ref(), stream) {
+                                                        warn!("Received reverse idle pool stream but no matching reverse listener found");
+                                                    }
                                                 } else {
                                                     // Control stream arrival: handle registration and listen on requested port
                                                     Self::handle_reverse_control(
@@ -465,6 +470,7 @@ impl ServerRunner {
         };
 
         info!(addr = %listen_addr, "Server bound reverse port successfully. Waiting for external traffic...");
+        let idle_pool = session_mgr.register_pool(&listen_addr);
         let mut local_tracker = TaskTracker::<()>::new(cancel_token.clone());
         // Activity-based deadline: inbound control frames AND real outbound
         // notifications (NewConnection / Pong) both prove the channel is in use.
@@ -488,6 +494,43 @@ impl ServerRunner {
                 accept_res = listener.accept() => {
                     match accept_res {
                         Ok((visitor_stream, visitor_addr)) => {
+                            // 1. FAST PATH (0-RTT Pool): Check if an idle stream is available in the inbound pool
+                            let mut fast_paired_stream = None;
+                            loop {
+                                let next_candidate = idle_pool.lock().pop_front();
+                                let Some(mut candidate) = next_candidate else {
+                                    break;
+                                };
+                                if tokio::io::AsyncWriteExt::write_all(&mut candidate, &[ACTIVATE_STREAM_MAGIC]).await.is_ok()
+                                    && tokio::io::AsyncWriteExt::flush(&mut candidate).await.is_ok()
+                                {
+                                    fast_paired_stream = Some(candidate);
+                                    break;
+                                }
+                                // Stale or dead stream; discard and try next
+                            }
+
+                            if let Some(data_stream) = fast_paired_stream {
+                                info!(
+                                    visitor = %visitor_addr,
+                                    "0-RTT Fast Path: Paired reverse visitor with idle pooled stream"
+                                );
+                                idle_deadline
+                                    .as_mut()
+                                    .reset(tokio::time::Instant::now() + idle_timeout);
+                                local_tracker.spawn_with_cancel(move |token| async move {
+                                    let _ = RelayEngine::relay_with_heartbeat(
+                                        visitor_stream,
+                                        data_stream,
+                                        token,
+                                        heartbeat_interval,
+                                        idle_timeout,
+                                    ).await;
+                                });
+                                continue;
+                            }
+
+                            // 2. SLOW PATH (Fallback): Allocate session_id and notify client via control channel
                             let session_id = format!(
                                 "sess_{}_{}",
                                 std::process::id(),
@@ -585,6 +628,7 @@ impl ServerRunner {
         }
 
         local_tracker.shutdown_and_wait().await;
+        session_mgr.unregister_pool(&listen_addr);
         info!(addr = %listen_addr, "Reverse listener closed.");
     }
 }

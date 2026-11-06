@@ -155,7 +155,7 @@ impl WsHandshakeHeaders {
         let mode_str = match self.tunnel_mode {
             TunnelMode::Forward => TUNNEL_MODE_FORWARD,
             TunnelMode::Reverse => {
-                if self.session_id.is_some() {
+                if self.session_id.is_some() || self.pool_idle {
                     TUNNEL_MODE_REVERSE_DATA
                 } else {
                     TUNNEL_MODE_REVERSE_CTRL

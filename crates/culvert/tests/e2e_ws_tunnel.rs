@@ -252,6 +252,109 @@ async fn test_reverse_tunnel_ws_e2e() {
 }
 
 #[tokio::test]
+async fn test_reverse_tunnel_with_inbound_pool_e2e() {
+    let cancel_token = CancellationToken::new();
+
+    let (echo_handle, local_echo_port) = spawn_echo_server(cancel_token.clone());
+    let server_ws_port = get_available_port();
+    let reverse_listen_port = get_available_port();
+
+    let server_ws_listen = format!("127.0.0.1:{}", server_ws_port);
+    let reverse_listen = format!("127.0.0.1:{}", reverse_listen_port);
+    let auth_token = "ws_reverse_pool_test_token_789";
+
+    // 1. Setup transport registry and start ServerRunner
+    let mut registry = TransportRegistry::new();
+    registry.register(WsTransportDriver);
+    let registry = Arc::new(registry);
+    let session_mgr = Arc::new(SessionManager::new());
+
+    let server_config = ServerConfig {
+        listen: vec![format!("ws://{}/tunnel", server_ws_listen)],
+        token: Some(auth_token.to_string()),
+        default_target: None,
+        ..Default::default()
+    };
+    let server_runner = ServerRunner::new(
+        server_config,
+        Arc::clone(&registry),
+        Arc::clone(&session_mgr),
+    );
+
+    let server_cancel = cancel_token.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = server_runner.run(server_cancel).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 2. Setup client reverse tunnel with pool_size: 4
+    let tunnel_config = TunnelConfig {
+        tag: "test-reverse-pool".to_string(),
+        endpoint: EndpointConfig::Simple(format!("ws://{}/tunnel", server_ws_listen)),
+        token: Some(auth_token.to_string()),
+        pool_size: Some(4),
+        failover: None,
+        multiplex: None,
+        mappings: vec![PortMappingConfig {
+            mode: TunnelMode::Reverse,
+            listen: reverse_listen.clone(),
+            target: format!("127.0.0.1:{}", local_echo_port),
+        }],
+        retry: None,
+    };
+
+    let app_config = AppConfig::default();
+    let endpoint_ctx = EndpointContext::build(&tunnel_config.endpoint, &app_config).unwrap();
+    let client_cancel = cancel_token.clone();
+    let client_registry = Arc::clone(&registry);
+    let client_handle = tokio::spawn(async move {
+        let _ =
+            run_reverse_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
+    });
+
+    // Give time for reverse listener to bind and pool connections to pre-warm
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // 3. Connect 5 consecutive external visitors (exceeding initial pool size 4 to verify replenishment)
+    for i in 1..=5 {
+        let mut visitor_stream = match TcpStream::connect(&reverse_listen).await {
+            Ok(s) => s,
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                TcpStream::connect(&reverse_listen)
+                    .await
+                    .expect("Failed to connect reverse listener port")
+            }
+        };
+
+        let payload = format!("Hello reverse pool echo packet #{}", i);
+        visitor_stream
+            .write_all(payload.as_bytes())
+            .await
+            .expect("Failed to write to reverse port");
+
+        let mut buf = vec![0u8; payload.len()];
+        tokio::time::timeout(Duration::from_secs(5), visitor_stream.read_exact(&mut buf))
+            .await
+            .expect("Timeout reading reverse pool reply")
+            .expect("Failed to read reverse pool reply");
+        assert_eq!(&buf, payload.as_bytes(), "Echo mismatch in reverse pool test");
+    }
+
+    // 4. Graceful shutdown
+    cancel_token.cancel();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (r1, r2, r3) = tokio::join!(echo_handle, server_handle, client_handle);
+        r1.expect("echo handle panicked");
+        r2.expect("server handle panicked");
+        r3.expect("client handle panicked");
+    })
+    .await
+    .expect("Timeout waiting for handles to exit in test_reverse_tunnel_with_inbound_pool_e2e");
+}
+
+#[tokio::test]
 async fn test_supervisor_multi_tunnel_concurrency_e2e() {
     let cancel_token = CancellationToken::new();
 

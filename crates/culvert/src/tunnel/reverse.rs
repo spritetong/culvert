@@ -7,6 +7,8 @@
 
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -14,8 +16,8 @@ use tracing::{error, info, warn};
 use crate::common::{CancelFutureExt, CancellationTokenExt, TaskTracker};
 use crate::config::model::{TunnelConfig, TunnelMode};
 use crate::consts::{
-    DEFAULT_REVERSE_BACKOFF_INITIAL, DEFAULT_REVERSE_BACKOFF_MAX, REVERSE_BACKOFF_RESET_THRESHOLD,
-    REVERSE_CONTROL_TARGET_HOST,
+    ACTIVATE_STREAM_MAGIC, DEFAULT_REVERSE_BACKOFF_INITIAL, DEFAULT_REVERSE_BACKOFF_MAX,
+    REVERSE_BACKOFF_RESET_THRESHOLD, REVERSE_CONTROL_TARGET_HOST,
 };
 use crate::control::stream::{ControlMessage, FramedControlStream};
 use crate::core::error::TunnelError;
@@ -25,6 +27,7 @@ use crate::dialer::endpoint::EndpointContext;
 use crate::transport::{TargetAddr, TransportConnector, TransportRegistry};
 
 /// Runs a single reverse mapping control loop.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_reverse_mapping(
     tag: String,
     listen: String,
@@ -32,6 +35,7 @@ pub async fn run_reverse_mapping(
     token: Option<String>,
     endpoint_ctx: EndpointContext,
     transport_registry: Arc<TransportRegistry>,
+    pool_size: Option<usize>,
     cancel_token: CancellationToken,
 ) -> Result<(), TunnelError> {
     info!(
@@ -148,6 +152,90 @@ pub async fn run_reverse_mapping(
         let idle_deadline = tokio::time::sleep(idle_timeout);
         tokio::pin!(idle_deadline);
 
+        let pool_cancel = cancel_token.child_token();
+        let mut pool_tracker = TaskTracker::<()>::new(pool_cancel.clone());
+
+        if let Some(size) = pool_size.filter(|&s| s > 0) {
+            let listen_target = crate::tunnel::forward::parse_target_addr(&listen)
+                .unwrap_or_else(|_| dummy_target.clone());
+            info!(
+                tag = %tag,
+                size,
+                "Pre-warming reverse inbound pool connections to remote server"
+            );
+
+            for _ in 0..size {
+                let connector = Arc::clone(&data_connector);
+                let listen_target = listen_target.clone();
+                let target_clone = target_addr.clone();
+                let parent_cancel = cancel_token.clone();
+                let hb = hb_interval;
+                let idle = idle_timeout;
+
+                pool_tracker.spawn_with_cancel(move |token| async move {
+                    while !token.is_cancelled() {
+                        let Some(conn_res) = connector
+                            .connect_pooled(&listen_target)
+                            .cancel_with(&token)
+                            .await
+                        else {
+                            break;
+                        };
+
+                        let mut stream = match conn_res {
+                            Ok(s) => s,
+                            Err(_) => {
+                                if !token.sleep_or_cancel(Duration::from_millis(500)).await {
+                                    break;
+                                }
+                                continue;
+                            }
+                        };
+
+                        let mut magic = [0u8; 1];
+                        let Some(read_res) = stream.read_exact(&mut magic).cancel_with(&token).await else {
+                            break;
+                        };
+
+                        match read_res {
+                            Ok(_) if magic[0] == ACTIVATE_STREAM_MAGIC => {
+                                let Some(local_res) = crate::platform::connect_target_str(&target_clone)
+                                    .cancel_with(&parent_cancel)
+                                    .await
+                                else {
+                                    break;
+                                };
+
+                                let local_stream = match local_res {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        error!("Failed to connect to local target {}: {:?}", target_clone, e);
+                                        continue;
+                                    }
+                                };
+
+                                let relay_cancel = parent_cancel.clone();
+                                tokio::spawn(async move {
+                                    let _ = RelayEngine::relay_with_heartbeat(
+                                        local_stream,
+                                        stream,
+                                        relay_cancel,
+                                        hb,
+                                        idle,
+                                    ).await;
+                                });
+                            }
+                            _ => {
+                                if !token.sleep_or_cancel(Duration::from_millis(100)).await {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
         // Main event loop handling incoming connection alerts from remote server
         loop {
             tokio::select! {
@@ -157,6 +245,7 @@ pub async fn run_reverse_mapping(
                     break;
                 }
                 Some(_) = conn_tracker.join_next(), if !conn_tracker.is_empty() => {}
+                Some(_) = pool_tracker.join_next(), if !pool_tracker.is_empty() => {}
                 _ = &mut idle_deadline => {
                     warn!(
                         tag = %tag,
@@ -273,6 +362,8 @@ pub async fn run_reverse_mapping(
             }
         }
 
+        pool_tracker.shutdown_and_wait().await;
+
         if loop_start.elapsed() > REVERSE_BACKOFF_RESET_THRESHOLD {
             backoff = DEFAULT_REVERSE_BACKOFF_INITIAL;
         } else {
@@ -308,6 +399,7 @@ pub async fn run_reverse_tunnel(
         config.token,
         endpoint_ctx,
         transport_registry,
+        config.pool_size,
         cancel_token,
     )
     .await
@@ -399,6 +491,7 @@ mod tests {
                 None,
                 ep_ctx,
                 reg,
+                None,
                 cancel_clone,
             )
             .await

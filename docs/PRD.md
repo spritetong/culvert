@@ -64,7 +64,7 @@ behavior is configurable, the configuration key is given.
 | :--- | :--- | :--- |
 | UC-1 | Publish a local service on a remote host (reverse mapping) | Client behind NAT connects to the ingress endpoint, sends `RegisterReverse`, the server binds the requested address, and each inbound connection is relayed back to the client's local target. |
 | UC-2 | Reach a private service from a local port (forward mapping) | Client binds `mappings.listen` locally; each local connection opens a tunnel stream to the ingress endpoint; the server dials `mappings.target` and relays bytes in both directions. |
-| UC-3 | Carry several ports over one endpoint (cluster) | One `tunnels` entry declares several `mappings`. All forward mappings share one connection pool when `pool_size` is set; reverse mappings use dedicated control and data streams. |
+| UC-3 | Carry several ports over one endpoint (cluster) | One `tunnels` entry declares several `mappings`. Forward mappings share the outbound pool, and reverse mappings share the inbound pool when `pool_size` is set; in-band 0-RTT activation is used when idle streams exist, falling back to signaling when the pool is empty. |
 | UC-4 | Reach a Unix domain socket through a tunnel | `mappings.target` or `mappings.listen` uses `unix://path`; the ingress side or client side binds/connects the socket directly. |
 | UC-5 | Deploy behind a reverse proxy | `server.listen` uses `ws+unix://...` or `ws://127.0.0.1:...`; the proxy handles public TLS and forwards the configured HTTP path to culvert. |
 | UC-6 | Deploy without a reverse proxy | `server.listen` uses a TLS scheme (`wss`, `h3`, `https`, `quic`, `wss+unix`). culvert terminates TLS using the configured certificate and key, or an ephemeral self-signed certificate when neither is provided. |
@@ -101,8 +101,8 @@ behavior is configurable, the configuration key is given.
 
 | Mode | Listener location | Target location | Pool |
 | :--- | :--- | :--- | :--- |
-| `forward` (default) | Client host | Dialed by the ingress server | Shared when `pool_size > 0` |
-| `reverse` | Ingress server (registered over a control channel) | Dialed by the client host | Not used |
+| `forward` (default) | Client host | Dialed by the ingress server | Shared outbound pool when `pool_size > 0` |
+| `reverse` | Ingress server (registered over a control channel) | Dialed by the client host | Shared inbound pool when `pool_size > 0` (0-RTT with signaling fallback) |
 
 ---
 
@@ -203,9 +203,9 @@ behavior is configurable, the configuration key is given.
 - **FR-4.6** An acquired stream is used once. Closing it decrements the pool's
   active-stream counter through a guard; the actor replenishes idle streams in
   the background. Streams are not returned to the idle queue after use.
-- **FR-4.7** Reverse mappings never use the forward pool.
+- **FR-4.7** In a cluster with both forward and reverse mappings, forward mappings share the Outbound Pool, while reverse mappings use the Inbound Pool. Reverse mappings never draw from the forward pool.
 
-### FR-5 Reverse mappings and control protocol
+### FR-5 Reverse mappings, 0-RTT inbound pool, and control protocol
 
 - **FR-5.1** The client opens a control stream in `reverse-ctrl` mode and
   sends `RegisterReverse { listen_addr, target_addr }`. The server binds the
@@ -214,18 +214,28 @@ behavior is configurable, the configuration key is given.
 - **FR-5.2** Control messages are encoded with MessagePack
   (`to_vec_named`) over a length-delimited frame. Variants are
   `RegisterReverse`, `RegisterAck`, `NewConnection`, `Ping`, `Pong`.
-- **FR-5.3** For each inbound connection on the registered listener, the
-  server allocates a session id, registers a pending session, and sends
-  `NewConnection { session_id, client_addr }` over the control channel.
-- **FR-5.4** The client dials its local `mappings.target`, opens a
-  `reverse-data` stream carrying `x-session-id`, and the server pairs it with
-  the waiting inbound connection through `SessionManager`. Pairing has a
-  10-second timeout.
-- **FR-5.5** Both sides then relay bytes bidirectionally. The control channel
-  stays open with activity-gated `Ping`/`Pong` and an idle timeout; any
-  inbound frame refreshes the activity deadline, while outbound probes alone
-  do not.
-- **FR-5.6** Control-channel reconnection uses an exponential backoff from
+- **FR-5.3** When `pool_size` is configured on a tunnel with reverse mappings,
+  the client pre-warms idle reverse streams to the server (`mode = reverse`,
+  `pool_idle = true`, `target = listen_addr`). The server maintains an inbound
+  stream pool for that reverse listener.
+- **FR-5.4** Fast path (0-RTT): For each inbound connection on the reverse
+  listener, if an idle stream is available in the inbound pool, the server pops
+  it, writes the single-byte activation signal `0xA5`, and immediately relays
+  with the inbound connection without control signaling. The client reads `0xA5`,
+  dials local `mappings.target`, starts relaying, and replenishes the inbound
+  pool in the background.
+- **FR-5.5** Fallback path (on-demand signaling): If no idle stream is
+  available (e.g. pool exhausted under burst or `pool_size` not set), the server
+  allocates a session id, registers a pending session, and sends
+  `NewConnection { session_id, client_addr }` over the control channel. The
+  client dials its local `mappings.target`, opens a `reverse-data` stream
+  carrying `x-session-id`, and the server pairs it with the waiting inbound
+  connection through `SessionManager`. Pairing has a 10-second timeout.
+- **FR-5.6** Both sides relay bytes bidirectionally via `RelayEngine`. The
+  control channel stays open with activity-gated `Ping`/`Pong` and an idle
+  timeout; any inbound frame refreshes the activity deadline, while outbound
+  probes alone do not.
+- **FR-5.7** Control-channel reconnection uses an exponential backoff from
   500 ms up to 30 s, reset after 30 s of stable operation.
 
 ### FR-6 Relay engine
