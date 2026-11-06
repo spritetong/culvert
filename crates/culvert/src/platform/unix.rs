@@ -7,7 +7,6 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::core::error::TunnelError;
