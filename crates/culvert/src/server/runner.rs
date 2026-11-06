@@ -36,6 +36,26 @@ pub struct ServerRunner {
 }
 
 impl ServerRunner {
+    /// Creates a new `ServerRunner` with default transport registry and session manager.
+    pub fn from_config(config: ServerConfig) -> Self {
+        Self::with_global_tls(
+            config,
+            None,
+            Arc::new(TransportRegistry::default()),
+            Arc::new(SessionManager::new()),
+        )
+    }
+
+    /// Creates a new `ServerRunner` with global TLS and default registries.
+    pub fn from_config_with_tls(config: ServerConfig, global_tls: Option<TlsConfig>) -> Self {
+        Self::with_global_tls(
+            config,
+            global_tls,
+            Arc::new(TransportRegistry::default()),
+            Arc::new(SessionManager::new()),
+        )
+    }
+
     /// Creates a new `ServerRunner`.
     pub fn new(
         config: ServerConfig,

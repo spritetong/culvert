@@ -66,11 +66,8 @@ mod tempfile_dummy {
     impl TempDir {
         pub fn new() -> Self {
             let id = PKI_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "culvert_pki_{}_{}",
-                std::process::id(),
-                id
-            ));
+            let path =
+                std::env::temp_dir().join(format!("culvert_pki_{}_{}", std::process::id(), id));
             let _ = std::fs::create_dir_all(&path);
             Self { path }
         }

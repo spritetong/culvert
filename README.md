@@ -111,6 +111,96 @@ culvert [OPTIONS]
 
 ---
 
+## Workspace & Library Usage
+
+`culvert` is structured as a Cargo workspace with two distinct crates:
+- **`culvert`**: The core library exposing client/server runners, connection pooling, multiplexing, and protocol drivers for external programmatic integration.
+- **`culvert-cli`**: Lightweight CLI frontend containing only `main.rs` and CLI argument parsing (compiled as the `culvert` binary).
+
+### Using `culvert` as a Library
+
+Add `culvert` to your `Cargo.toml`:
+
+```toml
+[dependencies]
+culvert = { version = "0.1", path = "../path/to/crates/culvert" }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+```
+
+#### Running an Ingress Server Service
+
+```rust
+use culvert::config::model::ServerConfig;
+use culvert::server::ServerRunner;
+use tokio_util::sync::CancellationToken;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let server_cfg = ServerConfig {
+        listen: vec!["wss://127.0.0.1:8443/tunnel".to_string()],
+        token: Some("MY_SECURE_TOKEN_32_BYTES_OR_MORE".to_string()),
+        ..Default::default()
+    };
+
+    let cancel_token = CancellationToken::new();
+
+    // Directly run the ingress server
+    culvert::run_server(server_cfg, cancel_token).await?;
+    Ok(())
+}
+```
+
+#### Running a Client Tunnel Service
+
+```rust
+use culvert::client::ClientRunner;
+use culvert::config::model::{PortMappingConfig, TunnelConfig, TunnelMode};
+use tokio_util::sync::CancellationToken;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let tunnel_cfg = TunnelConfig {
+        tag: "my-tunnel".to_string(),
+        endpoint: "wss://127.0.0.1:8443/tunnel".into(),
+        token: Some("MY_SECURE_TOKEN_32_BYTES_OR_MORE".to_string()),
+        pool_size: Some(4),
+        mappings: vec![PortMappingConfig {
+            mode: Some(TunnelMode::Forward),
+            listen: "127.0.0.1:13306".to_string(),
+            target: "10.0.0.5:3306".to_string(),
+            chmod: None,
+        }],
+        retry: None,
+    };
+
+    let cancel_token = CancellationToken::new();
+
+    // Directly run client tunnels with supervised retry
+    culvert::run_client(tunnel_cfg, cancel_token).await?;
+    Ok(())
+}
+```
+
+#### Running Combined Server & Client via Supervisor
+
+```rust
+use culvert::config::ConfigLoader;
+use culvert::supervisor::TunnelSupervisor;
+use tokio_util::sync::CancellationToken;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let app_config = ConfigLoader::from_file("config.yaml")?;
+    let cancel_token = CancellationToken::new();
+
+    culvert::run(app_config, cancel_token).await?;
+    Ok(())
+}
+```
+
+---
+
 ## Configuration Guide
 
 Configuration files are written in declarative **YAML**. All top-level and nested sections are described below.

@@ -506,11 +506,9 @@ tunnels:
 
     // Client endpoints
     assert_eq!(config.tunnels.len(), 2);
-    let ep1 =
-        culvert::dialer::endpoint::Endpoint::parse(config.tunnels[0].endpoint.url()).unwrap();
+    let ep1 = culvert::dialer::endpoint::Endpoint::parse(config.tunnels[0].endpoint.url()).unwrap();
     assert_eq!(ep1.scheme, "ws");
-    let ep2 =
-        culvert::dialer::endpoint::Endpoint::parse(config.tunnels[1].endpoint.url()).unwrap();
+    let ep2 = culvert::dialer::endpoint::Endpoint::parse(config.tunnels[1].endpoint.url()).unwrap();
     assert_eq!(ep2.scheme, "ws+unix");
 }
 

@@ -2,124 +2,20 @@
 // SPDX-License-Identifier: MPL-2.0
 // culvert is licensed under the Mozilla Public License Version 2.0.
 
-//! Entry point for the culvert daemon.
+//! Daemon lifecycle manager and graceful termination watchdog.
 //! All comments and docstrings must be in English.
 
-use clap::Parser;
-use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
-use tracing_subscriber::EnvFilter;
 
-use culvert::common::CancelFutureExt;
-use culvert::config::ConfigLoader;
-use culvert::consts::{DEFAULT_SHUTDOWN_HARD_DEADLINE, WATCHDOG_THREAD_NAME};
-use culvert::supervisor::TunnelSupervisor;
+use crate::common::CancelFutureExt;
+use crate::config::model::AppConfig;
+use crate::consts::{DEFAULT_SHUTDOWN_HARD_DEADLINE, WATCHDOG_THREAD_NAME};
+use crate::supervisor::TunnelSupervisor;
 
-use mimalloc::MiMalloc;
-
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
-
-/// High-performance lightweight HTTP/3 & WSS bidirectional TCP tunnel system.
-#[derive(Parser, Debug)]
-#[command(name = "culvert", version, about, long_about = None)]
-struct Cli {
-    /// Path to the YAML configuration file.
-    #[arg(short, long, default_value = "config.yaml")]
-    config: PathBuf,
-
-    /// Override the number of Tokio worker threads.
-    #[arg(short = 'w', long)]
-    worker_threads: Option<usize>,
-
-    /// Check and validate configuration syntax, schema, and semantics without starting the daemon.
-    #[arg(long)]
-    check: bool,
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
-
-    let app_config = match ConfigLoader::from_file(&cli.config) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            eprintln!("Configuration error in '{:?}': {}", cli.config, e);
-            std::process::exit(1);
-        }
-    };
-
-    if cli.check {
-        println!(
-            "Configuration check succeeded: '{:?}' is valid.",
-            cli.config
-        );
-        return Ok(());
-    }
-
-    // Initialize structured logging respecting LogConfig
-    let filter = match app_config.log.level.to_lowercase().as_str() {
-        "trace" => tracing::Level::TRACE,
-        "debug" => tracing::Level::DEBUG,
-        "info" => tracing::Level::INFO,
-        "warn" => tracing::Level::WARN,
-        "error" => tracing::Level::ERROR,
-        _ => tracing::Level::INFO,
-    };
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter.as_str()));
-
-    let fmt_builder = tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_ansi(!app_config.log.no_color);
-
-    if app_config.log.output.eq_ignore_ascii_case("stderr") {
-        fmt_builder.with_writer(std::io::stderr).init();
-    } else {
-        fmt_builder.with_writer(std::io::stdout).init();
-    }
-
-    info!(config = ?cli.config, "Loaded culvert configuration");
-
-    let threads = cli.worker_threads.or(app_config.worker_threads);
-
-    let mut builder = match threads {
-        Some(1) => {
-            info!("Configuring single-thread Tokio current_thread runtime");
-            tokio::runtime::Builder::new_current_thread()
-        }
-        Some(n) => {
-            info!(
-                threads = n,
-                "Configuring multi-threaded Tokio runtime with custom worker threads"
-            );
-            let mut b = tokio::runtime::Builder::new_multi_thread();
-            b.worker_threads(n);
-            b
-        }
-        None => {
-            info!("Configuring multi-threaded Tokio runtime auto-detecting CPU cores");
-            tokio::runtime::Builder::new_multi_thread()
-        }
-    };
-
-    builder.enable_all();
-
-    let runtime = match builder.build() {
-        Ok(rt) => rt,
-        Err(e) => {
-            error!("Failed to create Tokio runtime: {:?}", e);
-            std::process::exit(1);
-        }
-    };
-
-    runtime.block_on(run_daemon(app_config))
-}
-
-async fn run_daemon(
-    app_config: culvert::config::model::AppConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
-    culvert::common::task::reset_shutdown_deadline();
+/// Runs the culvert daemon until graceful termination signal or fatal error.
+pub async fn run_daemon(app_config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
+    crate::common::task::reset_shutdown_deadline();
     let cancel_token = CancellationToken::new();
 
     // Listen for graceful shutdown signals (SIGINT / SIGTERM / Ctrl+C)
@@ -130,7 +26,7 @@ async fn run_daemon(
     if let Err(e) = supervisor.run().await {
         error!("Tunnel supervisor terminated with error: {:?}", e);
         watchdog.finish().await;
-        std::process::exit(1);
+        return Err(Box::new(e));
     }
 
     info!("Culvert daemon exited cleanly.");
@@ -141,12 +37,6 @@ async fn run_daemon(
     Ok(())
 }
 
-/// Termination signals are handled in two stages: the first one starts graceful
-/// shutdown, a second signal (or the hard deadline) forces an immediate exit.
-///
-/// The signal stream must be re-armed: Tokio leaves the OS signal handler
-/// installed after the first stream is dropped, so subsequent Ctrl+C would be
-/// swallowed and the process could look stuck if any shutdown layer stalls.
 /// Explicit lifecycle events for the OS-thread watchdog. `Done` disarms it.
 enum WatchdogEvent {
     /// The first termination signal arrived; start the hard deadline.
@@ -157,7 +47,7 @@ enum WatchdogEvent {
 
 /// Owns the watchdog thread and its disarm channel. `finish()` must be called
 /// on every daemon exit path so the thread is joined, never detached.
-struct ShutdownWatchdog {
+pub struct ShutdownWatchdog {
     tx: std::sync::mpsc::Sender<WatchdogEvent>,
     signal_cancel: CancellationToken,
     signal_task: Option<tokio::task::JoinHandle<()>>,
@@ -167,7 +57,7 @@ struct ShutdownWatchdog {
 impl ShutdownWatchdog {
     /// Disarms the deadline and awaits both owned tasks. Called on every daemon
     /// exit path, so no signal task or watchdog thread is ever left detached.
-    async fn finish(mut self) {
+    pub async fn finish(mut self) {
         let _ = self.tx.send(WatchdogEvent::Done);
         self.signal_cancel.cancel();
         if let Some(task) = self.signal_task.take() {
@@ -194,7 +84,8 @@ impl Drop for ShutdownWatchdog {
     }
 }
 
-fn spawn_shutdown_handler(cancel_token: CancellationToken) -> ShutdownWatchdog {
+/// Spawns the shutdown signal listener and OS-level watchdog thread.
+pub fn spawn_shutdown_handler(cancel_token: CancellationToken) -> ShutdownWatchdog {
     use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
 
     // The hard deadline must not live on the Tokio runtime: if every worker is
@@ -234,7 +125,7 @@ fn spawn_shutdown_handler(cancel_token: CancellationToken) -> ShutdownWatchdog {
     let signal_cancel = CancellationToken::new();
     let signal_stop = signal_cancel.clone();
     let signal_task = tokio::spawn(async move {
-        let Some(_) = culvert::platform::wait_for_shutdown_signal()
+        let Some(_) = crate::platform::wait_for_shutdown_signal()
             .cancel_with(&signal_stop)
             .await
         else {
@@ -245,7 +136,7 @@ fn spawn_shutdown_handler(cancel_token: CancellationToken) -> ShutdownWatchdog {
 
         // Re-arm signal waiting: Tokio keeps the OS handler installed after
         // the first stream is dropped, so later signals would be swallowed.
-        let Some(_) = culvert::platform::wait_for_shutdown_signal()
+        let Some(_) = crate::platform::wait_for_shutdown_signal()
             .cancel_with(&signal_stop)
             .await
         else {

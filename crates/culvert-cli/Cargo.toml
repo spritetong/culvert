@@ -1,0 +1,21 @@
+[package]
+name = "culvert-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Command-line interface for the culvert bidirectional TCP tunneling system"
+readme = "../../README.md"
+
+[[bin]]
+name = "culvert"
+path = "src/main.rs"
+
+[dependencies]
+culvert = { path = "../culvert" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+mimalloc = { version = "0.1", default-features = false }

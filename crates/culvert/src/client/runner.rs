@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 // culvert is licensed under the Mozilla Public License Version 2.0.
 
-//! Multi-tunnel supervisor and lifecycle manager.
+//! Client tunnel runner and lifecycle supervisor.
 //! All comments and docstrings must be in English.
 
 use std::sync::Arc;
@@ -14,100 +14,102 @@ use crate::config::model::{AppConfig, TunnelConfig};
 use crate::consts::DEFAULT_RETRY_DELAY;
 use crate::core::error::TunnelError;
 use crate::dialer::endpoint::EndpointContext;
-use crate::server::ServerRunner;
-use crate::session::SessionManager;
 use crate::transport::TransportRegistry;
 use crate::tunnel::run_tunnel_cluster;
 
-/// Multi-tunnel supervisor that concurrently runs multiple tunnels and ensures orderly shutdown.
-pub struct TunnelSupervisor {
-    config: AppConfig,
-    cancel_token: CancellationToken,
+/// Client runner that manages one or more client tunnels with retry supervision.
+pub struct ClientRunner {
+    tunnels: Vec<(TunnelConfig, EndpointContext)>,
     transport_registry: Arc<TransportRegistry>,
-    session_manager: Arc<SessionManager>,
 }
 
-impl TunnelSupervisor {
-    /// Creates a new `TunnelSupervisor` instance.
-    pub fn new(config: AppConfig, cancel_token: CancellationToken) -> Self {
-        Self {
-            config,
-            cancel_token,
-            transport_registry: Arc::new(TransportRegistry::default()),
-            session_manager: Arc::new(SessionManager::new()),
-        }
+impl ClientRunner {
+    /// Creates a new `ClientRunner` for a single tunnel configuration with default settings.
+    pub fn new(tunnel: TunnelConfig) -> Result<Self, TunnelError> {
+        Self::from_tunnels(vec![tunnel])
     }
 
-    /// Spawns and manages all configured tunnels until cancelled or interrupted.
-    pub async fn run(&self) -> Result<(), TunnelError> {
-        let has_server = self
-            .config
-            .server
-            .as_ref()
-            .is_some_and(|s| !s.listen.is_empty());
-        let has_tunnels = !self.config.tunnels.is_empty();
-        if !has_server && !has_tunnels {
+    /// Creates a new `ClientRunner` for multiple tunnel configurations with default settings.
+    pub fn from_tunnels(tunnels: Vec<TunnelConfig>) -> Result<Self, TunnelError> {
+        let app_config = AppConfig {
+            tunnels,
+            ..Default::default()
+        };
+        Self::from_app_config(&app_config)
+    }
+
+    /// Creates a new `ClientRunner` using the tunnels and global settings from an `AppConfig`.
+    pub fn from_app_config(app_config: &AppConfig) -> Result<Self, TunnelError> {
+        Self::with_registry(app_config, Arc::new(TransportRegistry::default()))
+    }
+
+    /// Creates a new `ClientRunner` with a custom transport registry.
+    pub fn with_registry(
+        app_config: &AppConfig,
+        transport_registry: Arc<TransportRegistry>,
+    ) -> Result<Self, TunnelError> {
+        if app_config.tunnels.is_empty() {
             return Err(TunnelError::Config(
-                "No server listeners and no tunnels are configured. Configuration must not be empty."
-                    .to_string(),
+                "No client tunnels configured.".to_string(),
             ));
         }
 
-        let mut tracker: TaskTracker<Result<(), TunnelError>> =
-            TaskTracker::new(self.cancel_token.clone());
-
-        // Spawn server runner if ingress server is configured
-        if let Some(ref server_cfg) = self.config.server {
-            let server_runner = ServerRunner::with_global_tls(
-                server_cfg.clone(),
-                self.config.tls.clone(),
-                Arc::clone(&self.transport_registry),
-                Arc::clone(&self.session_manager),
-            );
-            tracker.spawn_with_cancel(move |token| async move { server_runner.run(token).await });
+        let mut tunnels = Vec::with_capacity(app_config.tunnels.len());
+        for tunnel_cfg in &app_config.tunnels {
+            let endpoint_ctx = EndpointContext::build(&tunnel_cfg.endpoint, app_config)?;
+            tunnels.push((tunnel_cfg.clone(), endpoint_ctx));
         }
 
-        // Spawn client tunnel workers with retry supervision
-        for tunnel_cfg in &self.config.tunnels {
-            let cfg = tunnel_cfg.clone();
+        Ok(Self {
+            tunnels,
+            transport_registry,
+        })
+    }
+
+    /// Runs all configured client tunnels with retry supervision until cancelled.
+    pub async fn run(&self, cancel_token: CancellationToken) -> Result<(), TunnelError> {
+        let mut tracker: TaskTracker<Result<(), TunnelError>> =
+            TaskTracker::new(cancel_token.clone());
+
+        for (cfg, endpoint_ctx) in &self.tunnels {
+            let config = cfg.clone();
+            let ctx = endpoint_ctx.clone();
             let registry = Arc::clone(&self.transport_registry);
-            let endpoint_ctx = EndpointContext::build(&cfg.endpoint, &self.config)?;
 
             tracker.spawn_with_cancel(move |token| async move {
-                Self::run_tunnel_with_retry(cfg, endpoint_ctx, registry, token).await
+                Self::run_tunnel_with_retry(config, ctx, registry, token).await
             });
         }
 
         info!(
             count = tracker.len(),
-            "All configured tunnels successfully spawned"
+            "All configured client tunnels successfully spawned"
         );
 
-        // Wait for cancellation signal or worker termination
         let mut exit_err: Option<TunnelError> = None;
         loop {
             tokio::select! {
                 biased;
-                _ = self.cancel_token.cancelled() => {
-                    info!("Supervisor received shutdown signal.");
+                _ = cancel_token.cancelled() => {
+                    info!("Client runner received shutdown signal.");
                     break;
                 }
                 res = tracker.join_next() => {
                     match res {
                         Some(Ok(Err(e))) => {
-                            error!("A tunnel worker terminated with an error: {:?}", e);
+                            error!("A client tunnel worker terminated with an error: {:?}", e);
                             if exit_err.is_none() {
                                 exit_err = Some(e);
                             }
-                            self.cancel_token.cancel();
+                            cancel_token.cancel();
                             break;
                         }
                         Some(Err(join_err)) => {
-                            error!("A tunnel worker panicked: {:?}", join_err);
+                            error!("A client tunnel worker panicked: {:?}", join_err);
                             if exit_err.is_none() {
                                 exit_err = Some(TunnelError::Internal(format!("Worker panic: {:?}", join_err)));
                             }
-                            self.cancel_token.cancel();
+                            cancel_token.cancel();
                             break;
                         }
                         Some(Ok(Ok(()))) => {
@@ -123,7 +125,6 @@ impl TunnelSupervisor {
             }
         }
 
-        // Graceful termination of all remaining tunnels (never aborts)
         tracker.shutdown_and_wait().await;
         if let Some(e) = exit_err {
             return Err(e);
@@ -132,7 +133,7 @@ impl TunnelSupervisor {
     }
 
     /// Supervised retry loop for a tunnel instance.
-    async fn run_tunnel_with_retry(
+    pub async fn run_tunnel_with_retry(
         config: TunnelConfig,
         endpoint_ctx: EndpointContext,
         registry: Arc<TransportRegistry>,

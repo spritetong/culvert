@@ -9,9 +9,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use culvert::config::model::{
-    AppConfig, EndpointConfig, PortMappingConfig, TlsConfig, TunnelMode,
-};
+use culvert::config::model::{AppConfig, EndpointConfig, PortMappingConfig, TlsConfig, TunnelMode};
 use culvert::core::error::TunnelError;
 use culvert::dialer::endpoint::EndpointContext;
 use culvert::transport::h3::H3Connector;
