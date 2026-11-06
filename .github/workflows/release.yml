@@ -1,0 +1,205 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        if: matrix.os == 'ubuntu-22.04'
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 glibc (baseline glibc 2.28 via zig, Cross.toml)
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            use_cross: true
+
+          # Linux x86_64 musl (static standalone / Alpine)
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
+            use_cross: true
+
+          # Linux aarch64 glibc (baseline glibc 2.28 via zig, Cross.toml)
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            use_cross: true
+
+          # Linux aarch64 musl (static ARM64 / OpenWrt / ImmortalWrt)
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-22.04
+            use_cross: true
+
+          # macOS Apple Silicon (ARM64)
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            use_cross: false
+
+          # macOS Intel (x86_64)
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            use_cross: false
+
+          # Windows i686
+          - target: i686-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
+
+          # Windows x86_64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
+
+          # Windows ARM64
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup LLVM / clang-cl (Windows ARM64)
+        if: runner.os == 'Windows' && matrix.target == 'aarch64-pc-windows-msvc'
+        run: |
+          if (Test-Path "C:\Program Files\LLVM\bin") {
+            echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
+          }
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (if required)
+        if: matrix.use_cross
+        run: |
+          curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+          cargo binstall --no-confirm cross
+
+      - name: Build target (Unix native)
+        if: "!matrix.use_cross && runner.os != 'Windows'"
+        run: cargo build --release --target ${{ matrix.target }} -p culvert-cli
+
+      - name: Build target (Windows)
+        if: runner.os == 'Windows'
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: cargo build --release --target ${{ matrix.target }} -p culvert-cli
+
+      - name: Build target (cross)
+        if: matrix.use_cross
+        run: cross build --release --target ${{ matrix.target }} -p culvert-cli
+
+      - name: Package archive (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          TAG="${GITHUB_REF_NAME:-latest}"
+          ARCHIVE_NAME="culvert-${TAG}-${{ matrix.target }}"
+          mkdir -p "${ARCHIVE_NAME}"
+          cp "target/${{ matrix.target }}/release/culvert" "${ARCHIVE_NAME}/"
+          cp README.md LICENSE config-example.yaml "${ARCHIVE_NAME}/"
+          if [ -d scripts ]; then
+            cp -r scripts "${ARCHIVE_NAME}/"
+            rm -rf "${ARCHIVE_NAME}/scripts/__pycache__"
+          fi
+          tar -cJf "${ARCHIVE_NAME}.tar.xz" "${ARCHIVE_NAME}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${ARCHIVE_NAME}.tar.xz" > "${ARCHIVE_NAME}.tar.xz.sha256"
+          elif command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "${ARCHIVE_NAME}.tar.xz" > "${ARCHIVE_NAME}.tar.xz.sha256"
+          fi
+
+      - name: Package archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $Tag = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "latest" }
+          $ArchiveName = "culvert-${Tag}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $ArchiveName
+          Copy-Item "target/${{ matrix.target }}/release/culvert.exe" -Destination $ArchiveName/
+          Copy-Item README.md, LICENSE, config-example.yaml -Destination $ArchiveName/
+          if (Test-Path scripts) {
+            Copy-Item scripts -Destination $ArchiveName/ -Recurse
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$ArchiveName/scripts/__pycache__"
+          }
+          Compress-Archive -Path "$ArchiveName/*" -DestinationPath "${ArchiveName}.zip" -Force
+          Remove-Item -Recurse -Force $ArchiveName
+          $Hash = (Get-FileHash -Algorithm SHA256 "${ArchiveName}.zip").Hash.ToLower()
+          "$Hash  ${ArchiveName}.zip" | Out-File -Encoding ascii "${ArchiveName}.zip.sha256"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.target }}
+          path: |
+            culvert-*.*
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate consolidated checksums
+        working-directory: dist
+        run: |
+          cat *.sha256 > SHA256SUMS.txt
+          ls -la
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.xz
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
+          draft: false
+          prerelease: false
