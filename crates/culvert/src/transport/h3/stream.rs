@@ -430,7 +430,7 @@ impl TunnelStream for H3TunnelStream {
                 )));
             }
             if let Some(ref mut tracker) = self.liveness
-                && !tracker.check_liveness(conn, std::time::Duration::from_secs(4))
+                && !tracker.check_liveness(conn, DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD)
             {
                 conn.close(quinn::VarInt::from_u32(0), b"liveness ping timeout");
                 return Poll::Ready(Err(io::Error::new(
@@ -454,7 +454,7 @@ impl TunnelStream for H3TunnelStream {
                 return Poll::Ready(HeartbeatStatus::Dead);
             }
             if let Some(ref mut tracker) = self.liveness
-                && !tracker.check_liveness(conn, std::time::Duration::from_secs(4))
+                && !tracker.check_liveness(conn, DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD)
             {
                 conn.close(quinn::VarInt::from_u32(0), b"liveness check timeout");
                 return Poll::Ready(HeartbeatStatus::Dead);
