@@ -88,6 +88,28 @@ impl ConfigLoader {
                     "dialer.connect_timeout must be greater than 0".to_string(),
                 ));
             }
+            if let Some(hb) = d.heartbeat_interval
+                && hb.is_zero()
+            {
+                return Err(TunnelError::Config(
+                    "dialer.heartbeat_interval must be greater than 0".to_string(),
+                ));
+            }
+            if let Some(it) = d.idle_timeout
+                && it.is_zero()
+            {
+                return Err(TunnelError::Config(
+                    "dialer.idle_timeout must be greater than 0".to_string(),
+                ));
+            }
+            if let (Some(hb), Some(it)) = (d.heartbeat_interval, d.idle_timeout)
+                && it <= hb
+            {
+                return Err(TunnelError::Config(
+                    "dialer.idle_timeout must be greater than dialer.heartbeat_interval"
+                        .to_string(),
+                ));
+            }
             if let Some(ref iface) = d.bind_interface {
                 crate::platform::validate_bind_interface(iface)?;
             }
@@ -114,6 +136,29 @@ impl ConfigLoader {
                         crate::common::auth::TOKEN_MAX_LEN
                     )));
                 }
+            }
+
+            if let Some(hb) = server.heartbeat_interval
+                && hb.is_zero()
+            {
+                return Err(TunnelError::Config(
+                    "server.heartbeat_interval must be greater than 0".to_string(),
+                ));
+            }
+            if let Some(it) = server.idle_timeout
+                && it.is_zero()
+            {
+                return Err(TunnelError::Config(
+                    "server.idle_timeout must be greater than 0".to_string(),
+                ));
+            }
+            if let (Some(hb), Some(it)) = (server.heartbeat_interval, server.idle_timeout)
+                && it <= hb
+            {
+                return Err(TunnelError::Config(
+                    "server.idle_timeout must be greater than server.heartbeat_interval"
+                        .to_string(),
+                ));
             }
 
             if let Some(ref dt) = server.default_target {
@@ -331,6 +376,30 @@ impl ConfigLoader {
                     {
                         return Err(TunnelError::Config(format!(
                             "tunnel '{}': dialer.connect_timeout must be greater than 0",
+                            tunnel.tag
+                        )));
+                    }
+                    if let Some(hb) = dl.heartbeat_interval
+                        && hb.is_zero()
+                    {
+                        return Err(TunnelError::Config(format!(
+                            "tunnel '{}': dialer.heartbeat_interval must be greater than 0",
+                            tunnel.tag
+                        )));
+                    }
+                    if let Some(it) = dl.idle_timeout
+                        && it.is_zero()
+                    {
+                        return Err(TunnelError::Config(format!(
+                            "tunnel '{}': dialer.idle_timeout must be greater than 0",
+                            tunnel.tag
+                        )));
+                    }
+                    if let (Some(hb), Some(it)) = (dl.heartbeat_interval, dl.idle_timeout)
+                        && it <= hb
+                    {
+                        return Err(TunnelError::Config(format!(
+                            "tunnel '{}': dialer.idle_timeout must be greater than dialer.heartbeat_interval",
                             tunnel.tag
                         )));
                     }

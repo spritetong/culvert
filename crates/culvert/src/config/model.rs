@@ -215,6 +215,14 @@ pub struct ServerConfig {
     /// Advanced TLS options (version bounds, cert paths, ALPN) for server termination.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+
+    /// Periodic heartbeat probe interval for ingress transport keepalive.
+    #[serde(with = "humantime_serde_opt", default)]
+    pub heartbeat_interval: Option<Duration>,
+
+    /// Maximum silent duration before terminating an idle client connection.
+    #[serde(with = "humantime_serde_opt", default)]
+    pub idle_timeout: Option<Duration>,
 }
 
 impl ServerConfig {
@@ -230,6 +238,8 @@ impl ServerConfig {
             certificate: None,
             key: None,
             tls: None,
+            heartbeat_interval: None,
+            idle_timeout: None,
         }
     }
 
@@ -433,33 +443,45 @@ pub struct DialerConfig {
 
     pub tcp_nodelay: Option<bool>,
     pub bind_interface: Option<String>,
+
+    #[serde(with = "humantime_serde_opt", default)]
+    pub heartbeat_interval: Option<Duration>,
+
+    #[serde(with = "humantime_serde_opt", default)]
+    pub idle_timeout: Option<Duration>,
 }
 
-mod humantime_serde_opt {
+pub(crate) mod humantime_serde_opt {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum DurHelper {
+        Str(String),
+        Secs(u64),
+    }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let opt = Option::<String>::deserialize(deserializer)?;
+        let opt = Option::<DurHelper>::deserialize(deserializer)?;
         match opt {
-            Some(s) => {
-                if let Ok(secs) = s.parse::<u64>() {
+            Some(DurHelper::Secs(secs)) => Ok(Some(Duration::from_secs(secs))),
+            Some(DurHelper::Str(s)) => {
+                let s_trimmed = s.trim();
+                if let Ok(secs) = s_trimmed.parse::<u64>() {
+                    Ok(Some(Duration::from_secs(secs)))
+                } else if let Some(stripped) = s_trimmed.strip_suffix("ms")
+                    && let Ok(ms) = stripped.parse::<u64>()
+                {
+                    Ok(Some(Duration::from_millis(ms)))
+                } else if let Some(stripped) = s_trimmed.strip_suffix('s')
+                    && let Ok(secs) = stripped.parse::<u64>()
+                {
                     Ok(Some(Duration::from_secs(secs)))
                 } else {
-                    let s_trimmed = s.trim();
-                    if let Some(stripped) = s_trimmed.strip_suffix('s')
-                        && let Ok(secs) = stripped.parse::<u64>()
-                    {
-                        return Ok(Some(Duration::from_secs(secs)));
-                    }
-                    if let Some(stripped) = s_trimmed.strip_suffix("ms")
-                        && let Ok(ms) = stripped.parse::<u64>()
-                    {
-                        return Ok(Some(Duration::from_millis(ms)));
-                    }
                     Err(serde::de::Error::custom(format!("invalid duration: {}", s)))
                 }
             }

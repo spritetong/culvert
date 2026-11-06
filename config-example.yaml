@@ -37,6 +37,8 @@ dialer:
   connect_timeout: "10s"
   tcp_keepalive: "15s"
   tcp_nodelay: true
+  heartbeat_interval: "15s"  # Optional: heartbeat ping interval (default: 15s)
+  idle_timeout: "30s"        # Optional: session idle timeout without RX activity (default: 30s)
 
 # Global default TLS settings
 tls:
@@ -55,6 +57,8 @@ server:
     - "ws://127.0.0.1:8080/tunnel"
   token: "SECURE_PRESHARED_TOKEN"   # Optional: omit or null for no-auth mode (empty string "" is rejected)
   default_target: "127.0.0.1:5201"  # Optional: fallback target
+  # heartbeat_interval: "15s"       # Optional: transport heartbeat interval (default: 15s)
+  # idle_timeout: "30s"             # Optional: reverse control & transport idle timeout (default: 30s)
   # TLS certificate & private key (Optional: wss/h3/quic auto-generate self-signed cert if omitted)
   # certificate: "/path/to/server.crt"
   # key: "/path/to/server.key"

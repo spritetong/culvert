@@ -576,3 +576,75 @@ tunnels:
 "#;
     assert!(ConfigLoader::from_yaml_str(client_yaml).is_err());
 }
+
+#[test]
+fn test_dialer_and_server_heartbeat_idle_timeout_parsing() {
+    let yaml = r#"
+dialer:
+  connect_timeout: "8s"
+  heartbeat_interval: "12s"
+  idle_timeout: "45s"
+
+server:
+  listen: "ws://127.0.0.1:8080/tunnel"
+  heartbeat_interval: "10s"
+  idle_timeout: "30s"
+
+tunnels:
+  - tag: "custom-timing-tunnel"
+    endpoint:
+      url: "wss://127.0.0.1:8443/tunnel"
+      dialer:
+        heartbeat_interval: "20s"
+        idle_timeout: "60s"
+    mappings:
+      - mode: "forward"
+        listen: "127.0.0.1:18080"
+        target: "127.0.0.1:8080"
+"#;
+
+    let app_cfg = ConfigLoader::from_yaml_str(yaml)
+        .expect("Failed to parse config with heartbeat/idle_timeout");
+    let dialer = app_cfg.dialer.as_ref().unwrap();
+    assert_eq!(dialer.connect_timeout, Some(Duration::from_secs(8)));
+    assert_eq!(dialer.heartbeat_interval, Some(Duration::from_secs(12)));
+    assert_eq!(dialer.idle_timeout, Some(Duration::from_secs(45)));
+
+    let server = app_cfg.server.as_ref().unwrap();
+    assert_eq!(server.heartbeat_interval, Some(Duration::from_secs(10)));
+    assert_eq!(server.idle_timeout, Some(Duration::from_secs(30)));
+
+    let ep_ctx = EndpointContext::build(&app_cfg.tunnels[0].endpoint, &app_cfg).unwrap();
+    assert_eq!(ep_ctx.heartbeat_interval(), Duration::from_secs(20));
+    assert_eq!(ep_ctx.idle_timeout(), Duration::from_secs(60));
+    assert_eq!(ep_ctx.connect_timeout(), Duration::from_secs(8));
+}
+
+#[test]
+fn test_reject_idle_timeout_not_exceeding_heartbeat_interval() {
+    let invalid_dialer_yaml = r#"
+dialer:
+  heartbeat_interval: "30s"
+  idle_timeout: "20s"
+
+server:
+  listen: "ws://127.0.0.1:8080/tunnel"
+"#;
+    let err = ConfigLoader::from_yaml_str(invalid_dialer_yaml).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("dialer.idle_timeout must be greater than dialer.heartbeat_interval")
+    );
+
+    let invalid_server_yaml = r#"
+server:
+  listen: "ws://127.0.0.1:8080/tunnel"
+  heartbeat_interval: "15s"
+  idle_timeout: "15s"
+"#;
+    let err2 = ConfigLoader::from_yaml_str(invalid_server_yaml).unwrap_err();
+    assert!(
+        err2.to_string()
+            .contains("server.idle_timeout must be greater than server.heartbeat_interval")
+    );
+}

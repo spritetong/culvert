@@ -71,6 +71,7 @@ async fn test_standalone_wss_server_self_signed_direct_termination() {
             certificate: None, // No file provided: triggers self-signed fallback
             key: None,
             tls: None,
+            ..Default::default()
         }),
         ..Default::default()
     };

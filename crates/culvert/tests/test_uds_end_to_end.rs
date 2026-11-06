@@ -57,6 +57,7 @@ async fn test_e2e_server_uds_url_and_mappings() {
             tls: None,
             certificate: None,
             key: None,
+            ..Default::default()
         }),
         tunnels: vec![TunnelConfig {
             tag: "uds-to-uds-forward".to_string(),
@@ -146,6 +147,7 @@ async fn test_e2e_reverse_mapping_uds() {
             tls: None,
             certificate: None,
             key: None,
+            ..Default::default()
         }),
         tunnels: vec![TunnelConfig {
             tag: "uds-reverse-tunnel".to_string(),
@@ -247,6 +249,7 @@ async fn test_e2e_server_ws_unix_with_query_path() {
             tls: None,
             certificate: None,
             key: None,
+            ..Default::default()
         }),
         tunnels: vec![TunnelConfig {
             tag: "ws-unix-tunnel".to_string(),

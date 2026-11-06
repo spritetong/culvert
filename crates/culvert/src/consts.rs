@@ -125,6 +125,12 @@ pub const DEFAULT_TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// Default heartbeat interval for idle connection pool and control streams.
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Default idle timeout before terminating silent or unresponsive control and transport sessions.
+///
+/// Under weak network conditions, 30 seconds covers temporary radio stalls and handover drops
+/// while ensuring dead connections are detected in bounded time (2x DEFAULT_HEARTBEAT_INTERVAL).
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Idle connection pool heartbeat inspection interval.
 pub const POOL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 

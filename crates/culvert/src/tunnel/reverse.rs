@@ -14,8 +14,8 @@ use tracing::{error, info, warn};
 use crate::common::{CancelFutureExt, CancellationTokenExt, TaskTracker};
 use crate::config::model::{TunnelConfig, TunnelMode};
 use crate::consts::{
-    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_REVERSE_BACKOFF_INITIAL, DEFAULT_REVERSE_BACKOFF_MAX,
-    REVERSE_BACKOFF_RESET_THRESHOLD, REVERSE_CONTROL_TARGET_HOST,
+    DEFAULT_REVERSE_BACKOFF_INITIAL, DEFAULT_REVERSE_BACKOFF_MAX, REVERSE_BACKOFF_RESET_THRESHOLD,
+    REVERSE_CONTROL_TARGET_HOST,
 };
 use crate::control::stream::{ControlMessage, FramedControlStream};
 use crate::core::error::TunnelError;
@@ -137,7 +137,11 @@ pub async fn run_reverse_mapping(
         }
 
         let loop_start = tokio::time::Instant::now();
-        let mut heartbeat = interval(DEFAULT_HEARTBEAT_INTERVAL);
+        let hb_interval = endpoint_ctx.heartbeat_interval();
+        let idle_timeout = endpoint_ctx.idle_timeout();
+        let mut heartbeat = interval(hb_interval);
+        let rx_timeout = tokio::time::sleep(idle_timeout);
+        tokio::pin!(rx_timeout);
 
         // Main event loop handling incoming connection alerts from remote server
         loop {
@@ -148,6 +152,14 @@ pub async fn run_reverse_mapping(
                     break;
                 }
                 Some(_) = conn_tracker.join_next(), if !conn_tracker.is_empty() => {}
+                _ = &mut rx_timeout => {
+                    warn!(
+                        tag = %tag,
+                        idle_timeout = ?idle_timeout,
+                        "Reverse control channel idle timeout: no packets received from server. Reconnecting..."
+                    );
+                    break;
+                }
                 _ = heartbeat.tick() => {
                     let Some(send_ping) = ctrl_stream.send(ControlMessage::Ping).cancel_with(&cancel_token).await else {
                         break;
@@ -158,6 +170,7 @@ pub async fn run_reverse_mapping(
                     }
                 }
                 msg_opt = ctrl_stream.next() => {
+                    rx_timeout.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
                     match msg_opt {
                         Some(Ok(msg)) => match msg {
                             ControlMessage::NewConnection { session_id, client_addr } => {

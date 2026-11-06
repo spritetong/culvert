@@ -101,10 +101,32 @@ pub struct EndpointContext {
     pub endpoint: Endpoint,
     pub dns_resolver: Arc<dyn DnsResolver>,
     pub dialer: Arc<dyn Dialer>,
+    pub dialer_config: DialerConfig,
     pub tls_config: Option<TlsConfig>,
 }
 
 impl EndpointContext {
+    /// Returns the effective heartbeat interval (configured or protocol default).
+    pub fn heartbeat_interval(&self) -> std::time::Duration {
+        self.dialer_config
+            .heartbeat_interval
+            .unwrap_or(crate::consts::DEFAULT_HEARTBEAT_INTERVAL)
+    }
+
+    /// Returns the effective idle timeout (configured or protocol default).
+    pub fn idle_timeout(&self) -> std::time::Duration {
+        self.dialer_config
+            .idle_timeout
+            .unwrap_or(crate::consts::DEFAULT_IDLE_TIMEOUT)
+    }
+
+    /// Returns the effective connect timeout (configured or protocol default).
+    pub fn connect_timeout(&self) -> std::time::Duration {
+        self.dialer_config
+            .connect_timeout
+            .unwrap_or(crate::consts::DEFAULT_CONNECT_TIMEOUT)
+    }
+
     /// Builds an `EndpointContext` by merging per-endpoint configuration with global defaults.
     pub fn build(
         endpoint_cfg: &EndpointConfig,
@@ -156,10 +178,21 @@ impl EndpointContext {
                         .as_ref()
                         .and_then(|d| d.bind_interface.clone())
                 }),
+            heartbeat_interval: endpoint_dialer
+                .and_then(|d| d.heartbeat_interval)
+                .or_else(|| {
+                    global_app
+                        .dialer
+                        .as_ref()
+                        .and_then(|d| d.heartbeat_interval)
+                }),
+            idle_timeout: endpoint_dialer
+                .and_then(|d| d.idle_timeout)
+                .or_else(|| global_app.dialer.as_ref().and_then(|d| d.idle_timeout)),
         };
 
         let dialer: Arc<dyn Dialer> = Arc::new(DefaultDialer::new(
-            effective_dialer,
+            effective_dialer.clone(),
             Arc::clone(&dns_resolver),
         ));
 
@@ -194,6 +227,7 @@ impl EndpointContext {
             endpoint,
             dns_resolver,
             dialer,
+            dialer_config: effective_dialer,
             tls_config: effective_tls,
         })
     }

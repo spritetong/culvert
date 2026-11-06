@@ -282,10 +282,12 @@ Low-level TCP socket configuration for outbound dialing. Can be overridden per-e
 
 ```yaml
 dialer:
-  connect_timeout: "10s"    # Socket connection timeout (e.g., "10s", "500ms", or raw seconds: 10; default: 10s)
-  tcp_keepalive: "15s"      # TCP keepalive interval (e.g., "15s", "30s"; default: 15s)
-  tcp_nodelay: true         # Disable Nagle's algorithm for low-latency transmission (default: true)
-  bind_interface: "eth0"    # Bind outbound traffic to network interface (Linux only via SO_BINDTODEVICE)
+  connect_timeout: "10s"       # Socket connection timeout (e.g., "10s", "500ms", or raw seconds: 10; default: 10s)
+  tcp_keepalive: "15s"         # TCP keepalive interval (e.g., "15s", "30s"; default: 15s)
+  tcp_nodelay: true            # Disable Nagle's algorithm for low-latency transmission (default: true)
+  heartbeat_interval: "15s"    # Heartbeat ping interval for transport / control streams (default: 15s)
+  idle_timeout: "30s"          # Session idle timeout without incoming RX activity (default: 30s)
+  bind_interface: "eth0"       # Bind outbound traffic to network interface (Linux only via SO_BINDTODEVICE)
 ```
 
 ---
@@ -350,6 +352,10 @@ server:
   # Fallback target address when the client does not specify one.
   # Supports 3 formats: ip:port, hostname:port, or unix://path
   default_target: "127.0.0.1:5201"
+
+  # Optional transport keepalive and idle timeout settings
+  # heartbeat_interval: "15s"  # Heartbeat probe interval (default: 15s)
+  # idle_timeout: "30s"        # Inactivity timeout without incoming RX activity (default: 30s)
 
   # Optional direct TLS termination certificates (used for wss/h3/wss+unix if not behind a reverse proxy).
   # If omitted on TLS schemes, a temporary self-signed certificate is automatically generated.
@@ -447,6 +453,8 @@ tunnels:
       dialer:
         connect_timeout: "10s"
         tcp_keepalive: "30s"
+        heartbeat_interval: "15s"
+        idle_timeout: "30s"
       tls:
         server_name: "fronting-camouflage.com" # SNI domain fronting override
         insecure: false

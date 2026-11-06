@@ -8,6 +8,7 @@
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -103,6 +104,10 @@ impl ServerRunner {
             let default_target = self.config.default_target.clone();
             let token_opt = self.config.token.clone();
             let server_tls = self.config.effective_tls(self.global_tls.as_ref());
+            let idle_timeout = self
+                .config
+                .idle_timeout
+                .unwrap_or(crate::consts::DEFAULT_IDLE_TIMEOUT);
 
             tracker.spawn_with_cancel(move |token| async move {
                 let mut listener = registry.create_listener(
@@ -147,6 +152,7 @@ impl ServerRunner {
                                 Ok((stream, metadata)) => {
                                     let session_mgr = Arc::clone(&session_mgr);
                                     let default_target = default_target.clone();
+                                    let idle_timeout = idle_timeout;
 
                                     conn_tracker.spawn_with_cancel(move |conn_token| async move {
                                         match metadata.mode {
@@ -271,7 +277,13 @@ impl ServerRunner {
                                                     }
                                                 } else {
                                                     // Control stream arrival: handle registration and listen on requested port
-                                                    Self::handle_reverse_control(stream, session_mgr, conn_token).await;
+                                                    Self::handle_reverse_control(
+                                                        stream,
+                                                        session_mgr,
+                                                        conn_token,
+                                                        idle_timeout,
+                                                    )
+                                                    .await;
                                                 }
                                             }
                                         }
@@ -355,23 +367,34 @@ impl ServerRunner {
         stream: Box<dyn crate::core::stream::TunnelStream>,
         session_mgr: Arc<SessionManager>,
         cancel_token: CancellationToken,
+        idle_timeout: Duration,
     ) {
         let mut ctrl_stream = FramedControlStream::new(stream);
 
-        // Await RegisterReverse
-        let (listen_addr, target_addr) = match ctrl_stream.next().cancel_with(&cancel_token).await {
-            Some(Some(Ok(ControlMessage::RegisterReverse {
+        // Await RegisterReverse bounded by idle_timeout
+        let (listen_addr, target_addr) = match timeout(idle_timeout, ctrl_stream.next())
+            .cancel_with(&cancel_token)
+            .await
+        {
+            Some(Ok(Some(Ok(ControlMessage::RegisterReverse {
                 listen_addr,
                 target_addr,
-            }))) => (listen_addr, target_addr),
-            Some(other) => {
+            })))) => (listen_addr, target_addr),
+            Some(Err(_)) => {
+                warn!(
+                    idle_timeout = ?idle_timeout,
+                    "Reverse control channel registration timed out waiting for client request"
+                );
+                return;
+            }
+            Some(Ok(Some(other))) => {
                 warn!(
                     "Expected RegisterReverse on reverse control channel, got: {:?}",
                     other
                 );
                 return;
             }
-            None => return,
+            _ => return,
         };
 
         info!(addr = %listen_addr, target = %target_addr, "Attempting to bind reverse listening port on server");
@@ -404,11 +427,22 @@ impl ServerRunner {
 
         info!(addr = %listen_addr, "Server bound reverse port successfully. Waiting for external traffic...");
         let mut local_tracker = TaskTracker::<()>::new(cancel_token.clone());
+        let rx_timeout = tokio::time::sleep(idle_timeout);
+        tokio::pin!(rx_timeout);
 
         loop {
             tokio::select! {
+                biased;
                 _ = cancel_token.cancelled() => break,
                 Some(_) = local_tracker.join_next(), if !local_tracker.is_empty() => {}
+                _ = &mut rx_timeout => {
+                    warn!(
+                        addr = %listen_addr,
+                        idle_timeout = ?idle_timeout,
+                        "Reverse control channel idle timeout: no packets received from client. Closing reverse listener."
+                    );
+                    break;
+                }
                 accept_res = listener.accept() => {
                     match accept_res {
                         Ok((visitor_stream, visitor_addr)) => {
@@ -472,6 +506,7 @@ impl ServerRunner {
                     }
                 }
                 msg_opt = ctrl_stream.next() => {
+                    rx_timeout.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
                     match msg_opt {
                         Some(Ok(ControlMessage::Ping)) => {
                             let Some(res) = ctrl_stream.send(ControlMessage::Pong).cancel_with(&cancel_token).await else {
@@ -517,7 +552,13 @@ mod tests {
         let cancel_clone = cancel_token.clone();
 
         let handle = tokio::spawn(async move {
-            ServerRunner::handle_reverse_control(Box::new(client), session_mgr, cancel_clone).await;
+            ServerRunner::handle_reverse_control(
+                Box::new(client),
+                session_mgr,
+                cancel_clone,
+                Duration::from_secs(5),
+            )
+            .await;
         });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -527,6 +568,30 @@ mod tests {
         assert!(
             res.is_ok(),
             "handle_reverse_control hung on silent client despite cancellation token!"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_server_reverse_control_idle_timeout_terminates_silent_channel() {
+        let (client, _server) = tokio::io::duplex(4096);
+        let session_mgr = Arc::new(SessionManager::new());
+        let cancel_token = CancellationToken::new();
+
+        // Silent client should time out on registration within idle_timeout
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            ServerRunner::handle_reverse_control(
+                Box::new(client),
+                session_mgr,
+                cancel_token,
+                Duration::from_millis(50),
+            ),
+        )
+        .await;
+
+        assert!(
+            res.is_ok(),
+            "handle_reverse_control did not time out on silent client within idle_timeout!"
         );
     }
 }

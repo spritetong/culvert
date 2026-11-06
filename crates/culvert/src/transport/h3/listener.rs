@@ -7,6 +7,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http::{Response, StatusCode};
@@ -95,6 +96,27 @@ impl H3Listener {
         server_rustls_config: rustls::ServerConfig,
         cancel: CancellationToken,
     ) -> Result<Self, TunnelError> {
+        Self::bind_with_options(
+            listen_addr,
+            auth_token,
+            path,
+            server_rustls_config,
+            cancel,
+            None,
+            None,
+        )
+    }
+
+    /// Binds an `H3Listener` wired to the root shutdown token with custom keepalive and idle timeouts.
+    pub fn bind_with_options(
+        listen_addr: &str,
+        auth_token: Option<&str>,
+        path: Option<&str>,
+        server_rustls_config: rustls::ServerConfig,
+        cancel: CancellationToken,
+        heartbeat_interval: Option<Duration>,
+        idle_timeout: Option<Duration>,
+    ) -> Result<Self, TunnelError> {
         let clean_addr = if let Some(idx) = listen_addr.find("://") {
             let without_scheme = &listen_addr[idx + 3..];
             without_scheme.split('/').next().unwrap_or(without_scheme)
@@ -140,8 +162,10 @@ impl H3Listener {
 
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_crypto));
         let mut transport_config = quinn::TransportConfig::default();
-        transport_config.max_idle_timeout(Some(DEFAULT_QUIC_MAX_IDLE_TIMEOUT.try_into().unwrap()));
-        transport_config.keep_alive_interval(Some(DEFAULT_QUIC_KEEP_ALIVE_INTERVAL));
+        let max_idle = idle_timeout.unwrap_or(DEFAULT_QUIC_MAX_IDLE_TIMEOUT);
+        let keep_alive = heartbeat_interval.unwrap_or(DEFAULT_QUIC_KEEP_ALIVE_INTERVAL);
+        transport_config.max_idle_timeout(Some(max_idle.try_into().unwrap()));
+        transport_config.keep_alive_interval(Some(keep_alive));
         transport_config.max_concurrent_bidi_streams(quinn::VarInt::from_u32(
             DEFAULT_QUIC_MAX_CONCURRENT_BIDI_STREAMS,
         ));
