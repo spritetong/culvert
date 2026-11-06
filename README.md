@@ -1,638 +1,525 @@
 # culvert
 
+`culvert` forwards TCP ports between hosts over WebSocket, HTTP/3, or raw QUIC.
+One YAML file configures an ingress server, one or more tunnel clients, or both
+in the same process. Forwarded data is an opaque byte stream; Unix domain
+sockets can be used as listeners and targets.
+
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL_2.0-blue.svg)](https://opensource.org/licenses/MPL-2.0)
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
-
-**culvert** is a high-performance, lightweight, production-ready bidirectional TCP tunneling system engineered to pair seamlessly with modern edge reverse proxies (such as **Caddy** or **Nginx**).
-
-Designed as a modern, clean replacement for tools like `wstunnel`, `culvert` eliminates protocol bloat, complex frame encapsulation state machines, and unnecessary internal certificate managers. It delivers near-bare-metal throughput and microsecond latency over HTTP/3 (QUIC) and WebSocket (WSS) while disguising traffic behind standard HTTPS ports.
 
 ---
 
-## Key Highlights & Design Philosophy
+## Why
 
-- **Zero ACME Bloat**: `culvert` delegates public ACME certificates to reverse proxies like Caddy. The server ingress listens on Unix Domain Sockets (UDS) or internal loopback with zero public TLS certificate renewal complexity. (Direct standalone TLS termination with auto-generated or custom certificates is also supported).
-- **Native QUIC & High-Speed WebSocket**:
-  - **HTTP/3**: Multiplexes tunnels directly over native QUIC streams. Packet loss on one connection never blocks other streams (zero TCP Head-of-Line blocking).
-  - **WSS**: Built on `fastwebsockets` with AVX2/NEON SIMD-accelerated masking.
-- **Decoupled 0-RTT Pre-warmed Connection Pool**: Pre-establishes idle tunnel streams in the background. Client connections acquire a ready stream immediately without waiting for transport or TLS handshakes.
-- **Multi-Mapping Cluster Sharing a Single Pool**: Multiple forward and reverse port mappings can share a single tunnel endpoint and connection pool. Remote targets are dialed on-demand only when client traffic arrives, preventing premature socket exhaustion.
-- **Unified Server & Client Coexistence**: Run server ingress listeners and multiple tunnel clients simultaneously in a single process from a single declarative YAML file.
-- **Optional Constant-Time Authentication**: High-entropy Pre-Shared Key (PSK) token validation using constant-time comparison immune to timing side-channel attacks. Token can be omitted for trusted or reverse-proxy-authenticated environments.
-- **Advanced DNS & Socket Tuning**: Supports libc system DNS, standard UDP DNS, DNS-over-HTTPS (DoH), and DNS-over-TLS (DoT), with configurable IP family selection (`prefer_ipv4`, `prefer_ipv6`, `ipv4_only`, `ipv6_only`).
+- Reach a service that is only visible from a remote host: open a local port
+  that is relayed through the tunnel (`forward` mapping).
+- Publish a service on a host behind NAT: register a listener on the remote
+  ingress host and relay its connections back to the local service (`reverse`
+  mapping).
+- Carry several ports through one endpoint: multiple mappings share one tunnel
+  configuration and, when enabled, one pre-warmed stream pool.
+- Terminate public TLS at an existing reverse proxy over a Unix domain socket,
+  or let culvert terminate TLS itself. No certificate issuance is built in.
+
+Tools such as `wstunnel`, `frp`, `Xray`, and `Hysteria` also provide TCP port
+forwarding over WebSocket or QUIC-based transports. `culvert` covers that
+forwarding use case with a single YAML file and both roles in one binary.
+
+## What
+
+A `server` accepts tunnel streams on one or more `listen` URLs and dials the
+forward targets. A `tunnels` entry connects to one `endpoint` URL and declares
+`mappings` with a `mode`, a `listen` address, and a `target` address.
+
+| Scheme | Transport | Default port |
+| :--- | :--- | :--- |
+| `ws` | WebSocket over TCP | 80 |
+| `wss` | WebSocket over TCP with TLS | 443 |
+| `https` | HTTP/3 `CONNECT` over QUIC/UDP | 443 |
+| `h3` | HTTP/3 `CONNECT` over QUIC/UDP | 443 |
+| `quic` | Raw QUIC bidirectional streams | 443 |
+| `ws+unix` | WebSocket over a Unix domain socket | — |
+| `wss+unix` | WebSocket over a Unix domain socket with TLS | — |
+
+`server.listen` and `tunnels[].endpoint` use the same scheme set. Unix socket
+URLs take `?path=/tunnel` for the HTTP path and `?chmod=0o660` for socket
+permissions (`660`, `0660`, and `0o660` are all octal).
+
+| Mapping mode | Listener | Target is dialed by | Stream pool |
+| :--- | :--- | :--- | :--- |
+| `forward` (default) | Client host | Server | Shared when `pool_size` is set |
+| `reverse` | Server, registered over a control channel | Client host | Not used |
+
+Not implemented: UDP tunneling, SOCKS5 or HTTP proxy semantics, ACME
+certificate management, P2P/STUN, automatic HTTP/3-to-WSS fallback, and
+seamless transport failover. The `multiplex` and `failover` configuration
+sections are rejected at load time because they are not wired into the data
+path.
 
 ---
 
-## Architecture Overview
+## Quick start
 
-```mermaid
-flowchart LR
-    subgraph ClientHost["Client Host (Local Network / Behind NAT)"]
-        App["App / Client"]
-        CulvertClient["culvert Client"]
-        LocalSvc["Local Service\n(e.g., SSH :22)"]
-    end
-
-    subgraph Internet["Public Network / CDN"]
-        Caddy["Caddy Reverse Proxy\n(HTTPS :443 / QUIC UDP :443)"]
-    end
-
-    subgraph ServerHost["Server Host (Cloud VPS / Gateway)"]
-        CulvertServer["culvert Server Ingress\n(UDS / Loopback)"]
-        RemoteSvc["Remote Service\n(e.g., MySQL :3306)"]
-        PublicPort["Public Port\n(e.g., :2222)"]
-    end
-
-    %% Forward Tunnel Traffic
-    App -->|Connect :13306| CulvertClient
-    CulvertClient -->|"WSS / HTTP/3 (POST /tunnel)"| Caddy
-    Caddy -->|"Proxy (UDS / TCP)"| CulvertServer
-    CulvertServer -->|Dial| RemoteSvc
-
-    %% Reverse Tunnel Traffic
-    PublicPort -->|External User| CulvertServer
-    CulvertServer -.->|"Reverse Stream"| CulvertClient
-    CulvertClient -->|Forward| LocalSvc
-```
-
----
-
-## Installation & Build
-
-### Prerequisites
-
-- [Rust 1.85+](https://www.rust-lang.org/tools/install) (Edition 2024 support)
-- C/C++ build toolchain (for `ring` / `mimalloc`)
-
-### Build from Source
+Requires Rust 1.85+ (edition 2024) and a C/C++ toolchain.
 
 ```bash
-# Clone the repository
-git clone https://github.com/spritetong/culvert.git
-cd culvert
-
-# Build optimized release binary
-cargo build --release
-
-# The compiled binary is located at:
-./target/release/culvert
+cargo build --release          # binary: target/release/culvert
+culvert --check -c config.yaml # validate without starting anything
+culvert -c config.yaml         # start
 ```
 
----
-
-## Command-Line Usage
-
-```bash
-culvert [OPTIONS]
-```
-
-### Options
-
-| Flag | Short | Environment / Argument | Description | Default |
-| :--- | :---: | :--- | :--- | :--- |
-| `--config` | `-c` | `<PATH>` | Path to the YAML configuration file | `config.yaml` |
-| `--worker-threads` | `-w` | `<NUM>` | Override number of Tokio runtime worker threads (`1` for single-threaded runtime) | Auto-detect CPU cores |
-| `--check` | | | Validate configuration syntax, schema, and semantics without starting the daemon | |
-| `--help` | `-h` | | Print command-line help message | |
-| `--version` | `-V` | | Print version information | |
-
-#### Example CLI Commands
-
-```bash
-# Validate configuration file without starting services
-./culvert --check -c /etc/culvert/config.yaml
-
-# Run with default config.yaml
-./culvert
-
-# Run with a custom config path and 2 worker threads
-./culvert -c /etc/culvert/server.yaml -w 2
-```
-
----
-
-## Workspace & Library Usage
-
-`culvert` is structured as a Cargo workspace with two distinct crates:
-- **`culvert`**: The core library exposing client/server runners, connection pooling, multiplexing, and protocol drivers for external programmatic integration.
-- **`culvert-cli`**: Lightweight CLI frontend containing only `main.rs` and CLI argument parsing (compiled as the `culvert` binary).
-
-### Using `culvert` as a Library
-
-Add `culvert` to your `Cargo.toml`:
-
-```toml
-[dependencies]
-culvert = { version = "0.1", path = "../path/to/crates/culvert" }
-tokio = { version = "1", features = ["full"] }
-tokio-util = "0.7"
-```
-
-#### Running an Ingress Server Service
-
-```rust
-use culvert::config::model::ServerConfig;
-use culvert::server::ServerRunner;
-use tokio_util::sync::CancellationToken;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let server_cfg = ServerConfig {
-        listen: vec!["wss://127.0.0.1:8443/tunnel".to_string()],
-        token: Some("MY_SECURE_TOKEN_32_BYTES_OR_MORE".to_string()),
-        ..Default::default()
-    };
-
-    let cancel_token = CancellationToken::new();
-
-    // Directly run the ingress server
-    culvert::run_server(server_cfg, cancel_token).await?;
-    Ok(())
-}
-```
-
-#### Running a Client Tunnel Service
-
-```rust
-use culvert::client::ClientRunner;
-use culvert::config::model::{PortMappingConfig, TunnelConfig, TunnelMode};
-use tokio_util::sync::CancellationToken;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let tunnel_cfg = TunnelConfig {
-        tag: "my-tunnel".to_string(),
-        endpoint: "wss://127.0.0.1:8443/tunnel".into(),
-        token: Some("MY_SECURE_TOKEN_32_BYTES_OR_MORE".to_string()),
-        pool_size: Some(4),
-        mappings: vec![PortMappingConfig {
-            mode: Some(TunnelMode::Forward),
-            listen: "127.0.0.1:13306".to_string(),
-            target: "10.0.0.5:3306".to_string(),
-            chmod: None,
-        }],
-        retry: None,
-    };
-
-    let cancel_token = CancellationToken::new();
-
-    // Directly run client tunnels with supervised retry
-    culvert::run_client(tunnel_cfg, cancel_token).await?;
-    Ok(())
-}
-```
-
-#### Running Combined Server & Client via Supervisor
-
-```rust
-use culvert::config::ConfigLoader;
-use culvert::supervisor::TunnelSupervisor;
-use tokio_util::sync::CancellationToken;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let app_config = ConfigLoader::from_file("config.yaml")?;
-    let cancel_token = CancellationToken::new();
-
-    culvert::run(app_config, cancel_token).await?;
-    Ok(())
-}
-```
-
----
-
-## Configuration Guide
-
-Configuration files are written in declarative **YAML**. All top-level and nested sections are described below.
-
-### 1. Global Settings
-
-#### `log` (Logging Options)
-
-Configures structured log output using Tokio `tracing`.
+**`server.yaml`** — ingress on a TCP port, with a fallback target:
 
 ```yaml
 log:
-  level: "info"      # Log verbosity level: "trace", "debug", "info", "warn", "error" (default: "info")
-                     # Note: RUST_LOG environment variable takes precedence over log.level if set.
-  output: "stdout"    # Output destination: "stdout" or "stderr" (default: "stdout")
-  no_color: false     # Set to true to disable ANSI terminal colors (default: false)
-```
-
-#### `worker_threads` (Runtime Concurrency)
-
-```yaml
-worker_threads: 4     # Number of Tokio worker threads.
-                      # Omit or set to null for auto-detecting CPU cores.
-                      # Set to 1 for lightweight single-threaded (current_thread) runtime.
-```
-
----
-
-### 2. DNS Settings (`dns`)
-
-Global DNS resolution settings. Can be overridden per-endpoint.
-
-`culvert` supports standard structured resolver configuration as well as standard URL schemes.
-
-```yaml
-dns:
-  strategy: "prefer_ipv4"   # IP resolution preference:
-                            #   "prefer_ipv4" (default): prefer IPv4, fallback to IPv6
-                            #   "prefer_ipv6": prefer IPv6, fallback to IPv4
-                            #   "ipv4_only": resolve A records only; ignore AAAA
-                            #   "ipv6_only": resolve AAAA records only; ignore A
-  resolvers:
-    # Standard structured resolver objects:
-    - type: "https"
-      server: "1.1.1.1"
-      tls:
-        server_name: "cloudflare-dns.com"
-    - type: "tls"
-      server: "8.8.8.8"
-      tls:
-        server_name: "dns.google"
-    - type: "udp"
-      server: "1.1.1.1:53"
-    - type: "system"
-
-    # Standard URL strings are also supported:
-    # - "https://1.1.1.1?sni=cloudflare-dns.com"
-    # - "tls://8.8.8.8?sni=dns.google"
-    # - "udp://1.1.1.1:53"
-    # - "system://0.0.0.0"
-  cache_capacity: 1024      # In-memory DNS cache capacity (default: 1024 entries)
-```
-
-#### Structured DNS Resolver Reference
-
-| Field | Type | Description |
-| :--- | :--- | :--- |
-| `type` | String | Protocol type: `"https"` (DoH), `"tls"` (DoT), `"udp"`/`"dns"`, `"tcp"`, `"system"` |
-| `server` | String | Upstream server IP address or hostname (e.g. `"1.1.1.1"`, `"8.8.8.8:853"`) |
-| `port` | Integer | Custom upstream port (optional; defaults to standard port: 443 for https, 853 for tls, 53 for udp/tcp) |
-| `path` | String | URL path for DoH (optional; e.g. `"/dns-query"`) |
-| `tls.server_name` | String | Expected TLS SNI domain for DoH/DoT validation (e.g. `"cloudflare-dns.com"`) |
-
----
-
-### 3. Socket Dialer Settings (`dialer`)
-
-Low-level TCP socket configuration for outbound dialing. Can be overridden per-endpoint.
-
-```yaml
-dialer:
-  connect_timeout: "10s"       # Socket connection timeout (e.g., "10s", "500ms", or raw seconds: 10; default: 10s)
-  tcp_nodelay: true            # Disable Nagle's algorithm for low-latency transmission (default: true)
-  heartbeat_interval: "15s"    # Probe interval when the stream is quiet; any RX or real TX suppresses probes (default: 15s)
-  idle_timeout: "30s"          # Deadline with no RX and no TX activity (probe PINGs do not count; default: 30s)
-  bind_interface: "eth0"       # Bind outbound traffic to network interface (Linux only via SO_BINDTODEVICE)
-```
-
----
-
-### 4. TLS Settings (`tls`)
-
-Global default TLS configuration for outbound client connections and fallback server termination.
-
-> **Note**: TLS activation is strictly determined by the URL scheme (`wss://`, `https://`, `h3://`, `quic://`, `wss+unix://` vs unencrypted `ws://`, `ws+unix://`). The `tls` configuration block specifies cryptographic parameters (SNI, certificates, versions).
-
-```yaml
-tls:
-  server_name: "tunnel.example.com"    # Override SNI hostname in TLS ClientHello
-  insecure: false                      # Skip remote certificate verification (default: false)
-  alpn: ["h3", "http/1.1"]             # Application-Layer Protocol Negotiation list
-  ca_certificate: "/etc/ssl/ca.crt"    # Custom CA certificate file path for server verification
-  client_certificate: "/etc/ssl/client.crt" # Client certificate for mutual TLS (mTLS)
-  client_key: "/etc/ssl/client.key"         # Client private key for mutual TLS (mTLS)
-  certificate: "/etc/ssl/server.crt"   # Server certificate for direct TLS termination
-  key: "/etc/ssl/server.key"           # Server private key for direct TLS termination
-  min_version: "1.2"                   # Minimum TLS version ("1.2" or "1.3")
-  max_version: "1.3"                   # Maximum TLS version ("1.2" or "1.3")
-```
-
----
-
-### 5. Server Ingress (`server`)
-
-Configures `culvert` as an ingress gateway on a cloud VPS or host.
-
-> **Note**: In a typical setup behind Caddy or Nginx, configure `listen` to a Unix Domain Socket (`ws+unix:///run/tunnel.sock`) or loopback (`ws://127.0.0.1:8080/tunnel`).
-
-`listen` takes a URL string or a list of URL strings. Both `server.listen` and client `tunnel.endpoint` share the exact same URL specification and supported schemes.
-
-#### Server Listen Configuration
-
-```yaml
+  level: "info"
 server:
-  # Ingress listeners: URL string or list of URL strings.
-  # Supported schemes: ws, wss, https, h3, quic, ws+unix, wss+unix
-  listen:
-    # 1. Plaintext WebSocket over Unix Domain Socket (IPC behind Caddy/Nginx)
-    - "ws+unix:///run/tunnel.sock?path=/tunnel&chmod=0o660"
-
-    # 2. TLS-encrypted WebSocket over Unix Domain Socket
-    - "wss+unix:///run/tunnel-tls.sock?path=/tunnel"
-
-    # 3. Plaintext WebSocket over TCP
-    - "ws://127.0.0.1:8080/tunnel"
-
-    # 4. Standalone WSS (TLS terminated by culvert)
-    - "wss://0.0.0.0:8443/tunnel"
-
-    # 5. Standalone HTTP/3 over QUIC/UDP
-    - "h3://0.0.0.0:8443/tunnel"
-
-  # Pre-shared authentication token (PSK).
-  # Optional: omit or set to null for unauthenticated mode (empty string "" is rejected).
-  # Maximum length: 256 bytes.
-  token: "SECRET_PRESHARED_TOKEN"
-
-  # Fallback target address when the client does not specify one.
-  # Supports 3 formats: ip:port, hostname:port, or unix://path
+  listen: "ws://0.0.0.0:8080/tunnel"
+  token: "CHANGE_ME"
   default_target: "127.0.0.1:5201"
-
-  # Optional transport keepalive and idle timeout settings
-  # heartbeat_interval: "15s"  # Probe interval when quiet; any RX or real TX suppresses probes (default: 15s)
-  # idle_timeout: "30s"        # Deadline with no RX and no TX activity (default: 30s)
-
-  # Optional direct TLS termination certificates (used for wss/h3/wss+unix if not behind a reverse proxy).
-  # If omitted on TLS schemes, a temporary self-signed certificate is automatically generated.
-  certificate: "/etc/ssl/server.crt"
-  key: "/etc/ssl/server.key"
-
-  # Optional advanced TLS settings overriding global tls block
-  tls:
-    min_version: "1.3"
 ```
 
-#### Supported Schemes Reference (Server `listen` & Client `endpoint`)
-
-Both `server.listen` and `tunnel.endpoint` support the exact same set of 7 URL schemes:
-
-| Scheme | Transport / Protocol | Description & Example |
-| :--- | :--- | :--- |
-| `ws` | WebSocket over TCP (Plaintext) | `ws://127.0.0.1:8080/tunnel` |
-| `wss` | WebSocket over TCP (TLS) | `wss://0.0.0.0:8443/tunnel` |
-| `https` | HTTP/3 over QUIC/UDP (alias for `h3`) | `https://0.0.0.0:8443/tunnel` |
-| `h3` | HTTP/3 over QUIC/UDP | `h3://0.0.0.0:8443/tunnel` |
-| `quic` | Raw QUIC bidirectional stream | `quic://0.0.0.0:8443/tunnel` |
-| `ws+unix` | WebSocket over Unix Domain Socket (Plaintext) | `ws+unix:///run/tunnel.sock?path=/tunnel&chmod=0o660` |
-| `wss+unix` | WebSocket over Unix Domain Socket (TLS) | `wss+unix:///run/tunnel.sock?path=/tunnel` |
-
-> [!NOTE]
-> **Cross-Platform Unix Domain Socket (UDS) Support**:
-> Unix Domain Sockets (`ws+unix`, `wss+unix`) are natively supported on **both Linux/macOS and Windows** (Windows 10 17063+ / Windows 11 / Windows Server 2019+ via WinSock `AF_UNIX`).
-> - On Linux / macOS, file permissions mode can be configured via URL query parameter `?chmod=0o660`.
-> - On Windows, filesystem socket paths such as `ws+unix://C:/temp/tunnel.sock` or `ws+unix://./local.sock` are fully supported with zero thread leaks and complete Tokio cancel-safety.
-> - For `h3` and `https` listeners, `"h3"` is prioritized at index 0 of ALPN negotiation per RFC 7301 / RFC 9114 so standard HTTP/3 clients always negotiate `h3`. Custom `tls.alpn` options serve as fallback identifiers for raw QUIC or specialized non-browser clients.
-
-> [!IMPORTANT]
-> **Path Matching**: Client requests must match the server URL's path exactly (e.g., `/tunnel`). Mismatched paths receive an HTTP `404 Not Found` response to defend against scanner probes.
-
----
-
-### 6. Tunnel Client (`tunnels`)
-
-Defines one or more outbound tunnel client instances.
+**`client.yaml`** — local port `18080` reaches port `8080` in the server's
+network:
 
 ```yaml
+log:
+  level: "info"
 tunnels:
-  - tag: "corp-cluster"                         # Unique identifier for the tunnel
-    endpoint: "wss://tunnel.example.com/tunnel" # Remote ingress server URL (or detailed endpoint object)
-    token: "SECRET_PRESHARED_TOKEN"             # PSK token matching server.token (optional: omit or null, empty string rejected)
-    pool_size: 8                                # Pre-warmed idle connection pool size (default: 0)
-
-    # Reconnection & self-healing supervisor settings
-    retry:
-      delay: "3s"            # Wait time between reconnect attempts (e.g. "3s", "500ms")
-      max_retries: 10        # Maximum retry attempts before giving up (omit or null for infinite)
-
-    # Port mappings: Multiple forward and reverse mappings share this endpoint & connection pool
+  - tag: "remote-http"
+    endpoint: "ws://203.0.113.10:8080/tunnel"
+    token: "CHANGE_ME"
     mappings:
-      # Local Forward Mapping: Clients connect to 127.0.0.1:15201, forwarded to 127.0.0.1:5201 on the server
-      - mode: "forward"
-        listen: "127.0.0.1:15201"
-        target: "127.0.0.1:5201"
-
-      # Local Forward Mapping: Forward local 13306 to internal database behind server
-      - mode: "forward"
-        listen: "127.0.0.1:13306"
-        target: "10.0.0.5:3306"
-
-      # Remote Reverse Mapping: Server opens port 2222; connections are routed back to local SSH (127.0.0.1:22)
-      - mode: "reverse"
-        listen: "0.0.0.0:2222"
-        target: "127.0.0.1:22"
-
-      # UDS Mapping: Forward or reverse over Unix Domain Socket (Linux, macOS, and Windows)
-      # Mappings support 3 formats: ip:port, hostname:port, and unix://path (port cannot be omitted; unix:// avoids hostname collision)
       - mode: "forward"
         listen: "127.0.0.1:18080"
-        target: "unix:///run/internal_service.sock"
-      - mode: "reverse"
-        listen: "unix:///run/public_api.sock"
         target: "127.0.0.1:8080"
 ```
 
-#### Detailed Endpoint Configuration (Per-Endpoint Overrides)
-
-Instead of a simple URL string, `endpoint` can be declared as an object with dedicated `dns`, `dialer`, and `tls` overrides:
-
-```yaml
-tunnels:
-  - tag: "special-node"
-    token: "SECRET_PRESHARED_TOKEN"
-    endpoint:
-      url: "wss://special.domain.com/tunnel"
-      dns:
-        strategy: "ipv4_only"
-        resolvers:
-          - "dns://1.1.1.1"
-      dialer:
-        connect_timeout: "10s"
-        heartbeat_interval: "15s"
-        idle_timeout: "30s"
-      tls:
-        server_name: "fronting-camouflage.com" # SNI domain fronting override
-        insecure: false
-        ca_certificate: "/path/to/custom-ca.pem"
-    mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:8080"
-        target: "127.0.0.1:80"
+```bash
+culvert -c server.yaml   # on the ingress host
+culvert -c client.yaml   # on the client host
+curl http://127.0.0.1:18080/
 ```
 
 ---
 
-## Configuration Recipes
+## Command-line reference
 
-### Recipe 1: Production Server Behind Caddy Reverse Proxy (Recommended)
+```
+culvert [OPTIONS]
+```
 
-Let Caddy handle public HTTPS, HTTP/3, and automated Let's Encrypt certificates. Culvert listens securely over Unix Domain Sockets.
+| Option | Argument | Description | Default |
+| :--- | :--- | :--- | :--- |
+| `-c`, `--config` | `<PATH>` | YAML configuration file | `config.yaml` |
+| `-w`, `--worker-threads` | `<NUM>` | Tokio worker threads; `1` selects a current-thread runtime. Overrides `worker_threads` in the file | auto-detected CPU cores |
+| `--check` | — | Parse and validate the configuration, then exit. Does not bind addresses or start the runtime | off |
+| `-h`, `--help` | — | Print command-line help | — |
+| `-V`, `--version` | — | Print version | — |
 
-#### `server.yaml` (culvert configuration)
+```bash
+culvert --check -c /etc/culvert/config.yaml
+culvert -c /etc/culvert/config.yaml -w 2
+```
+
+Configuration errors exit with code `1`. The first termination signal cancels
+all tasks and waits for them; a second signal exits with code `130`. A 10-second
+hard deadline applies to shutdown.
+
+---
+
+## Configuration reference
+
+Configuration is YAML. All sections reject unknown fields. A file must define
+at least one server listener or one tunnel.
+
+### Top-level
+
+| Key | Type | Required | Default | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| `log` | object | no | `info` / `stdout` / `false` | See `log`. |
+| `worker_threads` | integer | no | auto-detect | Must be `>= 1`. `1` selects a current-thread runtime. |
+| `dns` | object | no | system resolver, `prefer_ipv4` | Global defaults; overridable per endpoint. |
+| `dialer` | object | no | see `dialer` | Global defaults; overridable per endpoint. |
+| `tls` | object | no | — | Global defaults for TLS endpoints and server termination. |
+| `server` | object | no | — | Ingress listeners. |
+| `tunnels` | list | no | `[]` | Tunnel clients. |
+
+### `log`
+
+| Key | Type | Default | Values / constraints |
+| :--- | :--- | :--- | :--- |
+| `level` | string | `info` | `trace`, `debug`, `info`, `warn`, `error`. `RUST_LOG` overrides this value. |
+| `output` | string | `stdout` | `stdout`, `stderr`. |
+| `no_color` | bool | `false` | Disable ANSI colors in log output. |
+
+### `dns`
+
+| Key | Type | Default | Values / constraints |
+| :--- | :--- | :--- | :--- |
+| `strategy` | string | `prefer_ipv4` | `prefer_ipv4`, `prefer_ipv6`, `ipv4_only`, `ipv6_only`. |
+| `resolvers` | list | system resolver | Each item is an URL string or a structured object. |
+| `cache_capacity` | integer | `1024` | Must be `>= 1`; cache TTL is 300 s. |
+
+Structured resolver object:
+
+| Key | Type | Required | Notes |
+| :--- | :--- | :--- | :--- |
+| `type` | string | yes | `system`, `udp`, `dns`, `tcp`, `tls` (DoT), `https` (DoH). |
+| `server` | string | for all types except `system` | IP or hostname, optionally with `host:port`. |
+| `port` | integer | no | Defaults: 53 for `udp`/`dns`/`tcp`, 853 for `tls`, 443 for `https`. |
+| `path` | string | no | DoH request path, e.g. `/dns-query`. |
+| `tls.server_name` | string | no | SNI for DoH/DoT; defaults to the server address. |
+
+Resolver URL forms:
+
+```yaml
+resolvers:
+  - "system://0.0.0.0"                              # also accepted: "system"
+  - "udp://1.1.1.1:53"                              # "dns://..." is equivalent
+  - "tcp://1.1.1.1:53"
+  - "tls://8.8.8.8?sni=dns.google"
+  - "https://1.1.1.1/dns-query?sni=cloudflare-dns.com"
+  - type: "https"                                   # structured form
+    server: "1.1.1.1"
+    tls:
+      server_name: "cloudflare-dns.com"
+```
+
+### `dialer`
+
+| Key | Type | Default | Values / constraints |
+| :--- | :--- | :--- | :--- |
+| `connect_timeout` | duration | `10s` | Must be greater than 0. |
+| `tcp_nodelay` | bool | `true` | Sets `TCP_NODELAY` on outbound TCP sockets. |
+| `bind_interface` | string | — | Outbound interface via `SO_BINDTODEVICE`; rejected where unsupported. |
+| `heartbeat_interval` | duration | `15s` | Must be greater than 0. Probes are sent only when the stream is quiet. |
+| `idle_timeout` | duration | `30s` | Must be greater than 0 and greater than the effective `heartbeat_interval`. |
+
+Durations accept a plain integer (seconds), `"10s"`, or `"500ms"`.
+
+### `tls`
+
+TLS is activated by the endpoint scheme (`wss`, `https`, `h3`, `quic`,
+`wss+unix`), not by the presence of this section. A `tls` block on a `ws` or
+`ws+unix` endpoint is an error.
+
+| Key | Type | Default | Notes |
+| :--- | :--- | :--- | :--- |
+| `server_name` | string | endpoint host | Overrides the SNI hostname. |
+| `insecure` | bool | `false` | Skip server certificate verification. |
+| `alpn` | list of strings | `h3` for HTTP/3, `culvert-quic` for `quic` | ALPN identifiers. |
+| `ca_certificate` | path | — | Custom CA PEM for server verification. |
+| `client_certificate` | path | — | mTLS client certificate; requires `client_key`. |
+| `client_key` | path | — | mTLS private key; requires `client_certificate`. |
+| `certificate` | path | — | Server certificate for TLS termination; requires `key`. |
+| `key` | path | — | Server private key for TLS termination; requires `certificate`. |
+| `min_version` | string | — | `1.2` or `1.3`; must not exceed `max_version`. |
+| `max_version` | string | — | `1.2` or `1.3`. |
+
+Certificate, key, and CA files are checked for readability and valid PEM at
+load time.
+
+### `server`
+
+| Key | Type | Default | Notes |
+| :--- | :--- | :--- | :--- |
+| `listen` | string or list | `[]` | One or more URLs. Required when no tunnels are configured. A port is mandatory for TCP URLs and must not be `0`. |
+| `token` | string | — | Optional pre-shared token; empty strings are rejected; max 256 bytes. |
+| `default_target` | string | — | Fallback forward target when the client supplies none. |
+| `certificate` | path | — | TLS server certificate; requires `key`. Omit both for an ephemeral self-signed certificate. |
+| `key` | path | — | TLS server private key; requires `certificate`. |
+| `tls` | object | — | Advanced TLS options for server termination; overrides global `tls`. |
+| `heartbeat_interval` | duration | `15s` | Transport keepalive for accepted connections. |
+| `idle_timeout` | duration | `30s` | Must be greater than the effective `heartbeat_interval`. |
+
+WebSocket and Unix-socket clients send the token as `x-tunnel-auth: <token>`.
+HTTP/3 clients send both `authorization: Bearer <token>` and
+`x-tunnel-auth: <token>`; HTTP/3 listeners accept either header, in raw or
+`Bearer` form. Raw QUIC carries the token in its binary handshake. A missing or
+non-matching token is rejected during the handshake. When an HTTP path is
+configured on the listener, requests with a different path receive `404`.
+
+### `tunnels[]`
+
+| Key | Type | Required | Notes |
+| :--- | :--- | :--- | :--- |
+| `tag` | string | yes | Non-empty and unique across all tunnels. |
+| `endpoint` | string or object | yes | Ingress URL, or an object with per-endpoint overrides. |
+| `token` | string | no | Must match `server.token`; empty strings are rejected; max 256 bytes. |
+| `pool_size` | integer | no | Positive value enables a pre-warmed stream pool shared by all `forward` mappings of this tunnel. |
+| `retry` | object | no | See below. |
+| `mappings` | list | yes | At least one mapping; see below. |
+| `multiplex`, `failover` | object | — | Rejected at load time; not wired into the data path. |
+
+`endpoint` object:
+
+| Key | Type | Required | Notes |
+| :--- | :--- | :--- | :--- |
+| `url` | string | yes | Any supported scheme. Unix socket endpoints must include a socket path. |
+| `dns` | object | no | Endpoint-specific `dns`, same keys as the global section. |
+| `dialer` | object | no | Endpoint-specific `dialer`, same keys as the global section. |
+| `tls` | object | no | Endpoint-specific `tls`. Only valid on TLS schemes. |
+
+Effective values are merged field by field: endpoint override, then global
+value, then built-in default.
+
+`retry` object:
+
+| Key | Type | Default | Notes |
+| :--- | :--- | :--- | :--- |
+| `delay` | duration | `3s` | Fixed wait between attempts; must be greater than 0. |
+| `max_retries` | integer | unlimited | Must be `>= 1`. Omit to retry indefinitely. |
+
+`mappings[]` object:
+
+| Key | Type | Default | Notes |
+| :--- | :--- | :--- | :--- |
+| `mode` | string | `forward` | `forward` or `reverse`. |
+| `listen` | string | — | Address bound locally (`forward`) or on the server (`reverse`). |
+| `target` | string | — | Address dialed by the server (`forward`) or by the client (`reverse`). |
+
+Address formats for `listen` and `target`: `ip:port`, `hostname:port`,
+`[::1]:port`, or `unix://path`. A port is mandatory and non-zero for non-Unix
+forms. Forward `listen` addresses must be unique across all tunnels.
+
+### Validation summary
+
+`culvert --check` and every startup reject: unknown fields, missing schemes or
+ports, unsupported schemes, empty or overlong tokens, duplicate tags and
+duplicate forward listen addresses, missing mappings, unpaired certificates
+and keys, invalid PEM files, invalid TLS version ranges, invalid DNS resolver
+definitions, `tls` on non-TLS endpoints, certificates with only plaintext
+listeners, and effective `idle_timeout <= heartbeat_interval`.
+
+---
+
+## Examples
+
+### Reverse mapping (publish a local SSH service)
+
+Client on the machine behind NAT; the server binds `2222` on the ingress host:
+
+```yaml
+tunnels:
+  - tag: "home-ssh"
+    endpoint: "wss://tunnel.example.com/tunnel"
+    token: "CHANGE_ME"
+    mappings:
+      - mode: "reverse"
+        listen: "0.0.0.0:2222"
+        target: "127.0.0.1:22"
+```
+
+```bash
+ssh -p 2222 user@vps.example.com
+```
+
+### Ingress behind a reverse proxy over a Unix socket
+
+**`server.yaml`**
 
 ```yaml
 log:
   level: "info"
-
 server:
-  listen: "ws+unix:///run/culvert.sock"
-  token: "MY_SECURE_TOKEN_32_BYTES_OR_MORE"
-  default_target: "127.0.0.1:5201"
+  listen: "ws+unix:///run/culvert.sock?path=/tunnel&chmod=0o660"
+  token: "CHANGE_ME"
 ```
 
-#### `Caddyfile` (Caddy reverse proxy configuration)
+**Caddyfile** (public TLS is terminated by Caddy):
 
 ```caddy
-tunnel.yourdomain.com {
-    # Match culvert path
-    @tunnel path /tunnel*
-
-    # Reverse proxy WebSocket and HTTP traffic to culvert via Unix Domain Socket
+tunnel.example.com {
+    @tunnel path /tunnel
     handle @tunnel {
-        reverse_proxy unix//run/culvert.sock {
-            # stream_timeout defaults to 0 (unlimited), keeping tunnel streams alive indefinitely
-        }
+        reverse_proxy unix//run/culvert.sock
     }
-
-    # Optional camouflage / decoy website on root
     handle {
-        respond "System Operational" 200
+        respond "OK" 200
     }
 }
 ```
 
----
+Client endpoint: `wss://tunnel.example.com/tunnel`.
 
-### Recipe 2: Client Accessing Cloud Database (Local Forwarding)
+### Standalone TLS ingress (no reverse proxy)
 
-Access an internal MySQL database (`10.0.0.5:3306`) in a private cloud network through a local port (`127.0.0.1:13306`).
-
-#### `client.yaml`
-
-```yaml
-log:
-  level: "info"
-
-tunnels:
-  - tag: "cloud-mysql"
-    endpoint: "wss://tunnel.yourdomain.com/tunnel"
-    token: "MY_SECURE_TOKEN_32_BYTES_OR_MORE"
-    pool_size: 4
-    mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:13306"
-        target: "10.0.0.5:3306"
-```
-
-Now connect locally using any database tool:
-
-```bash
-mysql -h 127.0.0.1 -P 13306 -u root -p
-```
-
----
-
-### Recipe 3: Exposing Local Home / NAT Machine to VPS (Remote Reverse Forwarding)
-
-Expose a home computer's SSH server (`127.0.0.1:22`) on the public VPS port `2222` without configuring port forwarding on your home router.
-
-#### `client.yaml` (running on home computer)
+**`server.yaml`** — omit `certificate` / `key` to use an ephemeral self-signed
+certificate:
 
 ```yaml
-log:
-  level: "info"
-
-tunnels:
-  - tag: "home-ssh-reverse"
-    endpoint: "wss://tunnel.yourdomain.com/tunnel"
-    token: "MY_SECURE_TOKEN_32_BYTES_OR_MORE"
-    pool_size: 4
-    retry:
-      delay: "3s"
-    mappings:
-      - mode: "reverse"
-        listen: "0.0.0.0:2222"     # Bound on the VPS server
-        target: "127.0.0.1:22"     # Local SSH server on home machine
-```
-
-Anyone connecting to `vps-ip:2222` is transparently routed back to your home machine's SSH server.
-
----
-
-### Recipe 4: Standalone High-Speed HTTP/3 Direct Ingress
-
-Run `culvert` directly without a reverse proxy, leveraging HTTP/3 over UDP port `8443`.
-
-#### `server.yaml`
-
-```yaml
-log:
-  level: "info"
-
 server:
   listen:
-    - "h3://0.0.0.0:8443/tunnel"
     - "wss://0.0.0.0:8443/tunnel"
-  token: "MY_SECURE_TOKEN"
-  # Omit cert/key to automatically generate self-signed TLS certificates,
-  # or specify your own certificates:
-  # certificate: "/etc/ssl/cert.pem"
-  # key: "/etc/ssl/key.pem"
+    - "h3://0.0.0.0:8443/tunnel"
+    - "quic://0.0.0.0:8443/tunnel"
+  token: "CHANGE_ME"
+  # certificate: "/etc/ssl/certs/tunnel.pem"
+  # key: "/etc/ssl/private/tunnel.key"
 ```
 
-#### `client.yaml` (h3)
+**`client.yaml`** — `insecure: true` is needed only when the server uses a
+self-signed certificate; otherwise supply `ca_certificate`:
 
 ```yaml
-log:
-  level: "info"
-
-# Trust self-signed certificates for direct connections
 tls:
   insecure: true
-
 tunnels:
-  - tag: "direct-h3-tunnel"
+  - tag: "direct-h3"
     endpoint: "h3://vps.example.com:8443/tunnel"
-    token: "MY_SECURE_TOKEN"
-    pool_size: 8
+    token: "CHANGE_ME"
     mappings:
       - mode: "forward"
         listen: "127.0.0.1:15201"
         target: "127.0.0.1:5201"
 ```
 
----
+### Multi-mapping cluster with a shared pool
 
-## Benchmarks & Performance
+All `forward` mappings use the same endpoint and pool; the `reverse` mapping
+uses its own control and data streams.
 
-`culvert` comes equipped with automated Criterion micro-benchmarks and end-to-end `iperf3` benchmark suites.
-
-### Running Benchmarks
-
-```bash
-# Run internal Criterion component benchmarks (zero-copy relay, codecs, sessions)
-cargo bench
-
-# Run end-to-end multi-stream iperf3 throughput tests (Linux / macOS)
-./benchmarks/run-bench.sh 127.0.0.1 15201 8 10
-
-# Run end-to-end throughput tests (Windows PowerShell)
-.\benchmarks\run-bench.ps1 -TargetHost 127.0.0.1 -TargetPort 15201 -Streams 8 -DurationSec 10
+```yaml
+tunnels:
+  - tag: "corp-cluster"
+    endpoint: "wss://tunnel.example.com/tunnel"
+    token: "CHANGE_ME"
+    pool_size: 8
+    retry:
+      delay: "3s"
+      max_retries: 10
+    mappings:
+      - mode: "forward"
+        listen: "127.0.0.1:15201"
+        target: "127.0.0.1:5201"
+      - mode: "forward"
+        listen: "127.0.0.1:13306"
+        target: "10.0.0.5:3306"
+      - mode: "forward"
+        listen: "127.0.0.1:18000"
+        target: "unix:///var/run/docker.sock"
+      - mode: "reverse"
+        listen: "0.0.0.0:2222"
+        target: "127.0.0.1:22"
 ```
 
-### Performance Characteristics
+Pooled streams are opened without a backend target. The client writes an
+activation packet (`0xA5`, a two-byte big-endian length, and the target
+string), and the server dials the target only after receiving it. Acquired
+streams are used once and replenished in the background.
 
-- **Memory Footprint**: Under 15 MB RSS under high load.
-- **Throughput**: Saturated 10 Gbps+ line rate over loopback and LAN with minimal CPU overhead.
-- **Zero-Copy I/O**: Direct 64 KB kernel buffer splicing with `mimalloc` zero-fragmentation allocator.
-- **SIMD Acceleration**: AVX2 and ARM NEON hardware acceleration for WebSocket masking and unmasking.
+### Per-endpoint DNS, dialer, and mTLS overrides
+
+Global values apply unless the endpoint overrides them:
+
+```yaml
+dns:
+  strategy: "prefer_ipv4"
+  resolvers:
+    - "system://0.0.0.0"
+dialer:
+  connect_timeout: "10s"
+  heartbeat_interval: "15s"
+  idle_timeout: "30s"
+tls:
+  min_version: "1.3"
+tunnels:
+  - tag: "special-node"
+    token: "CHANGE_ME"
+    endpoint:
+      url: "wss://special.example.com/tunnel"
+      dns:
+        strategy: "ipv4_only"
+        resolvers:
+          - type: "https"
+            server: "1.1.1.1"
+            path: "/dns-query"
+            tls:
+              server_name: "cloudflare-dns.com"
+          - type: "system"
+      dialer:
+        connect_timeout: "5s"
+        tcp_nodelay: true
+      tls:
+        server_name: "cdn.example.com"
+        alpn: ["http/1.1"]
+        ca_certificate: "/etc/ssl/certs/ca.pem"
+        client_certificate: "/etc/ssl/certs/client.pem"
+        client_key: "/etc/ssl/private/client.key"
+    mappings:
+      - mode: "forward"
+        listen: "127.0.0.1:18080"
+        target: "10.0.0.8:8080"
+```
+
+The referenced PEM files must exist when the configuration is loaded.
+
+### Server and clients in one file
+
+`server` and `tunnels` can coexist, so a host can be an ingress for some peers
+and a client of another ingress:
+
+```yaml
+log:
+  level: "info"
+worker_threads: 4
+server:
+  listen:
+    - "ws://127.0.0.1:8080/tunnel"
+    - "h3://0.0.0.0:8443/tunnel"
+  token: "CHANGE_ME"
+  default_target: "127.0.0.1:5201"
+tunnels:
+  - tag: "upstream"
+    endpoint: "wss://upstream.example.com/tunnel"
+    token: "CHANGE_ME"
+    mappings:
+      - mode: "forward"
+        listen: "127.0.0.1:13306"
+        target: "10.0.0.5:3306"
+```
+
+The full example file with all listener schemes and two tunnels is
+[`config-example.yaml`](config-example.yaml).
+
+### Library usage
+
+`culvert` is a library crate; `culvert-cli` is the binary. `run()` starts the
+supervisor with a caller-owned cancellation token. `run_daemon()` additionally
+installs signal handling and the shutdown watchdog.
+
+```rust
+use culvert::config::ConfigLoader;
+use tokio_util::sync::CancellationToken;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = ConfigLoader::from_file("config.yaml")?;
+    let cancel = CancellationToken::new();
+    culvert::run(config, cancel).await?;
+    Ok(())
+}
+```
+
+Other public entry points: `culvert::run_server(ServerConfig, token)`,
+`culvert::run_client(TunnelConfig, token)`, `culvert::run_daemon(AppConfig)`,
+and the `ServerRunner` / `ClientRunner` / `TunnelSupervisor` types.
 
 ---
+
+## Development
+
+```bash
+cargo test --workspace       # unit and end-to-end tests
+cargo bench                  # Criterion micro-benchmarks
+```
+
+End-to-end throughput scripts are in `benchmarks/` (`run-bench.sh`,
+`run-bench.ps1`). Architecture and protocol details are in
+[DESIGN.md](docs/DESIGN.md); requirements and scope are in
+[PRD.md](docs/PRD.md).
 
 ## License
 
-This project is licensed under the **Mozilla Public License Version 2.0 (MPL-2.0)**.
-See the [LICENSE](LICENSE) file for details.
+Mozilla Public License Version 2.0. See [LICENSE](LICENSE).
