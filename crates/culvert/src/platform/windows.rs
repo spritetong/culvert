@@ -55,11 +55,6 @@ pub fn bind_device(_sock_ref: &socket2::SockRef, iface: &str) -> io::Result<()> 
     ))
 }
 
-/// Configures TCP keepalive on Windows.
-pub fn configure_tcp_keepalive(ka: socket2::TcpKeepalive) -> socket2::TcpKeepalive {
-    ka
-}
-
 /// Windows Unix Domain Socket (AF_UNIX) listener.
 pub struct PlatformUdsListener {
     /// `Option` so `Drop` can close the receiver *before* joining the accept

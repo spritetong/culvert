@@ -120,7 +120,7 @@ impl WsListener {
                     Some(_) = conn_tasks.join_next(), if !conn_tasks.is_empty() => continue,
                     res = listener.accept() => match res {
                         Ok((conn, _addr)) => {
-                            let _ = SocketTuner::tune_tcp_stream(&conn, true, None);
+                            let _ = SocketTuner::tune_tcp_stream(&conn, true);
                             conn
                         }
                         Err(_) => break,

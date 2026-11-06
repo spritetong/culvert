@@ -219,10 +219,11 @@ pub async fn run_reverse_mapping(
                                     };
 
                                     // 3. Relay bidirectionally
-                                    let _ = RelayEngine::relay_with_cancel(
+                                    let _ = RelayEngine::relay_with_heartbeat(
                                         local_stream,
                                         data_stream,
                                         token,
+                                        hb_interval,
                                     ).await;
                                 });
                             }

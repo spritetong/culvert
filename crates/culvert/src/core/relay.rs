@@ -11,9 +11,9 @@ use std::task::Poll;
 use tokio::io::ReadBuf;
 use tokio_util::sync::CancellationToken;
 
-use crate::consts::{DEFAULT_RELAY_DRAIN_TIMEOUT, RELAY_BUFFER_SIZE};
+use crate::consts::{DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_RELAY_DRAIN_TIMEOUT, RELAY_BUFFER_SIZE};
 use crate::core::error::TunnelError;
-use crate::core::stream::TunnelStream;
+use crate::core::stream::{HeartbeatStatus, TunnelStream};
 
 /// Directional transfer state for one half of the duplex relay.
 struct TransferState {
@@ -67,9 +67,20 @@ impl RelayEngine {
 
     /// Copies data bidirectionally while monitoring a cancellation token in the same event loop.
     pub async fn relay_with_cancel(
+        stream_a: Box<dyn TunnelStream>,
+        stream_b: Box<dyn TunnelStream>,
+        cancel_token: CancellationToken,
+    ) -> Result<(u64, u64), TunnelError> {
+        Self::relay_with_heartbeat(stream_a, stream_b, cancel_token, DEFAULT_HEARTBEAT_INTERVAL)
+            .await
+    }
+
+    /// Copies data bidirectionally while driving periodic heartbeats and monitoring cancellation.
+    pub async fn relay_with_heartbeat(
         mut stream_a: Box<dyn TunnelStream>,
         mut stream_b: Box<dyn TunnelStream>,
         cancel_token: CancellationToken,
+        heartbeat_interval: std::time::Duration,
     ) -> Result<(u64, u64), TunnelError> {
         let mut a_to_b = TransferState::new(RELAY_BUFFER_SIZE);
         let mut b_to_a = TransferState::new(RELAY_BUFFER_SIZE);
@@ -78,6 +89,7 @@ impl RelayEngine {
         // and achieve zero-allocation, purely event-driven cancellation without polling.
         let mut cancel_fut = pin!(cancel_token.cancelled_owned());
         let mut drain_sleep: Option<Pin<Box<tokio::time::Sleep>>> = None;
+        let mut heartbeat_timer = Box::pin(tokio::time::sleep(heartbeat_interval));
 
         poll_fn(|cx| {
             let is_cancelled = cancel_fut.as_mut().poll(cx).is_ready();
@@ -91,6 +103,33 @@ impl RelayEngine {
                 {
                     // Hard bounded deadline reached: terminate relay immediately without hanging
                     return Poll::Ready(Ok((a_to_b.total_bytes, b_to_a.total_bytes)));
+                }
+            }
+
+            // Periodic heartbeat ping & liveness check
+            if heartbeat_timer.as_mut().poll(cx).is_ready() {
+                heartbeat_timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + heartbeat_interval);
+
+                if let Poll::Ready(Err(e)) = stream_a.poll_send_ping(cx) {
+                    return Poll::Ready(Err(TunnelError::Io(e)));
+                }
+                if let Poll::Ready(Err(e)) = stream_b.poll_send_ping(cx) {
+                    return Poll::Ready(Err(TunnelError::Io(e)));
+                }
+
+                if let Poll::Ready(HeartbeatStatus::Dead) = stream_a.poll_check_alive(cx) {
+                    return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Relay stream A unresponsive to heartbeats",
+                    ))));
+                }
+                if let Poll::Ready(HeartbeatStatus::Dead) = stream_b.poll_check_alive(cx) {
+                    return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Relay stream B unresponsive to heartbeats",
+                    ))));
                 }
             }
 
@@ -285,6 +324,10 @@ impl RelayEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Context;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
     #[tokio::test]
@@ -452,5 +495,84 @@ mod tests {
             write_bytes_called.load(Ordering::SeqCst) > 0,
             "Must call poll_write_bytes via Path A"
         );
+    }
+
+    #[tokio::test]
+    async fn test_relay_heartbeat_terminates_on_dead_stream() {
+        struct MockDeadOnPingStream {
+            pings_received: Arc<AtomicUsize>,
+        }
+
+        impl tokio::io::AsyncRead for MockDeadOnPingStream {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+        }
+
+        impl tokio::io::AsyncWrite for MockDeadOnPingStream {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        impl TunnelStream for MockDeadOnPingStream {
+            fn poll_send_ping(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                self.pings_received.fetch_add(1, Ordering::SeqCst);
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_check_alive(&mut self, _cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+                if self.pings_received.load(Ordering::SeqCst) > 0 {
+                    Poll::Ready(HeartbeatStatus::Dead)
+                } else {
+                    Poll::Ready(HeartbeatStatus::Alive)
+                }
+            }
+        }
+
+        let pings = Arc::new(AtomicUsize::new(0));
+        let dead_stream = MockDeadOnPingStream {
+            pings_received: Arc::clone(&pings),
+        };
+
+        let (_client_app, client_side) = duplex(65536);
+
+        // Run relay with a short 20ms heartbeat interval
+        let cancel = CancellationToken::new();
+        let res = RelayEngine::relay_with_heartbeat(
+            Box::new(client_side),
+            Box::new(dead_stream),
+            cancel,
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+
+        assert!(
+            res.is_err(),
+            "Relay must terminate with error on dead stream"
+        );
+        match res.unwrap_err() {
+            TunnelError::Io(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+            }
+            other => panic!("Expected Io(TimedOut), got: {:?}", other),
+        }
+        assert!(pings.load(Ordering::SeqCst) > 0, "Ping must have been sent");
     }
 }

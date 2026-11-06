@@ -438,9 +438,6 @@ pub struct DialerConfig {
     #[serde(with = "humantime_serde_opt", default)]
     pub connect_timeout: Option<Duration>,
 
-    #[serde(with = "humantime_serde_opt", default)]
-    pub tcp_keepalive: Option<Duration>,
-
     pub tcp_nodelay: Option<bool>,
     pub bind_interface: Option<String>,
 

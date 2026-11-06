@@ -72,7 +72,6 @@ impl Dialer for DefaultDialer {
                 .unwrap_or(DEFAULT_CONNECT_TIMEOUT);
 
             let nodelay = self.config.tcp_nodelay.unwrap_or(true);
-            let tcp_keepalive = self.config.tcp_keepalive;
 
             async fn try_connect(
                 addr: SocketAddr,
@@ -103,8 +102,7 @@ impl Dialer for DefaultDialer {
             if ips.len() == 1 {
                 let addr = SocketAddr::new(ips[0], port);
                 let stream = try_connect(addr, connect_timeout, iface_opt).await?;
-                SocketTuner::tune_tcp_stream(&stream, nodelay, tcp_keepalive)
-                    .map_err(TunnelError::Io)?;
+                SocketTuner::tune_tcp_stream(&stream, nodelay).map_err(TunnelError::Io)?;
                 return Ok(Box::new(stream) as Box<dyn TunnelStream>);
             }
 
@@ -130,7 +128,7 @@ impl Dialer for DefaultDialer {
                     Some(res) = futs.next(), if !futs.is_empty() => {
                         match res {
                             Ok(stream) => {
-                                SocketTuner::tune_tcp_stream(&stream, nodelay, tcp_keepalive)
+                                SocketTuner::tune_tcp_stream(&stream, nodelay)
                                     .map_err(TunnelError::Io)?;
                                 return Ok(Box::new(stream) as Box<dyn TunnelStream>);
                             }

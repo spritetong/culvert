@@ -164,7 +164,6 @@ use crate::dialer::endpoint::EndpointContext;
 #[serde(deny_unknown_fields)]
 pub struct DialerConfig {
     pub connect_timeout: Option<Duration>,
-    pub tcp_keepalive: Option<Duration>,
     pub tcp_nodelay: Option<bool>,
     /// 仅 Linux 的 SO_BINDTODEVICE；其他平台配置该项会在加载期报错
     pub bind_interface: Option<String>,
@@ -210,7 +209,6 @@ dns:
 # 全局默认套接字拨号参数
 dialer:
   connect_timeout: "10s"
-  tcp_keepalive: "15s"
   tcp_nodelay: true
 
 # 全局默认 TLS 参数

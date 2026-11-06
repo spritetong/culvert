@@ -21,7 +21,6 @@ dns:
 
 dialer:
   connect_timeout: "3s"
-  tcp_keepalive: "15s"
   tcp_nodelay: true
 
 tls:

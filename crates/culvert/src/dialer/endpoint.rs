@@ -164,9 +164,6 @@ impl EndpointContext {
             connect_timeout: endpoint_dialer
                 .and_then(|d| d.connect_timeout)
                 .or_else(|| global_app.dialer.as_ref().and_then(|d| d.connect_timeout)),
-            tcp_keepalive: endpoint_dialer
-                .and_then(|d| d.tcp_keepalive)
-                .or_else(|| global_app.dialer.as_ref().and_then(|d| d.tcp_keepalive)),
             tcp_nodelay: endpoint_dialer
                 .and_then(|d| d.tcp_nodelay)
                 .or_else(|| global_app.dialer.as_ref().and_then(|d| d.tcp_nodelay)),

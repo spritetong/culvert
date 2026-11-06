@@ -38,7 +38,7 @@ dns:
 
 dialer:
   connect_timeout: "4s"
-  tcp_keepalive: "20s"
+  heartbeat_interval: "20s"
   tcp_nodelay: true
 {}
 tls:
@@ -101,7 +101,7 @@ tunnels:
     // Verify Dialer
     let dialer = app_config.dialer.as_ref().unwrap();
     assert_eq!(dialer.connect_timeout, Some(Duration::from_secs(4)));
-    assert_eq!(dialer.tcp_keepalive, Some(Duration::from_secs(20)));
+    assert_eq!(dialer.heartbeat_interval, Some(Duration::from_secs(20)));
     assert_eq!(dialer.tcp_nodelay, Some(true));
     #[cfg(target_os = "linux")]
     assert_eq!(dialer.bind_interface.as_deref(), Some("eth0"));

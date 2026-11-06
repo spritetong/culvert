@@ -104,7 +104,6 @@
   * `min_version` / `max_version`：显式约束 TLS 最低与最高版本（如 `1.2`, `1.3`）。
 * **FR-2.6 Endpoint 专属底层 Socket 拨号微调**：
   * `connect_timeout`：单端点定制建连超时。
-  * `tcp_keepalive`：单端点 TCP Keepalive 周期探测。
   * `tcp_nodelay`：默认禁用 Nagle 算法。
   * `bind_interface`：单端点指定绑定的出站网卡（多网卡分流）。
 
@@ -160,7 +159,6 @@ dns:
 # 全局默认套接字拨号参数
 dialer:
   connect_timeout: "10s"
-  tcp_keepalive: "15s"
   tcp_nodelay: true
 
 # 全局默认 TLS 参数

@@ -157,6 +157,8 @@ pub async fn run_forward_mapping(
         None
     };
 
+    let hb_interval = endpoint_ctx.heartbeat_interval();
+
     loop {
         tokio::select! {
             biased;
@@ -212,10 +214,11 @@ pub async fn run_forward_mapping(
                                         }
                                     }
 
-                                    let _ = RelayEngine::relay_with_cancel(
+                                    let _ = RelayEngine::relay_with_heartbeat(
                                         inbound_stream,
                                         remote_stream,
                                         conn_token,
+                                        hb_interval,
                                     ).await;
                                 }
                                 Err(e) => {

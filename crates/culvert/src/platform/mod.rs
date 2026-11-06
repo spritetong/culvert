@@ -101,7 +101,7 @@ impl GenericListener {
         match self {
             GenericListener::Tcp(l) => {
                 let (stream, addr) = l.accept().await.map_err(TunnelError::Io)?;
-                let _ = SocketTuner::tune_tcp_stream(&stream, true, None);
+                let _ = SocketTuner::tune_tcp_stream(&stream, true);
                 Ok((Box::new(stream), addr.to_string()))
             }
             GenericListener::Uds(l) => {
@@ -117,14 +117,14 @@ pub async fn connect_target(target: &TargetAddr) -> Result<Box<dyn TunnelStream>
     match target {
         TargetAddr::Ip(sa) => {
             let stream = TcpStream::connect(*sa).await.map_err(TunnelError::Io)?;
-            let _ = SocketTuner::tune_tcp_stream(&stream, true, None);
+            let _ = SocketTuner::tune_tcp_stream(&stream, true);
             Ok(Box::new(stream))
         }
         TargetAddr::Domain(host, port) => {
             let stream = TcpStream::connect((host.as_str(), *port))
                 .await
                 .map_err(TunnelError::Io)?;
-            let _ = SocketTuner::tune_tcp_stream(&stream, true, None);
+            let _ = SocketTuner::tune_tcp_stream(&stream, true);
             Ok(Box::new(stream))
         }
         TargetAddr::Path(path) => {

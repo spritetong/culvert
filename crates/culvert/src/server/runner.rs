@@ -108,6 +108,10 @@ impl ServerRunner {
                 .config
                 .idle_timeout
                 .unwrap_or(crate::consts::DEFAULT_IDLE_TIMEOUT);
+            let hb_interval = self
+                .config
+                .heartbeat_interval
+                .unwrap_or(crate::consts::DEFAULT_HEARTBEAT_INTERVAL);
 
             tracker.spawn_with_cancel(move |token| async move {
                 let mut listener = registry.create_listener(
@@ -153,6 +157,7 @@ impl ServerRunner {
                                     let session_mgr = Arc::clone(&session_mgr);
                                     let default_target = default_target.clone();
                                     let idle_timeout = idle_timeout;
+                                    let hb_interval = hb_interval;
 
                                     conn_tracker.spawn_with_cancel(move |conn_token| async move {
                                         match metadata.mode {
@@ -261,10 +266,11 @@ impl ServerRunner {
                                                     }
                                                 };
 
-                                                let _ = RelayEngine::relay_with_cancel(
+                                                let _ = RelayEngine::relay_with_heartbeat(
                                                     target_conn,
                                                     stream,
                                                     conn_token,
+                                                    hb_interval,
                                                 ).await;
                                             }
 
@@ -282,6 +288,7 @@ impl ServerRunner {
                                                         session_mgr,
                                                         conn_token,
                                                         idle_timeout,
+                                                        hb_interval,
                                                     )
                                                     .await;
                                                 }
@@ -368,6 +375,7 @@ impl ServerRunner {
         session_mgr: Arc<SessionManager>,
         cancel_token: CancellationToken,
         idle_timeout: Duration,
+        heartbeat_interval: Duration,
     ) {
         let mut ctrl_stream = FramedControlStream::new(stream);
 
@@ -486,10 +494,11 @@ impl ServerRunner {
                                 match timeout(DEFAULT_SESSION_PAIR_TIMEOUT, pair_rx).await {
                                     Ok(Ok(data_stream)) => {
                                         info!(session = %session_id_clone, "Reverse data stream paired successfully. Starting relay.");
-                                        let _ = RelayEngine::relay_with_cancel(
+                                        let _ = RelayEngine::relay_with_heartbeat(
                                             visitor_stream,
                                             data_stream,
                                             token,
+                                            heartbeat_interval,
                                         ).await;
                                     }
                                     _ => {
@@ -557,6 +566,7 @@ mod tests {
                 session_mgr,
                 cancel_clone,
                 Duration::from_secs(5),
+                crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
             )
             .await;
         });
@@ -585,6 +595,7 @@ mod tests {
                 session_mgr,
                 cancel_token,
                 Duration::from_millis(50),
+                crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
             ),
         )
         .await;

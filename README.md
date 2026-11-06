@@ -283,7 +283,6 @@ Low-level TCP socket configuration for outbound dialing. Can be overridden per-e
 ```yaml
 dialer:
   connect_timeout: "10s"       # Socket connection timeout (e.g., "10s", "500ms", or raw seconds: 10; default: 10s)
-  tcp_keepalive: "15s"         # TCP keepalive interval (e.g., "15s", "30s"; default: 15s)
   tcp_nodelay: true            # Disable Nagle's algorithm for low-latency transmission (default: true)
   heartbeat_interval: "15s"    # Heartbeat ping interval for transport / control streams (default: 15s)
   idle_timeout: "30s"          # Session idle timeout without incoming RX activity (default: 30s)
@@ -452,7 +451,6 @@ tunnels:
           - "dns://1.1.1.1"
       dialer:
         connect_timeout: "10s"
-        tcp_keepalive: "30s"
         heartbeat_interval: "15s"
         idle_timeout: "30s"
       tls:

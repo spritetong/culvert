@@ -12,10 +12,74 @@ use fastwebsockets::{
 };
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use crate::consts::DEFAULT_WS_MAX_UNANSWERED_PINGS;
 use crate::core::stream::{BoxFuture, HeartbeatStatus, TunnelStream};
+
+/// Tracks WebSocket application-level keep-alive health across multi-tier proxies.
+///
+/// Records unanswered consecutive ping frames and resets whenever ANY incoming frame
+/// (Pong, Ping, Binary, or Text) arrives from the remote peer.
+#[derive(Debug)]
+pub struct WsLivenessTracker {
+    unanswered_pings: AtomicU32,
+    last_rx_epoch_ms: AtomicU64,
+}
+
+impl Default for WsLivenessTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WsLivenessTracker {
+    /// Creates a fresh liveness tracker initialized to current timestamp and 0 unanswered pings.
+    pub fn new() -> Self {
+        Self {
+            unanswered_pings: AtomicU32::new(0),
+            last_rx_epoch_ms: AtomicU64::new(Self::now_ms()),
+        }
+    }
+
+    #[inline]
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Records receipt of an incoming packet/frame from the remote peer.
+    /// Resets consecutive unanswered pings and updates the last RX timestamp.
+    #[inline]
+    pub fn record_rx(&self) {
+        self.unanswered_pings.store(0, Ordering::Release);
+        self.last_rx_epoch_ms
+            .store(Self::now_ms(), Ordering::Release);
+    }
+
+    /// Records transmission of an outbound Ping frame.
+    #[inline]
+    pub fn record_ping_sent(&self) {
+        self.unanswered_pings.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Returns the number of consecutive pings sent without any RX response.
+    #[inline]
+    pub fn unanswered_pings(&self) -> u32 {
+        self.unanswered_pings.load(Ordering::Acquire)
+    }
+
+    /// Checks whether the connection is dead due to exceeding maximum unanswered pings.
+    #[inline]
+    pub fn is_dead(&self, max_unanswered_pings: u32) -> bool {
+        self.unanswered_pings() >= max_unanswered_pings
+    }
+}
 
 type DynRead = Box<dyn AsyncRead + Send + Unpin>;
 type DynWrite = Box<dyn AsyncWrite + Send + Unpin>;
@@ -59,6 +123,7 @@ pub struct WsTunnelStream {
     read_state: ReadState,
     write_state: WriteState,
     control_queue: std::collections::VecDeque<Frame<'static>>,
+    liveness: Arc<WsLivenessTracker>,
     peer_closed: bool,
     close_sent: bool,
     fin_sent: bool,
@@ -82,11 +147,17 @@ impl WsTunnelStream {
             read_state: ReadState::Idle(rx),
             write_state: WriteState::Idle(tx),
             control_queue: std::collections::VecDeque::new(),
+            liveness: Arc::new(WsLivenessTracker::new()),
             peer_closed: false,
             close_sent: false,
             fin_sent: false,
             fin_queued: false,
         }
+    }
+
+    /// Returns a clone of the internal liveness tracker for health inspection.
+    pub fn liveness(&self) -> Arc<WsLivenessTracker> {
+        Arc::clone(&self.liveness)
     }
 
     /// Drives pending obligated control frames (Pong/Close) out to the underlying writer.
@@ -161,6 +232,7 @@ impl AsyncRead for WsTunnelStream {
                     return Poll::Ready(Ok(()));
                 }
                 ReadState::Idle(mut rx) => {
+                    let liveness = Arc::clone(&self.liveness);
                     let fut = Box::pin(async move {
                         let mut obligated = Vec::new();
                         let mut budget = 32usize;
@@ -185,6 +257,7 @@ impl AsyncRead for WsTunnelStream {
                                 Ok(f) => f,
                                 Err(e) => break Err(e),
                             };
+                            liveness.record_rx();
                             match frame.opcode {
                                 OpCode::Binary | OpCode::Text => {
                                     let payload = match frame.payload {
@@ -566,6 +639,7 @@ impl TunnelStream for WsTunnelStream {
         loop {
             match std::mem::replace(&mut self.write_state, WriteState::Failed) {
                 WriteState::Idle(mut tx) => {
+                    self.liveness.record_ping_sent();
                     let mut fut = Box::pin(async move {
                         let res = tx
                             .write_frame(Frame::new(
@@ -632,6 +706,9 @@ impl TunnelStream for WsTunnelStream {
     }
 
     fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+        if self.liveness.is_dead(DEFAULT_WS_MAX_UNANSWERED_PINGS) {
+            return Poll::Ready(HeartbeatStatus::Dead);
+        }
         match &mut self.read_state {
             ReadState::Eof | ReadState::Failed => Poll::Ready(HeartbeatStatus::Dead),
             ReadState::Buffered { .. } => Poll::Ready(HeartbeatStatus::Alive),
@@ -648,7 +725,13 @@ impl TunnelStream for WsTunnelStream {
                     // The state is now `Reading` with a registered waker, so the
                     // next liveness check (or the relay's own poll_read) will
                     // consume and preserve the frame normally.
-                    Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
+                    Poll::Pending => {
+                        if self.liveness.is_dead(DEFAULT_WS_MAX_UNANSWERED_PINGS) {
+                            Poll::Ready(HeartbeatStatus::Dead)
+                        } else {
+                            Poll::Ready(HeartbeatStatus::Alive)
+                        }
+                    }
                     Poll::Ready(Ok(())) => match self.read_state {
                         ReadState::Eof | ReadState::Failed => Poll::Ready(HeartbeatStatus::Dead),
                         _ => Poll::Ready(HeartbeatStatus::Alive),
@@ -698,7 +781,13 @@ impl TunnelStream for WsTunnelStream {
                     }
                     Poll::Ready(HeartbeatStatus::Alive)
                 }
-                Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
+                Poll::Pending => {
+                    if self.liveness.is_dead(DEFAULT_WS_MAX_UNANSWERED_PINGS) {
+                        Poll::Ready(HeartbeatStatus::Dead)
+                    } else {
+                        Poll::Ready(HeartbeatStatus::Alive)
+                    }
+                }
             },
         }
     }
@@ -998,5 +1087,48 @@ mod tests {
             "Server must receive all 300,000 bytes"
         );
         assert_eq!(received, large_payload);
+    }
+
+    #[test]
+    fn test_ws_liveness_tracker_basic() {
+        let tracker = WsLivenessTracker::new();
+        assert_eq!(tracker.unanswered_pings(), 0);
+        assert!(!tracker.is_dead(3));
+
+        tracker.record_ping_sent();
+        assert_eq!(tracker.unanswered_pings(), 1);
+        assert!(!tracker.is_dead(3));
+
+        tracker.record_ping_sent();
+        tracker.record_ping_sent();
+        assert_eq!(tracker.unanswered_pings(), 3);
+        assert!(tracker.is_dead(3));
+
+        // Receipt of any incoming frame resets unanswered pings
+        tracker.record_rx();
+        assert_eq!(tracker.unanswered_pings(), 0);
+        assert!(!tracker.is_dead(3));
+    }
+
+    #[tokio::test]
+    async fn test_ws_liveness_dead_detection_on_unanswered_pings() {
+        use std::future::poll_fn;
+
+        let (raw_client, _raw_server) = duplex(65536);
+        let mut client = WsTunnelStream::new(raw_client, Role::Client);
+
+        // Initially alive
+        let status = poll_fn(|cx| client.poll_check_alive(cx)).await;
+        assert_eq!(status, HeartbeatStatus::Alive);
+
+        // Send 3 pings with zero response from server
+        for _ in 0..DEFAULT_WS_MAX_UNANSWERED_PINGS {
+            let res = poll_fn(|cx| client.poll_send_ping(cx)).await;
+            assert!(res.is_ok());
+        }
+
+        // Must now be detected as Dead!
+        let status = poll_fn(|cx| client.poll_check_alive(cx)).await;
+        assert_eq!(status, HeartbeatStatus::Dead);
     }
 }
