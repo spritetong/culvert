@@ -13,6 +13,7 @@ pub use listener::H3Listener;
 pub use stream::{H3TunnelStream, QuinnTunnelStream};
 
 use crate::config::model::TunnelMode;
+use crate::consts::{ALPN_H3, ALPN_QUIC, SCHEME_H3, SCHEME_HTTPS, SCHEME_QUIC};
 use crate::core::error::TunnelError;
 use crate::dialer::endpoint::EndpointContext;
 use crate::transport::{TransportConnector, TransportDriver, TransportListener};
@@ -23,7 +24,7 @@ pub struct H3TransportDriver;
 
 impl TransportDriver for H3TransportDriver {
     fn schemes(&self) -> &[&'static str] {
-        &["h3", "https", "quic"]
+        &[SCHEME_H3, SCHEME_HTTPS, SCHEME_QUIC]
     }
 
     fn build_connector(
@@ -68,11 +69,11 @@ impl TransportDriver for H3TransportDriver {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        if !alpn.iter().any(|p| p == b"h3") {
-            alpn.push(b"h3".to_vec());
+        if !alpn.iter().any(|p| p == ALPN_H3) {
+            alpn.push(ALPN_H3.to_vec());
         }
-        if !alpn.iter().any(|p| p == b"micro-tunnel-quic") {
-            alpn.push(b"micro-tunnel-quic".to_vec());
+        if !alpn.iter().any(|p| p == ALPN_QUIC) {
+            alpn.push(ALPN_QUIC.to_vec());
         }
         let cert_str = tls
             .and_then(|t| t.certificate.as_ref())

@@ -106,10 +106,13 @@ impl WsConnector {
             .method("GET")
             .uri(&self.endpoint.endpoint.path)
             .header(HOST, format!("{}:{}", host, port))
-            .header(UPGRADE, "websocket")
-            .header(CONNECTION, "upgrade")
-            .header("Sec-WebSocket-Key", key)
-            .header("Sec-WebSocket-Version", "13");
+            .header(UPGRADE, crate::consts::HEADER_VALUE_WEBSOCKET)
+            .header(CONNECTION, crate::consts::HEADER_VALUE_UPGRADE)
+            .header(crate::consts::HEADER_SEC_WEBSOCKET_KEY, key)
+            .header(
+                crate::consts::HEADER_SEC_WEBSOCKET_VERSION,
+                crate::consts::SEC_WEBSOCKET_VERSION_13,
+            );
 
         let headers = WsHandshakeHeaders::new(self.auth_token.clone(), self.mode)
             .with_session_id(session_id.map(|s| s.to_string()))
@@ -152,6 +155,6 @@ impl TransportConnector for WsConnector {
     }
 
     fn protocol_scheme(&self) -> &'static str {
-        "wss"
+        crate::consts::SCHEME_WSS
     }
 }

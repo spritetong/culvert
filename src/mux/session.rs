@@ -16,15 +16,14 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
+use crate::consts::{
+    MUX_GC_INTERVAL, MUX_NEW_STREAM_QUEUE_SIZE, MUX_SESSION_FRAME_QUEUE_SIZE,
+    MUX_STREAM_BUFFER_SIZE,
+};
 use crate::core::error::TunnelError;
 use crate::core::stream::TunnelStream;
 use crate::mux::frame::{FrameType, MuxCodec, MuxFrame};
 use crate::mux::stream::MuxStream;
-
-/// Default inbound stream channel buffer size per logical stream.
-const STREAM_BUFFER_SIZE: usize = 128;
-/// Default outbound frame channel queue capacity.
-const SESSION_FRAME_QUEUE_SIZE: usize = 256;
 
 type ActiveStreamHandle = (mpsc::Sender<Bytes>, Arc<AtomicBool>);
 type ActiveStreamsMap = Arc<DashMap<u32, ActiveStreamHandle>>;
@@ -56,8 +55,8 @@ impl MuxSession {
         is_client: bool,
         cancel_token: CancellationToken,
     ) -> Self {
-        let (tx_frames, rx_frames) = mpsc::channel(SESSION_FRAME_QUEUE_SIZE);
-        let (tx_new_streams, rx_new_streams) = mpsc::channel(64);
+        let (tx_frames, rx_frames) = mpsc::channel(MUX_SESSION_FRAME_QUEUE_SIZE);
+        let (tx_new_streams, rx_new_streams) = mpsc::channel(MUX_NEW_STREAM_QUEUE_SIZE);
 
         let initial_id = if is_client { 1 } else { 2 };
         let next_stream_id = Arc::new(AtomicU32::new(initial_id));
@@ -130,7 +129,7 @@ impl MuxSession {
 
         // Reader task: decodes inbound frames from `framed_reader` and demuxes to streams
         tokio::spawn(async move {
-            let mut gc_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            let mut gc_interval = tokio::time::interval(MUX_GC_INTERVAL);
             loop {
                 tokio::select! {
                     _ = cancel_token.cancelled() => break,
@@ -193,7 +192,7 @@ impl MuxSession {
                     return;
                 }
 
-                let (data_tx, data_rx) = mpsc::channel(STREAM_BUFFER_SIZE);
+                let (data_tx, data_rx) = mpsc::channel(MUX_STREAM_BUFFER_SIZE);
                 let closed_flag = Arc::new(AtomicBool::new(false));
                 active_streams.insert(stream_id, (data_tx, Arc::clone(&closed_flag)));
 
@@ -318,7 +317,7 @@ impl MuxSession {
         }
 
         let stream_id = self.next_stream_id.fetch_add(2, Ordering::AcqRel);
-        let (data_tx, data_rx) = mpsc::channel(STREAM_BUFFER_SIZE);
+        let (data_tx, data_rx) = mpsc::channel(MUX_STREAM_BUFFER_SIZE);
         let closed_flag = Arc::new(AtomicBool::new(false));
 
         self.active_streams

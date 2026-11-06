@@ -71,8 +71,8 @@ impl Endpoint {
             .to_string();
 
         let port = parsed.port().unwrap_or(match scheme.as_str() {
-            "https" | "wss" | "h3" | "quic" => 443,
-            "ws" => 80,
+            "https" | "wss" | "h3" | "quic" => crate::consts::DEFAULT_HTTPS_PORT,
+            "ws" => crate::consts::DEFAULT_HTTP_PORT,
             _ => 0,
         });
 

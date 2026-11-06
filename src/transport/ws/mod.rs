@@ -15,6 +15,7 @@ pub use model::WsHandshakeHeaders;
 pub use stream::WsTunnelStream;
 
 use crate::config::model::TunnelMode;
+use crate::consts::{SCHEME_WS, SCHEME_WSS};
 use crate::core::error::TunnelError;
 use crate::dialer::endpoint::EndpointContext;
 use crate::transport::{TransportConnector, TransportDriver, TransportListener};
@@ -25,7 +26,7 @@ pub struct WsTransportDriver;
 
 impl TransportDriver for WsTransportDriver {
     fn schemes(&self) -> &[&'static str] {
-        &["ws", "wss"]
+        &[SCHEME_WS, SCHEME_WSS]
     }
 
     fn build_connector(

@@ -13,7 +13,7 @@ use tokio::time::timeout;
 
 use crate::common::net::SocketTuner;
 use crate::config::model::DialerConfig;
-use crate::consts::DEFAULT_CONNECT_TIMEOUT;
+use crate::consts::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_HAPPY_EYEBALLS_DELAY};
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, TunnelStream};
 use crate::dialer::dns::DnsResolver;
@@ -120,7 +120,7 @@ impl Dialer for DefaultDialer {
             )));
 
             let mut next_idx = 1;
-            let delay = tokio::time::sleep(std::time::Duration::from_millis(250));
+            let delay = tokio::time::sleep(DEFAULT_HAPPY_EYEBALLS_DELAY);
             tokio::pin!(delay);
 
             let mut last_err = None;
@@ -142,7 +142,7 @@ impl Dialer for DefaultDialer {
                         let next_addr = SocketAddr::new(ordered_ips[next_idx], port);
                         next_idx += 1;
                         futs.push(Box::pin(try_connect(next_addr, connect_timeout, iface_opt)));
-                        delay.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_millis(250));
+                        delay.as_mut().reset(tokio::time::Instant::now() + DEFAULT_HAPPY_EYEBALLS_DELAY);
                     }
                 }
             }

@@ -13,12 +13,12 @@ use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::model::TunnelMode;
+use crate::consts::{DEFAULT_HANDSHAKE_TIMEOUT, SCHEME_WS_UNIX, SCHEME_WSS_UNIX};
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, BufferedTlsStream, TunnelStream};
 use crate::dialer::endpoint::EndpointContext;
@@ -55,7 +55,7 @@ pub struct UdsTransportDriver;
 
 impl TransportDriver for UdsTransportDriver {
     fn schemes(&self) -> &[&'static str] {
-        &["ws+unix", "wss+unix"]
+        &[SCHEME_WS_UNIX, SCHEME_WSS_UNIX]
     }
 
     fn build_connector(
@@ -236,7 +236,7 @@ impl UdsListener {
 
                     let mut serve = Box::pin(async move {
                         let io_stream: Box<dyn TunnelStream> = if let Some(tls) = acceptor {
-                                match tokio::time::timeout(Duration::from_secs(10), tls.accept(stream)).await {
+                                match tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, tls.accept(stream)).await {
                                     Ok(Ok(tls_stream)) => Box::new(BufferedTlsStream::new(tls_stream)),
                                     Ok(Err(e)) => {
                                         tracing::debug!("UDS WSS server TLS handshake failed: {:?}", e);
@@ -311,7 +311,7 @@ impl UdsListener {
                                     let work: UpgradeWork = Box::pin(async move {
                                         tokio::select! {
                                             _ = cancel_upgrade.cancelled() => {}
-                                            res = tokio::time::timeout(Duration::from_secs(10), fut) => {
+                                            res = tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, fut) => {
                                                 let item: AcceptedResult = match res {
                                                     Ok(Ok(ws)) => {
                                                         let ws_stream = WsTunnelStream::new(ws.into_inner(), Role::Server);
@@ -336,7 +336,7 @@ impl UdsListener {
                             });
 
                             let _ = tokio::time::timeout(
-                                Duration::from_secs(10),
+                                DEFAULT_HANDSHAKE_TIMEOUT,
                                 hyper::server::conn::http1::Builder::new()
                                     .serve_connection(io, service)
                                     .with_upgrades(),
@@ -556,6 +556,7 @@ impl TransportConnector for UdsConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     #[tokio::test]

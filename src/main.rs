@@ -6,21 +6,18 @@
 
 use clap::Parser;
 use std::path::PathBuf;
-use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use micro_tunnel::config::ConfigLoader;
+use micro_tunnel::consts::{DEFAULT_SHUTDOWN_HARD_DEADLINE, WATCHDOG_THREAD_NAME};
 use micro_tunnel::supervisor::TunnelSupervisor;
 
 use mimalloc::MiMalloc;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
-
-/// Upper bound for graceful shutdown. Once exceeded, the daemon exits hard.
-const SHUTDOWN_HARD_DEADLINE: Duration = Duration::from_secs(10);
 
 /// High-performance lightweight HTTP/3 & WSS bidirectional TCP tunnel system.
 #[derive(Parser, Debug)]
@@ -203,7 +200,7 @@ fn spawn_shutdown_handler(cancel_token: CancellationToken) -> ShutdownWatchdog {
     // deadline silently never fires. Run it on a dedicated OS thread instead.
     let (tx, rx) = std::sync::mpsc::channel::<WatchdogEvent>();
     let handle = std::thread::Builder::new()
-        .name("shutdown-watchdog".to_string())
+        .name(WATCHDOG_THREAD_NAME.to_string())
         .spawn(move || {
             // Phase 1: wait for the first signal. A daemon that exits without
             // ever receiving one sends `Done` directly and must not be held up.
@@ -214,7 +211,7 @@ fn spawn_shutdown_handler(cancel_token: CancellationToken) -> ShutdownWatchdog {
 
             // Phase 2: the hard deadline is only meaningful until graceful
             // shutdown reports completion.
-            match rx.recv_timeout(SHUTDOWN_HARD_DEADLINE) {
+            match rx.recv_timeout(DEFAULT_SHUTDOWN_HARD_DEADLINE) {
                 Ok(_) | Err(RecvTimeoutError::Disconnected) => (),
                 Err(RecvTimeoutError::Timeout) => {
                     // `Done` may have landed exactly at the deadline.
@@ -263,6 +260,7 @@ fn spawn_shutdown_handler(cancel_token: CancellationToken) -> ShutdownWatchdog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// A clean exit without any signal must disarm the hard deadline and join
     /// the watchdog thread, not leave it detached until it force-exits.

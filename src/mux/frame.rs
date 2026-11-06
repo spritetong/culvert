@@ -8,11 +8,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
 use tokio_util::codec::{Decoder, Encoder};
 
-/// Maximum payload size per frame (64 KB) to ensure fair scheduling between streams.
-pub const MAX_FRAME_PAYLOAD_SIZE: usize = 64 * 1024;
-
-/// Frame header length: 1 byte type + 4 bytes stream_id + 4 bytes payload_len = 9 bytes.
-pub const FRAME_HEADER_LEN: usize = 9;
+pub use crate::consts::{FRAME_HEADER_LEN, MAX_FRAME_PAYLOAD_SIZE};
 
 /// Multiplexing frame types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

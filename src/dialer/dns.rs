@@ -17,7 +17,10 @@ use hickory_resolver::{Resolver, TokioResolver};
 use tracing::{debug, warn};
 
 use crate::config::model::{DnsConfig, DnsResolverConfig, DnsServerConfig, DnsStrategy};
-use crate::consts::{DEFAULT_DNS_CACHE_CAPACITY, DEFAULT_DNS_CACHE_TTL};
+use crate::consts::{
+    DEFAULT_DNS_CACHE_CAPACITY, DEFAULT_DNS_CACHE_TTL, DEFAULT_DNS_PORT, DEFAULT_DOH_PORT,
+    DEFAULT_DOT_PORT,
+};
 use crate::core::error::TunnelError;
 use crate::core::stream::BoxFuture;
 
@@ -158,7 +161,7 @@ impl CachedDnsResolver {
 
         match proto.as_str() {
             "udp" | "dns" => {
-                let port = effective_port.unwrap_or(53);
+                let port = effective_port.unwrap_or(DEFAULT_DNS_PORT);
                 let mut ns = NameServerConfig::udp(ip);
                 if let Some(conn) = ns.connections.first_mut() {
                     conn.port = port;
@@ -166,7 +169,7 @@ impl CachedDnsResolver {
                 Ok(ParsedDnsServer::NameServer(ns))
             }
             "tcp" => {
-                let port = effective_port.unwrap_or(53);
+                let port = effective_port.unwrap_or(DEFAULT_DNS_PORT);
                 let mut ns = NameServerConfig::tcp(ip);
                 if let Some(conn) = ns.connections.first_mut() {
                     conn.port = port;
@@ -174,7 +177,7 @@ impl CachedDnsResolver {
                 Ok(ParsedDnsServer::NameServer(ns))
             }
             "tls" => {
-                let port = effective_port.unwrap_or(853);
+                let port = effective_port.unwrap_or(DEFAULT_DOT_PORT);
                 let mut ns = NameServerConfig::tls(ip, sni);
                 if let Some(conn) = ns.connections.first_mut() {
                     conn.port = port;
@@ -182,7 +185,7 @@ impl CachedDnsResolver {
                 Ok(ParsedDnsServer::NameServer(ns))
             }
             "https" => {
-                let port = effective_port.unwrap_or(443);
+                let port = effective_port.unwrap_or(DEFAULT_DOH_PORT);
                 let path = cfg.path.as_deref().map(Arc::from);
                 let mut ns = NameServerConfig::https(ip, sni, path);
                 if let Some(conn) = ns.connections.first_mut() {
@@ -227,7 +230,7 @@ impl CachedDnsResolver {
         if let Ok(ip) = clean_host.parse::<IpAddr>() {
             return Ok(ip);
         }
-        let addr_str = format!("{}:53", clean_host);
+        let addr_str = format!("{}:{}", clean_host, DEFAULT_DNS_PORT);
         match addr_str.to_socket_addrs() {
             Ok(mut addrs) => addrs.next().map(|sa| sa.ip()).ok_or_else(|| {
                 TunnelError::Config(format!("No IP found for DNS host '{}'", clean_host))
@@ -291,7 +294,7 @@ impl CachedDnsResolver {
 
         match scheme {
             "dns" | "udp" => {
-                let port = parsed.port().unwrap_or(53);
+                let port = parsed.port().unwrap_or(DEFAULT_DNS_PORT);
                 let mut ns = NameServerConfig::udp(ip);
                 if let Some(conn) = ns.connections.first_mut() {
                     conn.port = port;
@@ -299,7 +302,7 @@ impl CachedDnsResolver {
                 Ok(ParsedDnsServer::NameServer(ns))
             }
             "tcp" => {
-                let port = parsed.port().unwrap_or(53);
+                let port = parsed.port().unwrap_or(DEFAULT_DNS_PORT);
                 let mut ns = NameServerConfig::tcp(ip);
                 if let Some(conn) = ns.connections.first_mut() {
                     conn.port = port;
@@ -307,7 +310,7 @@ impl CachedDnsResolver {
                 Ok(ParsedDnsServer::NameServer(ns))
             }
             "tls" => {
-                let port = parsed.port().unwrap_or(853);
+                let port = parsed.port().unwrap_or(DEFAULT_DOT_PORT);
                 let mut ns = NameServerConfig::tls(ip, sni);
                 if let Some(conn) = ns.connections.first_mut() {
                     conn.port = port;
@@ -315,7 +318,7 @@ impl CachedDnsResolver {
                 Ok(ParsedDnsServer::NameServer(ns))
             }
             "https" => {
-                let port = parsed.port().unwrap_or(443);
+                let port = parsed.port().unwrap_or(DEFAULT_DOH_PORT);
                 let path = if !parsed.path().is_empty() && parsed.path() != "/" {
                     Some(Arc::from(parsed.path()))
                 } else {

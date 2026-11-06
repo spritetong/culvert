@@ -52,8 +52,7 @@ enum WriteState {
 ///
 /// Implements `AsyncRead` and `AsyncWrite` purely using state-machine transitions without
 /// intermediate duplex pipes, background tasks, or multi-copy buffering.
-/// Hard upper bound on pending control frames (Pong/Close) to prevent memory amplification attacks from Ping floods.
-const MAX_CONTROL_QUEUE: usize = 64;
+const MAX_CONTROL_QUEUE: usize = crate::consts::WS_MAX_CONTROL_QUEUE;
 
 pub struct WsTunnelStream {
     read_state: ReadState,

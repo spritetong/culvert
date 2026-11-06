@@ -6,13 +6,16 @@
 
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
-use tokio::time::{Duration, interval};
+use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::common::task::TaskTracker;
 use crate::config::model::{TunnelConfig, TunnelMode};
-use crate::consts::DEFAULT_HEARTBEAT_INTERVAL;
+use crate::consts::{
+    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_REVERSE_BACKOFF_INITIAL, DEFAULT_REVERSE_BACKOFF_MAX,
+    REVERSE_BACKOFF_RESET_THRESHOLD, REVERSE_CONTROL_TARGET_HOST,
+};
 use crate::control::stream::{ControlMessage, FramedControlStream};
 use crate::core::error::TunnelError;
 use crate::core::relay::RelayEngine;
@@ -36,7 +39,7 @@ pub async fn run_reverse_mapping(
         "Starting reverse tunnel control loop"
     );
 
-    let dummy_target = TargetAddr::Domain("control".to_string(), 0);
+    let dummy_target = TargetAddr::Domain(REVERSE_CONTROL_TARGET_HOST.to_string(), 0);
     let mut conn_tracker = TaskTracker::<()>::new(cancel_token.clone());
 
     let cancel_fut = cancel_token.cancelled();
@@ -50,7 +53,7 @@ pub async fn run_reverse_mapping(
             TunnelMode::Reverse,
         )?);
 
-    let mut backoff = Duration::from_millis(500);
+    let mut backoff = DEFAULT_REVERSE_BACKOFF_INITIAL;
 
     while !cancel_token.is_cancelled() {
         let connector = transport_registry.create_connector(
@@ -72,7 +75,7 @@ pub async fn run_reverse_mapping(
                     biased;
                     _ = &mut cancel_fut => break,
                     _ = tokio::time::sleep(backoff) => {
-                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        backoff = (backoff * 2).min(DEFAULT_REVERSE_BACKOFF_MAX);
                         continue;
                     }
                 }
@@ -98,7 +101,7 @@ pub async fn run_reverse_mapping(
                 biased;
                 _ = &mut cancel_fut => break,
                 _ = tokio::time::sleep(backoff) => {
-                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    backoff = (backoff * 2).min(DEFAULT_REVERSE_BACKOFF_MAX);
                     continue;
                 }
             }
@@ -127,7 +130,7 @@ pub async fn run_reverse_mapping(
                         biased;
                         _ = &mut cancel_fut => break,
                         _ = tokio::time::sleep(backoff) => {
-                            backoff = (backoff * 2).min(Duration::from_secs(30));
+                            backoff = (backoff * 2).min(DEFAULT_REVERSE_BACKOFF_MAX);
                             continue;
                         }
                     }
@@ -140,7 +143,7 @@ pub async fn run_reverse_mapping(
                     biased;
                     _ = &mut cancel_fut => break,
                     _ = tokio::time::sleep(backoff) => {
-                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        backoff = (backoff * 2).min(DEFAULT_REVERSE_BACKOFF_MAX);
                         continue;
                     }
                 }
@@ -246,10 +249,10 @@ pub async fn run_reverse_mapping(
             }
         }
 
-        if loop_start.elapsed() > Duration::from_secs(30) {
-            backoff = Duration::from_millis(500);
+        if loop_start.elapsed() > REVERSE_BACKOFF_RESET_THRESHOLD {
+            backoff = DEFAULT_REVERSE_BACKOFF_INITIAL;
         } else {
-            backoff = (backoff * 2).min(Duration::from_secs(30));
+            backoff = (backoff * 2).min(DEFAULT_REVERSE_BACKOFF_MAX);
         }
 
         tokio::select! {
@@ -294,6 +297,7 @@ mod tests {
     use crate::config::model::{AppConfig, EndpointConfig};
     use crate::core::stream::{BoxFuture, TunnelStream};
     use crate::transport::{TargetAddr, TransportConnector, TransportDriver, TransportListener};
+    use std::time::Duration;
 
     struct MockSilentConnector;
 

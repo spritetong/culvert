@@ -15,6 +15,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::PollSender;
 use tracing::debug;
 
+use crate::consts::{
+    DEFAULT_H3_FINISH_STREAM_TIMEOUT, DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD,
+    H3_STREAM_CHUNK_QUEUE_SIZE,
+};
 use crate::core::stream::{HeartbeatStatus, TunnelStream};
 
 /// Raw QUIC bidirectional stream adapter directly polling `quinn::SendStream` and `quinn::RecvStream`.
@@ -143,7 +147,7 @@ impl TunnelStream for QuinnTunnelStream {
                 )));
             }
             if let Some(ref mut tracker) = self.liveness
-                && !tracker.check_liveness(conn, std::time::Duration::from_secs(4))
+                && !tracker.check_liveness(conn, DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD)
             {
                 conn.close(quinn::VarInt::from_u32(0), b"liveness ping timeout");
                 return Poll::Ready(Err(io::Error::new(
@@ -161,7 +165,7 @@ impl TunnelStream for QuinnTunnelStream {
                 return Poll::Ready(HeartbeatStatus::Dead);
             }
             if let Some(ref mut tracker) = self.liveness
-                && !tracker.check_liveness(conn, std::time::Duration::from_secs(4))
+                && !tracker.check_liveness(conn, DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD)
             {
                 conn.close(quinn::VarInt::from_u32(0), b"liveness check timeout");
                 return Poll::Ready(HeartbeatStatus::Dead);
@@ -212,8 +216,9 @@ impl H3TunnelStream {
         S: H3SendStream,
         R: H3RecvStream,
     {
-        let (tx_outbound, mut rx_outbound) = mpsc::channel::<Bytes>(128);
-        let (tx_inbound, rx_inbound) = mpsc::channel::<io::Result<Bytes>>(128);
+        let (tx_outbound, mut rx_outbound) = mpsc::channel::<Bytes>(H3_STREAM_CHUNK_QUEUE_SIZE);
+        let (tx_inbound, rx_inbound) =
+            mpsc::channel::<io::Result<Bytes>>(H3_STREAM_CHUNK_QUEUE_SIZE);
         let (tx_shutdown, rx_shutdown) = oneshot::channel::<io::Result<()>>();
 
         // Outbound send task: continuously drains outgoing chunks without being blocked by incoming reading
@@ -228,7 +233,7 @@ impl H3TunnelStream {
             }
             if result.is_ok() {
                 match tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
+                    DEFAULT_H3_FINISH_STREAM_TIMEOUT,
                     send_stream.finish_stream(),
                 )
                 .await

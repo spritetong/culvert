@@ -12,11 +12,16 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::consts::ACTIVATE_STREAM_MAGIC;
+use crate::consts::{
+    ACTIVATE_STREAM_MAGIC, POOL_ACQUIRE_TIMEOUT, POOL_BACKOFF_ACTIVE_WAITERS_MAX,
+    POOL_BACKOFF_BASE, POOL_BACKOFF_MAX, POOL_COMMAND_QUEUE_SIZE, POOL_DUMMY_HOST,
+    POOL_HEARTBEAT_INTERVAL, POOL_HEARTBEAT_TICK_INTERVAL, POOL_HEARTBEAT_TIMEOUT,
+    POOL_MAX_CAPACITY, POOL_MAX_CONCURRENT_CONNECTS,
+};
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, HeartbeatStatus, TunnelStream};
 use crate::transport::{TargetAddr, TransportConnector};
@@ -187,7 +192,7 @@ impl ReplenishingStreamPool {
         target_size: usize,
         cancel_token: CancellationToken,
     ) -> Self {
-        let (tx_cmd, mut rx_cmd) = mpsc::channel::<PoolCommand>(1024);
+        let (tx_cmd, mut rx_cmd) = mpsc::channel::<PoolCommand>(POOL_COMMAND_QUEUE_SIZE);
         let stats = Arc::new(Mutex::new(PoolStats::default()));
         let stats_clone = Arc::clone(&stats);
         let active_count = Arc::new(AtomicUsize::new(0));
@@ -200,24 +205,15 @@ impl ReplenishingStreamPool {
             > = FuturesUnordered::new();
             let dummy_target = default_target
                 .clone()
-                .unwrap_or_else(|| TargetAddr::Domain("pool.idle".to_string(), 0));
-
-            const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-            const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(3);
-            const HEARTBEAT_TICK_INTERVAL: Duration = Duration::from_secs(1);
-            const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(15);
-            const MAX_CONCURRENT_CONNECTS: usize = 4;
-            const MAX_POOL_CAPACITY: usize = 16;
-            const BACKOFF_BASE: Duration = Duration::from_millis(200);
-            const BACKOFF_MAX: Duration = Duration::from_secs(10);
+                .unwrap_or_else(|| TargetAddr::Domain(POOL_DUMMY_HOST.to_string(), 0));
 
             let mut next_retry_at = Instant::now();
-            let mut backoff = BACKOFF_BASE;
+            let mut backoff = POOL_BACKOFF_BASE;
             let mut retry_timer: Option<Pin<Box<tokio::time::Sleep>>> = None;
 
             let mut heartbeat_ticker = tokio::time::interval_at(
-                tokio::time::Instant::now() + HEARTBEAT_TICK_INTERVAL,
-                HEARTBEAT_TICK_INTERVAL,
+                tokio::time::Instant::now() + POOL_HEARTBEAT_TICK_INTERVAL,
+                POOL_HEARTBEAT_TICK_INTERVAL,
             );
             heartbeat_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -236,11 +232,11 @@ impl ReplenishingStreamPool {
                 let needed = (current_total < target_size)
                     || (has_waiters && in_flight < pending_requests.len());
                 let capacity_available =
-                    total_allocated < MAX_POOL_CAPACITY && in_flight < MAX_CONCURRENT_CONNECTS;
+                    total_allocated < POOL_MAX_CAPACITY && in_flight < POOL_MAX_CONCURRENT_CONNECTS;
 
-                // When recovering from failures (backoff > BACKOFF_BASE), limit in_flight to 1 probe
+                // When recovering from failures (backoff > POOL_BACKOFF_BASE), limit in_flight to 1 probe
                 // to avoid slamming or serializing gate locks until a connection succeeds.
-                let throttled_by_failure = backoff > BACKOFF_BASE && in_flight >= 1;
+                let throttled_by_failure = backoff > POOL_BACKOFF_BASE && in_flight >= 1;
 
                 if needed && capacity_available && !throttled_by_failure {
                     if now >= next_retry_at {
@@ -288,7 +284,9 @@ impl ReplenishingStreamPool {
                         } else {
                             match managed.state {
                                 HeartbeatState::Idle(last_check) => {
-                                    if sweep_now.duration_since(last_check) >= HEARTBEAT_INTERVAL {
+                                    if sweep_now.duration_since(last_check)
+                                        >= POOL_HEARTBEAT_INTERVAL
+                                    {
                                         match managed.stream.poll_send_ping(cx) {
                                             Poll::Ready(Ok(())) => {
                                                 managed.state = HeartbeatState::Idle(sweep_now);
@@ -304,7 +302,8 @@ impl ReplenishingStreamPool {
                                     }
                                 }
                                 HeartbeatState::SendingPing(started_at) => {
-                                    if sweep_now.duration_since(started_at) > HEARTBEAT_TIMEOUT {
+                                    if sweep_now.duration_since(started_at) > POOL_HEARTBEAT_TIMEOUT
+                                    {
                                         is_dead = true;
                                     } else {
                                         match managed.stream.poll_send_ping(cx) {
@@ -360,7 +359,7 @@ impl ReplenishingStreamPool {
                     PoolEvent::ConnectionResult(conn_res) => {
                         match conn_res {
                             Ok(stream) => {
-                                backoff = BACKOFF_BASE;
+                                backoff = POOL_BACKOFF_BASE;
                                 next_retry_at = Instant::now();
                                 retry_timer = None;
 
@@ -397,9 +396,9 @@ impl ReplenishingStreamPool {
                             Err(e) => {
                                 tracing::debug!("Background connect_pooled failed: {:?}", e);
                                 let max_backoff = if !pending_requests.is_empty() {
-                                    Duration::from_secs(1)
+                                    POOL_BACKOFF_ACTIVE_WAITERS_MAX
                                 } else {
-                                    BACKOFF_MAX
+                                    POOL_BACKOFF_MAX
                                 };
                                 next_retry_at = Instant::now() + backoff;
                                 backoff = (backoff * 2).min(max_backoff);
@@ -448,7 +447,7 @@ impl ReplenishingStreamPool {
                                     if pending_requests.is_empty() && connecting_futures.is_empty()
                                     {
                                         next_retry_at = Instant::now();
-                                        backoff = BACKOFF_BASE;
+                                        backoff = POOL_BACKOFF_BASE;
                                         retry_timer = None;
                                     }
                                     // Idle pool exhausted: enqueue into pending requests for hand-off
@@ -505,7 +504,7 @@ impl ReplenishingStreamPool {
                         while let Some((front, enqueued_at)) = pending_requests.front() {
                             if front.reply.is_closed() {
                                 pending_requests.pop_front();
-                            } else if now.duration_since(*enqueued_at) > ACQUIRE_TIMEOUT {
+                            } else if now.duration_since(*enqueued_at) > POOL_ACQUIRE_TIMEOUT {
                                 let (req, _) = pending_requests.pop_front().unwrap();
                                 let _ = req.reply.send(Err(TunnelError::PoolExhausted));
                             } else {
@@ -595,6 +594,7 @@ impl ReplenishingStreamPool {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
 
     struct MockFailingConnector {
         call_count: Arc<AtomicUsize>,

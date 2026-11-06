@@ -14,6 +14,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::config::model::TunnelMode;
+use crate::consts::{
+    ALPN_H3, ALPN_QUIC, AUTH_BEARER_PREFIX, DEFAULT_H3_REQUEST_DRAIN_TIMEOUT,
+    DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_QUIC_KEEP_ALIVE_INTERVAL,
+    DEFAULT_QUIC_MAX_CONCURRENT_BIDI_STREAMS, DEFAULT_QUIC_MAX_CONCURRENT_UNI_STREAMS,
+    DEFAULT_QUIC_MAX_IDLE_TIMEOUT, DEFAULT_QUIC_RECEIVE_WINDOW, DEFAULT_QUIC_SEND_WINDOW,
+    DEFAULT_QUIC_STREAM_RECEIVE_WINDOW, HEADER_SESSION_ID, HEADER_TARGET_HOST, HEADER_TARGET_PATH,
+    HEADER_TARGET_PORT, HEADER_TUNNEL_AUTH, HEADER_TUNNEL_MODE, HEADER_TUNNEL_POOL,
+    HEADER_TUNNEL_TARGET, RAW_QUIC_MAX_AUTH_LEN, RAW_QUIC_MAX_META_LEN, TUNNEL_MODE_REVERSE,
+    TUNNEL_MODE_REVERSE_CTRL, TUNNEL_MODE_REVERSE_DATA, TUNNEL_POOL_IDLE,
+};
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, TunnelStream};
 use crate::transport::h3::stream::{H3TunnelStream, QuinnTunnelStream};
@@ -98,34 +108,26 @@ impl H3Listener {
         let is_quic_listener = listen_addr.starts_with("quic://");
         let mut rustls_server = server_rustls_config;
         if is_quic_listener {
-            if !rustls_server
-                .alpn_protocols
-                .iter()
-                .any(|p| p == b"micro-tunnel-quic")
-            {
-                rustls_server
-                    .alpn_protocols
-                    .push(b"micro-tunnel-quic".to_vec());
+            if !rustls_server.alpn_protocols.iter().any(|p| p == ALPN_QUIC) {
+                rustls_server.alpn_protocols.push(ALPN_QUIC.to_vec());
             }
         } else {
             // For H3 or generic listen addresses, ensure h3 is prioritized at index 0
-            if let Some(pos) = rustls_server.alpn_protocols.iter().position(|p| p == b"h3") {
+            if let Some(pos) = rustls_server
+                .alpn_protocols
+                .iter()
+                .position(|p| p == ALPN_H3)
+            {
                 if pos != 0 {
                     let h3 = rustls_server.alpn_protocols.remove(pos);
                     rustls_server.alpn_protocols.insert(0, h3);
                 }
             } else {
-                rustls_server.alpn_protocols.insert(0, b"h3".to_vec());
+                rustls_server.alpn_protocols.insert(0, ALPN_H3.to_vec());
             }
             // Retain micro-tunnel-quic fallback so raw QUIC clients can still negotiate
-            if !rustls_server
-                .alpn_protocols
-                .iter()
-                .any(|p| p == b"micro-tunnel-quic")
-            {
-                rustls_server
-                    .alpn_protocols
-                    .push(b"micro-tunnel-quic".to_vec());
+            if !rustls_server.alpn_protocols.iter().any(|p| p == ALPN_QUIC) {
+                rustls_server.alpn_protocols.push(ALPN_QUIC.to_vec());
             }
         }
 
@@ -136,19 +138,23 @@ impl H3Listener {
 
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_crypto));
         let mut transport_config = quinn::TransportConfig::default();
-        transport_config
-            .max_idle_timeout(Some(std::time::Duration::from_secs(8).try_into().unwrap()));
-        transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(2)));
-        transport_config.max_concurrent_bidi_streams(quinn::VarInt::from_u32(10_000));
-        transport_config.max_concurrent_uni_streams(quinn::VarInt::from_u32(10_000));
+        transport_config.max_idle_timeout(Some(DEFAULT_QUIC_MAX_IDLE_TIMEOUT.try_into().unwrap()));
+        transport_config.keep_alive_interval(Some(DEFAULT_QUIC_KEEP_ALIVE_INTERVAL));
+        transport_config.max_concurrent_bidi_streams(quinn::VarInt::from_u32(
+            DEFAULT_QUIC_MAX_CONCURRENT_BIDI_STREAMS,
+        ));
+        transport_config.max_concurrent_uni_streams(quinn::VarInt::from_u32(
+            DEFAULT_QUIC_MAX_CONCURRENT_UNI_STREAMS,
+        ));
         // Per-stream window must stay small relative to the connection window:
         // otherwise a couple of unread streams pin the whole connection's
         // receive_window and head-of-line block every other stream (quinn docs
         // explicitly warn about this). 4MiB x 32 concurrent stalled streams
         // still fits inside the 128MiB connection window.
-        transport_config.stream_receive_window(quinn::VarInt::from_u32(4 * 1024 * 1024));
-        transport_config.receive_window(quinn::VarInt::from_u32(128 * 1024 * 1024));
-        transport_config.send_window(128 * 1024 * 1024);
+        transport_config
+            .stream_receive_window(quinn::VarInt::from_u32(DEFAULT_QUIC_STREAM_RECEIVE_WINDOW));
+        transport_config.receive_window(quinn::VarInt::from_u32(DEFAULT_QUIC_RECEIVE_WINDOW));
+        transport_config.send_window(DEFAULT_QUIC_SEND_WINDOW);
         server_config.transport_config(Arc::new(transport_config));
 
         let quinn_endpoint =
@@ -209,7 +215,7 @@ impl H3Listener {
                                             tokio::select! {
                                                 _ = cancel_conn.cancelled() => {}
                                                 _ = async {
-                                                    let handshake = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                                                    let handshake = tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, async {
                                                         let alpn = {
                                                             let handshake_res = connecting.handshake_data().await;
                                                             handshake_res
@@ -271,7 +277,7 @@ impl H3Listener {
         tx_streams: mpsc::Sender<(Box<dyn TunnelStream>, StreamMetadata)>,
         cancel_token: CancellationToken,
     ) {
-        let is_raw_quic = is_quic_listener || alpn.as_deref() == Some(b"micro-tunnel-quic");
+        let is_raw_quic = is_quic_listener || alpn.as_deref() == Some(ALPN_QUIC);
         debug!(
             alpn = ?alpn.as_ref().map(|b| String::from_utf8_lossy(b)),
             is_quic_listener,
@@ -346,10 +352,10 @@ impl H3Listener {
                                         let auth_header = req
                                             .headers()
                                             .get("authorization")
-                                            .or_else(|| req.headers().get(crate::consts::HEADER_TUNNEL_AUTH))
+                                            .or_else(|| req.headers().get(HEADER_TUNNEL_AUTH))
                                             .and_then(|v| v.to_str().ok());
 
-                                        let expected_bearer = format!("Bearer {}", token);
+                                        let expected_bearer = format!("{}{}", AUTH_BEARER_PREFIX, token);
                                         let is_authed = auth_header
                                             .map(|h| {
                                                 crate::common::constant_time_token_eq(h.as_bytes(), expected_bearer.as_bytes())
@@ -370,34 +376,34 @@ impl H3Listener {
 
                                 let mode = match req
                                     .headers()
-                                    .get(crate::consts::HEADER_TUNNEL_MODE)
+                                    .get(HEADER_TUNNEL_MODE)
                                     .and_then(|v| v.to_str().ok())
                                 {
-                                    Some(crate::consts::TUNNEL_MODE_REVERSE_CTRL)
-                                    | Some(crate::consts::TUNNEL_MODE_REVERSE_DATA)
-                                    | Some("reverse") => TunnelMode::Reverse,
+                                    Some(TUNNEL_MODE_REVERSE_CTRL)
+                                    | Some(TUNNEL_MODE_REVERSE_DATA)
+                                    | Some(TUNNEL_MODE_REVERSE) => TunnelMode::Reverse,
                                     _ => TunnelMode::Forward,
                                 };
 
                                 let target = req
                                     .headers()
-                                    .get("x-tunnel-target")
+                                    .get(HEADER_TUNNEL_TARGET)
                                     .and_then(|v| v.to_str().ok())
                                     .and_then(|s| crate::tunnel::forward::parse_target_addr(s).ok())
                                     .or_else(|| {
                                         req.headers()
-                                            .get(crate::consts::HEADER_TARGET_PATH)
+                                            .get(HEADER_TARGET_PATH)
                                             .and_then(|v| v.to_str().ok())
                                             .map(|p| TargetAddr::Path(std::path::PathBuf::from(p)))
                                     })
                                     .or_else(|| {
                                         let host = req
                                             .headers()
-                                            .get(crate::consts::HEADER_TARGET_HOST)
+                                            .get(HEADER_TARGET_HOST)
                                             .and_then(|v| v.to_str().ok());
                                         let port = req
                                             .headers()
-                                            .get(crate::consts::HEADER_TARGET_PORT)
+                                            .get(HEADER_TARGET_PORT)
                                             .and_then(|v| v.to_str().ok())
                                             .and_then(|p| p.parse::<u16>().ok());
                                         match (host, port) {
@@ -414,15 +420,15 @@ impl H3Listener {
 
                                 let session_id = req
                                     .headers()
-                                    .get(crate::consts::HEADER_SESSION_ID)
+                                    .get(HEADER_SESSION_ID)
                                     .and_then(|v| v.to_str().ok())
                                     .map(|s| s.to_string());
 
                                 let pool_idle = req
                                     .headers()
-                                    .get(crate::consts::HEADER_TUNNEL_POOL)
+                                    .get(HEADER_TUNNEL_POOL)
                                     .and_then(|v| v.to_str().ok())
-                                    .map(|v| v == crate::consts::TUNNEL_POOL_IDLE)
+                                    .map(|v| v == TUNNEL_POOL_IDLE)
                                     .unwrap_or(false);
 
                                 let resp = Response::builder()
@@ -471,7 +477,7 @@ impl H3Listener {
             _ = cancel_drain.cancelled() => {
                 request_tasks.abort_all();
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            _ = tokio::time::sleep(DEFAULT_H3_REQUEST_DRAIN_TIMEOUT) => {
                 request_tasks.abort_all();
             }
             _ = async {
@@ -518,7 +524,7 @@ impl H3Listener {
                                     let mut len_buf = [0u8; 4];
                                     recv.read_exact(&mut len_buf).await.map_err(|_| ())?;
                                     let auth_len = u32::from_be_bytes(len_buf) as usize;
-                                    if auth_len > 1024 {
+                                    if auth_len > RAW_QUIC_MAX_AUTH_LEN {
                                         return Err(());
                                     }
                                     let mut auth_buf = vec![0u8; auth_len];
@@ -532,7 +538,7 @@ impl H3Listener {
                                     // Read metadata
                                     recv.read_exact(&mut len_buf).await.map_err(|_| ())?;
                                     let meta_len = u32::from_be_bytes(len_buf) as usize;
-                                    if meta_len > 65536 {
+                                    if meta_len > RAW_QUIC_MAX_META_LEN {
                                         return Err(());
                                     }
                                     let mut meta_buf = vec![0u8; meta_len];
@@ -547,7 +553,7 @@ impl H3Listener {
 
                                 tokio::select! {
                                     _ = cancel_handshake.cancelled() => {}
-                                    res = tokio::time::timeout(std::time::Duration::from_secs(10), handshake_fut) => {
+                                    res = tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, handshake_fut) => {
                                         match res {
                                             Ok(Ok((send, recv, metadata))) => {
                                                 let tunnel_stream = Box::new(QuinnTunnelStream::new(send, recv).with_connection(conn_clone)) as Box<dyn TunnelStream>;

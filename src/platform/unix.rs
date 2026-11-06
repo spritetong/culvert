@@ -87,7 +87,7 @@ pub fn bind_device(sock_ref: &socket2::SockRef, iface: &str) -> io::Result<()> {
 
 /// Configures TCP keepalive interval on Unix.
 pub fn configure_tcp_keepalive(ka: socket2::TcpKeepalive) -> socket2::TcpKeepalive {
-    ka.with_interval(Duration::from_secs(5))
+    ka.with_interval(crate::consts::DEFAULT_TCP_KEEPALIVE_INTERVAL)
 }
 
 /// Returns the filesystem identity of a socket file, used to make `Drop`

@@ -15,6 +15,16 @@ use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use crate::config::model::TunnelMode;
+use crate::consts::{
+    ALPN_H3_STR, ALPN_QUIC_STR, AUTH_BEARER_PREFIX, DEFAULT_CONNECT_TIMEOUT,
+    DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_QUIC_KEEP_ALIVE_INTERVAL,
+    DEFAULT_QUIC_MAX_CONCURRENT_BIDI_STREAMS, DEFAULT_QUIC_MAX_CONCURRENT_UNI_STREAMS,
+    DEFAULT_QUIC_MAX_IDLE_TIMEOUT, DEFAULT_QUIC_RECEIVE_WINDOW, DEFAULT_QUIC_SEND_WINDOW,
+    DEFAULT_QUIC_STREAM_RECEIVE_WINDOW, DEFAULT_TUNNEL_PATH, H3_FAILURE_SUPPRESSION_COOLDOWN,
+    HEADER_SESSION_ID, HEADER_TUNNEL_AUTH, HEADER_TUNNEL_MODE, HEADER_TUNNEL_POOL,
+    HEADER_TUNNEL_TARGET, SCHEME_QUIC, TUNNEL_MODE_FORWARD, TUNNEL_MODE_REVERSE_CTRL,
+    TUNNEL_MODE_REVERSE_DATA, TUNNEL_POOL_IDLE,
+};
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, TunnelStream};
 use crate::dialer::endpoint::EndpointContext;
@@ -70,32 +80,32 @@ impl H3Connector {
         mode: TunnelMode,
     ) -> Result<Self, TunnelError> {
         let scheme = endpoint.endpoint.scheme.as_str();
-        let is_quic_raw = scheme == "quic";
+        let is_quic_raw = scheme == SCHEME_QUIC;
 
         let mut tls_config = endpoint.tls_config.clone().unwrap_or_default();
         if is_quic_raw {
             match tls_config.alpn.take() {
                 Some(mut list) => {
-                    if !list.iter().any(|p| p == "micro-tunnel-quic") {
-                        list.push("micro-tunnel-quic".to_string());
+                    if !list.iter().any(|p| p == ALPN_QUIC_STR) {
+                        list.push(ALPN_QUIC_STR.to_string());
                     }
                     tls_config.alpn = Some(list);
                 }
                 None => {
-                    tls_config.alpn = Some(vec!["micro-tunnel-quic".to_string()]);
+                    tls_config.alpn = Some(vec![ALPN_QUIC_STR.to_string()]);
                 }
             }
         } else {
             // For HTTP/3 endpoints, ensure "h3" is included in ALPN protocols
             match tls_config.alpn.take() {
                 Some(mut list) => {
-                    if !list.iter().any(|p| p == "h3") {
-                        list.push("h3".to_string());
+                    if !list.iter().any(|p| p == ALPN_H3_STR) {
+                        list.push(ALPN_H3_STR.to_string());
                     }
                     tls_config.alpn = Some(list);
                 }
                 None => {
-                    tls_config.alpn = Some(vec!["h3".to_string()]);
+                    tls_config.alpn = Some(vec![ALPN_H3_STR.to_string()]);
                 }
             }
         }
@@ -108,19 +118,23 @@ impl H3Connector {
 
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
         let mut transport_config = quinn::TransportConfig::default();
-        transport_config
-            .max_idle_timeout(Some(std::time::Duration::from_secs(8).try_into().unwrap()));
-        transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(2)));
-        transport_config.max_concurrent_bidi_streams(quinn::VarInt::from_u32(10_000));
-        transport_config.max_concurrent_uni_streams(quinn::VarInt::from_u32(10_000));
+        transport_config.max_idle_timeout(Some(DEFAULT_QUIC_MAX_IDLE_TIMEOUT.try_into().unwrap()));
+        transport_config.keep_alive_interval(Some(DEFAULT_QUIC_KEEP_ALIVE_INTERVAL));
+        transport_config.max_concurrent_bidi_streams(quinn::VarInt::from_u32(
+            DEFAULT_QUIC_MAX_CONCURRENT_BIDI_STREAMS,
+        ));
+        transport_config.max_concurrent_uni_streams(quinn::VarInt::from_u32(
+            DEFAULT_QUIC_MAX_CONCURRENT_UNI_STREAMS,
+        ));
         // Per-stream window must stay small relative to the connection window:
         // otherwise a couple of unread streams pin the whole connection's
         // receive_window and head-of-line block every other stream (quinn docs
         // explicitly warn about this). 4MiB x 32 concurrent stalled streams
         // still fits inside the 128MiB connection window.
-        transport_config.stream_receive_window(quinn::VarInt::from_u32(4 * 1024 * 1024));
-        transport_config.receive_window(quinn::VarInt::from_u32(128 * 1024 * 1024));
-        transport_config.send_window(128 * 1024 * 1024);
+        transport_config
+            .stream_receive_window(quinn::VarInt::from_u32(DEFAULT_QUIC_STREAM_RECEIVE_WINDOW));
+        transport_config.receive_window(quinn::VarInt::from_u32(DEFAULT_QUIC_RECEIVE_WINDOW));
+        transport_config.send_window(DEFAULT_QUIC_SEND_WINDOW);
         client_config.transport_config(Arc::new(transport_config));
 
         let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
@@ -144,13 +158,13 @@ impl H3Connector {
     /// Dials a fresh underlying QUIC connection to the target endpoint.
     async fn dial_quic_connection(&self) -> Result<quinn::Connection, TunnelError> {
         let ips = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            DEFAULT_CONNECT_TIMEOUT,
             self.endpoint
                 .dns_resolver
                 .resolve(&self.endpoint.endpoint.host),
         )
         .await
-        .map_err(|_| TunnelError::ConnectTimeout(std::time::Duration::from_secs(5)))??;
+        .map_err(|_| TunnelError::ConnectTimeout(DEFAULT_CONNECT_TIMEOUT))??;
         let ip = ips.first().copied().ok_or_else(|| {
             TunnelError::DnsNoAddresses(self.endpoint.endpoint.host.clone(), "any".to_string())
         })?;
@@ -168,9 +182,9 @@ impl H3Connector {
             .connect(resolved_addr, sni)
             .map_err(|e| TunnelError::TlsHandshake(format!("QUIC connect error: {:?}", e)))?;
 
-        let conn = tokio::time::timeout(std::time::Duration::from_secs(5), connecting)
+        let conn = tokio::time::timeout(DEFAULT_CONNECT_TIMEOUT, connecting)
             .await
-            .map_err(|_| TunnelError::ConnectTimeout(std::time::Duration::from_secs(5)))?
+            .map_err(|_| TunnelError::ConnectTimeout(DEFAULT_CONNECT_TIMEOUT))?
             .map_err(|e| TunnelError::TlsHandshake(format!("QUIC handshake error: {:?}", e)))?;
 
         Ok(conn)
@@ -196,9 +210,9 @@ impl H3Connector {
             return Ok(Arc::clone(session));
         }
 
-        // Fail fast if an establishment attempt failed within the last 500ms to avoid serial cascading 5s timeouts
+        // Fail fast if an establishment attempt failed within cooldown to avoid serial cascading timeouts
         if let Some((failed_at, ref err_msg)) = *self.last_h3_failure.read()
-            && failed_at.elapsed() < std::time::Duration::from_millis(500)
+            && failed_at.elapsed() < H3_FAILURE_SUPPRESSION_COOLDOWN
         {
             return Err(TunnelError::ControlProtocol(format!(
                 "H3 establishment failed recently: {}",
@@ -224,7 +238,7 @@ impl H3Connector {
         let id = conn.stable_id();
 
         let build_res = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            DEFAULT_CONNECT_TIMEOUT,
             h3::client::builder().build::<_, _, Bytes>(h3_quinn::Connection::new(conn.clone())),
         )
         .await;
@@ -241,9 +255,7 @@ impl H3Connector {
                 *self.last_h3_failure.write() =
                     Some((std::time::Instant::now(), "H3 build timeout".to_string()));
                 conn.close(quinn::VarInt::from_u32(0), b"H3 build timeout");
-                return Err(TunnelError::ConnectTimeout(std::time::Duration::from_secs(
-                    5,
-                )));
+                return Err(TunnelError::ConnectTimeout(DEFAULT_CONNECT_TIMEOUT));
             }
         };
 
@@ -298,9 +310,9 @@ impl H3Connector {
             return Ok(Arc::clone(session));
         }
 
-        // Fail fast if raw QUIC dial failed within the last 500ms
+        // Fail fast if raw QUIC dial failed within cooldown
         if let Some((failed_at, ref err_msg)) = *self.last_quic_failure.read()
-            && failed_at.elapsed() < std::time::Duration::from_millis(500)
+            && failed_at.elapsed() < H3_FAILURE_SUPPRESSION_COOLDOWN
         {
             return Err(TunnelError::ControlProtocol(format!(
                 "Raw QUIC establishment failed recently: {}",
@@ -362,7 +374,7 @@ impl H3Connector {
         let conn_clone = session.conn.clone();
 
         let path = if self.endpoint.endpoint.path.is_empty() {
-            "/tunnel"
+            DEFAULT_TUNNEL_PATH
         } else {
             &self.endpoint.endpoint.path
         };
@@ -378,33 +390,33 @@ impl H3Connector {
 
         if !self.auth_token.is_empty() {
             req_builder = req_builder
-                .header("authorization", format!("Bearer {}", self.auth_token))
-                .header(crate::consts::HEADER_TUNNEL_AUTH, &self.auth_token);
+                .header(
+                    "authorization",
+                    format!("{}{}", AUTH_BEARER_PREFIX, self.auth_token),
+                )
+                .header(HEADER_TUNNEL_AUTH, &self.auth_token);
         }
 
         let mode_str = match self.mode {
-            TunnelMode::Forward => crate::consts::TUNNEL_MODE_FORWARD,
+            TunnelMode::Forward => TUNNEL_MODE_FORWARD,
             TunnelMode::Reverse => {
                 if session_id.is_some() {
-                    crate::consts::TUNNEL_MODE_REVERSE_DATA
+                    TUNNEL_MODE_REVERSE_DATA
                 } else {
-                    crate::consts::TUNNEL_MODE_REVERSE_CTRL
+                    TUNNEL_MODE_REVERSE_CTRL
                 }
             }
         };
-        req_builder = req_builder.header(crate::consts::HEADER_TUNNEL_MODE, mode_str);
+        req_builder = req_builder.header(HEADER_TUNNEL_MODE, mode_str);
 
         if pool_idle {
-            req_builder = req_builder.header(
-                crate::consts::HEADER_TUNNEL_POOL,
-                crate::consts::TUNNEL_POOL_IDLE,
-            );
+            req_builder = req_builder.header(HEADER_TUNNEL_POOL, TUNNEL_POOL_IDLE);
         }
 
-        req_builder = req_builder.header("x-tunnel-target", target.to_string());
+        req_builder = req_builder.header(HEADER_TUNNEL_TARGET, target.to_string());
 
         if let Some(sid) = session_id {
-            req_builder = req_builder.header(crate::consts::HEADER_SESSION_ID, sid);
+            req_builder = req_builder.header(HEADER_SESSION_ID, sid);
         }
 
         let request = req_builder
@@ -413,7 +425,7 @@ impl H3Connector {
 
         debug!(path = %path, target = %target, pool_idle, "Sending HTTP/3 CONNECT tunnel request");
         let mut stream = match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            DEFAULT_HANDSHAKE_TIMEOUT,
             send_request.send_request(request),
         )
         .await
@@ -430,16 +442,12 @@ impl H3Connector {
             }
             Err(_) => {
                 self.invalidate_h3_session_if_same(session_id_val);
-                return Err(TunnelError::ConnectTimeout(std::time::Duration::from_secs(
-                    10,
-                )));
+                return Err(TunnelError::ConnectTimeout(DEFAULT_HANDSHAKE_TIMEOUT));
             }
         };
 
         let response =
-            match tokio::time::timeout(std::time::Duration::from_secs(10), stream.recv_response())
-                .await
-            {
+            match tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, stream.recv_response()).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
                     if !session.is_alive() || session.conn.close_reason().is_some() {
@@ -452,9 +460,7 @@ impl H3Connector {
                 }
                 Err(_) => {
                     self.invalidate_h3_session_if_same(session_id_val);
-                    return Err(TunnelError::ConnectTimeout(std::time::Duration::from_secs(
-                        10,
-                    )));
+                    return Err(TunnelError::ConnectTimeout(DEFAULT_HANDSHAKE_TIMEOUT));
                 }
             };
 
@@ -489,7 +495,7 @@ impl H3Connector {
         let session_id_val = session.id;
 
         let (mut send, recv) =
-            match tokio::time::timeout(std::time::Duration::from_secs(5), conn.open_bi()).await {
+            match tokio::time::timeout(DEFAULT_CONNECT_TIMEOUT, conn.open_bi()).await {
                 Ok(Ok(pair)) => pair,
                 Ok(Err(e)) => {
                     self.invalidate_quic_session_if_same(session_id_val);
@@ -500,9 +506,7 @@ impl H3Connector {
                 }
                 Err(_) => {
                     self.invalidate_quic_session_if_same(session_id_val);
-                    return Err(TunnelError::ConnectTimeout(std::time::Duration::from_secs(
-                        5,
-                    )));
+                    return Err(TunnelError::ConnectTimeout(DEFAULT_CONNECT_TIMEOUT));
                 }
             };
 
@@ -526,7 +530,7 @@ impl H3Connector {
         header.extend_from_slice(&handshake_bytes);
 
         let write_res = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            DEFAULT_CONNECT_TIMEOUT,
             tokio::io::AsyncWriteExt::write_all(&mut send, &header),
         )
         .await;
@@ -539,9 +543,7 @@ impl H3Connector {
             }
             Err(_) => {
                 self.invalidate_quic_session_if_same(session_id_val);
-                return Err(TunnelError::ConnectTimeout(std::time::Duration::from_secs(
-                    5,
-                )));
+                return Err(TunnelError::ConnectTimeout(DEFAULT_CONNECT_TIMEOUT));
             }
         }
 

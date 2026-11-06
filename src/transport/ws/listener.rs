@@ -11,13 +11,13 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
 use crate::common::net::SocketTuner;
+use crate::consts::DEFAULT_HANDSHAKE_TIMEOUT;
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, BufferedTlsStream, TunnelStream};
 use crate::transport::ws::model::WsHandshakeHeaders;
@@ -143,9 +143,9 @@ impl WsListener {
                     let cancel_serve = cancel_conn.clone();
 
                     let mut serve = Box::pin(async move {
-                        // If TLS acceptor is configured (wss://), perform TLS handshake with 10s timeout
+                        // If TLS acceptor is configured (wss://), perform TLS handshake with timeout
                             let io: TokioIo<Box<dyn TunnelStream>> = if let Some(tls) = acceptor {
-                                match tokio::time::timeout(Duration::from_secs(10), tls.accept(stream)).await {
+                                match tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, tls.accept(stream)).await {
                                     Ok(Ok(tls_stream)) => {
                                         TokioIo::new(Box::new(BufferedTlsStream::new(tls_stream)) as Box<dyn TunnelStream>)
                                     }
@@ -219,7 +219,7 @@ impl WsListener {
                                             let work: UpgradeWork = Box::pin(async move {
                                                 tokio::select! {
                                                     _ = cancel_upgrade.cancelled() => {}
-                                                    res = tokio::time::timeout(Duration::from_secs(10), fut) => {
+                                                    res = tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, fut) => {
                                                         if let Ok(Ok(ws)) = res {
                                                             let stream =
                                                                 WsTunnelStream::new(ws.into_inner(), Role::Server);
@@ -252,7 +252,7 @@ impl WsListener {
                             });
 
                             let _ = tokio::time::timeout(
-                                Duration::from_secs(10),
+                                DEFAULT_HANDSHAKE_TIMEOUT,
                                 hyper::server::conn::http1::Builder::new()
                                     .serve_connection(io, service)
                                     .with_upgrades(),
@@ -329,6 +329,7 @@ impl TransportListener for WsListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn free_port() -> u16 {
         std::net::TcpListener::bind("127.0.0.1:0")

@@ -7,8 +7,7 @@
 use ring::digest::{SHA256, digest};
 use subtle::ConstantTimeEq;
 
-/// Maximum supported token length in bytes for constant-time comparison.
-pub const TOKEN_MAX_LEN: usize = 256;
+pub use crate::consts::TOKEN_MAX_LEN;
 
 /// Compares two token byte sequences in constant time without leaking length information.
 ///

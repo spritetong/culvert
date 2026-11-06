@@ -14,7 +14,10 @@ use tracing::{error, info, warn};
 
 use crate::common::task::TaskTracker;
 use crate::config::model::{ServerConfig, TlsConfig, TunnelMode};
-use crate::consts::{ACTIVATE_STREAM_MAGIC, DEFAULT_SESSION_PAIR_TIMEOUT};
+use crate::consts::{
+    ACTIVATE_STREAM_MAGIC, DEFAULT_ACTIVATION_READ_TIMEOUT, DEFAULT_SESSION_PAIR_TIMEOUT,
+    MAX_ACTIVATION_TARGET_LEN, POOL_DUMMY_HOST,
+};
 use crate::control::stream::{ControlMessage, FramedControlStream};
 use crate::core::error::TunnelError;
 use crate::core::relay::RelayEngine;
@@ -140,11 +143,11 @@ impl ServerRunner {
                                                         res = stream.read_exact(&mut magic) => {
                                                             match res {
                                                                 Ok(_) if magic[0] == ACTIVATE_STREAM_MAGIC => {
-                                                                    // Activated! Check if dynamic target address is appended: [len: u16, target_str] with 10s timeout
+                                                                    // Activated! Check if dynamic target address is appended: [len: u16, target_str] with timeout
                                                                     let mut len_bytes = [0u8; 2];
                                                                     let read_len_res = tokio::select! {
                                                                         _ = conn_token.cancelled() => return,
-                                                                        res = tokio::time::timeout(std::time::Duration::from_secs(10), stream.read_exact(&mut len_bytes)) => match res {
+                                                                        res = tokio::time::timeout(DEFAULT_ACTIVATION_READ_TIMEOUT, stream.read_exact(&mut len_bytes)) => match res {
                                                                             Ok(r) => r,
                                                                             Err(_) => {
                                                                                 warn!("Timed out reading activation target length (10s)");
@@ -157,7 +160,7 @@ impl ServerRunner {
                                                                         return;
                                                                     }
                                                                     let target_len = u16::from_be_bytes(len_bytes) as usize;
-                                                                    if target_len >= 512 {
+                                                                    if target_len >= MAX_ACTIVATION_TARGET_LEN {
                                                                         warn!("Activation target length too large: {}", target_len);
                                                                         return;
                                                                     }
@@ -165,7 +168,7 @@ impl ServerRunner {
                                                                         let mut target_bytes = vec![0u8; target_len];
                                                                         let read_target_res = tokio::select! {
                                                                             _ = conn_token.cancelled() => return,
-                                                                            res = tokio::time::timeout(std::time::Duration::from_secs(10), stream.read_exact(&mut target_bytes)) => match res {
+                                                                            res = tokio::time::timeout(DEFAULT_ACTIVATION_READ_TIMEOUT, stream.read_exact(&mut target_bytes)) => match res {
                                                                                 Ok(r) => r,
                                                                                 Err(_) => {
                                                                                     warn!("Timed out reading activation target payload (10s)");
@@ -197,7 +200,7 @@ impl ServerRunner {
                                                 }
 
                                                 let is_dummy_target = match &metadata.target {
-                                                    Some(TargetAddr::Domain(host, _)) => host == "pool.idle",
+                                                    Some(TargetAddr::Domain(host, _)) => host == POOL_DUMMY_HOST,
                                                     _ => false,
                                                 };
                                                 let valid_meta_target = if is_dummy_target { None } else { metadata.target };

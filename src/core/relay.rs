@@ -10,7 +10,7 @@ use std::task::Poll;
 use tokio::io::ReadBuf;
 use tokio_util::sync::CancellationToken;
 
-use crate::consts::RELAY_BUFFER_SIZE;
+use crate::consts::{DEFAULT_RELAY_DRAIN_TIMEOUT, RELAY_BUFFER_SIZE};
 use crate::core::error::TunnelError;
 use crate::core::stream::TunnelStream;
 
@@ -82,10 +82,8 @@ impl RelayEngine {
             let is_cancelled = cancel_fut.as_mut().poll(cx).is_ready();
             if is_cancelled {
                 if drain_sleep.is_none() {
-                    // Give at most 250ms bounded drain period to flush in-flight tails
-                    drain_sleep = Some(Box::pin(tokio::time::sleep(
-                        std::time::Duration::from_millis(250),
-                    )));
+                    // Give at most bounded drain period to flush in-flight tails
+                    drain_sleep = Some(Box::pin(tokio::time::sleep(DEFAULT_RELAY_DRAIN_TIMEOUT)));
                 }
                 if let Some(sleep_fut) = drain_sleep.as_mut()
                     && sleep_fut.as_mut().poll(cx).is_ready()

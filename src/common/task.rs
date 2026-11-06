@@ -6,14 +6,12 @@
 
 use std::future::Future;
 use std::sync::Mutex;
-use std::time::Duration;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-/// Graceful shutdown grace period shared by every nested tracker.
-const GRACE_PERIOD: Duration = Duration::from_secs(5);
+use crate::consts::DEFAULT_GRACE_PERIOD;
 
 /// Process-wide absolute deadline for the current graceful shutdown.
 ///
@@ -36,7 +34,7 @@ fn shared_shutdown_deadline() -> Instant {
     match *guard {
         Some(deadline) if deadline > now => deadline,
         _ => {
-            let deadline = now + GRACE_PERIOD;
+            let deadline = now + DEFAULT_GRACE_PERIOD;
             *guard = Some(deadline);
             deadline
         }
@@ -148,6 +146,7 @@ impl<T: 'static> TaskTracker<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn nested_trackers_share_one_absolute_deadline() {

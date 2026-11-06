@@ -112,10 +112,10 @@ impl PlatformUdsListener {
             return Err(err);
         }
 
-        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let (tx, rx) = tokio::sync::mpsc::channel(crate::consts::WINDOWS_UDS_ACCEPT_QUEUE_SIZE);
         let l = Arc::new(listener);
         let thread = match std::thread::Builder::new()
-            .name("micro-tunnel-windows-uds".to_string())
+            .name(crate::consts::WINDOWS_UDS_THREAD_NAME.to_string())
             .spawn(move || {
                 // Index 0 is the cancel event, so it wins when both are signalled.
                 let wait_handles: [HANDLE; 2] = [cancel_event as HANDLE, socket_event as HANDLE];

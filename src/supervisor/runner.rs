@@ -5,12 +5,12 @@
 //! All comments and docstrings must be in English.
 
 use std::sync::Arc;
-use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::common::task::TaskTracker;
 use crate::config::model::{AppConfig, TunnelConfig};
+use crate::consts::DEFAULT_RETRY_DELAY;
 use crate::core::error::TunnelError;
 use crate::dialer::endpoint::EndpointContext;
 use crate::server::ServerRunner;
@@ -138,7 +138,7 @@ impl TunnelSupervisor {
         token: CancellationToken,
     ) -> Result<(), TunnelError> {
         let retry_cfg = config.retry.clone().unwrap_or_default();
-        let retry_delay = retry_cfg.delay.unwrap_or_else(|| Duration::from_secs(3));
+        let retry_delay = retry_cfg.delay.unwrap_or(DEFAULT_RETRY_DELAY);
         let max_retries = retry_cfg.max_retries;
 
         let mut attempts = 0usize;

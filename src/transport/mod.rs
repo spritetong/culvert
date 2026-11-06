@@ -13,8 +13,7 @@ use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-/// Capacity of the accepted-stream channel shared by every ingress listener.
-pub const ACCEPTED_STREAM_QUEUE_SIZE: usize = 128;
+pub use crate::consts::ACCEPTED_STREAM_QUEUE_SIZE;
 
 pub mod h3;
 pub mod registry;

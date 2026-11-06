@@ -9,6 +9,8 @@ use std::io;
 use std::time::Duration;
 use tokio::net::TcpStream;
 
+use crate::consts::DEFAULT_TCP_KEEPALIVE;
+
 /// Socket configuration helper.
 pub struct SocketTuner;
 
@@ -24,7 +26,7 @@ impl SocketTuner {
         }
 
         let sock_ref = SockRef::from(stream);
-        let keepalive_time = keepalive.unwrap_or(Duration::from_secs(15));
+        let keepalive_time = keepalive.unwrap_or(DEFAULT_TCP_KEEPALIVE);
         let ka = TcpKeepalive::new().with_time(keepalive_time);
         let ka = crate::platform::configure_tcp_keepalive(ka);
 
