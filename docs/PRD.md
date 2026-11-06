@@ -251,9 +251,13 @@ behavior is configurable, the configuration key is given.
   peer. Activation writes and `NewConnection` sends share a deadline derived
   from the configured idle window (1/3, clamped to 5–10 s and never above the
   idle window), so high-RTT / low-bandwidth links do not tear down the listener.
-  An empty or stale pool always falls back to signaling instead of stalling
-  visitors. Relay tasks are owned and awaited by their worker; none are
-  detached.
+  Pre-warm dials are throttled to at most 4 concurrent handshakes across workers
+  with staggered exponential backoff up to 10 s, protecting low-bandwidth links
+  from dial storms. Listener teardown immediately drops the listening socket and
+  unregisters the pool before waiting for in-flight visitor relays, allowing prompt
+  reconnection without port binding conflicts. An empty or stale pool always
+  falls back to signaling instead of stalling visitors. Relay tasks are owned
+  and awaited by their worker; none are detached.
 
 ### FR-6 Relay engine
 

@@ -488,8 +488,11 @@ committed to a visitor. Expiry, overflow eviction, re-registration and listener
 teardown all close idle streams from the server side; the worker sees EOF and
 re-dials. Upon activation it dials the local `mappings.target`, hands the relay
 to its own `TaskTracker` (never detached), and immediately dials a replacement
-— one dial RTT, with no server-side "pool low" message. Dial failures back off
-from 200 ms to 1 s.
+— one dial RTT, with no server-side "pool low" message. Pre-warm dials are
+throttled to at most `POOL_MAX_CONCURRENT_CONNECTS` = 4 concurrent handshakes
+via a shared semaphore, protecting low-bandwidth links from connection storms.
+Dial failures back off exponentially from 200 ms up to 10 s (`POOL_BACKOFF_MAX`),
+with worker-index stagger to prevent lockstep retries.
 
 Because each consumed slot is replenished by its own worker, an extra server
 signaling round trip would be strictly slower; the control channel is reserved
@@ -602,8 +605,10 @@ this loop and in the pool reactor is deliberately retained.
    Both eviction and expiry act only on entries still in the queue: `pop_back`
    removes a stream under the same lock before the activation byte is written,
    so a committed stream can never be evicted. `drain()` closes a superseded
-   generation on re-registration; teardown is identity-checked with
-   `remove_if`.
+   generation on re-registration; listener teardown immediately drops the listening
+   socket and unregisters the pool before awaiting in-flight visitor relays, freeing
+   the port without delay so reconnecting peers never hit port conflicts. Teardown
+   is identity-checked with `remove_if`.
 
 Errors are `SessionNotFound`, `SessionClosed`, and `SessionPairTimeout`.
 

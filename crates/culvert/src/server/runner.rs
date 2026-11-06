@@ -675,8 +675,14 @@ impl ServerRunner {
             }
         }
 
-        local_tracker.shutdown_and_wait().await;
+        // Immediately drop the listening socket and unregister the inbound pool.
+        // This frees the port and pool key instantly so a reconnecting client
+        // can re-bind the reverse listener without failing on "Address already in use",
+        // even while existing visitor relay tasks are winding down gracefully.
+        drop(listener);
         session_mgr.unregister_pool(&listen_addr, &idle_pool);
+
+        local_tracker.shutdown_and_wait().await;
         info!(addr = %listen_addr, "Reverse listener closed.");
     }
 }
@@ -777,6 +783,72 @@ mod tests {
             run_res.is_ok(),
             "ServerRunner should exit with Ok(()) on shutdown, got: {:?}",
             run_res
+        );
+    }
+
+    #[tokio::test]
+    async fn test_server_reverse_control_immediate_port_release_on_disconnect() {
+        use futures_util::{SinkExt, StreamExt};
+
+        let (client, server) = tokio::io::duplex(4096);
+        let mut ctrl_client = FramedControlStream::new(client);
+        let session_mgr = Arc::new(SessionManager::new());
+        let cancel_token = CancellationToken::new();
+
+        let listen_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let listen_addr = format!("127.0.0.1:{}", listen_port);
+
+        let s_mgr = Arc::clone(&session_mgr);
+        let c_token = cancel_token.clone();
+        let l_addr = listen_addr.clone();
+
+        let handle = tokio::spawn(async move {
+            ServerRunner::handle_reverse_control(
+                Box::new(server),
+                s_mgr,
+                c_token,
+                Duration::from_secs(30),
+                crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
+            )
+            .await;
+        });
+
+        // Send RegisterReverse
+        ctrl_client
+            .send(ControlMessage::RegisterReverse {
+                listen_addr: listen_addr.clone(),
+                target_addr: "127.0.0.1:9099".to_string(),
+                pool_size: Some(2),
+            })
+            .await
+            .unwrap();
+
+        // Await RegisterAck
+        let ack = ctrl_client.next().await.unwrap().unwrap();
+        assert!(matches!(
+            ack,
+            ControlMessage::RegisterAck { success: true, .. }
+        ));
+
+        // Drop client control stream to trigger disconnect
+        drop(ctrl_client);
+
+        // Await handle termination
+        let res = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(
+            res.is_ok(),
+            "handle_reverse_control should exit promptly on client disconnect"
+        );
+
+        // The bound port must be released immediately so a reconnecting client can rebind
+        let rebind = crate::platform::GenericListener::bind(&l_addr).await;
+        assert!(
+            rebind.is_ok(),
+            "Port must be freed immediately for rebinding"
         );
     }
 }

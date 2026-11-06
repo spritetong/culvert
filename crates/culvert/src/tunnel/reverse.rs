@@ -17,8 +17,8 @@ use crate::common::{CancelFutureExt, CancellationTokenExt, TaskTracker};
 use crate::config::model::{TunnelConfig, TunnelMode};
 use crate::consts::{
     ACTIVATE_STREAM_MAGIC, DEFAULT_REVERSE_BACKOFF_INITIAL, DEFAULT_REVERSE_BACKOFF_MAX,
-    POOL_BACKOFF_ACTIVE_WAITERS_MAX, POOL_BACKOFF_BASE, REVERSE_BACKOFF_RESET_THRESHOLD,
-    REVERSE_CONTROL_TARGET_HOST, clamp_reverse_pool_size,
+    POOL_BACKOFF_BASE, POOL_BACKOFF_MAX, POOL_MAX_CONCURRENT_CONNECTS,
+    REVERSE_BACKOFF_RESET_THRESHOLD, REVERSE_CONTROL_TARGET_HOST, clamp_reverse_pool_size,
 };
 use crate::control::stream::{ControlMessage, FramedControlStream};
 use crate::core::error::TunnelError;
@@ -181,10 +181,17 @@ pub async fn run_reverse_mapping(
                 "Pre-warming reverse inbound pool connections to remote server"
             );
 
-            for _ in 0..size {
+            // Throttle concurrent outbound dial handshakes across all workers in this
+            // reverse mapping to protect low-bandwidth links from connection storms.
+            // Symmetrically matches Forward mode's POOL_MAX_CONCURRENT_CONNECTS.
+            let dial_semaphore =
+                Arc::new(tokio::sync::Semaphore::new(POOL_MAX_CONCURRENT_CONNECTS));
+
+            for worker_idx in 0..size {
                 let connector = Arc::clone(&data_connector);
                 let listen_target = listen_target.clone();
                 let target_clone = target_addr.clone();
+                let dial_semaphore = Arc::clone(&dial_semaphore);
                 let hb = hb_interval;
                 let idle = idle_timeout;
 
@@ -192,20 +199,30 @@ pub async fn run_reverse_mapping(
                     // Every relay this worker starts is owned and awaited; no task
                     // may outlive the control-channel generation that created it.
                     let mut relays = TaskTracker::<()>::new(token.child_token());
-                    let mut retry = POOL_BACKOFF_BASE;
+                    // Stagger initial backoff slightly by worker index to avoid synchronous lockstep retries
+                    let initial_retry =
+                        POOL_BACKOFF_BASE + Duration::from_millis((worker_idx as u64) * 25);
+                    let mut retry = initial_retry;
 
                     while !token.is_cancelled() {
-                        let Some(conn_res) = connector
+                        let _permit = match dial_semaphore.acquire().cancel_with(&token).await {
+                            Some(Ok(p)) => p,
+                            _ => break,
+                        };
+
+                        let conn_res_opt = connector
                             .connect_pooled(&listen_target)
                             .cancel_with(&token)
-                            .await
-                        else {
+                            .await;
+                        drop(_permit);
+
+                        let Some(conn_res) = conn_res_opt else {
                             break;
                         };
 
                         let mut stream = match conn_res {
                             Ok(s) => {
-                                retry = POOL_BACKOFF_BASE;
+                                retry = initial_retry;
                                 s
                             }
                             Err(e) => {
@@ -213,7 +230,7 @@ pub async fn run_reverse_mapping(
                                 if !token.sleep_or_cancel(retry).await {
                                     break;
                                 }
-                                retry = (retry * 2).min(POOL_BACKOFF_ACTIVE_WAITERS_MAX);
+                                retry = (retry * 2).min(POOL_BACKOFF_MAX);
                                 continue;
                             }
                         };
@@ -572,5 +589,138 @@ mod tests {
         );
         let inner_res = res.unwrap().unwrap();
         assert!(inner_res.is_ok());
+    }
+
+    struct MockThrottledConnector {
+        concurrent: Arc<std::sync::atomic::AtomicUsize>,
+        max_concurrent: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl TransportConnector for MockThrottledConnector {
+        fn connect<'a>(
+            &'a self,
+            _target: &'a TargetAddr,
+            _session_id: Option<&'a str>,
+        ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+            let concurrent = Arc::clone(&self.concurrent);
+            let max_concurrent = Arc::clone(&self.max_concurrent);
+            Box::pin(async move {
+                let (client, server) = tokio::io::duplex(4096);
+                let cur = concurrent.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                max_concurrent.fetch_max(cur, std::sync::atomic::Ordering::SeqCst);
+
+                tokio::spawn(async move {
+                    let mut framed = FramedControlStream::new(server);
+                    // Handle RegisterReverse by replying RegisterAck if this is a control channel
+                    if let Some(Ok(ControlMessage::RegisterReverse { listen_addr, .. })) =
+                        futures_util::StreamExt::next(&mut framed).await
+                    {
+                        let _ = futures_util::SinkExt::send(
+                            &mut framed,
+                            ControlMessage::RegisterAck {
+                                listen_addr,
+                                success: true,
+                                error_msg: None,
+                            },
+                        )
+                        .await;
+                    }
+                    // Keep stream open
+                    while futures_util::StreamExt::next(&mut framed).await.is_some() {}
+                });
+
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                concurrent.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Box::new(client) as Box<dyn TunnelStream>)
+            })
+        }
+
+        fn protocol_scheme(&self) -> &'static str {
+            "ws"
+        }
+    }
+
+    struct MockThrottledDriver {
+        concurrent: Arc<std::sync::atomic::AtomicUsize>,
+        max_concurrent: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl TransportDriver for MockThrottledDriver {
+        fn schemes(&self) -> &[&'static str] {
+            &["ws"]
+        }
+
+        fn build_connector(
+            &self,
+            _endpoint: &EndpointContext,
+            _auth_token: &str,
+            _mode: TunnelMode,
+        ) -> Result<Box<dyn TransportConnector>, TunnelError> {
+            Ok(Box::new(MockThrottledConnector {
+                concurrent: Arc::clone(&self.concurrent),
+                max_concurrent: Arc::clone(&self.max_concurrent),
+            }))
+        }
+
+        fn build_listener(
+            &self,
+            _listen_addr: &str,
+            _auth_token: Option<&str>,
+            _path: Option<&str>,
+            _tls: Option<&crate::config::model::TlsConfig>,
+        ) -> Result<Box<dyn TransportListener>, TunnelError> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reverse_pool_prewarm_dial_concurrency_throttled() {
+        let concurrent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_concurrent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let driver = MockThrottledDriver {
+            concurrent: Arc::clone(&concurrent),
+            max_concurrent: Arc::clone(&max_concurrent),
+        };
+
+        let mut reg = TransportRegistry::new();
+        reg.register(driver);
+        let reg = Arc::new(reg);
+
+        let cancel_token = CancellationToken::new();
+        let cancel_clone = cancel_token.clone();
+
+        let ep_cfg = EndpointConfig::Simple("ws://127.0.0.1:8080".to_string());
+        let app_cfg = AppConfig::default();
+        let ep_ctx = EndpointContext::build(&ep_cfg, &app_cfg).unwrap();
+
+        // Spawn with pool_size = 12 (> POOL_MAX_CONCURRENT_CONNECTS = 4)
+        let handle = tokio::spawn(async move {
+            run_reverse_mapping(
+                "test_throttle".to_string(),
+                "127.0.0.1:9090".to_string(),
+                "127.0.0.1:9091".to_string(),
+                None,
+                ep_ctx,
+                reg,
+                Some(12),
+                cancel_clone,
+            )
+            .await
+        });
+
+        // Allow workers to start pre-warming
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        cancel_token.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        let peak = max_concurrent.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            peak <= POOL_MAX_CONCURRENT_CONNECTS + 1, // +1 for the control channel dial
+            "Peak concurrent dials ({peak}) must be bounded by POOL_MAX_CONCURRENT_CONNECTS ({})",
+            POOL_MAX_CONCURRENT_CONNECTS
+        );
+        assert!(peak > 0, "At least one pre-warm dial should have completed");
     }
 }
