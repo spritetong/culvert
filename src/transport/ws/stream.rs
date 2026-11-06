@@ -499,7 +499,11 @@ impl TunnelStream for WsTunnelStream {
         match std::mem::replace(&mut self.write_state, WriteState::Failed) {
             WriteState::Idle(mut tx) => {
                 let len = buf.len();
-                let payload = bytes::BytesMut::from(buf.as_ref());
+                // `BytesMut::from(Bytes)` reuses the original allocation when the
+                // chunk is uniquely owned (the normal relay path) and only copies
+                // for shared/sliced buffers. Converting via `buf.as_ref()` always
+                // copied the whole payload a second time.
+                let payload = bytes::BytesMut::from(buf);
                 let mut fut = Box::pin(async move {
                     let res = tx.write_frame(Frame::binary(Payload::Bytes(payload))).await;
                     (tx, res)
@@ -637,42 +641,14 @@ impl TunnelStream for WsTunnelStream {
                 let mut buf = ReadBuf::new(&mut empty);
                 match Pin::new(&mut *self).poll_read(cx, &mut buf) {
                     Poll::Ready(Err(_)) => Poll::Ready(HeartbeatStatus::Dead),
-                    Poll::Pending => {
-                        // Check if poll_read transitioned into Reading and inspect completion
-                        if let ReadState::Reading(ref mut fut) = self.read_state {
-                            match fut.as_mut().poll(cx) {
-                                Poll::Ready((_rx, obligated, Ok((OpCode::Close, payload)))) => {
-                                    if !obligated.is_empty() {
-                                        self.control_queue.extend(obligated);
-                                    }
-                                    self.peer_closed = true;
-                                    if !self.close_sent {
-                                        let close_frame = if payload.is_empty() {
-                                            Frame::close(1000, &[])
-                                        } else {
-                                            Frame::close_raw(Payload::Owned(payload.to_vec()))
-                                        };
-                                        self.control_queue.push_back(close_frame);
-                                        self.close_sent = true;
-                                    }
-                                    let _ = self.poll_flush_control(cx);
-                                    self.read_state = ReadState::Eof;
-                                    Poll::Ready(HeartbeatStatus::Dead)
-                                }
-                                Poll::Ready((_rx, obligated, Err(_))) => {
-                                    if !obligated.is_empty() {
-                                        self.control_queue.extend(obligated);
-                                        let _ = self.poll_flush_control(cx);
-                                    }
-                                    self.read_state = ReadState::Failed;
-                                    Poll::Ready(HeartbeatStatus::Dead)
-                                }
-                                _ => Poll::Ready(HeartbeatStatus::Alive),
-                            }
-                        } else {
-                            Poll::Ready(HeartbeatStatus::Alive)
-                        }
-                    }
+                    // Never re-poll the future that `poll_read` just created with
+                    // the same `cx`: a buffered frame can make that second poll
+                    // return Ready, which used to drop both the read half and the
+                    // payload while leaving a completed future in `Reading`.
+                    // The state is now `Reading` with a registered waker, so the
+                    // next liveness check (or the relay's own poll_read) will
+                    // consume and preserve the frame normally.
+                    Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
                     Poll::Ready(Ok(())) => match self.read_state {
                         ReadState::Eof | ReadState::Failed => Poll::Ready(HeartbeatStatus::Dead),
                         _ => Poll::Ready(HeartbeatStatus::Alive),

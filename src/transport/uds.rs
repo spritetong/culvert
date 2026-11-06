@@ -27,10 +27,15 @@ use crate::platform::{PlatformUdsListener, connect_uds, normalize_uds_path};
 use crate::transport::ws::model::WsHandshakeHeaders;
 use crate::transport::ws::stream::WsTunnelStream;
 use crate::transport::{
-    StreamMetadata, TargetAddr, TransportConnector, TransportDriver, TransportListener,
+    ACCEPTED_STREAM_QUEUE_SIZE, StreamMetadata, TargetAddr, TransportConnector, TransportDriver,
+    TransportListener,
 };
 
 type AcceptedResult = Result<(Box<dyn TunnelStream>, StreamMetadata), TunnelError>;
+
+/// An upgrade future handed back by the HTTP service to its owning connection
+/// task. It is never spawned without an owner.
+type UpgradeWork = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
 
 /// Hyper executor bridging Hyper futures onto Tokio runtime.
 struct TokioSpawnExecutor;
@@ -73,6 +78,23 @@ impl TransportDriver for UdsTransportDriver {
         path: Option<&str>,
         tls: Option<&crate::config::model::TlsConfig>,
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
+        self.build_listener_with_cancel(
+            socket_path,
+            auth_token,
+            path,
+            tls,
+            CancellationToken::new(),
+        )
+    }
+
+    fn build_listener_with_cancel(
+        &self,
+        socket_path: &str,
+        auth_token: Option<&str>,
+        path: Option<&str>,
+        tls: Option<&crate::config::model::TlsConfig>,
+        cancel: CancellationToken,
+    ) -> Result<Box<dyn TransportListener>, TunnelError> {
         let is_wss = socket_path.starts_with("wss+unix://");
         let cert_str = tls
             .and_then(|t| t.certificate.as_ref())
@@ -104,23 +126,23 @@ impl TransportDriver for UdsTransportDriver {
         };
 
         let clean_path = normalize_uds_path(socket_path);
-        let listener =
-            UdsListener::bind(clean_path.to_string_lossy(), auth_token, path, tls_acceptor)?;
+        let listener = UdsListener::bind_with_cancel(
+            clean_path.to_string_lossy(),
+            auth_token,
+            path,
+            tls_acceptor,
+            cancel,
+        )?;
 
-        // If chmod query parameter was supplied in socket_path URL, apply it immediately
+        // Apply `?chmod=` for callers that build a listener directly from a URL.
+        // The production server path parses chmod in `ServerListenSpec::parse()`
+        // and applies it in `ServerRunner`, so use the same octal parser here.
         if let Some(q_idx) = socket_path.find('?') {
             for param in socket_path[q_idx + 1..].split('&') {
-                if let Some(val) = param.strip_prefix("chmod=") {
-                    let mode = if val.starts_with("0o") || val.starts_with("0O") {
-                        u32::from_str_radix(&val[2..], 8).ok()
-                    } else if val.starts_with('0') && val.len() > 1 {
-                        u32::from_str_radix(val, 8).ok()
-                    } else {
-                        val.parse::<u32>().ok()
-                    };
-                    if let Some(m) = mode {
-                        let _ = crate::platform::set_socket_permissions(&clean_path, m);
-                    }
+                if let Some(val) = param.strip_prefix("chmod=")
+                    && let Some(mode) = crate::config::model::parse_socket_mode(val)
+                {
+                    let _ = crate::platform::set_socket_permissions(&clean_path, mode);
                 }
             }
         }
@@ -131,32 +153,57 @@ impl TransportDriver for UdsTransportDriver {
 
 pub struct UdsListener {
     cancel_token: CancellationToken,
-    incoming_rx: mpsc::Receiver<AcceptedResult>,
-    server_task: tokio::task::JoinHandle<()>,
+    incoming_rx: Option<mpsc::Receiver<AcceptedResult>>,
+    server_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for UdsListener {
     fn drop(&mut self) {
+        // `shutdown()` is the awaited termination boundary. Drop is only an
+        // abnormal-path safety net: signal cancellation, never abort a live
+        // handle and never hide an unawaited task behind detach.
         self.cancel_token.cancel();
-        self.server_task.abort();
+        if self.server_task.is_some() {
+            tracing::warn!(
+                "UdsListener dropped without shutdown(); accept loop cancelled but not awaited"
+            );
+        }
     }
 }
 
 impl UdsListener {
+    /// Binds a listener with a private lifecycle token.
     pub fn bind(
         socket_path: impl Into<String>,
         auth_token: Option<impl Into<String>>,
         http_path: Option<impl Into<String>>,
         tls_acceptor: Option<TlsAcceptor>,
     ) -> Result<Self, TunnelError> {
+        Self::bind_with_cancel(
+            socket_path,
+            auth_token,
+            http_path,
+            tls_acceptor,
+            CancellationToken::new(),
+        )
+    }
+
+    /// Binds a listener whose accept loop is a child of the root shutdown token.
+    pub fn bind_with_cancel(
+        socket_path: impl Into<String>,
+        auth_token: Option<impl Into<String>>,
+        http_path: Option<impl Into<String>>,
+        tls_acceptor: Option<TlsAcceptor>,
+        cancel: CancellationToken,
+    ) -> Result<Self, TunnelError> {
         let socket_path_str = socket_path.into();
         let path = normalize_uds_path(&socket_path_str);
         let mut listener = PlatformUdsListener::bind(&path).map_err(TunnelError::Io)?;
 
-        let (tx, rx) = mpsc::channel(128);
+        let (tx, rx) = mpsc::channel(ACCEPTED_STREAM_QUEUE_SIZE);
         let auth_token = Arc::new(auth_token.map(|t| t.into()));
         let expected_path = Arc::new(http_path.map(|p| p.into()));
-        let cancel_token = CancellationToken::new();
+        let cancel_token = cancel.child_token();
         let cancel_loop = cancel_token.clone();
 
         let task = tokio::spawn(async move {
@@ -178,10 +225,17 @@ impl UdsListener {
                 let cancel_conn = cancel_loop.child_token();
 
                 conn_tasks.spawn(async move {
-                    tokio::select! {
-                        _ = cancel_conn.cancelled() => {}
-                        _ = async {
-                            let io_stream: Box<dyn TunnelStream> = if let Some(tls) = acceptor {
+                    // Termination contract for one accepted connection: the
+                    // HTTP service returns immediately after an upgrade, so the
+                    // upgrade future must be driven concurrently. It is handed
+                    // back over this channel and owned by a JoinSet here; this
+                    // connection task awaits every one before returning.
+                    let (upgrade_tx, mut upgrade_rx) = mpsc::unbounded_channel::<UpgradeWork>();
+                    let mut upgrade_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+                    let cancel_serve = cancel_conn.clone();
+
+                    let mut serve = Box::pin(async move {
+                        let io_stream: Box<dyn TunnelStream> = if let Some(tls) = acceptor {
                                 match tokio::time::timeout(Duration::from_secs(10), tls.accept(stream)).await {
                                     Ok(Ok(tls_stream)) => Box::new(BufferedTlsStream::new(tls_stream)),
                                     Ok(Err(e)) => {
@@ -198,12 +252,13 @@ impl UdsListener {
                             };
 
                             let io = TokioIo::new(io_stream);
-                            let service_cancel = cancel_conn.clone();
+                            let service_cancel = cancel_serve.clone();
                             let service = service_fn(move |mut req: Request<Incoming>| {
                                 let tx = tx.clone();
                                 let token = Arc::clone(&token);
                                 let path = Arc::clone(&path);
                                 let cancel_upgrade = service_cancel.clone();
+                                let upgrade_tx = upgrade_tx.clone();
 
                                 async move {
                                     if let Some(ref p) = *path
@@ -253,23 +308,28 @@ impl UdsListener {
                                         }
                                     };
 
-                                    tokio::spawn(async move {
+                                    let work: UpgradeWork = Box::pin(async move {
                                         tokio::select! {
                                             _ = cancel_upgrade.cancelled() => {}
-                                            res = tokio::time::timeout(Duration::from_secs(10), fut) => match res {
-                                                Ok(Ok(ws)) => {
-                                                    let ws_stream = WsTunnelStream::new(ws.into_inner(), Role::Server);
-                                                    let _ = tx.send(Ok((Box::new(ws_stream) as Box<dyn TunnelStream>, metadata))).await;
-                                                }
-                                                Ok(Err(e)) => {
-                                                    let _ = tx.send(Err(TunnelError::Internal(e.to_string()))).await;
-                                                }
-                                                Err(_) => {
-                                                    let _ = tx.send(Err(TunnelError::Internal("UDS WebSocket upgrade timed out".to_string()))).await;
+                                            res = tokio::time::timeout(Duration::from_secs(10), fut) => {
+                                                let item: AcceptedResult = match res {
+                                                    Ok(Ok(ws)) => {
+                                                        let ws_stream = WsTunnelStream::new(ws.into_inner(), Role::Server);
+                                                        Ok((Box::new(ws_stream) as Box<dyn TunnelStream>, metadata))
+                                                    }
+                                                    Ok(Err(e)) => Err(TunnelError::Internal(e.to_string())),
+                                                    Err(_) => Err(TunnelError::Internal("UDS WebSocket upgrade timed out".to_string())),
+                                                };
+                                                // A full accepted-stream queue must never pin an
+                                                // owned upgrade task during shutdown.
+                                                tokio::select! {
+                                                    _ = cancel_upgrade.cancelled() => {}
+                                                    _ = tx.send(item) => {}
                                                 }
                                             }
                                         }
                                     });
+                                    let _ = upgrade_tx.send(work);
 
                                     Ok(response)
                                 }
@@ -282,18 +342,37 @@ impl UdsListener {
                                     .with_upgrades(),
                             )
                             .await;
-                        } => {}
+                    });
+
+                    loop {
+                        tokio::select! {
+                            _ = cancel_conn.cancelled() => break,
+                            _ = &mut serve => break,
+                            Some(work) = upgrade_rx.recv() => { upgrade_tasks.spawn(work); },
+                            Some(_) = upgrade_tasks.join_next(), if !upgrade_tasks.is_empty() => {},
+                        }
                     }
+
+                    // Dropping `serve` releases the last sender, so any future
+                    // queued in the same poll is still visible before the drain.
+                    drop(serve);
+                    while let Ok(work) = upgrade_rx.try_recv() {
+                        upgrade_tasks.spawn(work);
+                    }
+                    while upgrade_tasks.join_next().await.is_some() {}
                 });
             }
-            conn_tasks.abort_all();
+
+            // Every connection task owns its upgrade futures, observes
+            // cancellation and bounds each await, so awaiting the JoinSet is
+            // a real termination boundary rather than a guessed timeout.
             while conn_tasks.join_next().await.is_some() {}
         });
 
         Ok(Self {
             cancel_token,
-            incoming_rx: rx,
-            server_task: task,
+            incoming_rx: Some(rx),
+            server_task: Some(task),
         })
     }
 
@@ -312,9 +391,25 @@ impl TransportListener for UdsListener {
         &'a mut self,
     ) -> BoxFuture<'a, Result<(Box<dyn TunnelStream>, StreamMetadata), TunnelError>> {
         Box::pin(async move {
+            let Some(rx) = self.incoming_rx.as_mut() else {
+                return Err(TunnelError::Shutdown);
+            };
             tokio::select! {
                 _ = self.cancel_token.cancelled() => Err(TunnelError::Shutdown),
-                item = self.incoming_rx.recv() => item.unwrap_or(Err(TunnelError::Shutdown)),
+                item = rx.recv() => item.unwrap_or(Err(TunnelError::Shutdown)),
+            }
+        })
+    }
+
+    fn shutdown<'a>(&'a mut self) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            // Cancel first, then close the accepted-stream queue so no sender
+            // can stay parked, then await the accept loop and all of its owned
+            // connection/upgrade tasks.
+            self.cancel_token.cancel();
+            self.incoming_rx.take();
+            if let Some(task) = self.server_task.take() {
+                let _ = task.await;
             }
         })
     }

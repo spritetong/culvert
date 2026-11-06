@@ -18,6 +18,7 @@ use crate::config::model::TunnelMode;
 use crate::core::error::TunnelError;
 use crate::dialer::endpoint::EndpointContext;
 use crate::transport::{TransportConnector, TransportDriver, TransportListener};
+use tokio_util::sync::CancellationToken;
 
 /// WebSocket transport driver implementation.
 pub struct WsTransportDriver;
@@ -46,6 +47,23 @@ impl TransportDriver for WsTransportDriver {
         auth_token: Option<&str>,
         path: Option<&str>,
         tls: Option<&crate::config::model::TlsConfig>,
+    ) -> Result<Box<dyn TransportListener>, TunnelError> {
+        self.build_listener_with_cancel(
+            listen_addr,
+            auth_token,
+            path,
+            tls,
+            CancellationToken::new(),
+        )
+    }
+
+    fn build_listener_with_cancel(
+        &self,
+        listen_addr: &str,
+        auth_token: Option<&str>,
+        path: Option<&str>,
+        tls: Option<&crate::config::model::TlsConfig>,
+        cancel: CancellationToken,
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
         let is_wss = listen_addr.starts_with("wss://") || listen_addr.starts_with("https://");
         let cert_str = tls
@@ -81,11 +99,12 @@ impl TransportDriver for WsTransportDriver {
             None
         };
 
-        Ok(Box::new(WsListener::new(
+        Ok(Box::new(WsListener::new_with_cancel(
             listen_addr,
             auth_token,
             path,
             tls_acceptor,
+            cancel,
         )))
     }
 }

@@ -11,6 +11,10 @@ use crate::dialer::endpoint::EndpointContext;
 use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
+
+/// Capacity of the accepted-stream channel shared by every ingress listener.
+pub const ACCEPTED_STREAM_QUEUE_SIZE: usize = 128;
 
 pub mod h3;
 pub mod registry;
@@ -79,6 +83,16 @@ pub trait TransportListener: Send + Sync {
     fn accept<'a>(
         &'a mut self,
     ) -> BoxFuture<'a, Result<(Box<dyn TunnelStream>, StreamMetadata), TunnelError>>;
+
+    /// Explicit termination boundary for the listener's own background tasks.
+    ///
+    /// Implementations cancel their accept loop and **await every owned task
+    /// handle** before returning. `Drop` is only a safety net for abnormal
+    /// paths and must never abort or leak a live handle in normal shutdown.
+    /// The owner must call this before dropping the listener.
+    fn shutdown<'a>(&'a mut self) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
 }
 
 /// Plugin driver interface for transport factory registration.
@@ -102,4 +116,21 @@ pub trait TransportDriver: Send + Sync + 'static {
         path: Option<&str>,
         tls: Option<&crate::config::model::TlsConfig>,
     ) -> Result<Box<dyn TransportListener>, TunnelError>;
+
+    /// Builds a listener wired to the root shutdown token.
+    ///
+    /// Ingress listeners must not own private cancellation tokens: those are
+    /// only cancelled in `Drop`, which happens after the connection tracker has
+    /// already drained. Drivers that do not override this method keep their
+    /// legacy lifecycle for backwards compatibility.
+    fn build_listener_with_cancel(
+        &self,
+        listen_addr: &str,
+        auth_token: Option<&str>,
+        path: Option<&str>,
+        tls: Option<&crate::config::model::TlsConfig>,
+        _cancel: CancellationToken,
+    ) -> Result<Box<dyn TransportListener>, TunnelError> {
+        self.build_listener(listen_addr, auth_token, path, tls)
+    }
 }

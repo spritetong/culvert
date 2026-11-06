@@ -28,6 +28,16 @@ pub struct AppConfig {
     pub tunnels: Vec<TunnelConfig>,
 }
 
+/// Parses a UDS `chmod=` value. Socket modes are always octal: a plain `660`
+/// means `0o660`, never decimal 660. Accepts `0o660`, `0660` and `660`.
+pub fn parse_socket_mode(value: &str) -> Option<u32> {
+    let digits = value
+        .strip_prefix("0o")
+        .or_else(|| value.strip_prefix("0O"))
+        .unwrap_or(value);
+    u32::from_str_radix(digits, 8).ok().filter(|m| *m <= 0o7777)
+}
+
 /// Parsed server listening specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerListenSpec {
@@ -129,14 +139,7 @@ impl ServerListenSpec {
                             };
                             http_path = Some(p);
                         } else if let Some(val) = param.strip_prefix("chmod=") {
-                            let mode = if val.starts_with("0o") || val.starts_with("0O") {
-                                u32::from_str_radix(&val[2..], 8).ok()
-                            } else if val.starts_with('0') && val.len() > 1 {
-                                u32::from_str_radix(val, 8).ok()
-                            } else {
-                                val.parse::<u32>().ok()
-                            };
-                            chmod = mode;
+                            chmod = parse_socket_mode(val);
                         }
                     }
                 }
@@ -811,4 +814,21 @@ pub struct FailoverConfig {
     pub enabled: bool,
     pub standby_endpoint: EndpointConfig,
     pub ring_buffer_capacity: Option<usize>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_socket_mode;
+
+    #[test]
+    fn socket_modes_are_always_octal() {
+        assert_eq!(parse_socket_mode("660"), Some(0o660));
+        assert_eq!(parse_socket_mode("0660"), Some(0o660));
+        assert_eq!(parse_socket_mode("0o660"), Some(0o660));
+        assert_eq!(parse_socket_mode("0O660"), Some(0o660));
+        assert_eq!(parse_socket_mode("7777"), Some(0o7777));
+        assert_eq!(parse_socket_mode("10000"), None, "mode above 0o7777");
+        assert_eq!(parse_socket_mode("888"), None, "non-octal digit");
+        assert_eq!(parse_socket_mode(""), None);
+    }
 }

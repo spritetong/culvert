@@ -36,7 +36,9 @@ pub trait TunnelStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {
     }
 
     /// Writes an owned byte slice without copying if supported by the transport.
-    /// Default implementation falls back to `poll_write`.
+    /// The default implementation is a compatibility fallback only: it passes the
+    /// borrowed slice to `poll_write`, which may copy. Implementations that can
+    /// retain the refcounted buffer must override this.
     fn poll_write_bytes(
         &mut self,
         cx: &mut Context<'_>,
@@ -58,9 +60,13 @@ pub trait TunnelStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {
     /// Returns `Poll::Ready(HeartbeatStatus::Alive)` or `Poll::Pending` if still healthy.
     fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus>;
 
-    /// Indicates whether the transport stream supports true half-close (closing write direction
-    /// while keeping read direction open, e.g. TCP FIN or QUIC stream FIN).
-    /// Transports that do not support half-close (e.g. WebSocket RFC 6455) must return false.
+    /// Indicates whether the transport stream supports half-close (closing the write
+    /// direction while keeping the read direction open, e.g. TCP/QUIC FIN).
+    ///
+    /// Every in-tree transport implements a FIN: TCP/QUIC use the transport FIN,
+    /// Mux uses a FIN frame, and WebSocket uses an in-band zero-length binary FIN
+    /// understood by both micro-tunnel peers. A transport that can only tear down
+    /// the whole connection must override this to return false.
     fn supports_half_close(&self) -> bool {
         true
     }
@@ -147,6 +153,11 @@ impl<S: AsyncRead + Unpin> AsyncRead for BufferedTlsStream<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // A zero-capacity ReadBuf is legal (e.g. liveness probes). `put_slice`
+        // would panic, and taking the byte here would silently drop payload.
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         if let Some(b) = self.pushback.take() {
             buf.put_slice(&[b]);
             return Poll::Ready(Ok(()));
@@ -243,5 +254,27 @@ mod tests {
         let mut buf = vec![0u8; 11];
         buffered.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn test_zero_capacity_read_preserves_pushback() {
+        let (mut client, server) = duplex(64);
+        let mut buffered = BufferedTlsStream::new(server);
+        client.write_all(b"xy").await.unwrap();
+
+        // Liveness check consumes one byte into the pushback cache.
+        let status = poll_fn(|cx| buffered.poll_check_alive(cx)).await;
+        assert_eq!(status, HeartbeatStatus::Alive);
+
+        // A zero-capacity ReadBuf must be a no-op: no panic, no lost byte.
+        let mut empty: [u8; 0] = [];
+        let mut rb = ReadBuf::new(&mut empty);
+        let res = poll_fn(|cx| Pin::new(&mut buffered).poll_read(cx, &mut rb)).await;
+        assert!(res.is_ok());
+        assert!(rb.filled().is_empty());
+
+        let mut buf = [0u8; 2];
+        buffered.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"xy");
     }
 }

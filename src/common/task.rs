@@ -5,14 +5,53 @@
 //! All comments and docstrings must be in English.
 
 use std::future::Future;
+use std::sync::Mutex;
+use std::time::Duration;
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
+/// Graceful shutdown grace period shared by every nested tracker.
+const GRACE_PERIOD: Duration = Duration::from_secs(5);
+
+/// Process-wide absolute deadline for the current graceful shutdown.
+///
+/// Nested trackers each call `shutdown_and_wait()`; deriving a fresh
+/// `Instant::now() + 5s` in each one compounded into a 20s+ shutdown. The first
+/// tracker to shut down fixes the instant and every other tracker reuses it.
+/// An already-expired deadline opens a new window, so unit tests that create
+/// several independent runtimes in one process remain independent.
+static SHUTDOWN_DEADLINE: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Resets the shared deadline at daemon startup.
+pub fn reset_shutdown_deadline() {
+    *SHUTDOWN_DEADLINE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Returns the single absolute deadline shared by all trackers in this process.
+fn shared_shutdown_deadline() -> Instant {
+    let mut guard = SHUTDOWN_DEADLINE.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    match *guard {
+        Some(deadline) if deadline > now => deadline,
+        _ => {
+            let deadline = now + GRACE_PERIOD;
+            *guard = Some(deadline);
+            deadline
+        }
+    }
+}
+
 /// Manages a set of async tasks to ensure full lifecycle supervision and safe shutdown.
-/// Tasks should always observe cooperative cancellation. Calling `abort()` directly on
-/// individual task handles during normal lifecycle is prohibited; `abort_all()` is reserved
-/// strictly as an emergency last-resort fallback when graceful cancellation exceeds the deadline.
+///
+/// Termination contract (the behaviour boundary, defined here once):
+/// every tracked task observes the tracker's cancellation token, and every
+/// await inside it is either cancellation-aware or bounded by a timeout.
+/// Shutdown is therefore simply `cancel` followed by awaiting the JoinSet to
+/// empty. `abort_all()` is only the deadline fallback, and even then every
+/// handle is still awaited. A task must never be detached: a task that cannot
+/// terminate has broken this contract and must be fixed at its source.
 pub struct TaskTracker<T: 'static> {
     join_set: JoinSet<T>,
     cancel_token: CancellationToken,
@@ -70,10 +109,8 @@ impl<T: 'static> TaskTracker<T> {
     /// Signals all tasks to stop via the cancellation token and awaits their orderly completion.
     /// If graceful shutdown exceeds the 5-second deadline, remaining tasks are aborted.
     pub async fn shutdown_and_wait(&mut self) {
-        self.shutdown_and_wait_until(
-            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
-        )
-        .await;
+        self.shutdown_and_wait_until(shared_shutdown_deadline())
+            .await;
     }
 
     /// Signals cancellation and awaits completion until a specified instant deadline.
@@ -97,11 +134,55 @@ impl<T: 'static> TaskTracker<T> {
                 _ = &mut sleep => {
                     tracing::warn!("Graceful shutdown deadline reached, aborting remaining tasks");
                     self.join_set.abort_all();
+                    // Abort is a forced termination, not permission to leak the
+                    // handles. Every aborted task is still awaited here.
                     while self.join_set.join_next().await.is_some() {}
                     break;
                 }
             }
         }
         info!("All tracked tasks completed cleanly.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn nested_trackers_share_one_absolute_deadline() {
+        reset_shutdown_deadline();
+        let first = shared_shutdown_deadline();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let second = shared_shutdown_deadline();
+        assert_eq!(
+            first, second,
+            "nested trackers must not restart the grace window"
+        );
+        reset_shutdown_deadline();
+    }
+
+    #[tokio::test]
+    async fn shutdown_awaits_aborted_tasks_after_deadline() {
+        let cancel = CancellationToken::new();
+        let mut tracker = TaskTracker::<()>::new(cancel);
+        tracker.spawn(async {
+            std::future::pending::<()>().await;
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+        let finished = tokio::time::timeout(
+            Duration::from_secs(1),
+            tracker.shutdown_and_wait_until(deadline),
+        )
+        .await;
+        assert!(
+            finished.is_ok(),
+            "shutdown chain must not block on a stuck task after the deadline"
+        );
+        assert!(
+            tracker.is_empty(),
+            "every aborted handle must be awaited, never detached"
+        );
     }
 }

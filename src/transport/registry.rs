@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 use crate::core::error::TunnelError;
 use crate::dialer::endpoint::EndpointContext;
@@ -73,6 +74,7 @@ impl TransportRegistry {
         auth_token: Option<&str>,
         path: Option<&str>,
         tls: Option<&crate::config::model::TlsConfig>,
+        cancel: CancellationToken,
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
         let driver = self
             .get_driver(scheme)
@@ -85,6 +87,6 @@ impl TransportRegistry {
             format!("{}://{}", scheme, listen_addr)
         };
 
-        driver.build_listener(&full_addr, auth_token, path, tls)
+        driver.build_listener_with_cancel(&full_addr, auth_token, path, tls, cancel)
     }
 }

@@ -90,10 +90,19 @@ pub fn configure_tcp_keepalive(ka: socket2::TcpKeepalive) -> socket2::TcpKeepali
     ka.with_interval(Duration::from_secs(5))
 }
 
+/// Returns the filesystem identity of a socket file, used to make `Drop`
+/// unlink only the file that this listener actually created.
+fn socket_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
 /// Unix Domain Socket listener.
 pub struct PlatformUdsListener {
     listener: UnixListener,
     path: PathBuf,
+    identity: Option<(u64, u64)>,
 }
 
 impl PlatformUdsListener {
@@ -102,14 +111,29 @@ impl PlatformUdsListener {
         if let Some(parent) = path.parent()
             && !parent.exists()
         {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)?;
         }
-        let _ = std::fs::remove_file(path);
+
+        // Never blindly unlink: a second listen spec pointing at the same path
+        // used to steal the socket file from a live listener. Only a stale
+        // socket (one that refuses connections) may be removed.
+        if path.exists() {
+            let in_use = std::os::unix::net::UnixStream::connect(path).is_ok();
+            if in_use {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!("Unix socket is already in use: {}", path.display()),
+                ));
+            }
+            std::fs::remove_file(path)?;
+        }
 
         let listener = UnixListener::bind(path)?;
+        let identity = socket_identity(path);
         Ok(Self {
             listener,
             path: path.to_path_buf(),
+            identity,
         })
     }
 
@@ -123,7 +147,14 @@ impl PlatformUdsListener {
 
 impl Drop for PlatformUdsListener {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Do not delete a socket file that was replaced by someone else after
+        // we bound it; that would unlink a still-live listener.
+        match self.identity {
+            Some(expected) if socket_identity(&self.path) != Some(expected) => {}
+            _ => {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
     }
 }
 

@@ -87,6 +87,7 @@ impl ServerRunner {
                     token_opt.as_deref(),
                     spec_clone.path.as_deref(),
                     server_tls.as_ref(),
+                    token.clone(),
                 )?;
 
                 if let Some(mode) = spec_clone.chmod
@@ -111,6 +112,7 @@ impl ServerRunner {
                 );
 
                 let mut conn_tracker = TaskTracker::<()>::new(token.clone());
+                let mut accept_err: Option<TunnelError> = None;
 
                 loop {
                     tokio::select! {
@@ -254,7 +256,11 @@ impl ServerRunner {
                                         "Server ingress listener accept failure: {:?}",
                                         e
                                     );
-                                    return Err(e);
+                                    // Do not return here: the listener owns
+                                    // background tasks that must be awaited by
+                                    // `shutdown()` on every exit path.
+                                    accept_err = Some(e);
+                                    break;
                                 }
                             }
                         }
@@ -262,7 +268,11 @@ impl ServerRunner {
                 }
 
                 conn_tracker.shutdown_and_wait().await;
-                Ok(())
+                listener.shutdown().await;
+                match accept_err {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                }
             });
         }
 

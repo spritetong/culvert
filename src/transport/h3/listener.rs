@@ -17,12 +17,45 @@ use crate::config::model::TunnelMode;
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, TunnelStream};
 use crate::transport::h3::stream::{H3TunnelStream, QuinnTunnelStream};
-use crate::transport::{StreamMetadata, TargetAddr, TransportListener};
+use crate::transport::{ACCEPTED_STREAM_QUEUE_SIZE, StreamMetadata, TargetAddr, TransportListener};
+
+/// Resolves a hostname listen address without pinning a Tokio worker.
+fn resolve_listen_socket_addr(
+    clean_addr: &str,
+    listen_addr: &str,
+) -> Result<SocketAddr, TunnelError> {
+    use std::net::ToSocketAddrs;
+
+    let resolve = || {
+        clean_addr
+            .to_socket_addrs()
+            .map_err(|e| {
+                TunnelError::Config(format!("Invalid listen address '{}': {}", listen_addr, e))
+            })?
+            .next()
+            .ok_or_else(|| {
+                TunnelError::Config(format!(
+                    "Listen address '{}' resolved to no socket addresses",
+                    listen_addr
+                ))
+            })
+    };
+
+    // `getaddrinfo` is a blocking libc call with no timeout. On a multi-thread
+    // runtime hand the worker off to the blocking pool first.
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(resolve)
+        }
+        _ => resolve(),
+    }
+}
 
 /// HTTP/3 and QUIC transport listener.
 pub struct H3Listener {
     rx_streams: mpsc::Receiver<(Box<dyn TunnelStream>, StreamMetadata)>,
     cancel_token: CancellationToken,
+    server_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl H3Listener {
@@ -33,6 +66,23 @@ impl H3Listener {
         path: Option<&str>,
         server_rustls_config: rustls::ServerConfig,
     ) -> Result<Self, TunnelError> {
+        Self::bind_with_cancel(
+            listen_addr,
+            auth_token,
+            path,
+            server_rustls_config,
+            CancellationToken::new(),
+        )
+    }
+
+    /// Binds an `H3Listener` wired to the root shutdown token.
+    pub fn bind_with_cancel(
+        listen_addr: &str,
+        auth_token: Option<&str>,
+        path: Option<&str>,
+        server_rustls_config: rustls::ServerConfig,
+        cancel: CancellationToken,
+    ) -> Result<Self, TunnelError> {
         let clean_addr = if let Some(idx) = listen_addr.find("://") {
             let without_scheme = &listen_addr[idx + 3..];
             without_scheme.split('/').next().unwrap_or(without_scheme)
@@ -40,21 +90,10 @@ impl H3Listener {
             listen_addr
         };
 
-        let addr: SocketAddr = clean_addr.parse().or_else(|_| {
-            use std::net::ToSocketAddrs;
-            clean_addr
-                .to_socket_addrs()
-                .map_err(|e| {
-                    TunnelError::Config(format!("Invalid listen address '{}': {}", listen_addr, e))
-                })?
-                .next()
-                .ok_or_else(|| {
-                    TunnelError::Config(format!(
-                        "Listen address '{}' resolved to no socket addresses",
-                        listen_addr
-                    ))
-                })
-        })?;
+        let addr: SocketAddr = match clean_addr.parse() {
+            Ok(a) => a,
+            Err(_) => resolve_listen_socket_addr(clean_addr, listen_addr)?,
+        };
 
         let is_quic_listener = listen_addr.starts_with("quic://");
         let mut rustls_server = server_rustls_config;
@@ -117,10 +156,10 @@ impl H3Listener {
 
         info!(addr = %addr, is_quic_listener, "Bound HTTP/3 & QUIC listener on UDP socket");
 
-        let (tx_streams, rx_streams) = mpsc::channel(128);
-        let cancel_token = CancellationToken::new();
+        let (tx_streams, rx_streams) = mpsc::channel(ACCEPTED_STREAM_QUEUE_SIZE);
+        let cancel_token = cancel.child_token();
 
-        Self::spawn_listener_loop(
+        let server_task = Self::spawn_listener_loop(
             quinn_endpoint,
             auth_token.map(|s| s.to_string()),
             path.map(|p| p.to_string()),
@@ -132,10 +171,12 @@ impl H3Listener {
         Ok(Self {
             rx_streams,
             cancel_token,
+            server_task: Some(server_task),
         })
     }
 
     /// Spawns the main listener event loop accepting QUIC connections.
+    /// Returns the owned handle; the listener awaits it in `shutdown()`.
     fn spawn_listener_loop(
         endpoint: quinn::Endpoint,
         auth_token: Option<String>,
@@ -143,7 +184,7 @@ impl H3Listener {
         is_quic_listener: bool,
         tx_streams: mpsc::Sender<(Box<dyn TunnelStream>, StreamMetadata)>,
         cancel_token: CancellationToken,
-    ) {
+    ) -> tokio::task::JoinHandle<()> {
         let auth_token = Arc::new(auth_token);
         let path = Arc::new(path);
 
@@ -213,9 +254,11 @@ impl H3Listener {
                     }
                 }
             }
-            conn_tasks.abort_all();
+            // Each connection task observes the cancellation token and bounds
+            // every await (handshake, request drain, connection close), so
+            // awaiting the JoinSet is a real termination boundary.
             while conn_tasks.join_next().await.is_some() {}
-        });
+        })
     }
 
     /// Handles an established QUIC connection, demuxing H3 or raw QUIC streams.
@@ -421,7 +464,8 @@ impl H3Listener {
             }
         }
 
-        // Allow in-flight request setup tasks to finish sending responses (bounded and cancellable)
+        // Allow in-flight request setup tasks to finish. Abort is only the
+        // deadline fallback; the handles are still awaited afterwards.
         let cancel_drain = cancel_token.clone();
         tokio::select! {
             _ = cancel_drain.cancelled() => {
@@ -434,6 +478,7 @@ impl H3Listener {
                 while request_tasks.join_next().await.is_some() {}
             } => {}
         }
+        while request_tasks.join_next().await.is_some() {}
 
         // Keep h3_conn alive until connection is closed by peer or cancelled,
         // preventing premature QUIC teardown while accepted streams are still relaying.
@@ -450,17 +495,24 @@ impl H3Listener {
         tx_streams: mpsc::Sender<(Box<dyn TunnelStream>, StreamMetadata)>,
         cancel_token: CancellationToken,
     ) {
+        // Handshake futures must run concurrently with `accept_bi`, but that
+        // is not a reason to detach them. They live in this owned JoinSet and
+        // are awaited before the connection handler returns.
+        let mut handshake_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => break,
+                Some(_) = handshake_tasks.join_next(), if !handshake_tasks.is_empty() => continue,
                 res = conn.accept_bi() => {
                     match res {
                         Ok((send, mut recv)) => {
                             let auth_clone = Arc::clone(&auth_token);
                             let tx_clone = tx_streams.clone();
                             let conn_clone = conn.clone();
+                            let cancel_stream = cancel_token.clone();
+                            let cancel_handshake = cancel_token.clone();
 
-                            tokio::spawn(async move {
+                            handshake_tasks.spawn(async move {
                                 let handshake_fut = async {
                                     // Read auth length
                                     let mut len_buf = [0u8; 4];
@@ -493,16 +545,27 @@ impl H3Listener {
                                     Ok((send, recv, metadata))
                                 };
 
-                                match tokio::time::timeout(std::time::Duration::from_secs(10), handshake_fut).await {
-                                    Ok(Ok((send, recv, metadata))) => {
-                                        let tunnel_stream = Box::new(QuinnTunnelStream::new(send, recv).with_connection(conn_clone)) as Box<dyn TunnelStream>;
-                                        let _ = tx_clone.send((tunnel_stream, metadata)).await;
-                                    }
-                                    Ok(Err(())) => {
-                                        debug!("Raw QUIC handshake aborted due to protocol error");
-                                    }
-                                    Err(_) => {
-                                        warn!("Raw QUIC inbound handshake timed out (10s)");
+                                tokio::select! {
+                                    _ = cancel_handshake.cancelled() => {}
+                                    res = tokio::time::timeout(std::time::Duration::from_secs(10), handshake_fut) => {
+                                        match res {
+                                            Ok(Ok((send, recv, metadata))) => {
+                                                let tunnel_stream = Box::new(QuinnTunnelStream::new(send, recv).with_connection(conn_clone)) as Box<dyn TunnelStream>;
+                                                // The accepted-stream queue can be full during
+                                                // shutdown; the owned handshake task must
+                                                // never sit on an uncancellable send.
+                                                tokio::select! {
+                                                    _ = cancel_stream.cancelled() => {}
+                                                    _ = tx_clone.send((tunnel_stream, metadata)) => {}
+                                                }
+                                            }
+                                            Ok(Err(())) => {
+                                                debug!("Raw QUIC handshake aborted due to protocol error");
+                                            }
+                                            Err(_) => {
+                                                warn!("Raw QUIC inbound handshake timed out (10s)");
+                                            }
+                                        }
                                     }
                                 }
                             });
@@ -512,6 +575,9 @@ impl H3Listener {
                 }
             }
         }
+        // Each handshake is bounded by a 10s timeout and observes
+        // cancellation, so this await is a bounded termination boundary.
+        while handshake_tasks.join_next().await.is_some() {}
     }
 }
 
@@ -520,9 +586,23 @@ impl TransportListener for H3Listener {
         &'a mut self,
     ) -> BoxFuture<'a, Result<(Box<dyn TunnelStream>, StreamMetadata), TunnelError>> {
         Box::pin(async move {
-            match self.rx_streams.recv().await {
-                Some((stream, meta)) => Ok((stream, meta)),
-                None => Err(TunnelError::SessionClosed),
+            tokio::select! {
+                _ = self.cancel_token.cancelled() => Err(TunnelError::Shutdown),
+                item = self.rx_streams.recv() => match item {
+                    Some((stream, meta)) => Ok((stream, meta)),
+                    None => Err(TunnelError::SessionClosed),
+                },
+            }
+        })
+    }
+
+    fn shutdown<'a>(&'a mut self) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            // Cancel the accept loop and all of its owned connection tasks,
+            // then await the listener handle itself.
+            self.cancel_token.cancel();
+            if let Some(task) = self.server_task.take() {
+                let _ = task.await;
             }
         })
     }
@@ -530,6 +610,14 @@ impl TransportListener for H3Listener {
 
 impl Drop for H3Listener {
     fn drop(&mut self) {
+        // `shutdown()` is the awaited termination boundary. Drop is only an
+        // abnormal-path safety net: signal cancellation, never abort a live
+        // handle and never hide an unawaited task behind detach.
         self.cancel_token.cancel();
+        if self.server_task.is_some() {
+            tracing::warn!(
+                "H3Listener dropped without shutdown(); accept loop cancelled but not awaited"
+            );
+        }
     }
 }

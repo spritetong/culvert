@@ -16,6 +16,7 @@ use crate::config::model::TunnelMode;
 use crate::core::error::TunnelError;
 use crate::dialer::endpoint::EndpointContext;
 use crate::transport::{TransportConnector, TransportDriver, TransportListener};
+use tokio_util::sync::CancellationToken;
 
 /// HTTP/3 transport driver handling `h3`, `https`, and `quic` schemes.
 pub struct H3TransportDriver;
@@ -41,6 +42,23 @@ impl TransportDriver for H3TransportDriver {
         auth_token: Option<&str>,
         path: Option<&str>,
         tls: Option<&crate::config::model::TlsConfig>,
+    ) -> Result<Box<dyn TransportListener>, TunnelError> {
+        self.build_listener_with_cancel(
+            listen_addr,
+            auth_token,
+            path,
+            tls,
+            CancellationToken::new(),
+        )
+    }
+
+    fn build_listener_with_cancel(
+        &self,
+        listen_addr: &str,
+        auth_token: Option<&str>,
+        path: Option<&str>,
+        tls: Option<&crate::config::model::TlsConfig>,
+        cancel: CancellationToken,
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
         let mut alpn = tls
             .and_then(|t| t.alpn.as_ref())
@@ -73,7 +91,8 @@ impl TransportDriver for H3TransportDriver {
             max_v,
         )?;
 
-        let listener = H3Listener::bind(listen_addr, auth_token, path, server_rustls)?;
+        let listener =
+            H3Listener::bind_with_cancel(listen_addr, auth_token, path, server_rustls, cancel)?;
         Ok(Box::new(listener))
     }
 }

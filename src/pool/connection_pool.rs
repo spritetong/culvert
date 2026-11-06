@@ -568,7 +568,13 @@ impl ReplenishingStreamPool {
 
     /// Decrements the active connection count when a stream finishes relaying.
     pub fn on_stream_closed(&self) {
-        self.active_count.fetch_sub(1, Ordering::Relaxed);
+        // Duplicate/over-eager close notifications must not wrap the counter to
+        // usize::MAX and corrupt `stats()`.
+        let _ = self
+            .active_count
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
         let _ = self.tx_cmd.try_send(PoolCommand::StreamClosed);
     }
 
@@ -734,6 +740,20 @@ mod tests {
             0,
             "Handed-off stream must bypass idle_streams"
         );
+
+        cancel_token.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_on_stream_closed_never_underflows_active_count() {
+        let connector = Arc::new(MockSuccessfulConnector);
+        let cancel_token = CancellationToken::new();
+        let pool = ReplenishingStreamPool::new_shared(connector, 0, cancel_token.clone());
+
+        // Duplicate close notifications used to wrap the counter to usize::MAX.
+        pool.on_stream_closed();
+        pool.on_stream_closed();
+        assert_eq!(pool.stats().active_count, 0);
 
         cancel_token.cancel();
     }

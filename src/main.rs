@@ -120,19 +120,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_daemon(
     app_config: micro_tunnel::config::model::AppConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    micro_tunnel::common::task::reset_shutdown_deadline();
     let cancel_token = CancellationToken::new();
 
     // Listen for graceful shutdown signals (SIGINT / SIGTERM / Ctrl+C)
     spawn_shutdown_handler(cancel_token.clone());
 
+    let watchdog = spawn_shutdown_handler(cancel_token.clone());
+
     let supervisor = TunnelSupervisor::new(app_config, cancel_token);
 
     if let Err(e) = supervisor.run().await {
         error!("Tunnel supervisor terminated with error: {:?}", e);
+        watchdog.finish().await;
         std::process::exit(1);
     }
 
     info!("Micro-tunnel daemon exited cleanly.");
+    // Disarm the hard deadline and await the watchdog thread. Without this,
+    // the watchdog would force-exit 10s after the first signal even on a
+    // perfectly clean shutdown.
+    watchdog.finish().await;
     Ok(())
 }
 
@@ -142,19 +150,124 @@ async fn run_daemon(
 /// The signal stream must be re-armed: Tokio leaves the OS signal handler
 /// installed after the first stream is dropped, so subsequent Ctrl+C would be
 /// swallowed and the process could look stuck if any shutdown layer stalls.
-fn spawn_shutdown_handler(cancel_token: CancellationToken) {
-    tokio::spawn(async move {
-        micro_tunnel::platform::wait_for_shutdown_signal().await;
-        cancel_token.cancel();
+/// Explicit lifecycle events for the OS-thread watchdog. `Done` disarms it.
+enum WatchdogEvent {
+    /// The first termination signal arrived; start the hard deadline.
+    Start,
+    /// Graceful shutdown completed; the watchdog must exit normally.
+    Done,
+}
 
-        tokio::select! {
-            _ = micro_tunnel::platform::wait_for_shutdown_signal() => {
-                tracing::warn!("Second termination signal received; forcing immediate exit");
-            }
-            _ = tokio::time::sleep(SHUTDOWN_HARD_DEADLINE) => {
-                tracing::warn!("Graceful shutdown exceeded hard deadline; forcing exit");
-            }
+/// Owns the watchdog thread and its disarm channel. `finish()` must be called
+/// on every daemon exit path so the thread is joined, never detached.
+struct ShutdownWatchdog {
+    tx: std::sync::mpsc::Sender<WatchdogEvent>,
+    signal_cancel: CancellationToken,
+    signal_task: Option<tokio::task::JoinHandle<()>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ShutdownWatchdog {
+    /// Disarms the deadline and awaits both owned tasks. Called on every daemon
+    /// exit path, so no signal task or watchdog thread is ever left detached.
+    async fn finish(mut self) {
+        let _ = self.tx.send(WatchdogEvent::Done);
+        self.signal_cancel.cancel();
+        if let Some(task) = self.signal_task.take() {
+            let _ = task.await;
         }
+        // The watchdog has already received `Done`, so this join returns at
+        // once instead of blocking a Tokio worker.
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn spawn_shutdown_handler(cancel_token: CancellationToken) -> ShutdownWatchdog {
+    use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+
+    // The hard deadline must not live on the Tokio runtime: if every worker is
+    // pinned by busy relay tasks, a timer task never gets polled and the
+    // deadline silently never fires. Run it on a dedicated OS thread instead.
+    let (tx, rx) = std::sync::mpsc::channel::<WatchdogEvent>();
+    let handle = std::thread::Builder::new()
+        .name("shutdown-watchdog".to_string())
+        .spawn(move || {
+            // Phase 1: wait for the first signal. A daemon that exits without
+            // ever receiving one sends `Done` directly and must not be held up.
+            match rx.recv() {
+                Ok(WatchdogEvent::Start) => {}
+                Ok(WatchdogEvent::Done) | Err(_) => return,
+            }
+
+            // Phase 2: the hard deadline is only meaningful until graceful
+            // shutdown reports completion.
+            match rx.recv_timeout(SHUTDOWN_HARD_DEADLINE) {
+                Ok(_) | Err(RecvTimeoutError::Disconnected) => (),
+                Err(RecvTimeoutError::Timeout) => {
+                    // `Done` may have landed exactly at the deadline.
+                    if matches!(
+                        rx.try_recv(),
+                        Ok(WatchdogEvent::Done) | Err(TryRecvError::Disconnected)
+                    ) {
+                        return;
+                    }
+                    eprintln!("Graceful shutdown exceeded hard deadline; forcing exit");
+                    std::process::exit(130);
+                }
+            }
+        })
+        .expect("failed to spawn shutdown watchdog thread");
+
+    let signal_tx = tx.clone();
+    let signal_cancel = CancellationToken::new();
+    let signal_stop = signal_cancel.clone();
+    let signal_task = tokio::spawn(async move {
+        tokio::select! {
+            _ = signal_stop.cancelled() => return,
+            _ = micro_tunnel::platform::wait_for_shutdown_signal() => {}
+        }
+        cancel_token.cancel();
+        let _ = signal_tx.send(WatchdogEvent::Start);
+
+        // Re-arm signal waiting: Tokio keeps the OS handler installed after
+        // the first stream is dropped, so later signals would be swallowed.
+        tokio::select! {
+            _ = signal_stop.cancelled() => return,
+            _ = micro_tunnel::platform::wait_for_shutdown_signal() => {}
+        }
+        eprintln!("Second termination signal received; forcing immediate exit");
         std::process::exit(130);
     });
+
+    ShutdownWatchdog {
+        tx,
+        signal_cancel,
+        signal_task: Some(signal_task),
+        handle: Some(handle),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A clean exit without any signal must disarm the hard deadline and join
+    /// the watchdog thread, not leave it detached until it force-exits.
+    #[tokio::test]
+    async fn watchdog_is_disarmed_and_joined_on_clean_exit() {
+        let cancel = CancellationToken::new();
+        let watchdog = spawn_shutdown_handler(cancel.clone());
+
+        let finished = tokio::time::timeout(Duration::from_secs(2), watchdog.finish()).await;
+        assert!(
+            finished.is_ok(),
+            "clean exit must join the watchdog instead of waiting for the deadline"
+        );
+        assert!(
+            !cancel.is_cancelled(),
+            "no termination signal was received, so cancellation must not fire"
+        );
+    }
 }
