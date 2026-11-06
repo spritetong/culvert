@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::sync::CancellationToken;
 
+use crate::common::{CancelFutureExt, TimeoutOrCancel};
 use crate::config::model::TunnelMode;
 use crate::consts::{DEFAULT_HANDSHAKE_TIMEOUT, SCHEME_WS_UNIX, SCHEME_WSS_UNIX};
 use crate::core::error::TunnelError;
@@ -236,42 +237,49 @@ impl UdsListener {
 
                     let mut serve = Box::pin(async move {
                         let io_stream: Box<dyn TunnelStream> = if let Some(tls) = acceptor {
-                                match tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, tls.accept(stream)).await {
-                                    Ok(Ok(tls_stream)) => Box::new(BufferedTlsStream::new(tls_stream)),
-                                    Ok(Err(e)) => {
-                                        tracing::debug!("UDS WSS server TLS handshake failed: {:?}", e);
-                                        return;
-                                    }
-                                    Err(_) => {
-                                        tracing::debug!("UDS WSS server TLS handshake timed out");
-                                        return;
-                                    }
+                            match tokio::time::timeout(
+                                DEFAULT_HANDSHAKE_TIMEOUT,
+                                tls.accept(stream),
+                            )
+                            .await
+                            {
+                                Ok(Ok(tls_stream)) => Box::new(BufferedTlsStream::new(tls_stream)),
+                                Ok(Err(e)) => {
+                                    tracing::debug!("UDS WSS server TLS handshake failed: {:?}", e);
+                                    return;
                                 }
-                            } else {
-                                stream
-                            };
+                                Err(_) => {
+                                    tracing::debug!("UDS WSS server TLS handshake timed out");
+                                    return;
+                                }
+                            }
+                        } else {
+                            stream
+                        };
 
-                            let io = TokioIo::new(io_stream);
-                            let service_cancel = cancel_serve.clone();
-                            let service = service_fn(move |mut req: Request<Incoming>| {
-                                let tx = tx.clone();
-                                let token = Arc::clone(&token);
-                                let path = Arc::clone(&path);
-                                let cancel_upgrade = service_cancel.clone();
-                                let upgrade_tx = upgrade_tx.clone();
+                        let io = TokioIo::new(io_stream);
+                        let service_cancel = cancel_serve.clone();
+                        let service = service_fn(move |mut req: Request<Incoming>| {
+                            let tx = tx.clone();
+                            let token = Arc::clone(&token);
+                            let path = Arc::clone(&path);
+                            let cancel_upgrade = service_cancel.clone();
+                            let upgrade_tx = upgrade_tx.clone();
 
-                                async move {
-                                    if let Some(ref p) = *path
-                                        && req.uri().path() != p.as_str() {
-                                            return Ok::<_, hyper::Error>(
-                                                Response::builder()
-                                                    .status(StatusCode::NOT_FOUND)
-                                                    .body(Empty::<Bytes>::new())
-                                                    .unwrap(),
-                                            );
-                                    }
+                            async move {
+                                if let Some(ref p) = *path
+                                    && req.uri().path() != p.as_str()
+                                {
+                                    return Ok::<_, hyper::Error>(
+                                        Response::builder()
+                                            .status(StatusCode::NOT_FOUND)
+                                            .body(Empty::<Bytes>::new())
+                                            .unwrap(),
+                                    );
+                                }
 
-                                    let headers = match WsHandshakeHeaders::from_http_headers(req.headers()) {
+                                let headers =
+                                    match WsHandshakeHeaders::from_http_headers(req.headers()) {
                                         Ok(h) => h,
                                         Err(_) => {
                                             return Ok(Response::builder()
@@ -281,67 +289,80 @@ impl UdsListener {
                                         }
                                     };
 
-                                    if let Some(ref expected) = *token
-                                        && !expected.is_empty() {
-                                            let matches = headers
-                                                .auth_token
-                                                .as_deref()
-                                                .map(|t| crate::common::constant_time_token_eq(t.as_bytes(), expected.as_bytes()))
-                                                .unwrap_or(false);
-                                            if !matches {
-                                                return Ok(Response::builder()
-                                                    .status(StatusCode::FORBIDDEN)
-                                                    .body(Empty::<Bytes>::new())
-                                                    .unwrap());
-                                            }
+                                if let Some(ref expected) = *token
+                                    && !expected.is_empty()
+                                {
+                                    let matches = headers
+                                        .auth_token
+                                        .as_deref()
+                                        .map(|t| {
+                                            crate::common::constant_time_token_eq(
+                                                t.as_bytes(),
+                                                expected.as_bytes(),
+                                            )
+                                        })
+                                        .unwrap_or(false);
+                                    if !matches {
+                                        return Ok(Response::builder()
+                                            .status(StatusCode::FORBIDDEN)
+                                            .body(Empty::<Bytes>::new())
+                                            .unwrap());
                                     }
-
-                                    let metadata = headers.to_stream_metadata();
-
-                                    let (response, fut) = match upgrade(&mut req) {
-                                        Ok(res) => res,
-                                        Err(_) => {
-                                            return Ok(Response::builder()
-                                                .status(StatusCode::BAD_REQUEST)
-                                                .body(Empty::<Bytes>::new())
-                                                .unwrap());
-                                        }
-                                    };
-
-                                    let work: UpgradeWork = Box::pin(async move {
-                                        tokio::select! {
-                                            _ = cancel_upgrade.cancelled() => {}
-                                            res = tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, fut) => {
-                                                let item: AcceptedResult = match res {
-                                                    Ok(Ok(ws)) => {
-                                                        let ws_stream = WsTunnelStream::new(ws.into_inner(), Role::Server);
-                                                        Ok((Box::new(ws_stream) as Box<dyn TunnelStream>, metadata))
-                                                    }
-                                                    Ok(Err(e)) => Err(TunnelError::Internal(e.to_string())),
-                                                    Err(_) => Err(TunnelError::Internal("UDS WebSocket upgrade timed out".to_string())),
-                                                };
-                                                // A full accepted-stream queue must never pin an
-                                                // owned upgrade task during shutdown.
-                                                tokio::select! {
-                                                    _ = cancel_upgrade.cancelled() => {}
-                                                    _ = tx.send(item) => {}
-                                                }
-                                            }
-                                        }
-                                    });
-                                    let _ = upgrade_tx.send(work);
-
-                                    Ok(response)
                                 }
-                            });
 
-                            let _ = tokio::time::timeout(
-                                DEFAULT_HANDSHAKE_TIMEOUT,
-                                hyper::server::conn::http1::Builder::new()
-                                    .serve_connection(io, service)
-                                    .with_upgrades(),
-                            )
-                            .await;
+                                let metadata = headers.to_stream_metadata();
+
+                                let (response, fut) = match upgrade(&mut req) {
+                                    Ok(res) => res,
+                                    Err(_) => {
+                                        return Ok(Response::builder()
+                                            .status(StatusCode::BAD_REQUEST)
+                                            .body(Empty::<Bytes>::new())
+                                            .unwrap());
+                                    }
+                                };
+
+                                let work: UpgradeWork = Box::pin(async move {
+                                    let res = fut
+                                        .timeout_or_cancel(
+                                            DEFAULT_HANDSHAKE_TIMEOUT,
+                                            &cancel_upgrade,
+                                        )
+                                        .await;
+                                    let item: AcceptedResult = match res {
+                                        TimeoutOrCancel::Ok(Ok(ws)) => {
+                                            let ws_stream =
+                                                WsTunnelStream::new(ws.into_inner(), Role::Server);
+                                            Ok((
+                                                Box::new(ws_stream) as Box<dyn TunnelStream>,
+                                                metadata,
+                                            ))
+                                        }
+                                        TimeoutOrCancel::Ok(Err(e)) => {
+                                            Err(TunnelError::Internal(e.to_string()))
+                                        }
+                                        TimeoutOrCancel::TimedOut => Err(TunnelError::Internal(
+                                            "UDS WebSocket upgrade timed out".to_string(),
+                                        )),
+                                        TimeoutOrCancel::Cancelled => return,
+                                    };
+                                    // A full accepted-stream queue must never pin an
+                                    // owned upgrade task during shutdown.
+                                    let _ = tx.send(item).cancel_with(&cancel_upgrade).await;
+                                });
+                                let _ = upgrade_tx.send(work);
+
+                                Ok(response)
+                            }
+                        });
+
+                        let _ = tokio::time::timeout(
+                            DEFAULT_HANDSHAKE_TIMEOUT,
+                            hyper::server::conn::http1::Builder::new()
+                                .serve_connection(io, service)
+                                .with_upgrades(),
+                        )
+                        .await;
                     });
 
                     loop {

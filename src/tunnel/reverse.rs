@@ -10,7 +10,7 @@ use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::common::task::TaskTracker;
+use crate::common::{CancelFutureExt, CancellationTokenExt, TaskTracker};
 use crate::config::model::{TunnelConfig, TunnelMode};
 use crate::consts::{
     DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_REVERSE_BACKOFF_INITIAL, DEFAULT_REVERSE_BACKOFF_MAX,
@@ -42,9 +42,6 @@ pub async fn run_reverse_mapping(
     let dummy_target = TargetAddr::Domain(REVERSE_CONTROL_TARGET_HOST.to_string(), 0);
     let mut conn_tracker = TaskTracker::<()>::new(cancel_token.clone());
 
-    let cancel_fut = cancel_token.cancelled();
-    tokio::pin!(cancel_fut);
-
     // Share data connector across all incoming visitor sessions to maximize connection/0-RTT reuse
     let data_connector: Arc<dyn TransportConnector> =
         Arc::from(transport_registry.create_connector(
@@ -63,22 +60,23 @@ pub async fn run_reverse_mapping(
         )?;
 
         info!(tag = %tag, "Connecting reverse control channel to remote server...");
-        let raw_stream = match tokio::select! {
-            biased;
-            _ = &mut cancel_fut => break,
-            res = connector.connect(&dummy_target, None) => res,
-        } {
+        let Some(conn_res) = connector
+            .connect(&dummy_target, None)
+            .cancel_with(&cancel_token)
+            .await
+        else {
+            break;
+        };
+
+        let raw_stream = match conn_res {
             Ok(s) => s,
             Err(e) => {
                 warn!(tag = %tag, "Failed to connect control channel: {:?}. Retrying in {:?}...", e, backoff);
-                tokio::select! {
-                    biased;
-                    _ = &mut cancel_fut => break,
-                    _ = tokio::time::sleep(backoff) => {
-                        backoff = (backoff * 2).min(DEFAULT_REVERSE_BACKOFF_MAX);
-                        continue;
-                    }
+                if !cancel_token.sleep_or_cancel(backoff).await {
+                    break;
                 }
+                backoff = (backoff * 2).min(DEFAULT_REVERSE_BACKOFF_MAX);
+                continue;
             }
         };
 
@@ -90,28 +88,21 @@ pub async fn run_reverse_mapping(
             target_addr: target_addr.clone(),
         };
 
-        let send_res = tokio::select! {
-            biased;
-            _ = &mut cancel_fut => break,
-            res = ctrl_stream.send(reg_msg) => res,
+        let Some(send_res) = ctrl_stream.send(reg_msg).cancel_with(&cancel_token).await else {
+            break;
         };
         if let Err(e) = send_res {
             warn!(tag = %tag, "Failed to send RegisterReverse: {:?}. Retrying in {:?}...", e, backoff);
-            tokio::select! {
-                biased;
-                _ = &mut cancel_fut => break,
-                _ = tokio::time::sleep(backoff) => {
-                    backoff = (backoff * 2).min(DEFAULT_REVERSE_BACKOFF_MAX);
-                    continue;
-                }
+            if !cancel_token.sleep_or_cancel(backoff).await {
+                break;
             }
+            backoff = (backoff * 2).min(DEFAULT_REVERSE_BACKOFF_MAX);
+            continue;
         }
 
         // Await RegisterAck from remote server
-        let ack_res = tokio::select! {
-            biased;
-            _ = &mut cancel_fut => break,
-            res = ctrl_stream.next() => res,
+        let Some(ack_res) = ctrl_stream.next().cancel_with(&cancel_token).await else {
+            break;
         };
         match ack_res {
             Some(Ok(ControlMessage::RegisterAck {
@@ -126,27 +117,21 @@ pub async fn run_reverse_mapping(
                         err = ?error_msg,
                         "Server rejected reverse listener registration. Retrying in {:?}...", backoff
                     );
-                    tokio::select! {
-                        biased;
-                        _ = &mut cancel_fut => break,
-                        _ = tokio::time::sleep(backoff) => {
-                            backoff = (backoff * 2).min(DEFAULT_REVERSE_BACKOFF_MAX);
-                            continue;
-                        }
+                    if !cancel_token.sleep_or_cancel(backoff).await {
+                        break;
                     }
+                    backoff = (backoff * 2).min(DEFAULT_REVERSE_BACKOFF_MAX);
+                    continue;
                 }
                 info!(tag = %tag, addr = %ack_addr, "Remote server bound reverse port successfully");
             }
             other => {
                 warn!(tag = %tag, "Unexpected response to RegisterReverse: {:?}. Retrying in {:?}...", other, backoff);
-                tokio::select! {
-                    biased;
-                    _ = &mut cancel_fut => break,
-                    _ = tokio::time::sleep(backoff) => {
-                        backoff = (backoff * 2).min(DEFAULT_REVERSE_BACKOFF_MAX);
-                        continue;
-                    }
+                if !cancel_token.sleep_or_cancel(backoff).await {
+                    break;
                 }
+                backoff = (backoff * 2).min(DEFAULT_REVERSE_BACKOFF_MAX);
+                continue;
             }
         }
 
@@ -157,16 +142,14 @@ pub async fn run_reverse_mapping(
         loop {
             tokio::select! {
                 biased;
-                _ = &mut cancel_fut => {
+                _ = cancel_token.cancelled() => {
                     info!(tag = %tag, "Reverse tunnel received cancellation signal");
                     break;
                 }
                 Some(_) = conn_tracker.join_next(), if !conn_tracker.is_empty() => {}
                 _ = heartbeat.tick() => {
-                    let send_ping = tokio::select! {
-                        biased;
-                        _ = &mut cancel_fut => break,
-                        res = ctrl_stream.send(ControlMessage::Ping) => res,
+                    let Some(send_ping) = ctrl_stream.send(ControlMessage::Ping).cancel_with(&cancel_token).await else {
+                        break;
                     };
                     if let Err(e) = send_ping {
                         warn!(tag = %tag, "Failed to send heartbeat ping: {:?}", e);
@@ -191,11 +174,13 @@ pub async fn run_reverse_mapping(
 
                                 conn_tracker.spawn_with_cancel(move |token| async move {
                                     // 1. Dial local target service
-                                    let dial_local_fut = crate::platform::connect_target_str(&target_clone);
-                                    let local_stream = match tokio::select! {
-                                        _ = token.cancelled() => return,
-                                        res = dial_local_fut => res,
-                                    } {
+                                    let Some(local_res) = crate::platform::connect_target_str(&target_clone)
+                                        .cancel_with(&token)
+                                        .await
+                                    else {
+                                        return;
+                                    };
+                                    let local_stream = match local_res {
                                         Ok(s) => s,
                                         Err(e) => {
                                             error!("Failed to connect to local target {}: {:?}", target_clone, e);
@@ -204,11 +189,14 @@ pub async fn run_reverse_mapping(
                                     };
 
                                     // 2. Open reverse data stream to server matching session_id
-                                    let dial_remote_fut = connector.connect(&dummy_target, Some(&session_id_clone));
-                                    let data_stream = match tokio::select! {
-                                        _ = token.cancelled() => return,
-                                        res = dial_remote_fut => res,
-                                    } {
+                                    let Some(remote_res) = connector
+                                        .connect(&dummy_target, Some(&session_id_clone))
+                                        .cancel_with(&token)
+                                        .await
+                                    else {
+                                        return;
+                                    };
+                                    let data_stream = match remote_res {
                                         Ok(s) => s,
                                         Err(e) => {
                                             error!("Failed to connect reverse data stream for session {}: {:?}", session_id_clone, e);
@@ -228,11 +216,10 @@ pub async fn run_reverse_mapping(
                                 tracing::trace!(tag = %tag, "Heartbeat pong received");
                             }
                             ControlMessage::Ping => {
-                                let _ = tokio::select! {
-                                    biased;
-                                    _ = &mut cancel_fut => break,
-                                    res = ctrl_stream.send(ControlMessage::Pong) => res,
+                                let Some(res) = ctrl_stream.send(ControlMessage::Pong).cancel_with(&cancel_token).await else {
+                                    break;
                                 };
+                                let _ = res;
                             }
                             _ => {}
                         },
@@ -255,10 +242,8 @@ pub async fn run_reverse_mapping(
             backoff = (backoff * 2).min(DEFAULT_REVERSE_BACKOFF_MAX);
         }
 
-        tokio::select! {
-            biased;
-            _ = &mut cancel_fut => break,
-            _ = tokio::time::sleep(backoff) => {}
+        if !cancel_token.sleep_or_cancel(backoff).await {
+            break;
         }
     }
 

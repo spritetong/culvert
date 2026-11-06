@@ -16,6 +16,7 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
+use crate::common::CancelFutureExt;
 use crate::consts::{
     MUX_GC_INTERVAL, MUX_NEW_STREAM_QUEUE_SIZE, MUX_SESSION_FRAME_QUEUE_SIZE,
     MUX_STREAM_BUFFER_SIZE,
@@ -111,15 +112,13 @@ impl MuxSession {
                         // A peer that stops reading can pin `SinkExt::send` on a
                         // full flow-control window indefinitely. Cancellation must
                         // also cover the send itself, not only the queue recv.
-                        let mut send = std::pin::pin!(framed_writer.send(frame));
-                        tokio::select! {
-                            _ = cancel_writer.cancelled() => break,
-                            res = &mut send => {
-                                if let Err(e) = res {
-                                    debug!("Multiplexer writer send error: {:?}", e);
-                                    break;
-                                }
-                            }
+                        let send = std::pin::pin!(framed_writer.send(frame));
+                        let Some(res) = send.cancel_with(&cancel_writer).await else {
+                            break;
+                        };
+                        if let Err(e) = res {
+                            debug!("Multiplexer writer send error: {:?}", e);
+                            break;
                         }
                     }
                 }
@@ -326,13 +325,17 @@ impl MuxSession {
         // Send SYN to remote peer. A full outbound queue must not trap this
         // caller after the session has been cancelled.
         let syn = MuxFrame::syn(stream_id);
-        let sent = tokio::select! {
-            _ = self.cancel_token.cancelled() => Err(TunnelError::Multiplex(
+        let sent = match self
+            .tx_frames
+            .send(syn)
+            .cancel_with(&self.cancel_token)
+            .await
+        {
+            Some(res) => res
+                .map_err(|e| TunnelError::Multiplex(format!("Failed to send SYN frame: {:?}", e))),
+            None => Err(TunnelError::Multiplex(
                 "Multiplexer session is closed".to_string(),
             )),
-            res = self.tx_frames.send(syn) => res.map_err(|e| {
-                TunnelError::Multiplex(format!("Failed to send SYN frame: {:?}", e))
-            }),
         };
         if let Err(e) = sent {
             self.active_streams.remove(&stream_id);
@@ -353,9 +356,14 @@ impl MuxSession {
         // Clone is cheap: the payload is a refcounted `Bytes`. Keep it so the
         // cancellation branch can still hand the frame back in `SendError`.
         let on_cancel = frame.clone();
-        tokio::select! {
-            _ = self.cancel_token.cancelled() => Err(mpsc::error::SendError(on_cancel)),
-            res = self.tx_frames.send(frame) => res,
+        match self
+            .tx_frames
+            .send(frame)
+            .cancel_with(&self.cancel_token)
+            .await
+        {
+            Some(res) => res,
+            None => Err(mpsc::error::SendError(on_cancel)),
         }
     }
 

@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::common::{CancelFutureExt, TimeoutOrCancel};
 use crate::config::model::TunnelMode;
 use crate::consts::{
     ALPN_H3, ALPN_QUIC, AUTH_BEARER_PREFIX, DEFAULT_H3_REQUEST_DRAIN_TIMEOUT,
@@ -452,12 +453,10 @@ impl H3Listener {
                                         .with_connection(conn_clone),
                                 ) as Box<dyn TunnelStream>;
 
-                                tokio::select! {
-                                    _ = cancel_task.cancelled() => {}
-                                    res = tx_clone.send((tunnel_stream, metadata)) => {
-                                        let _ = res;
-                                    }
-                                }
+                                let _ = tx_clone
+                                    .send((tunnel_stream, metadata))
+                                    .cancel_with(&cancel_task)
+                                    .await;
                             });
                         }
                         Ok(None) => break,
@@ -472,26 +471,18 @@ impl H3Listener {
 
         // Allow in-flight request setup tasks to finish. Abort is only the
         // deadline fallback; the handles are still awaited afterwards.
-        let cancel_drain = cancel_token.clone();
-        tokio::select! {
-            _ = cancel_drain.cancelled() => {
-                request_tasks.abort_all();
-            }
-            _ = tokio::time::sleep(DEFAULT_H3_REQUEST_DRAIN_TIMEOUT) => {
-                request_tasks.abort_all();
-            }
-            _ = async {
-                while request_tasks.join_next().await.is_some() {}
-            } => {}
+        let drain_fut = async { while request_tasks.join_next().await.is_some() {} };
+        let drain_res = drain_fut
+            .timeout_or_cancel(DEFAULT_H3_REQUEST_DRAIN_TIMEOUT, &cancel_token)
+            .await;
+        if !drain_res.is_ok() {
+            request_tasks.abort_all();
         }
         while request_tasks.join_next().await.is_some() {}
 
         // Keep h3_conn alive until connection is closed by peer or cancelled,
         // preventing premature QUIC teardown while accepted streams are still relaying.
-        tokio::select! {
-            _ = cancel_token.cancelled() => {}
-            _ = conn.closed() => {}
-        }
+        let _ = conn.closed().cancel_with(&cancel_token).await;
     }
 
     /// Processes raw QUIC bidirectional streams on the connection.
@@ -551,28 +542,27 @@ impl H3Listener {
                                     Ok((send, recv, metadata))
                                 };
 
-                                tokio::select! {
-                                    _ = cancel_handshake.cancelled() => {}
-                                    res = tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, handshake_fut) => {
-                                        match res {
-                                            Ok(Ok((send, recv, metadata))) => {
-                                                let tunnel_stream = Box::new(QuinnTunnelStream::new(send, recv).with_connection(conn_clone)) as Box<dyn TunnelStream>;
-                                                // The accepted-stream queue can be full during
-                                                // shutdown; the owned handshake task must
-                                                // never sit on an uncancellable send.
-                                                tokio::select! {
-                                                    _ = cancel_stream.cancelled() => {}
-                                                    _ = tx_clone.send((tunnel_stream, metadata)) => {}
-                                                }
-                                            }
-                                            Ok(Err(())) => {
-                                                debug!("Raw QUIC handshake aborted due to protocol error");
-                                            }
-                                            Err(_) => {
-                                                warn!("Raw QUIC inbound handshake timed out (10s)");
-                                            }
-                                        }
+                                let res = handshake_fut
+                                    .timeout_or_cancel(DEFAULT_HANDSHAKE_TIMEOUT, &cancel_handshake)
+                                    .await;
+                                match res {
+                                    TimeoutOrCancel::Ok(Ok((send, recv, metadata))) => {
+                                        let tunnel_stream = Box::new(QuinnTunnelStream::new(send, recv).with_connection(conn_clone)) as Box<dyn TunnelStream>;
+                                        // The accepted-stream queue can be full during
+                                        // shutdown; the owned handshake task must
+                                        // never sit on an uncancellable send.
+                                        let _ = tx_clone
+                                            .send((tunnel_stream, metadata))
+                                            .cancel_with(&cancel_stream)
+                                            .await;
                                     }
+                                    TimeoutOrCancel::Ok(Err(())) => {
+                                        debug!("Raw QUIC handshake aborted due to protocol error");
+                                    }
+                                    TimeoutOrCancel::TimedOut => {
+                                        warn!("Raw QUIC inbound handshake timed out (10s)");
+                                    }
+                                    TimeoutOrCancel::Cancelled => {}
                                 }
                             });
                         }

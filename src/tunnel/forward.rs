@@ -9,7 +9,7 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::common::task::TaskTracker;
+use crate::common::{CancelFutureExt, TaskTracker};
 use crate::config::model::{TunnelConfig, TunnelMode};
 use crate::core::error::TunnelError;
 use crate::core::relay::RelayEngine;
@@ -184,10 +184,8 @@ pub async fn run_forward_mapping(
                                 }
                             };
 
-                            let remote_res = tokio::select! {
-                                biased;
-                                _ = conn_token.cancelled() => return,
-                                res = acquire_fut => res,
+                            let Some(remote_res) = acquire_fut.cancel_with(&conn_token).await else {
+                                return;
                             };
 
                             match remote_res {
@@ -196,14 +194,15 @@ pub async fn run_forward_mapping(
 
                                     if pool_clone.is_some() {
                                         let activation_pkt = ReplenishingStreamPool::encode_activation(Some(&target));
-                                        let write_act_res = tokio::select! {
-                                            biased;
-                                            _ = conn_token.cancelled() => return,
-                                            res = async {
-                                                remote_stream.write_all(&activation_pkt).await?;
-                                                remote_stream.flush().await?;
-                                                Ok::<(), std::io::Error>(())
-                                            } => res,
+                                        let Some(write_act_res) = async {
+                                            remote_stream.write_all(&activation_pkt).await?;
+                                            remote_stream.flush().await?;
+                                            Ok::<(), std::io::Error>(())
+                                        }
+                                        .cancel_with(&conn_token)
+                                        .await
+                                        else {
+                                            return;
                                         };
 
                                         if let Err(e) = write_act_res {

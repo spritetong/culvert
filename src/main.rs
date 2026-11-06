@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+use micro_tunnel::common::CancelFutureExt;
 use micro_tunnel::config::ConfigLoader;
 use micro_tunnel::consts::{DEFAULT_SHUTDOWN_HARD_DEADLINE, WATCHDOG_THREAD_NAME};
 use micro_tunnel::supervisor::TunnelSupervisor;
@@ -232,19 +233,23 @@ fn spawn_shutdown_handler(cancel_token: CancellationToken) -> ShutdownWatchdog {
     let signal_cancel = CancellationToken::new();
     let signal_stop = signal_cancel.clone();
     let signal_task = tokio::spawn(async move {
-        tokio::select! {
-            _ = signal_stop.cancelled() => return,
-            _ = micro_tunnel::platform::wait_for_shutdown_signal() => {}
-        }
+        let Some(_) = micro_tunnel::platform::wait_for_shutdown_signal()
+            .cancel_with(&signal_stop)
+            .await
+        else {
+            return;
+        };
         cancel_token.cancel();
         let _ = signal_tx.send(WatchdogEvent::Start);
 
         // Re-arm signal waiting: Tokio keeps the OS handler installed after
         // the first stream is dropped, so later signals would be swallowed.
-        tokio::select! {
-            _ = signal_stop.cancelled() => return,
-            _ = micro_tunnel::platform::wait_for_shutdown_signal() => {}
-        }
+        let Some(_) = micro_tunnel::platform::wait_for_shutdown_signal()
+            .cancel_with(&signal_stop)
+            .await
+        else {
+            return;
+        };
         eprintln!("Second termination signal received; forcing immediate exit");
         std::process::exit(130);
     });

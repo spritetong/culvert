@@ -12,7 +12,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::common::task::TaskTracker;
+use crate::common::{CancelFutureExt, TaskTracker, TimeoutOrCancel};
 use crate::config::model::{ServerConfig, TlsConfig, TunnelMode};
 use crate::consts::{
     ACTIVATE_STREAM_MAGIC, DEFAULT_ACTIVATION_READ_TIMEOUT, DEFAULT_SESSION_PAIR_TIMEOUT,
@@ -138,48 +138,52 @@ impl ServerRunner {
                                                 // wait for the client activation signal before touching the target service.
                                                 if metadata.pool_idle {
                                                     let mut magic = [0u8; 1];
-                                                    tokio::select! {
-                                                        _ = conn_token.cancelled() => return,
-                                                        res = stream.read_exact(&mut magic) => {
-                                                            match res {
-                                                                Ok(_) if magic[0] == ACTIVATE_STREAM_MAGIC => {
-                                                                    // Activated! Check if dynamic target address is appended: [len: u16, target_str] with timeout
-                                                                    let mut len_bytes = [0u8; 2];
-                                                                    let read_len_res = tokio::select! {
-                                                                        _ = conn_token.cancelled() => return,
-                                                                        res = tokio::time::timeout(DEFAULT_ACTIVATION_READ_TIMEOUT, stream.read_exact(&mut len_bytes)) => match res {
-                                                                            Ok(r) => r,
-                                                                            Err(_) => {
-                                                                                warn!("Timed out reading activation target length (10s)");
-                                                                                return;
-                                                                            }
-                                                                        },
-                                                                    };
-                                                                    if let Err(e) = read_len_res {
-                                                                        warn!("Failed to read activation target length: {:?}", e);
+                                                    let Some(res) = stream.read_exact(&mut magic).cancel_with(&conn_token).await else {
+                                                        return;
+                                                    };
+                                                    match res {
+                                                        Ok(_) if magic[0] == ACTIVATE_STREAM_MAGIC => {
+                                                            // Activated! Check if dynamic target address is appended: [len: u16, target_str] with timeout
+                                                            let mut len_bytes = [0u8; 2];
+                                                            let read_len_res = match stream
+                                                                .read_exact(&mut len_bytes)
+                                                                .timeout_or_cancel(DEFAULT_ACTIVATION_READ_TIMEOUT, &conn_token)
+                                                                .await
+                                                            {
+                                                                TimeoutOrCancel::Ok(r) => r,
+                                                                TimeoutOrCancel::TimedOut => {
+                                                                    warn!("Timed out reading activation target length (10s)");
+                                                                    return;
+                                                                }
+                                                                TimeoutOrCancel::Cancelled => return,
+                                                            };
+                                                            if let Err(e) = read_len_res {
+                                                                warn!("Failed to read activation target length: {:?}", e);
+                                                                return;
+                                                            }
+                                                            let target_len = u16::from_be_bytes(len_bytes) as usize;
+                                                            if target_len >= MAX_ACTIVATION_TARGET_LEN {
+                                                                warn!("Activation target length too large: {}", target_len);
+                                                                return;
+                                                            }
+                                                            if target_len > 0 {
+                                                                let mut target_bytes = vec![0u8; target_len];
+                                                                let read_target_res = match stream
+                                                                    .read_exact(&mut target_bytes)
+                                                                    .timeout_or_cancel(DEFAULT_ACTIVATION_READ_TIMEOUT, &conn_token)
+                                                                    .await
+                                                                {
+                                                                    TimeoutOrCancel::Ok(r) => r,
+                                                                    TimeoutOrCancel::TimedOut => {
+                                                                        warn!("Timed out reading activation target payload (10s)");
                                                                         return;
                                                                     }
-                                                                    let target_len = u16::from_be_bytes(len_bytes) as usize;
-                                                                    if target_len >= MAX_ACTIVATION_TARGET_LEN {
-                                                                        warn!("Activation target length too large: {}", target_len);
-                                                                        return;
-                                                                    }
-                                                                    if target_len > 0 {
-                                                                        let mut target_bytes = vec![0u8; target_len];
-                                                                        let read_target_res = tokio::select! {
-                                                                            _ = conn_token.cancelled() => return,
-                                                                            res = tokio::time::timeout(DEFAULT_ACTIVATION_READ_TIMEOUT, stream.read_exact(&mut target_bytes)) => match res {
-                                                                                Ok(r) => r,
-                                                                                Err(_) => {
-                                                                                    warn!("Timed out reading activation target payload (10s)");
-                                                                                    return;
-                                                                                }
-                                                                            },
-                                                                        };
-                                                                        if let Err(e) = read_target_res {
-                                                                            warn!("Failed to read activation target payload: {:?}", e);
-                                                                            return;
-                                                                        }
+                                                                    TimeoutOrCancel::Cancelled => return,
+                                                                };
+                                                                if let Err(e) = read_target_res {
+                                                                    warn!("Failed to read activation target payload: {:?}", e);
+                                                                    return;
+                                                                }
                                                                         if let Ok(t_str) = std::str::from_utf8(&target_bytes)
                                                                             && let Ok(sa) = crate::tunnel::forward::parse_target_addr(t_str) {
                                                                                 dynamic_target = Some(sa);
@@ -196,8 +200,6 @@ impl ServerRunner {
                                                                 }
                                                             }
                                                         }
-                                                    }
-                                                }
 
                                                 let is_dummy_target = match &metadata.target {
                                                     Some(TargetAddr::Domain(host, _)) => host == POOL_DUMMY_HOST,
@@ -218,11 +220,13 @@ impl ServerRunner {
                                                 };
 
                                                 info!(target = %target, "Dialing forward target in local/internal network");
-                                                let dial_target_fut = crate::platform::connect_target(&target);
-                                                let target_conn = match tokio::select! {
-                                                    _ = conn_token.cancelled() => return,
-                                                    res = dial_target_fut => res,
-                                                } {
+                                                let Some(target_res) = crate::platform::connect_target(&target)
+                                                    .cancel_with(&conn_token)
+                                                    .await
+                                                else {
+                                                    return;
+                                                };
+                                                let target_conn = match target_res {
                                                     Ok(s) => s,
                                                     Err(e) => {
                                                         error!(target = %target, "Failed to connect to forward target: {:?}", e);
@@ -334,47 +338,45 @@ impl ServerRunner {
         let mut ctrl_stream = FramedControlStream::new(stream);
 
         // Await RegisterReverse
-        let (listen_addr, target_addr) = match tokio::select! {
-            _ = cancel_token.cancelled() => return,
-            res = ctrl_stream.next() => res,
-        } {
-            Some(Ok(ControlMessage::RegisterReverse {
+        let (listen_addr, target_addr) = match ctrl_stream.next().cancel_with(&cancel_token).await {
+            Some(Some(Ok(ControlMessage::RegisterReverse {
                 listen_addr,
                 target_addr,
-            })) => (listen_addr, target_addr),
-            other => {
+            }))) => (listen_addr, target_addr),
+            Some(other) => {
                 warn!(
                     "Expected RegisterReverse on reverse control channel, got: {:?}",
                     other
                 );
                 return;
             }
+            None => return,
         };
 
         info!(addr = %listen_addr, target = %target_addr, "Attempting to bind reverse listening port on server");
 
         let mut listener = match crate::platform::GenericListener::bind(&listen_addr).await {
             Ok(l) => {
-                let _ = tokio::select! {
-                    _ = cancel_token.cancelled() => return,
-                    res = ctrl_stream.send(ControlMessage::RegisterAck {
+                let _ = ctrl_stream
+                    .send(ControlMessage::RegisterAck {
                         listen_addr: listen_addr.clone(),
                         success: true,
                         error_msg: None,
-                    }) => res,
-                };
+                    })
+                    .cancel_with(&cancel_token)
+                    .await;
                 l
             }
             Err(e) => {
                 warn!(addr = %listen_addr, "Failed to bind reverse listener: {:?}", e);
-                let _ = tokio::select! {
-                    _ = cancel_token.cancelled() => return,
-                    res = ctrl_stream.send(ControlMessage::RegisterAck {
+                let _ = ctrl_stream
+                    .send(ControlMessage::RegisterAck {
                         listen_addr: listen_addr.clone(),
                         success: false,
                         error_msg: Some(e.to_string()),
-                    }) => res,
-                };
+                    })
+                    .cancel_with(&cancel_token)
+                    .await;
                 return;
             }
         };
@@ -410,12 +412,9 @@ impl ServerRunner {
                                 client_addr: visitor_addr.to_string(),
                             };
 
-                            let send_res = tokio::select! {
-                                _ = cancel_token.cancelled() => {
-                                    session_mgr.remove(&session_id);
-                                    break;
-                                }
-                                res = ctrl_stream.send(notify_msg) => res,
+                            let Some(send_res) = ctrl_stream.send(notify_msg).cancel_with(&cancel_token).await else {
+                                session_mgr.remove(&session_id);
+                                break;
                             };
 
                             if let Err(e) = send_res {
@@ -454,10 +453,10 @@ impl ServerRunner {
                 msg_opt = ctrl_stream.next() => {
                     match msg_opt {
                         Some(Ok(ControlMessage::Ping)) => {
-                            let _ = tokio::select! {
-                                _ = cancel_token.cancelled() => break,
-                                res = ctrl_stream.send(ControlMessage::Pong) => res,
+                            let Some(res) = ctrl_stream.send(ControlMessage::Pong).cancel_with(&cancel_token).await else {
+                                break;
                             };
+                            let _ = res;
                         }
                         Some(Ok(ControlMessage::Pong)) => {}
                         _ => {

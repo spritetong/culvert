@@ -17,6 +17,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
 use crate::common::net::SocketTuner;
+use crate::common::{CancelFutureExt, TimeoutOrCancel};
 use crate::consts::DEFAULT_HANDSHAKE_TIMEOUT;
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, BufferedTlsStream, TunnelStream};
@@ -144,46 +145,53 @@ impl WsListener {
 
                     let mut serve = Box::pin(async move {
                         // If TLS acceptor is configured (wss://), perform TLS handshake with timeout
-                            let io: TokioIo<Box<dyn TunnelStream>> = if let Some(tls) = acceptor {
-                                match tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, tls.accept(stream)).await {
-                                    Ok(Ok(tls_stream)) => {
-                                        TokioIo::new(Box::new(BufferedTlsStream::new(tls_stream)) as Box<dyn TunnelStream>)
-                                    }
-                                    Ok(Err(e)) => {
-                                        tracing::debug!("WSS server TLS handshake failed: {:?}", e);
-                                        return;
-                                    }
-                                    Err(_) => {
-                                        tracing::warn!("WSS server TLS handshake timed out (10s)");
-                                        return;
-                                    }
+                        let io: TokioIo<Box<dyn TunnelStream>> = if let Some(tls) = acceptor {
+                            match tokio::time::timeout(
+                                DEFAULT_HANDSHAKE_TIMEOUT,
+                                tls.accept(stream),
+                            )
+                            .await
+                            {
+                                Ok(Ok(tls_stream)) => {
+                                    TokioIo::new(Box::new(BufferedTlsStream::new(tls_stream))
+                                        as Box<dyn TunnelStream>)
                                 }
-                            } else {
-                                TokioIo::new(Box::new(stream) as Box<dyn TunnelStream>)
-                            };
+                                Ok(Err(e)) => {
+                                    tracing::debug!("WSS server TLS handshake failed: {:?}", e);
+                                    return;
+                                }
+                                Err(_) => {
+                                    tracing::warn!("WSS server TLS handshake timed out (10s)");
+                                    return;
+                                }
+                            }
+                        } else {
+                            TokioIo::new(Box::new(stream) as Box<dyn TunnelStream>)
+                        };
 
-                            let service_cancel = cancel_serve.clone();
-                            let service = service_fn(move |mut req: Request<Incoming>| {
-                                let tx = tx.clone();
-                                let token = Arc::clone(&token);
-                                let path = Arc::clone(&path);
-                                let cancel_upgrade = service_cancel.clone();
-                                let upgrade_tx = upgrade_tx.clone();
+                        let service_cancel = cancel_serve.clone();
+                        let service = service_fn(move |mut req: Request<Incoming>| {
+                            let tx = tx.clone();
+                            let token = Arc::clone(&token);
+                            let path = Arc::clone(&path);
+                            let cancel_upgrade = service_cancel.clone();
+                            let upgrade_tx = upgrade_tx.clone();
 
-                                async move {
-                                    // Validate URI path if configured on listener
-                                    if let Some(ref p) = *path
-                                        && req.uri().path() != p.as_str() {
-                                            let resp = Response::builder()
-                                                .status(StatusCode::NOT_FOUND)
-                                                .body(Empty::<Bytes>::new())
-                                                .unwrap();
-                                            return Ok::<_, hyper::Error>(resp);
-                                        }
+                            async move {
+                                // Validate URI path if configured on listener
+                                if let Some(ref p) = *path
+                                    && req.uri().path() != p.as_str()
+                                {
+                                    let resp = Response::builder()
+                                        .status(StatusCode::NOT_FOUND)
+                                        .body(Empty::<Bytes>::new())
+                                        .unwrap();
+                                    return Ok::<_, hyper::Error>(resp);
+                                }
 
-                                    // Validate custom handshake headers
-                                    let headers = match WsHandshakeHeaders::from_http_headers(req.headers())
-                                    {
+                                // Validate custom handshake headers
+                                let headers =
+                                    match WsHandshakeHeaders::from_http_headers(req.headers()) {
                                         Ok(h) => h,
                                         Err(_) => {
                                             let resp = Response::builder()
@@ -194,70 +202,79 @@ impl WsListener {
                                         }
                                     };
 
-                                    // Validate token if configured on listener using constant-time equality
-                                    if let Some(ref expected) = *token
-                                        && !expected.is_empty() {
-                                            let matches = headers
-                                                .auth_token
-                                                .as_deref()
-                                                .map(|t| crate::common::constant_time_token_eq(t.as_bytes(), expected.as_bytes()))
-                                                .unwrap_or(false);
-                                            if !matches {
-                                                let resp = Response::builder()
-                                                    .status(StatusCode::FORBIDDEN)
-                                                    .body(Empty::<Bytes>::new())
-                                                    .unwrap();
-                                                return Ok::<_, hyper::Error>(resp);
-                                            }
-                                        }
-
-                                    let metadata = headers.to_stream_metadata();
-
-                                    // Upgrade HTTP connection to WebSocket
-                                    match upgrade(&mut req) {
-                                        Ok((response, fut)) => {
-                                            let work: UpgradeWork = Box::pin(async move {
-                                                tokio::select! {
-                                                    _ = cancel_upgrade.cancelled() => {}
-                                                    res = tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, fut) => {
-                                                        if let Ok(Ok(ws)) = res {
-                                                            let stream =
-                                                                WsTunnelStream::new(ws.into_inner(), Role::Server);
-                                                            let item = Ok((
-                                                                Box::new(stream) as Box<dyn TunnelStream>,
-                                                                metadata,
-                                                            ));
-                                                            // A full accepted-stream queue must never
-                                                            // pin an owned upgrade task during shutdown.
-                                                            tokio::select! {
-                                                                _ = cancel_upgrade.cancelled() => {}
-                                                                _ = tx.send(item) => {}
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            });
-                                            let _ = upgrade_tx.send(work);
-                                            Ok::<_, hyper::Error>(response)
-                                        }
-                                        Err(_) => {
-                                            let resp = Response::builder()
-                                                .status(StatusCode::BAD_REQUEST)
-                                                .body(Empty::<Bytes>::new())
-                                                .unwrap();
-                                            Ok::<_, hyper::Error>(resp)
-                                        }
+                                // Validate token if configured on listener using constant-time equality
+                                if let Some(ref expected) = *token
+                                    && !expected.is_empty()
+                                {
+                                    let matches = headers
+                                        .auth_token
+                                        .as_deref()
+                                        .map(|t| {
+                                            crate::common::constant_time_token_eq(
+                                                t.as_bytes(),
+                                                expected.as_bytes(),
+                                            )
+                                        })
+                                        .unwrap_or(false);
+                                    if !matches {
+                                        let resp = Response::builder()
+                                            .status(StatusCode::FORBIDDEN)
+                                            .body(Empty::<Bytes>::new())
+                                            .unwrap();
+                                        return Ok::<_, hyper::Error>(resp);
                                     }
                                 }
-                            });
 
-                            let _ = tokio::time::timeout(
-                                DEFAULT_HANDSHAKE_TIMEOUT,
-                                hyper::server::conn::http1::Builder::new()
-                                    .serve_connection(io, service)
-                                    .with_upgrades(),
-                            )
-                            .await;
+                                let metadata = headers.to_stream_metadata();
+
+                                // Upgrade HTTP connection to WebSocket
+                                match upgrade(&mut req) {
+                                    Ok((response, fut)) => {
+                                        let work: UpgradeWork = Box::pin(async move {
+                                            let res = fut
+                                                .timeout_or_cancel(
+                                                    DEFAULT_HANDSHAKE_TIMEOUT,
+                                                    &cancel_upgrade,
+                                                )
+                                                .await;
+                                            if let TimeoutOrCancel::Ok(Ok(ws)) = res {
+                                                let stream = WsTunnelStream::new(
+                                                    ws.into_inner(),
+                                                    Role::Server,
+                                                );
+                                                let item = Ok((
+                                                    Box::new(stream) as Box<dyn TunnelStream>,
+                                                    metadata,
+                                                ));
+                                                // A full accepted-stream queue must never
+                                                // pin an owned upgrade task during shutdown.
+                                                let _ = tx
+                                                    .send(item)
+                                                    .cancel_with(&cancel_upgrade)
+                                                    .await;
+                                            }
+                                        });
+                                        let _ = upgrade_tx.send(work);
+                                        Ok::<_, hyper::Error>(response)
+                                    }
+                                    Err(_) => {
+                                        let resp = Response::builder()
+                                            .status(StatusCode::BAD_REQUEST)
+                                            .body(Empty::<Bytes>::new())
+                                            .unwrap();
+                                        Ok::<_, hyper::Error>(resp)
+                                    }
+                                }
+                            }
+                        });
+
+                        let _ = tokio::time::timeout(
+                            DEFAULT_HANDSHAKE_TIMEOUT,
+                            hyper::server::conn::http1::Builder::new()
+                                .serve_connection(io, service)
+                                .with_upgrades(),
+                        )
+                        .await;
                     });
 
                     loop {

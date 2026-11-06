@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::common::task::TaskTracker;
+use crate::common::{CancellationTokenExt, TaskTracker};
 use crate::config::model::{AppConfig, TunnelConfig};
 use crate::consts::DEFAULT_RETRY_DELAY;
 use crate::core::error::TunnelError;
@@ -191,10 +191,8 @@ impl TunnelSupervisor {
                         e
                     );
 
-                    tokio::select! {
-                        biased;
-                        _ = token.cancelled() => break,
-                        _ = tokio::time::sleep(retry_delay) => {}
+                    if !token.sleep_or_cancel(retry_delay).await {
+                        break;
                     }
                 }
             }
