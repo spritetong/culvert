@@ -20,9 +20,16 @@ use crate::core::error::TunnelError;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ControlMessage {
     /// Client requests the server to bind a listening port on the remote host.
+    ///
+    /// `pool_size` is the *effective, clamped* worker count the client will
+    /// pre-warm. The server derives its inbound-queue soft cap from it, so both
+    /// ends size the same pool. `None` means pooling is disabled. The field is
+    /// defaulted so older peers that omit it still interoperate.
     RegisterReverse {
         listen_addr: String,
         target_addr: String,
+        #[serde(default)]
+        pool_size: Option<usize>,
     },
     /// Server acknowledges the port binding request.
     RegisterAck {
@@ -138,6 +145,7 @@ mod tests {
         let msg = ControlMessage::RegisterReverse {
             listen_addr: "0.0.0.0:2222".to_string(),
             target_addr: "127.0.0.1:22".to_string(),
+            pool_size: Some(4),
         };
 
         ctrl_a.send(msg.clone()).await.unwrap();
@@ -154,5 +162,33 @@ mod tests {
         ctrl_b.send(ack.clone()).await.unwrap();
         let received_ack = ctrl_a.next().await.unwrap().unwrap();
         assert_eq!(received_ack, ack);
+    }
+
+    /// Wire shape emitted by peers predating the negotiated `pool_size` field.
+    #[derive(Serialize)]
+    enum LegacyControlMessage {
+        RegisterReverse {
+            listen_addr: String,
+            target_addr: String,
+        },
+    }
+
+    #[test]
+    fn test_register_reverse_decodes_legacy_frame_without_pool_size() {
+        let legacy = rmp_serde::to_vec_named(&LegacyControlMessage::RegisterReverse {
+            listen_addr: "0.0.0.0:2222".to_string(),
+            target_addr: "127.0.0.1:22".to_string(),
+        })
+        .unwrap();
+
+        let decoded: ControlMessage = rmp_serde::from_slice(&legacy).unwrap();
+        assert_eq!(
+            decoded,
+            ControlMessage::RegisterReverse {
+                listen_addr: "0.0.0.0:2222".to_string(),
+                target_addr: "127.0.0.1:22".to_string(),
+                pool_size: None,
+            }
+        );
     }
 }

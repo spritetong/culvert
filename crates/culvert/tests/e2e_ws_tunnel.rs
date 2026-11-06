@@ -339,7 +339,11 @@ async fn test_reverse_tunnel_with_inbound_pool_e2e() {
             .await
             .expect("Timeout reading reverse pool reply")
             .expect("Failed to read reverse pool reply");
-        assert_eq!(&buf, payload.as_bytes(), "Echo mismatch in reverse pool test");
+        assert_eq!(
+            &buf,
+            payload.as_bytes(),
+            "Echo mismatch in reverse pool test"
+        );
     }
 
     // 4. Graceful shutdown
@@ -352,6 +356,101 @@ async fn test_reverse_tunnel_with_inbound_pool_e2e() {
     })
     .await
     .expect("Timeout waiting for handles to exit in test_reverse_tunnel_with_inbound_pool_e2e");
+}
+
+/// A burst larger than the pre-warmed pool must be served by on-demand
+/// `NewConnection` signaling instead of stalling or dropping visitors.
+#[tokio::test]
+async fn test_reverse_pool_burst_falls_back_to_signaling_e2e() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let cancel_token = CancellationToken::new();
+    let (echo_handle, local_echo_port) = spawn_echo_server(cancel_token.clone());
+    let server_ws_port = get_available_port();
+    let reverse_listen_port = get_available_port();
+    let server_ws_listen = format!("127.0.0.1:{}", server_ws_port);
+    let reverse_listen = format!("127.0.0.1:{}", reverse_listen_port);
+    let auth_token = "ws_reverse_burst_token";
+
+    let mut registry = TransportRegistry::new();
+    registry.register(WsTransportDriver);
+    let registry = Arc::new(registry);
+    let session_mgr = Arc::new(SessionManager::new());
+
+    let server_config = ServerConfig {
+        listen: vec![format!("ws://{}/tunnel", server_ws_listen)],
+        token: Some(auth_token.to_string()),
+        default_target: None,
+        ..Default::default()
+    };
+    let server_runner = ServerRunner::new(
+        server_config,
+        Arc::clone(&registry),
+        Arc::clone(&session_mgr),
+    );
+    let server_cancel = cancel_token.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = server_runner.run(server_cancel).await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let tunnel_config = TunnelConfig {
+        tag: "test-reverse-burst".to_string(),
+        endpoint: EndpointConfig::Simple(format!("ws://{}/tunnel", server_ws_listen)),
+        token: Some(auth_token.to_string()),
+        pool_size: Some(2),
+        failover: None,
+        multiplex: None,
+        mappings: vec![PortMappingConfig {
+            mode: TunnelMode::Reverse,
+            listen: reverse_listen.clone(),
+            target: format!("127.0.0.1:{}", local_echo_port),
+        }],
+        retry: None,
+    };
+    let app_config = AppConfig::default();
+    let endpoint_ctx = EndpointContext::build(&tunnel_config.endpoint, &app_config).unwrap();
+    let client_cancel = cancel_token.clone();
+    let client_registry = Arc::clone(&registry);
+    let client_handle = tokio::spawn(async move {
+        let _ =
+            run_reverse_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let mut visitors = Vec::new();
+    for i in 0..8 {
+        let addr = reverse_listen.clone();
+        visitors.push(tokio::spawn(async move {
+            let payload = format!("burst-packet-{}", i);
+            tokio::time::timeout(Duration::from_secs(8), async {
+                let mut stream = loop {
+                    match TcpStream::connect(&addr).await {
+                        Ok(s) => break s,
+                        Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+                    }
+                };
+                stream.write_all(payload.as_bytes()).await.unwrap();
+                let mut buf = vec![0u8; payload.len()];
+                stream.read_exact(&mut buf).await.unwrap();
+                assert_eq!(&buf, payload.as_bytes());
+            })
+            .await
+            .expect("burst visitor timed out (empty pool did not fall back to signaling)");
+        }));
+    }
+    for visitor in visitors {
+        visitor.await.expect("burst visitor task panicked");
+    }
+
+    cancel_token.cancel();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (r1, r2, r3) = tokio::join!(echo_handle, server_handle, client_handle);
+        r1.expect("echo handle panicked");
+        r2.expect("server handle panicked");
+        r3.expect("client handle panicked");
+    })
+    .await
+    .expect("Timeout waiting for handles to exit in test_reverse_pool_burst_falls_back_to_signaling_e2e");
 }
 
 #[tokio::test]

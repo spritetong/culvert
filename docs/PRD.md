@@ -208,9 +208,11 @@ behavior is configurable, the configuration key is given.
 ### FR-5 Reverse mappings, 0-RTT inbound pool, and control protocol
 
 - **FR-5.1** The client opens a control stream in `reverse-ctrl` mode and
-  sends `RegisterReverse { listen_addr, target_addr }`. The server binds the
-  requested listener and replies with `RegisterAck { listen_addr, success,
-  error_msg }`.
+  sends `RegisterReverse { listen_addr, target_addr, pool_size }`, where
+  `pool_size` is the effective clamped worker count (defaulted on the wire so
+  older peers interoperate). The server derives the inbound-queue soft cap from
+  it, binds the requested listener, and replies with `RegisterAck {
+  listen_addr, success, error_msg }`.
 - **FR-5.2** Control messages are encoded with MessagePack
   (`to_vec_named`) over a length-delimited frame. Variants are
   `RegisterReverse`, `RegisterAck`, `NewConnection`, `Ping`, `Pong`.
@@ -237,6 +239,21 @@ behavior is configurable, the configuration key is given.
   probes alone do not.
 - **FR-5.7** Control-channel reconnection uses an exponential backoff from
   500 ms up to 30 s, reset after 30 s of stable operation.
+- **FR-5.8** Inbound pool bounds and single-owner lifetime: the client caps
+  pre-warm workers at 16 and advertises that clamped value; the server registers
+  each pool before `RegisterAck` with a soft cap of twice the negotiated count,
+  FIFO evicts the oldest entry on overflow, drains the previous generation on
+  re-registration, and keys pools by host and port (never guesses a target into
+  an unrelated listener). Only streams younger than the effective idle window
+  and passing a liveness check are paired. The server is the sole owner of an
+  idle stream's lifetime — the client worker has no independent recycle timer —
+  so a connection the server has committed to a visitor cannot be closed by the
+  peer. Activation writes and `NewConnection` sends share a deadline derived
+  from the configured idle window (1/3, clamped to 5–10 s and never above the
+  idle window), so high-RTT / low-bandwidth links do not tear down the listener.
+  An empty or stale pool always falls back to signaling instead of stalling
+  visitors. Relay tasks are owned and awaited by their worker; none are
+  detached.
 
 ### FR-6 Relay engine
 

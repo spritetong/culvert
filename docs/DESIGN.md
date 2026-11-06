@@ -415,21 +415,36 @@ If none is available the stream is closed with a log message. Dialing uses
 ### 6.2 Reverse control channel & Inbound Pool
 
 `handle_reverse_control` wraps the accepted stream in `FramedControlStream`,
-reads `RegisterReverse`, binds the requested listener on the server, registers
-an `inbound_pool` with `SessionManager` for this listener, replies
-`RegisterAck`, and starts accepting inbound connections.
+reads `RegisterReverse { listen_addr, target_addr, pool_size }`, binds the
+requested listener on the server, registers an `inbound_pool` with
+`SessionManager` **before** replying `RegisterAck` (the client starts
+pre-warming immediately on the ack), and starts accepting inbound connections.
+`pool_size` is the effective, already-clamped worker count, so the server's
+soft cap is derived from the same number the client uses; the field is
+`#[serde(default)]` for interoperability with older peers. Registration of a
+new generation drains the previous pool, closing its stale idle streams.
+Teardown removes the pool only if it is still the same `Arc`, so an overlapping
+reconnect cannot delete the new generation.
 
 For each inbound connection on the reverse listener:
 
-1. **Fast path (0-RTT Pool)**: Server checks the listener's `inbound_pool`.
-   If an idle stream is available, the server writes `0xA5` directly to it and
-   immediately relays with the inbound visitor stream without any control
-   messages.
-2. **Fallback path (On-demand Signaling)**: If the pool is empty or not
-   configured, the server allocates a session id (`REVERSE_SESSION_COUNTER`),
-   registers a oneshot receiver in `SessionManager`, and sends `NewConnection`.
-   The paired data stream is delivered by `SessionManager::fulfill`; pairing is
-   bounded by `DEFAULT_SESSION_PAIR_TIMEOUT` (10 s). Both sides then relay.
+1. **Fast path (0-RTT Pool)**: `pop_live(idle_timeout)` takes the newest idle
+   stream, drops entries older than the effective idle window, and verifies the
+   rest with `poll_check_alive`. The activation write and the `NewConnection`
+   send share one derived `reverse_frame_timeout(idle_timeout)` — one third of
+   the effective idle window, clamped to `[POOL_HEARTBEAT_TIMEOUT,
+   DEFAULT_SESSION_PAIR_TIMEOUT]` and never longer than the idle window. With
+   defaults this is 10 s, not a LAN-scale 2 s that would tear down the whole
+   listener on a slow link. On failure the next candidate is tried; a stream
+   that passes is relayed immediately with no control messages.
+2. **Fallback path (On-demand Signaling)**: If no live stream is available
+   (empty pool, stale entries, or `pool_size` not set), the server allocates a
+   session id (`REVERSE_SESSION_COUNTER`), registers a oneshot receiver in
+   `SessionManager`, and sends `NewConnection`. A stalled channel cannot block
+   the accept loop indefinitely; on failure the listener closes and the client
+   re-registers. The paired data stream is delivered by
+   `SessionManager::fulfill`; pairing is bounded by
+   `DEFAULT_SESSION_PAIR_TIMEOUT` (10 s). Both sides then relay.
 
 The control loop also handles `Ping`/`Pong` and reconnect with exponential
 backoff.
@@ -462,12 +477,23 @@ flushed first. Both streams are then passed to `RelayEngine`. An
 `control:0`, sends `RegisterReverse`, awaits `RegisterAck`, and then loops on
 control messages.
 
-When `pool_size` is configured, an inbound pool worker loop is spawned that
-maintains `pool_size` pre-warmed idle streams connected to the server
-(`mode = Reverse`, `pool_idle = true`, `target = listen_addr`). Each stream
-blocks waiting for the `0xA5` activation byte from the server. Upon reading
-`0xA5`, it immediately dials the local `mappings.target`, starts relaying via
-`RelayEngine`, and replenishes an idle stream to the server in the background.
+When `pool_size` is configured, `clamp_reverse_pool_size` caps it at
+`POOL_MAX_CAPACITY` = 16 and one worker per slot maintains a pre-warmed idle
+stream connected to the server (`mode = Reverse`, `pool_idle = true`,
+`target = listen_addr`). The worker waits cancellably for the `0xA5` activation
+byte and reaps its own relay tasks while waiting. It has **no independent
+recycle timer**: the server is the sole owner of an idle stream's lifetime, so
+a worker can never close a connection the server has already popped and
+committed to a visitor. Expiry, overflow eviction, re-registration and listener
+teardown all close idle streams from the server side; the worker sees EOF and
+re-dials. Upon activation it dials the local `mappings.target`, hands the relay
+to its own `TaskTracker` (never detached), and immediately dials a replacement
+— one dial RTT, with no server-side "pool low" message. Dial failures back off
+from 200 ms to 1 s.
+
+Because each consumed slot is replenished by its own worker, an extra server
+signaling round trip would be strictly slower; the control channel is reserved
+for visitors that actually find the pool empty.
 
 On `NewConnection` (the signaling fallback path), it continues to dial the local
 `mappings.target`, opens a `reverse-data` stream with the session id, and
@@ -560,11 +586,24 @@ this loop and in the pool reactor is deliberately retained.
    When no idle stream is available, the server calls `register(session_id)`,
    waits up to 10 s, and the reverse data stream is delivered by
    `fulfill(session_id, stream)`. `remove` clears timed-out entries.
-2. **Reverse Inbound Pools**: A `DashMap<String, Arc<Mutex<VecDeque<Box<dyn TunnelStream>>>>>`
-   keyed by the reverse listener canonical key (e.g. port or UDS path). Pre-warmed
-   reverse streams (`mode = Reverse`, `pool_idle = true`, `target = listen_addr`)
-   are enqueued via `push_idle_stream`. The reverse listener pops streams via
-   `pop_idle_stream` to perform 0-RTT pairing with incoming visitor connections.
+2. **Reverse Inbound Pools**: A `DashMap<String, Arc<ReverseInboundPool>>` keyed
+   by the canonical `TargetAddr` string (host **and** port or UDS path, so two
+   listeners sharing a port on different local addresses never collide).
+   Pre-warmed reverse streams (`mode = Reverse`, `pool_idle = true`,
+   `target = listen_addr`) are enqueued via `push_idle_stream`; a known target
+   that matches no pool is dropped rather than guessed into another listener's
+   pool. Each queue is LIFO with a soft cap of
+   `reverse_pool_soft_cap(pool_size) = 2 x` the negotiated worker count:
+   overflow evicts the oldest entry, tolerating one overlapping reconnect
+   generation while preventing unbounded growth. Entries carry their enqueue
+   time; `pop_live(idle_timeout)` lazily closes over-age entries (the only
+   practical defence against a silently expired NAT/QUIC pinhole, since
+   `poll_check_alive` reports `Pending` as healthy) and skips EOF/dead streams.
+   Both eviction and expiry act only on entries still in the queue: `pop_back`
+   removes a stream under the same lock before the activation byte is written,
+   so a committed stream can never be evicted. `drain()` closes a superseded
+   generation on re-registration; teardown is identity-checked with
+   `remove_if`.
 
 Errors are `SessionNotFound`, `SessionClosed`, and `SessionPairTimeout`.
 

@@ -174,6 +174,34 @@ pub const POOL_MAX_CAPACITY: usize = 16;
 /// Dummy host domain used for pre-warmed connections awaiting dynamic target specification.
 pub const POOL_DUMMY_HOST: &str = "pool.idle";
 
+/// Clamps a configured reverse pool size to the worker bound shared by both ends.
+///
+/// `None` (or zero) means the client does not pre-warm at all. The clamped value
+/// is what the client actually spawns and what it sends in `RegisterReverse`, so
+/// the server never has to guess a second, divergent capacity.
+pub fn clamp_reverse_pool_size(configured: Option<usize>) -> Option<usize> {
+    configured
+        .filter(|&size| size > 0)
+        .map(|size| size.min(POOL_MAX_CAPACITY))
+}
+
+/// Soft upper bound on one reverse listener's idle queue, derived from the
+/// negotiated worker count. Twice the worker count tolerates one overlapping
+/// reconnect generation without an absolute, hard reservation.
+pub fn reverse_pool_soft_cap(size: Option<usize>) -> usize {
+    size.unwrap_or(POOL_MAX_CAPACITY).saturating_mul(2)
+}
+
+/// Deadline for one activation byte or one `NewConnection` frame on the reverse
+/// path. Derived from the effective idle window instead of a LAN-scale constant:
+/// a high-RTT / low-bandwidth link inherits the operator's timing, while the
+/// weak-network probe allowance and the pairing deadline keep it bounded.
+pub fn reverse_frame_timeout(idle_timeout: Duration) -> Duration {
+    (idle_timeout / 3)
+        .clamp(POOL_HEARTBEAT_TIMEOUT, DEFAULT_SESSION_PAIR_TIMEOUT)
+        .min(idle_timeout)
+}
+
 // =============================================================================
 // 5. QUIC & HTTP/3 Transport Parameters & Flow Control Windows
 // =============================================================================
@@ -365,3 +393,37 @@ pub const WATCHDOG_THREAD_NAME: &str = "shutdown-watchdog";
 
 /// Thread name for the Windows UDS accept worker thread.
 pub const WINDOWS_UDS_THREAD_NAME: &str = "culvert-windows-uds";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_reverse_pool_size_is_clamped_once_and_shared() {
+        assert_eq!(clamp_reverse_pool_size(None), None);
+        assert_eq!(clamp_reverse_pool_size(Some(0)), None);
+        assert_eq!(clamp_reverse_pool_size(Some(2)), Some(2));
+        assert_eq!(clamp_reverse_pool_size(Some(1000)), Some(POOL_MAX_CAPACITY));
+        assert_eq!(reverse_pool_soft_cap(Some(2)), 4);
+        assert_eq!(reverse_pool_soft_cap(None), POOL_MAX_CAPACITY * 2);
+    }
+
+    #[test]
+    fn test_reverse_frame_timeout_scales_with_idle_window() {
+        // A default idle window yields 10 s, not a LAN-scale 2 s deadline.
+        assert_eq!(
+            reverse_frame_timeout(DEFAULT_IDLE_TIMEOUT),
+            Duration::from_secs(10)
+        );
+        // A long, lossy WAN window stays bounded by the pairing deadline.
+        assert_eq!(
+            reverse_frame_timeout(Duration::from_secs(300)),
+            DEFAULT_SESSION_PAIR_TIMEOUT
+        );
+        // A shorter configured window is never exceeded.
+        assert_eq!(
+            reverse_frame_timeout(Duration::from_secs(3)),
+            Duration::from_secs(3)
+        );
+    }
+}

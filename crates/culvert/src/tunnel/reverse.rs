@@ -17,7 +17,8 @@ use crate::common::{CancelFutureExt, CancellationTokenExt, TaskTracker};
 use crate::config::model::{TunnelConfig, TunnelMode};
 use crate::consts::{
     ACTIVATE_STREAM_MAGIC, DEFAULT_REVERSE_BACKOFF_INITIAL, DEFAULT_REVERSE_BACKOFF_MAX,
-    REVERSE_BACKOFF_RESET_THRESHOLD, REVERSE_CONTROL_TARGET_HOST,
+    POOL_BACKOFF_ACTIVE_WAITERS_MAX, POOL_BACKOFF_BASE, REVERSE_BACKOFF_RESET_THRESHOLD,
+    REVERSE_CONTROL_TARGET_HOST, clamp_reverse_pool_size,
 };
 use crate::control::stream::{ControlMessage, FramedControlStream};
 use crate::core::error::TunnelError;
@@ -46,6 +47,19 @@ pub async fn run_reverse_mapping(
     );
 
     let dummy_target = TargetAddr::Domain(REVERSE_CONTROL_TARGET_HOST.to_string(), 0);
+    // Clamp once and advertise the effective worker count: the server derives
+    // its soft cap from exactly this value instead of an independent constant.
+    let pool_workers = clamp_reverse_pool_size(pool_size);
+    if let Some(configured) = pool_size.filter(|&s| s > 0)
+        && pool_workers != Some(configured)
+    {
+        warn!(
+            tag = %tag,
+            configured,
+            size = pool_workers.unwrap_or(0),
+            "Clamping reverse inbound pool size to the worker cap"
+        );
+    }
     let mut conn_tracker = TaskTracker::<()>::new(cancel_token.clone());
 
     // Share data connector across all incoming visitor sessions to maximize connection/0-RTT reuse
@@ -92,6 +106,7 @@ pub async fn run_reverse_mapping(
         let reg_msg = ControlMessage::RegisterReverse {
             listen_addr: listen.clone(),
             target_addr: target_addr.clone(),
+            pool_size: pool_workers,
         };
 
         let Some(send_res) = ctrl_stream.send(reg_msg).cancel_with(&cancel_token).await else {
@@ -155,7 +170,9 @@ pub async fn run_reverse_mapping(
         let pool_cancel = cancel_token.child_token();
         let mut pool_tracker = TaskTracker::<()>::new(pool_cancel.clone());
 
-        if let Some(size) = pool_size.filter(|&s| s > 0) {
+        if let Some(size) = pool_workers {
+            // One worker holds at most one idle stream, so an unbounded config
+            // value would spawn an unbounded number of dialing tasks.
             let listen_target = crate::tunnel::forward::parse_target_addr(&listen)
                 .unwrap_or_else(|_| dummy_target.clone());
             info!(
@@ -168,11 +185,15 @@ pub async fn run_reverse_mapping(
                 let connector = Arc::clone(&data_connector);
                 let listen_target = listen_target.clone();
                 let target_clone = target_addr.clone();
-                let parent_cancel = cancel_token.clone();
                 let hb = hb_interval;
                 let idle = idle_timeout;
 
                 pool_tracker.spawn_with_cancel(move |token| async move {
+                    // Every relay this worker starts is owned and awaited; no task
+                    // may outlive the control-channel generation that created it.
+                    let mut relays = TaskTracker::<()>::new(token.child_token());
+                    let mut retry = POOL_BACKOFF_BASE;
+
                     while !token.is_cancelled() {
                         let Some(conn_res) = connector
                             .connect_pooled(&listen_target)
@@ -183,55 +204,95 @@ pub async fn run_reverse_mapping(
                         };
 
                         let mut stream = match conn_res {
+                            Ok(s) => {
+                                retry = POOL_BACKOFF_BASE;
+                                s
+                            }
+                            Err(e) => {
+                                tracing::debug!("Reverse pool pre-warm dial failed: {:?}", e);
+                                if !token.sleep_or_cancel(retry).await {
+                                    break;
+                                }
+                                retry = (retry * 2).min(POOL_BACKOFF_ACTIVE_WAITERS_MAX);
+                                continue;
+                            }
+                        };
+
+                        // The server is the sole owner of an idle stream's
+                        // lifetime. This worker must NEVER close the stream on
+                        // its own timer: the server may already have popped it
+                        // and be writing the activation byte, and a local
+                        // recycle in that window would blackhole the visitor.
+                        // Eviction, re-registration and listener teardown all
+                        // close the stream from the server side; this worker
+                        // then sees EOF (or cancellation) and re-dials.
+                        // The inner scope releases the stream borrow before the
+                        // stream is moved into the relay task.
+                        let activated = {
+                            let activation = async {
+                                let mut magic = [0u8; 1];
+                                let res = stream.read_exact(&mut magic).await;
+                                (res, magic)
+                            };
+                            tokio::pin!(activation);
+
+                            loop {
+                                tokio::select! {
+                                    biased;
+                                    _ = token.cancelled() => break false,
+                                    (res, magic) = &mut activation => {
+                                        break res.is_ok() && magic[0] == ACTIVATE_STREAM_MAGIC;
+                                    }
+                                    Some(_) = relays.join_next(), if !relays.is_empty() => {}
+                                }
+                            }
+                        };
+
+                        if token.is_cancelled() {
+                            break;
+                        }
+                        if !activated {
+                            if !token.sleep_or_cancel(Duration::from_millis(100)).await {
+                                break;
+                            }
+                            continue;
+                        }
+
+                        let Some(local_res) = crate::platform::connect_target_str(&target_clone)
+                            .cancel_with(&token)
+                            .await
+                        else {
+                            break;
+                        };
+                        let local_stream = match local_res {
                             Ok(s) => s,
-                            Err(_) => {
-                                if !token.sleep_or_cancel(Duration::from_millis(500)).await {
+                            Err(e) => {
+                                error!(
+                                    "Failed to connect to local target {}: {:?}",
+                                    target_clone, e
+                                );
+                                if !token.sleep_or_cancel(Duration::from_millis(100)).await {
                                     break;
                                 }
                                 continue;
                             }
                         };
 
-                        let mut magic = [0u8; 1];
-                        let Some(read_res) = stream.read_exact(&mut magic).cancel_with(&token).await else {
-                            break;
-                        };
-
-                        match read_res {
-                            Ok(_) if magic[0] == ACTIVATE_STREAM_MAGIC => {
-                                let Some(local_res) = crate::platform::connect_target_str(&target_clone)
-                                    .cancel_with(&parent_cancel)
-                                    .await
-                                else {
-                                    break;
-                                };
-
-                                let local_stream = match local_res {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        error!("Failed to connect to local target {}: {:?}", target_clone, e);
-                                        continue;
-                                    }
-                                };
-
-                                let relay_cancel = parent_cancel.clone();
-                                tokio::spawn(async move {
-                                    let _ = RelayEngine::relay_with_heartbeat(
-                                        local_stream,
-                                        stream,
-                                        relay_cancel,
-                                        hb,
-                                        idle,
-                                    ).await;
-                                });
-                            }
-                            _ => {
-                                if !token.sleep_or_cancel(Duration::from_millis(100)).await {
-                                    break;
-                                }
-                            }
-                        }
+                        relays.spawn_with_cancel(move |relay_token| async move {
+                            let _ = RelayEngine::relay_with_heartbeat(
+                                local_stream,
+                                stream,
+                                relay_token,
+                                hb,
+                                idle,
+                            )
+                            .await;
+                        });
+                        // Loop immediately: the consumed slot is replenished in
+                        // one dial RTT, with no extra control-channel signaling.
                     }
+
+                    relays.shutdown_and_wait().await;
                 });
             }
         }

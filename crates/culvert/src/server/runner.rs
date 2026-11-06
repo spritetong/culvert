@@ -18,7 +18,7 @@ use crate::common::{CancelFutureExt, TaskTracker, TimeoutOrCancel};
 use crate::config::model::{ServerConfig, TlsConfig, TunnelMode};
 use crate::consts::{
     ACTIVATE_STREAM_MAGIC, DEFAULT_ACTIVATION_READ_TIMEOUT, DEFAULT_SESSION_PAIR_TIMEOUT,
-    MAX_ACTIVATION_TARGET_LEN, POOL_DUMMY_HOST,
+    MAX_ACTIVATION_TARGET_LEN, POOL_DUMMY_HOST, reverse_frame_timeout, reverse_pool_soft_cap,
 };
 use crate::control::stream::{ControlMessage, FramedControlStream};
 use crate::core::error::TunnelError;
@@ -286,7 +286,9 @@ impl ServerRunner {
                                                 } else if metadata.pool_idle {
                                                     // Pre-warmed idle reverse stream arrival: push into inbound pool
                                                     if !session_mgr.push_idle_stream(metadata.target.as_ref(), stream) {
-                                                        warn!("Received reverse idle pool stream but no matching reverse listener found");
+                                                        // Expected briefly while a control channel reconnects:
+                                                        // the orphaned worker will recycle after a short cooldown.
+                                                        tracing::debug!("Dropped reverse idle pool stream: no matching listener");
                                                     }
                                                 } else {
                                                     // Control stream arrival: handle registration and listen on requested port
@@ -414,16 +416,21 @@ impl ServerRunner {
         heartbeat_interval: Duration,
     ) {
         let mut ctrl_stream = FramedControlStream::new(stream);
+        // One derived deadline for both the activation byte and NewConnection:
+        // a high-RTT link inherits the configured idle window instead of a
+        // hard-coded LAN-scale timeout that would tear down the listener.
+        let frame_timeout = reverse_frame_timeout(idle_timeout);
 
         // Await RegisterReverse bounded by idle_timeout
-        let (listen_addr, target_addr) = match timeout(idle_timeout, ctrl_stream.next())
+        let (listen_addr, target_addr, pool_size) = match timeout(idle_timeout, ctrl_stream.next())
             .cancel_with(&cancel_token)
             .await
         {
             Some(Ok(Some(Ok(ControlMessage::RegisterReverse {
                 listen_addr,
                 target_addr,
-            })))) => (listen_addr, target_addr),
+                pool_size,
+            })))) => (listen_addr, target_addr, pool_size),
             Some(Err(_)) => {
                 warn!(
                     idle_timeout = ?idle_timeout,
@@ -444,17 +451,7 @@ impl ServerRunner {
         info!(addr = %listen_addr, target = %target_addr, "Attempting to bind reverse listening port on server");
 
         let mut listener = match crate::platform::GenericListener::bind(&listen_addr).await {
-            Ok(l) => {
-                let _ = ctrl_stream
-                    .send(ControlMessage::RegisterAck {
-                        listen_addr: listen_addr.clone(),
-                        success: true,
-                        error_msg: None,
-                    })
-                    .cancel_with(&cancel_token)
-                    .await;
-                l
-            }
+            Ok(l) => l,
             Err(e) => {
                 warn!(addr = %listen_addr, "Failed to bind reverse listener: {:?}", e);
                 let _ = ctrl_stream
@@ -469,8 +466,28 @@ impl ServerRunner {
             }
         };
 
+        // Register the inbound pool BEFORE acknowledging. The client starts its
+        // pre-warm workers as soon as RegisterAck arrives; a late registration
+        // would discard the whole first generation and delay the first 0-RTT pair.
+        // The soft cap is derived from the worker count the client negotiated,
+        // so both ends size the same pool.
+        let idle_pool = session_mgr.register_pool(&listen_addr, reverse_pool_soft_cap(pool_size));
+
+        let ack_sent = ctrl_stream
+            .send(ControlMessage::RegisterAck {
+                listen_addr: listen_addr.clone(),
+                success: true,
+                error_msg: None,
+            })
+            .cancel_with(&cancel_token)
+            .await;
+        if !matches!(ack_sent, Some(Ok(()))) {
+            warn!(addr = %listen_addr, "Failed to send RegisterAck; dropping reverse listener");
+            session_mgr.unregister_pool(&listen_addr, &idle_pool);
+            return;
+        }
+
         info!(addr = %listen_addr, "Server bound reverse port successfully. Waiting for external traffic...");
-        let idle_pool = session_mgr.register_pool(&listen_addr);
         let mut local_tracker = TaskTracker::<()>::new(cancel_token.clone());
         // Activity-based deadline: inbound control frames AND real outbound
         // notifications (NewConnection / Pong) both prove the channel is in use.
@@ -494,20 +511,34 @@ impl ServerRunner {
                 accept_res = listener.accept() => {
                     match accept_res {
                         Ok((visitor_stream, visitor_addr)) => {
-                            // 1. FAST PATH (0-RTT Pool): Check if an idle stream is available in the inbound pool
+                            // 1. FAST PATH (0-RTT Pool): only pair streams that are
+                            // fresh and still alive. A stale generation must fall
+                            // through to signaling rather than blackhole the visitor.
+                            // The server owns the idle-stream lifetime; entries are
+                            // removed under the pool lock before the activation byte
+                            // is written, so eviction can never hit a committed stream.
                             let mut fast_paired_stream = None;
-                            loop {
-                                let next_candidate = idle_pool.lock().pop_front();
-                                let Some(mut candidate) = next_candidate else {
-                                    break;
+                            while let Some(mut candidate) = idle_pool.pop_live(idle_timeout).await {
+                                let activate = async {
+                                    tokio::io::AsyncWriteExt::write_all(
+                                        &mut candidate,
+                                        &[ACTIVATE_STREAM_MAGIC],
+                                    )
+                                    .await?;
+                                    tokio::io::AsyncWriteExt::flush(&mut candidate).await
                                 };
-                                if tokio::io::AsyncWriteExt::write_all(&mut candidate, &[ACTIVATE_STREAM_MAGIC]).await.is_ok()
-                                    && tokio::io::AsyncWriteExt::flush(&mut candidate).await.is_ok()
-                                {
-                                    fast_paired_stream = Some(candidate);
-                                    break;
+                                match tokio::time::timeout(frame_timeout, activate).await {
+                                    Ok(Ok(())) => {
+                                        fast_paired_stream = Some(candidate);
+                                        break;
+                                    }
+                                    Ok(Err(e)) => {
+                                        warn!(addr = %listen_addr, "Discarding dead pooled reverse stream: {:?}", e);
+                                    }
+                                    Err(_) => {
+                                        warn!(addr = %listen_addr, "Discarding stalled pooled reverse stream");
+                                    }
                                 }
-                                // Stale or dead stream; discard and try next
                             }
 
                             if let Some(data_stream) = fast_paired_stream {
@@ -552,15 +583,32 @@ impl ServerRunner {
                                 client_addr: visitor_addr.to_string(),
                             };
 
-                            let Some(send_res) = ctrl_stream.send(notify_msg).cancel_with(&cancel_token).await else {
-                                session_mgr.remove(&session_id);
-                                break;
-                            };
-
-                            if let Err(e) = send_res {
-                                warn!(session = %session_id, "Failed to notify client over control channel: {:?}", e);
-                                session_mgr.remove(&session_id);
-                                continue;
+                            // Bounded signaling: a stalled or dead control channel
+                            // must never block the accept loop and starve later
+                            // visitors. Any failure closes the listener so the
+                            // client re-registers instead of leaking sessions.
+                            let notify_res = tokio::time::timeout(
+                                frame_timeout,
+                                ctrl_stream.send(notify_msg),
+                            )
+                            .cancel_with(&cancel_token)
+                            .await;
+                            match notify_res {
+                                Some(Ok(Ok(()))) => {}
+                                Some(Ok(Err(e))) => {
+                                    warn!(session = %session_id, "Failed to notify client over control channel: {:?}", e);
+                                    session_mgr.remove(&session_id);
+                                    break;
+                                }
+                                Some(Err(_)) => {
+                                    warn!(session = %session_id, "Timed out signaling NewConnection; closing reverse listener");
+                                    session_mgr.remove(&session_id);
+                                    break;
+                                }
+                                None => {
+                                    session_mgr.remove(&session_id);
+                                    break;
+                                }
                             }
 
                             // Real TX is activity too. A busy reverse port with a
@@ -628,7 +676,7 @@ impl ServerRunner {
         }
 
         local_tracker.shutdown_and_wait().await;
-        session_mgr.unregister_pool(&listen_addr);
+        session_mgr.unregister_pool(&listen_addr, &idle_pool);
         info!(addr = %listen_addr, "Reverse listener closed.");
     }
 }
@@ -717,9 +765,7 @@ mod tests {
         };
         let runner = ServerRunner::from_config(server_config);
         let cancel_clone = cancel_token.clone();
-        let handle = tokio::spawn(async move {
-            runner.run(cancel_clone).await
-        });
+        let handle = tokio::spawn(async move { runner.run(cancel_clone).await });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         cancel_token.cancel();

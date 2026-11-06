@@ -8,25 +8,119 @@
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
+use std::future::poll_fn;
 use std::sync::Arc;
+use std::task::Poll;
+use std::time::Duration;
 use tokio::sync::oneshot;
+use tokio::time::Instant;
 
 use crate::core::error::TunnelError;
-use crate::core::stream::TunnelStream;
+use crate::core::stream::{HeartbeatStatus, TunnelStream};
 use crate::transport::TargetAddr;
 
 /// Derives a canonical key for matching reverse listener inbound pools.
+///
+/// The client puts its `listen` address into the pre-warm target header while
+/// the server registers the pool under the `listen_addr` from
+/// `RegisterReverse`. Normalizing both through `TargetAddr` keeps IPv4/IPv6/UDS
+/// spellings aligned. The host is preserved: two listeners that share a port
+/// on different local addresses must never share one pool.
 pub fn canonical_reverse_key(addr: &str) -> String {
     let s = addr.trim();
-    if s.starts_with("unix://") {
-        return s.to_string();
+    match crate::tunnel::forward::parse_target_addr(s) {
+        Ok(target) => target.to_string(),
+        Err(_) => s.to_string(),
     }
-    if let Some((_, port_str)) = s.rsplit_once(':') {
-        if let Ok(port) = port_str.parse::<u16>() {
-            return format!("tcp:{}", port);
+}
+
+/// One queued idle stream together with the time it arrived at the server.
+struct IdleEntry {
+    stream: Box<dyn TunnelStream>,
+    enqueued_at: Instant,
+}
+
+/// Pre-warmed stream queue owned by one reverse listener.
+///
+/// The server is the *only* owner of an idle stream's lifetime: the client
+/// worker holds the other end but never closes it on its own timer. `push`
+/// evicts the oldest entry on overflow and `pop_live` lazily discards entries
+/// older than the effective idle window. Both operations only ever touch
+/// entries still in this queue, so a popped (committed) stream can never be
+/// closed by the peer while it is about to be used.
+pub struct ReverseInboundPool {
+    idle: Mutex<VecDeque<IdleEntry>>,
+    capacity: usize,
+}
+
+impl ReverseInboundPool {
+    /// Creates a pool with a soft upper bound on queued idle streams.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            idle: Mutex::new(VecDeque::new()),
+            capacity,
         }
     }
-    s.to_string()
+
+    /// Enqueues an idle stream, evicting the oldest entry when at capacity.
+    pub fn push(&self, stream: Box<dyn TunnelStream>) -> bool {
+        if self.capacity == 0 {
+            return false;
+        }
+        let mut idle = self.idle.lock();
+        if idle.len() >= self.capacity {
+            // Dropping the handle closes the transport; the client worker sees
+            // EOF and re-dials. No visitor has been paired with this stream.
+            idle.pop_front();
+        }
+        idle.push_back(IdleEntry {
+            stream,
+            enqueued_at: Instant::now(),
+        });
+        true
+    }
+
+    /// Pops the newest idle stream that is both fresh enough and still alive.
+    ///
+    /// LIFO favours fresh streams. An entry older than `max_age` is closed
+    /// rather than paired: a silently expired NAT/QUIC pinhole cannot be
+    /// detected by `poll_check_alive`, so age is the second liveness signal.
+    /// Note that `poll_check_alive` reports `Pending` as healthy for transports
+    /// without a detectable EOF; the age bound is what covers that half-open
+    /// case without an extra RTT on the visitor's fast path.
+    pub async fn pop_live(&self, max_age: Duration) -> Option<Box<dyn TunnelStream>> {
+        loop {
+            let entry = self.idle.lock().pop_back()?;
+            if entry.enqueued_at.elapsed() >= max_age {
+                drop(entry);
+                continue;
+            }
+            let mut candidate = entry.stream;
+            let alive = poll_fn(|cx| match candidate.poll_check_alive(cx) {
+                Poll::Ready(HeartbeatStatus::Dead) => Poll::Ready(false),
+                _ => Poll::Ready(true),
+            })
+            .await;
+            if alive {
+                return Some(candidate);
+            }
+        }
+    }
+
+    /// Closes every idle stream of a superseded control-channel generation.
+    pub fn drain(&self) {
+        self.idle.lock().clear();
+    }
+
+    /// Returns the number of currently queued idle streams.
+    pub fn len(&self) -> usize {
+        self.idle.lock().len()
+    }
+
+    /// Returns true when no idle streams are queued.
+    pub fn is_empty(&self) -> bool {
+        self.idle.lock().is_empty()
+    }
 }
 
 /// Thread-safe in-memory routing table for matching incoming reverse data streams
@@ -34,7 +128,7 @@ pub fn canonical_reverse_key(addr: &str) -> String {
 #[derive(Clone, Default)]
 pub struct SessionManager {
     pending_sessions: Arc<DashMap<String, oneshot::Sender<Box<dyn TunnelStream>>>>,
-    reverse_pools: Arc<DashMap<String, Arc<Mutex<VecDeque<Box<dyn TunnelStream>>>>>>,
+    reverse_pools: Arc<DashMap<String, Arc<ReverseInboundPool>>>,
 }
 
 impl SessionManager {
@@ -82,20 +176,27 @@ impl SessionManager {
     }
 
     /// Registers an inbound pool for a reverse listener address.
-    pub fn register_pool(
-        &self,
-        listen_addr: &str,
-    ) -> Arc<Mutex<VecDeque<Box<dyn TunnelStream>>>> {
+    ///
+    /// A reconnect replaces the pool and closes everything queued by the old
+    /// control-channel generation, so late-arriving stale streams cannot be
+    /// inherited and consumed LIFO ahead of the new generation.
+    pub fn register_pool(&self, listen_addr: &str, capacity: usize) -> Arc<ReverseInboundPool> {
         let key = canonical_reverse_key(listen_addr);
-        let pool = Arc::new(Mutex::new(VecDeque::new()));
-        self.reverse_pools.insert(key, Arc::clone(&pool));
+        let pool = Arc::new(ReverseInboundPool::new(capacity));
+        if let Some(previous) = self.reverse_pools.insert(key, Arc::clone(&pool)) {
+            previous.drain();
+        }
         pool
     }
 
-    /// Unregisters an inbound pool for a reverse listener address.
-    pub fn unregister_pool(&self, listen_addr: &str) {
+    /// Removes a pool only if it is still the one this listener registered.
+    ///
+    /// A reconnecting control channel can overlap with the old one; without the
+    /// identity check the old listener's teardown would delete the new pool.
+    pub fn unregister_pool(&self, listen_addr: &str, pool: &Arc<ReverseInboundPool>) {
         let key = canonical_reverse_key(listen_addr);
-        self.reverse_pools.remove(&key);
+        self.reverse_pools
+            .remove_if(&key, |_, current| Arc::ptr_eq(current, pool));
     }
 
     /// Pushes a pre-warmed idle reverse stream into the matching listener's pool.
@@ -106,17 +207,18 @@ impl SessionManager {
     ) -> bool {
         if let Some(target) = target_opt {
             let key = canonical_reverse_key(&target.to_string());
-            if let Some(entry) = self.reverse_pools.get(&key) {
-                entry.lock().push_back(stream);
-                return true;
-            }
+            return match self.reverse_pools.get(&key) {
+                Some(entry) => entry.value().push(stream),
+                // Never guess: routing a stream meant for another listener would
+                // pair it with the wrong local target.
+                None => false,
+            };
         }
-        // Fallback: If exactly one reverse pool is active on the server, route to it
-        if self.reverse_pools.len() == 1 {
-            if let Some(entry) = self.reverse_pools.iter().next() {
-                entry.value().lock().push_back(stream);
-                return true;
-            }
+        // Target-less transports are ambiguous; only a single active pool is safe.
+        if self.reverse_pools.len() == 1
+            && let Some(entry) = self.reverse_pools.iter().next()
+        {
+            return entry.value().push(stream);
         }
         false
     }
@@ -130,19 +232,54 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::duplex;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::Context;
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, duplex};
+
+    /// Stream whose liveness hook always reports EOF/RST.
+    struct DeadStream;
+
+    impl AsyncRead for DeadStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for DeadStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl TunnelStream for DeadStream {
+        fn poll_check_alive(&mut self, _cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+            Poll::Ready(HeartbeatStatus::Dead)
+        }
+    }
 
     #[tokio::test]
     async fn test_session_register_and_fulfill() {
         let manager = SessionManager::new();
         let session_id = "test_sess_001".to_string();
-
         let rx = manager.register(session_id.clone());
         assert_eq!(manager.len(), 1);
-
         let (client, _server) = duplex(1024);
         manager.fulfill(&session_id, Box::new(client)).unwrap();
-
         assert_eq!(manager.len(), 0);
         let stream = rx.await.unwrap();
         drop(stream);
@@ -153,28 +290,136 @@ mod tests {
         let manager = SessionManager::new();
         assert_eq!(manager.pool_count(), 0);
 
-        let pool = manager.register_pool("0.0.0.0:8080");
+        let pool = manager.register_pool("0.0.0.0:8080", 8);
         assert_eq!(manager.pool_count(), 1);
 
         let (client, _server) = duplex(1024);
-        let target = TargetAddr::Domain("127.0.0.1".into(), 8080);
-        let pushed = manager.push_idle_stream(Some(&target), Box::new(client));
-        assert!(pushed, "Should match port 8080");
-        assert_eq!(pool.lock().len(), 1);
+        let target = TargetAddr::Domain("0.0.0.0".into(), 8080);
+        assert!(manager.push_idle_stream(Some(&target), Box::new(client)));
+        assert_eq!(pool.len(), 1);
+        assert!(pool.pop_live(Duration::from_secs(60)).await.is_some());
+        assert!(pool.is_empty());
 
-        let popped = pool.lock().pop_front();
-        assert!(popped.is_some());
-        assert_eq!(pool.lock().len(), 0);
-
-        manager.unregister_pool("0.0.0.0:8080");
+        manager.unregister_pool("0.0.0.0:8080", &pool);
         assert_eq!(manager.pool_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_pool_soft_cap_evicts_oldest() {
+        let pool = ReverseInboundPool::new(3);
+        for _ in 0..5 {
+            let (client, _server) = duplex(64);
+            assert!(pool.push(Box::new(client)));
+            assert!(pool.len() <= 3);
+        }
+        assert_eq!(pool.len(), 3, "soft cap must bound queued streams");
+        assert!(!ReverseInboundPool::new(0).push(Box::new(DeadStream)));
+    }
+
+    #[tokio::test]
+    async fn test_pop_live_skips_dead_streams() {
+        let pool = ReverseInboundPool::new(8);
+        let (client, _server) = duplex(64);
+        pool.push(Box::new(client));
+        pool.push(Box::new(DeadStream));
+        assert!(
+            pool.pop_live(Duration::from_secs(60)).await.is_some(),
+            "live stream must be used"
+        );
+        assert!(
+            pool.pop_live(Duration::from_secs(60)).await.is_none(),
+            "dead stream must be discarded, not paired"
+        );
+        assert!(pool.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_pop_live_discards_over_age_streams() {
+        let pool = ReverseInboundPool::new(4);
+        let (old, _old_peer) = duplex(64);
+        pool.push(Box::new(old));
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let (fresh, _fresh_peer) = duplex(64);
+        pool.push(Box::new(fresh));
+
+        assert!(
+            pool.pop_live(Duration::from_millis(60)).await.is_some(),
+            "the fresh stream must be paired"
+        );
+        assert!(
+            pool.pop_live(Duration::from_millis(60)).await.is_none(),
+            "an over-age stream must be closed, never paired"
+        );
+        assert!(pool.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_register_pool_drains_previous_generation() {
+        let manager = SessionManager::new();
+        let old_pool = manager.register_pool("127.0.0.1:8080", 8);
+        let (client, _peer) = duplex(64);
+        assert!(old_pool.push(Box::new(client)));
+        assert_eq!(old_pool.len(), 1);
+
+        let new_pool = manager.register_pool("127.0.0.1:8080", 8);
+        assert!(
+            old_pool.is_empty(),
+            "a reconnect must close the stale generation's idle streams"
+        );
+        assert!(new_pool.is_empty());
+        assert_eq!(manager.pool_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_push_does_not_route_to_wrong_listener() {
+        let manager = SessionManager::new();
+        let pool_a = manager.register_pool("127.0.0.1:8080", 8);
+        let (client, _server) = duplex(64);
+        let wrong = TargetAddr::Domain("127.0.0.1".into(), 9090);
+        assert!(
+            !manager.push_idle_stream(Some(&wrong), Box::new(client)),
+            "a single registered pool must not capture another listener's streams"
+        );
+        assert!(pool_a.is_empty());
+
+        // Two listeners on the same port but different hosts stay distinct.
+        let pool_b = manager.register_pool("127.0.0.2:8080", 8);
+        assert_eq!(manager.pool_count(), 2);
+        assert!(!Arc::ptr_eq(&pool_a, &pool_b));
+    }
+
+    #[tokio::test]
+    async fn test_unregister_pool_is_identity_aware() {
+        let manager = SessionManager::new();
+        let old_pool = manager.register_pool("127.0.0.1:8080", 8);
+        let new_pool = manager.register_pool("127.0.0.1:8080", 8);
+        manager.unregister_pool("127.0.0.1:8080", &old_pool);
+        assert_eq!(
+            manager.pool_count(),
+            1,
+            "stale teardown must not delete new pool"
+        );
+        let (client, _server) = duplex(64);
+        let target = TargetAddr::Domain("127.0.0.1".into(), 8080);
+        assert!(manager.push_idle_stream(Some(&target), Box::new(client)));
+        assert_eq!(new_pool.len(), 1);
     }
 
     #[test]
     fn test_canonical_reverse_key() {
-        assert_eq!(canonical_reverse_key("0.0.0.0:9090"), "tcp:9090");
-        assert_eq!(canonical_reverse_key("127.0.0.1:9090"), "tcp:9090");
-        assert_eq!(canonical_reverse_key("[::1]:9090"), "tcp:9090");
-        assert_eq!(canonical_reverse_key("unix:///tmp/sock"), "unix:///tmp/sock");
+        assert_eq!(canonical_reverse_key("0.0.0.0:9090"), "0.0.0.0:9090");
+        assert_eq!(canonical_reverse_key("127.0.0.1:9090"), "127.0.0.1:9090");
+        assert_ne!(
+            canonical_reverse_key("127.0.0.1:9090"),
+            canonical_reverse_key("127.0.0.2:9090")
+        );
+        assert_eq!(canonical_reverse_key("[::1]:9090"), "[::1]:9090");
+        // UDS paths are normalized by the platform, so assert stability rather
+        // than a POSIX-specific literal.
+        let uds_a = canonical_reverse_key("unix:///tmp/sock");
+        let uds_b = canonical_reverse_key(&uds_a);
+        assert!(uds_a.starts_with("unix://"));
+        assert_eq!(uds_a, uds_b);
     }
 }
