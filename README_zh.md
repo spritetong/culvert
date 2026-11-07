@@ -7,7 +7,7 @@
 
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL_2.0-blue.svg)](https://opensource.org/licenses/MPL-2.0)
 [![Rust Edition: 2024](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](https://www.rust-lang.org)
-[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)]()
+[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](.)
 
 ---
 
@@ -53,6 +53,7 @@
 在实际网络运维中，常常会遭遇严苛的 TCP 连接限制：部分企业出口防火墙或运营商链路会对长时间运行的 TCP 连接进行频繁中断、限速或并发数压制；而在高延迟、高丢包的跨洋或弱网链路下，TCP 传统的拥塞控制与队头阻塞（Head-of-Line Blocking）会导致业务严重卡顿。
 
 `culvert` 原生支持基于 QUIC 的 **HTTP/3 `CONNECT` 隧道协议**：
+
 - **抗丢包与零队头阻塞**：基于 UDP 多路复用，某条流的偶发丢包绝不影响其他并发流的顺畅传输。
 - **连接迁移 (Connection Migration)**：客户端网络在 Wi-Fi、蜂窝网络之间无缝切换时，长连接不中断。
 - **极速握手**：享受 QUIC 的 0-RTT / 1-RTT 握手优势，在 TCP 严苛受限或弱网环境下表现极为出色。
@@ -62,6 +63,7 @@
 常规隧道软件在客户端接收到新连接时，往往才临时向远端发起端到端握手（TCP 握手 + TLS 握手 + 协议协商），这会额外增加 1~3 个 RTT 的网络延迟，对 SSH 按键响应、MySQL 短查询等低延迟场景极不友好。
 
 `culvert` 创新设计了**全链路双向预热连接池**：
+
 - **正向模式 (Forward)**：客户端后台自动建立并预热维持一组就绪的空闲连接流。当本地新连接到达时，毫秒级从池中弹出可用流（0-RTT），通过微秒级带内激活报文（`0xA5` + 目标地址）瞬间开启转发，客户端后台并发平滑补充新空闲流。
 - **反向模式 (Reverse)**：客户端主动向服务端预先建立反向就绪流并在服务端侧排队维护。公网访客接入服务端端口时，服务端秒级弹出可用流并通过单字节 `0xA5` 瞬间激活，无须等待控制信令握手往返，真正达成 0-RTT 极速响应！
 - **完备的防风暴机制**：内置并发握手信号量（限制最大并发连接建立），避免在弱网断线重连时引发连接风暴；结合指数退避与服务端统一生命周期裁决，确保工业级稳定性。
@@ -384,6 +386,7 @@ tunnels:
 Caddy 原生支持自动化证书申请与 Unix Domain Socket 反代，与 `culvert` 的后置理念完美契合：
 
 **`server.yaml`**：
+
 ```yaml
 log:
   level: "info"
@@ -393,6 +396,7 @@ server:
 ```
 
 **`Caddyfile`**：
+
 ```caddy
 tunnel.example.com {
     # 匹配专用隧道路径
@@ -463,6 +467,7 @@ server {
 为了保障 `culvert` 作为守护进程可靠稳定运行，建议配置 Systemd 服务单元文件。
 
 创建运行用户并设置权限：
+
 ```bash
 sudo useradd --system --shell /usr/sbin/nologin --user-group culvert
 sudo mkdir -p /etc/culvert /run
@@ -470,6 +475,7 @@ sudo chown culvert:culvert /run
 ```
 
 创建服务文件 `/etc/systemd/system/culvert.service`：
+
 ```ini
 [Unit]
 Description=culvert High-Performance TCP Tunnel Service
@@ -496,6 +502,7 @@ WantedBy=multi-user.target
 ```
 
 加载并启动服务：
+
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now culvert
@@ -523,6 +530,7 @@ tunnels:
 ```
 
 外部访客连接：
+
 ```bash
 ssh -p 2222 user@tunnel.example.com
 ```
@@ -534,6 +542,7 @@ ssh -p 2222 user@tunnel.example.com
 在没有标准 Web 网关或需要直穿 UDP 的场景下，服务端直接终结 HTTP/3：
 
 **`server.yaml`**：
+
 ```yaml
 server:
   listen:
@@ -543,6 +552,7 @@ server:
 ```
 
 **`client.yaml`**：
+
 ```yaml
 tls:
   insecure: true                     # 当服务端使用自签名证书时开启
@@ -589,20 +599,26 @@ tunnels:
 ## 常见问题与排障 (FAQ)
 
 ### Q1: 使用 Unix Domain Socket 时，前端反代报错 `Permission denied`？
+
 **解答**：请检查 URL Query 中的 `chmod` 参数或套接字所在目录权限。推荐在 URL 后添加 `?chmod=0o660`，并确保 Caddy / Nginx 的运行用户与 `culvert` 用户属于同一用户组，例如：
+
 ```yaml
 server:
   listen: "ws+unix:///run/culvert.sock?path=/tunnel&chmod=0o660"
 ```
 
 ### Q2: 隧道连接在空闲几分钟后总是被主动切断？
+
 **解答**：通常是由反代服务器的默认超时设置引起的。
+
 - 在 **Caddy** 中，请将 `reverse_proxy` 块的 `stream_timeout` 维持为 `0`（默认值即无限制）。
 - 在 **Nginx** 中，请确保设置了 `proxy_read_timeout 3600s;` 与 `proxy_send_timeout 3600s;`。
 - 同时确认配置中的 `dialer.heartbeat_interval`（默认 15s）正常工作，定时发送保活探测维持链路活性。
 
 ### Q3: 什么时候推荐使用 HTTP/3 (H3)，什么时候推荐 WebSocket (WSS)？
+
 **解答**：
+
 - **推荐 WSS 场景**：在标准云服务器生产环境、有成熟的 Caddy/Nginx 网关、需要复用 443 端口与合规 Web 站点共享入口时，WSS 后置反代是最佳选择。
 - **推荐 H3 / QUIC 场景**：在 TCP 连接受到严格限制、长连接经常被强制重置、或者处于高丢包、高延迟的跨洋弱网链路时，HTTP/3 基于 UDP 的多路复用与抗丢包特性将带来显著的稳定性与吞吐提升。
 
@@ -611,9 +627,11 @@ server:
 ## 合规使用警示与免责声明
 
 > [!CAUTION]
+>
 > ### ⚠️ 合规使用严正警示
+>
 > 本项目定位为企业及开发者在**合法合规**前提下进行系统运维、内网调试、远程办公与网络传输优化的基础工具。
-> 
+>
 > **严禁**将 `culvert` 用于任何形式的网络攻击、网络黑灰产业、电信网络诈骗、侵入计算机信息系统、非法未授权接入、窃取数据或规避监管等违法犯罪活动。
 
 ### 免责声明 (Disclaimer)

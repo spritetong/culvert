@@ -7,7 +7,7 @@ English | [简体中文](README_zh.md)
 
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL_2.0-blue.svg)](https://opensource.org/licenses/MPL-2.0)
 [![Rust Edition: 2024](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](https://www.rust-lang.org)
-[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)]()
+[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](.)
 
 ---
 
@@ -58,6 +58,7 @@ In enterprise production environments and compliant server architectures, standa
 In production networking, engineers frequently encounter restrictive environments: enterprise firewalls or intermediate carriers may throttle, aggressively terminate, or limit concurrent long-lived TCP connections. On high-latency or packet-loss-heavy links (e.g., cross-region connections), standard TCP congestion control and head-of-line blocking cause severe throughput degradation.
 
 `culvert` provides native support for **HTTP/3 `CONNECT` tunneling over QUIC**:
+
 - **Loss resilience & zero head-of-line blocking**: Leveraging UDP-based multiplexing, packet drops on one stream never stall or impair sibling streams.
 - **Connection Migration**: QUIC preserves active connections when clients switch between Wi-Fi and cellular networks.
 - **Rapid Handshakes**: Takes full advantage of 0-RTT and 1-RTT connection establishment, delivering high stability and responsiveness where TCP is restricted or unreliable.
@@ -67,6 +68,7 @@ In production networking, engineers frequently encounter restrictive environment
 Traditional tunneling tools initiate an end-to-end handshake (TCP + TLS + HTTP Upgrade/CONNECT) only after an inbound visitor arrives, adding 1 to 3 RTTs of latency before data can flow. This noticeable lag impairs interactive sessions like SSH or bursty short connections like MySQL queries.
 
 `culvert` implements a **bidirectional pre-warmed stream pool**:
+
 - **Forward Mode**: The client automatically maintains a pool of pre-warmed idle streams in the background. When a local application connects, an idle stream is acquired instantly (0-RTT), activated via a lightweight in-band packet (`0xA5` + target address), and data transfer begins immediately while the pool is replenished asynchronously.
 - **Reverse Mode**: The client pre-establishes idle reverse streams queued on the server. When an external visitor connects to the server port, the server pops an idle stream and activates it with a single `0xA5` byte without round-trip signaling.
 - **Storm protection**: Handshake concurrency is governed by a semaphore to prevent connection storms on reconnect, backed by exponential backoff and server-authoritative stream lifecycles.
@@ -389,6 +391,7 @@ tunnels:
 Caddy provides automated HTTPS certificate issuance, HTTP/3 support, and clean Unix Domain Socket reverse proxying:
 
 **`server.yaml`**:
+
 ```yaml
 log:
   level: "info"
@@ -398,6 +401,7 @@ server:
 ```
 
 **`Caddyfile`**:
+
 ```caddy
 tunnel.example.com {
     # Match dedicated tunnel endpoint path
@@ -468,6 +472,7 @@ server {
 To manage `culvert` reliably as a background system daemon:
 
 Create a dedicated unprivileged user and directories:
+
 ```bash
 sudo useradd --system --shell /usr/sbin/nologin --user-group culvert
 sudo mkdir -p /etc/culvert /run
@@ -475,6 +480,7 @@ sudo chown culvert:culvert /run
 ```
 
 Create `/etc/systemd/system/culvert.service`:
+
 ```ini
 [Unit]
 Description=culvert High-Performance TCP Tunnel Service
@@ -501,6 +507,7 @@ WantedBy=multi-user.target
 ```
 
 Reload and enable the service:
+
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now culvert
@@ -528,6 +535,7 @@ tunnels:
 ```
 
 Connect via SSH:
+
 ```bash
 ssh -p 2222 user@tunnel.example.com
 ```
@@ -539,6 +547,7 @@ ssh -p 2222 user@tunnel.example.com
 In deployments without a web proxy where direct QUIC over UDP is preferred:
 
 **`server.yaml`**:
+
 ```yaml
 server:
   listen:
@@ -548,6 +557,7 @@ server:
 ```
 
 **`client.yaml`**:
+
 ```yaml
 tls:
   insecure: true                     # Required only when using self-signed certs
@@ -594,20 +604,26 @@ tunnels:
 ## FAQ & Troubleshooting
 
 ### Q1: `Permission denied` error when connecting to Unix Domain Sockets?
+
 **Answer**: Check socket permissions and ownership. Append `?chmod=0o660` to the socket URL and verify that the reverse proxy (Caddy / Nginx) and `culvert` share a common user group:
+
 ```yaml
 server:
   listen: "ws+unix:///run/culvert.sock?path=/tunnel&chmod=0o660"
 ```
 
 ### Q2: Idle tunnel connections terminate after a few minutes?
+
 **Answer**: This is typically caused by reverse proxy idle timeouts.
+
 - In **Caddy**: Ensure `stream_timeout` is kept at `0` (unlimited).
 - In **Nginx**: Ensure `proxy_read_timeout 3600s;` and `proxy_send_timeout 3600s;` are set.
 - Ensure `dialer.heartbeat_interval` (default `15s`) is active to periodically refresh connection liveness.
 
 ### Q3: When should I choose HTTP/3 (H3) over WebSocket (WSS)?
+
 **Answer**:
+
 - **Choose WSS**: In standard cloud environments with existing Caddy or Nginx ingress infrastructure, where sharing port `443` with standard web traffic is desired.
 - **Choose H3 / QUIC**: In environments where TCP is subject to strict QoS, connection resets, or where links exhibit high packet loss and latency. QUIC's loss resilience and lack of head-of-line blocking offer substantial stability gains.
 
@@ -616,9 +632,11 @@ server:
 ## Compliance Warning & Legal Disclaimer
 
 > [!CAUTION]
+>
 > ### ⚠️ Strict Compliance Warning
+>
 > `culvert` is developed exclusively for **authorized and lawful** system operations, private network diagnostics, remote administration, and academic networking research.
-> 
+>
 > **It is strictly prohibited** to use `culvert` for any unauthorized access, computer intrusion, malicious cyber operations, telecommunication fraud, or any activity that evades legal and regulatory compliance.
 
 ### Legal Disclaimer
