@@ -380,7 +380,7 @@ impl AsyncWrite for WsTunnelStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.peer_closed || self.close_sent {
+        if self.peer_closed || self.close_sent || self.fin_sent || self.fin_queued {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "WebSocket peer or write half closed",
@@ -437,10 +437,21 @@ impl AsyncWrite for WsTunnelStream {
                     Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)))
                 }
             },
-            WriteState::WritingControl(fut) => {
-                self.write_state = WriteState::WritingControl(fut);
-                Poll::Pending
-            }
+            WriteState::WritingControl(mut fut) => match fut.as_mut().poll(cx) {
+                Poll::Pending => {
+                    self.write_state = WriteState::WritingControl(fut);
+                    Poll::Pending
+                }
+                Poll::Ready((tx, Ok(()))) => {
+                    self.write_state = WriteState::Idle(tx);
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                Poll::Ready((_tx, Err(e))) => {
+                    self.write_state = WriteState::Failed;
+                    Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)))
+                }
+            },
             WriteState::Failed => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "WebSocket write half in failed state",
@@ -480,10 +491,20 @@ impl AsyncWrite for WsTunnelStream {
                         return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
                     }
                 },
-                WriteState::WritingControl(fut) => {
-                    self.write_state = WriteState::WritingControl(fut);
-                    return Poll::Pending;
-                }
+                WriteState::WritingControl(mut fut) => match fut.as_mut().poll(cx) {
+                    Poll::Pending => {
+                        self.write_state = WriteState::WritingControl(fut);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready((tx, Ok(()))) => {
+                        self.write_state = WriteState::Idle(tx);
+                        continue;
+                    }
+                    Poll::Ready((_tx, Err(e))) => {
+                        self.write_state = WriteState::Failed;
+                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
+                    }
+                },
                 WriteState::Failed => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
@@ -542,10 +563,20 @@ impl AsyncWrite for WsTunnelStream {
                         return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
                     }
                 },
-                WriteState::WritingControl(fut) => {
-                    self.write_state = WriteState::WritingControl(fut);
-                    return Poll::Pending;
-                }
+                WriteState::WritingControl(mut fut) => match fut.as_mut().poll(cx) {
+                    Poll::Pending => {
+                        self.write_state = WriteState::WritingControl(fut);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready((tx, Ok(()))) => {
+                        self.write_state = WriteState::Idle(tx);
+                        continue;
+                    }
+                    Poll::Ready((_tx, Err(e))) => {
+                        self.write_state = WriteState::Failed;
+                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
+                    }
+                },
                 WriteState::Failed => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
@@ -559,7 +590,7 @@ impl AsyncWrite for WsTunnelStream {
 
 impl TunnelStream for WsTunnelStream {
     fn poll_write_bytes(&mut self, cx: &mut Context<'_>, buf: Bytes) -> Poll<io::Result<usize>> {
-        if self.peer_closed || self.close_sent {
+        if self.peer_closed || self.close_sent || self.fin_sent || self.fin_queued {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "WebSocket peer or write half closed",
@@ -620,10 +651,21 @@ impl TunnelStream for WsTunnelStream {
                     Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)))
                 }
             },
-            WriteState::WritingControl(fut) => {
-                self.write_state = WriteState::WritingControl(fut);
-                Poll::Pending
-            }
+            WriteState::WritingControl(mut fut) => match fut.as_mut().poll(cx) {
+                Poll::Pending => {
+                    self.write_state = WriteState::WritingControl(fut);
+                    Poll::Pending
+                }
+                Poll::Ready((tx, Ok(()))) => {
+                    self.write_state = WriteState::Idle(tx);
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                Poll::Ready((_tx, Err(e))) => {
+                    self.write_state = WriteState::Failed;
+                    Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)))
+                }
+            },
             WriteState::Failed => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "WebSocket write half in failed state",
@@ -1261,5 +1303,128 @@ mod tests {
             poll_fn(|cx| server.poll_check_alive(cx)).await,
             HeartbeatStatus::Alive
         );
+    }
+
+    /// Verifies that calling write or poll_write_bytes after shutdown()
+    /// returns BrokenPipe error, enforcing AsyncWrite contract.
+    #[tokio::test]
+    async fn test_ws_write_after_shutdown_returns_broken_pipe() {
+        use std::future::poll_fn;
+
+        let (raw_client, raw_server) = duplex(65536);
+        let mut client = WsTunnelStream::new(raw_client, Role::Client);
+        let mut server = WsTunnelStream::new(raw_server, Role::Server);
+
+        client.write_all(b"initial data").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        // Write after shutdown must fail
+        let err = client.write_all(b"post shutdown").await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+
+        let err_bytes = poll_fn(|cx| {
+            client.poll_write_bytes(cx, bytes::Bytes::from_static(b"post shutdown bytes"))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err_bytes.kind(), io::ErrorKind::BrokenPipe);
+
+        // Server still drains the initial data and observes clean EOF
+        let mut buf = [0u8; 12];
+        server.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"initial data");
+
+        let mut eof_buf = [0u8; 1];
+        let n = server.read(&mut eof_buf).await.unwrap();
+        assert_eq!(n, 0, "server must observe EOF");
+    }
+
+    /// Tests full bidirectional half-close workflow: client closes its write half,
+    /// server drains client data, continues writing back to client while client's
+    /// write half is dead, then server closes its write half, and client observes EOF.
+    #[tokio::test]
+    async fn test_ws_bidirectional_half_close_interleaving() {
+        let (raw_client, raw_server) = duplex(65536);
+        let mut client = WsTunnelStream::new(raw_client, Role::Client);
+        let mut server = WsTunnelStream::new(raw_server, Role::Server);
+
+        // 1. Client writes payload and shuts down its write direction
+        let client_payload = vec![0x42u8; 8192];
+        client.write_all(&client_payload).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        // 2. Server reads all client payload
+        let mut server_received = vec![0u8; 8192];
+        server.read_exact(&mut server_received).await.unwrap();
+        assert_eq!(server_received, client_payload);
+
+        // 3. Server observes EOF
+        let mut eof_buf = [0u8; 1];
+        let n = server.read(&mut eof_buf).await.unwrap();
+        assert_eq!(n, 0, "server must see EOF after client shutdown");
+
+        // 4. Server writes response back to client (half-close: server -> client is still alive!)
+        let server_payload = vec![0x24u8; 16384];
+        server.write_all(&server_payload).await.unwrap();
+        server.shutdown().await.unwrap();
+
+        // 5. Client reads server response even after having shut down its own write half
+        let mut client_received = vec![0u8; 16384];
+        client.read_exact(&mut client_received).await.unwrap();
+        assert_eq!(client_received, server_payload);
+
+        // 6. Client observes EOF from server
+        let n = client.read(&mut eof_buf).await.unwrap();
+        assert_eq!(n, 0, "client must see EOF after server shutdown");
+    }
+
+    /// Tests that continuous concurrent liveness checks do not drop data frames
+    /// or corrupt streams during high-throughput transfer.
+    #[tokio::test]
+    async fn test_ws_continuous_liveness_sweeps_under_concurrent_transfer() {
+        use std::future::poll_fn;
+
+        let (raw_client, raw_server) = duplex(131072);
+        let mut client = WsTunnelStream::new(raw_client, Role::Client);
+        let mut server = WsTunnelStream::new(raw_server, Role::Server);
+
+        let data_size = 65536 * 4; // 256 KB
+        let send_data: Vec<u8> = (0..data_size).map(|i| (i % 251) as u8).collect();
+        let expected = send_data.clone();
+
+        let sender = tokio::spawn(async move {
+            let mut offset = 0;
+            while offset < send_data.len() {
+                let chunk_size = (send_data.len() - offset).min(4096);
+                client
+                    .write_all(&send_data[offset..offset + chunk_size])
+                    .await
+                    .unwrap();
+                offset += chunk_size;
+            }
+            client.shutdown().await.unwrap();
+            client
+        });
+
+        // Concurrently on server side: continuously poll poll_check_alive
+        // while reading data to ensure zero payload is swallowed or lost
+        let mut received = Vec::with_capacity(data_size);
+        let mut temp_buf = [0u8; 4096];
+        loop {
+            // Rapid liveness check interleaving
+            let status = poll_fn(|cx| server.poll_check_alive(cx)).await;
+            assert_eq!(status, HeartbeatStatus::Alive);
+
+            let n = server.read(&mut temp_buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            received.extend_from_slice(&temp_buf[..n]);
+        }
+
+        assert_eq!(received.len(), expected.len());
+        assert_eq!(received, expected);
+
+        let _ = sender.await.unwrap();
     }
 }

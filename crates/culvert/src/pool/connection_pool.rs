@@ -497,8 +497,36 @@ impl ReplenishingStreamPool {
                                 }
 
                                 if let Some(stream) = acquired {
+                                    match req.reply.send(Ok(stream)) {
+                                        Ok(()) => {}
+                                        Err(Ok(returned)) => {
+                                            // The caller cancelled / dropped rx before receiving the stream.
+                                            // Reclaim it: first offer to any live pending waiters, otherwise
+                                            // put back into idle_streams so the pre-warmed stream is not wasted.
+                                            let mut cur_stream = Some(returned);
+                                            while let Some((pending_req, _)) =
+                                                pending_requests.pop_front()
+                                            {
+                                                if let Some(s) = cur_stream.take() {
+                                                    match pending_req.reply.send(Ok(s)) {
+                                                        Ok(()) => break,
+                                                        Err(returned_res) => {
+                                                            if let Ok(r) = returned_res {
+                                                                cur_stream = Some(r);
+                                                            } else {
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if let Some(s) = cur_stream {
+                                                idle_streams.push_front(ManagedStream::new(s));
+                                            }
+                                        }
+                                        Err(Err(_)) => {}
+                                    }
                                     stats_clone.lock().idle_count = idle_streams.len();
-                                    let _ = req.reply.send(Ok(stream));
                                 } else {
                                     // If pool has no idle streams and no connects currently in-flight,
                                     // reset backoff timer so this incoming demand is attempted promptly
@@ -556,17 +584,18 @@ impl ReplenishingStreamPool {
                     }
                     PoolEvent::HeartbeatTick => {
                         let now = Instant::now();
-                        // Prune closed and timed-out requests in FIFO order
-                        while let Some((front, enqueued_at)) = pending_requests.front() {
-                            if front.reply.is_closed() {
-                                pending_requests.pop_front();
-                            } else if now.duration_since(*enqueued_at) > POOL_ACQUIRE_TIMEOUT {
-                                let (req, _) = pending_requests.pop_front().unwrap();
-                                let _ = req.reply.send(Err(TunnelError::PoolExhausted));
+                        // Prune closed and timed-out requests across the entire queue
+                        let mut live = VecDeque::new();
+                        while let Some(entry) = pending_requests.pop_front() {
+                            if entry.0.reply.is_closed() {
+                                continue;
+                            } else if now.duration_since(entry.1) > POOL_ACQUIRE_TIMEOUT {
+                                let _ = entry.0.reply.send(Err(TunnelError::PoolExhausted));
                             } else {
-                                break;
+                                live.push_back(entry);
                             }
                         }
+                        pending_requests = live;
                         stats_clone.lock().idle_count = idle_streams.len();
                     }
                 }
@@ -977,6 +1006,197 @@ mod tests {
         pool.on_stream_closed();
         pool.on_stream_closed();
         assert_eq!(pool.stats().active_count, 0);
+
+        cancel_token.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_acquire_reclaims_stream() {
+        let connector = Arc::new(MockSuccessfulConnector);
+        let cancel_token = CancellationToken::new();
+        let pool = ReplenishingStreamPool::new_shared(
+            connector,
+            2,
+            cancel_token.clone(),
+            DEFAULT_HEARTBEAT_INTERVAL,
+            DEFAULT_IDLE_TIMEOUT,
+        );
+        // Wait for pre-warm: idle_count == 2
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pool.stats().idle_count < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("prewarm failed");
+
+        // Send an Acquire command whose receiver is already dropped (cancelled)
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        drop(rx);
+        pool.tx_cmd
+            .send(PoolCommand::Acquire(AcquireRequest {
+                target: None,
+                reply,
+            }))
+            .await
+            .expect("send acquire failed");
+
+        // Give the actor a moment to process the command
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The pre-warmed stream must be reclaimed, not destroyed and re-dialed.
+        assert_eq!(
+            pool.stats().total_created,
+            2,
+            "a new stream was dialed because cancelled acquire dropped the idle stream"
+        );
+        assert_eq!(
+            pool.stats().idle_count,
+            2,
+            "stream was lost when caller dropped receive channel"
+        );
+
+        cancel_token.cancel();
+    }
+
+    /// Tests that cancelled acquire requests trapped behind an active waiter
+    /// are completely pruned by the periodic heartbeat tick without head-of-line blocking.
+    #[tokio::test]
+    async fn test_pending_requests_cancellation_head_of_line_pruning() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let connector = Arc::new(MockFailingConnector {
+            call_count: Arc::clone(&call_count),
+        });
+        let cancel_token = CancellationToken::new();
+        // target_size = 0 so no background connects occur
+        let pool = ReplenishingStreamPool::new_shared(
+            connector,
+            0,
+            cancel_token.clone(),
+            DEFAULT_HEARTBEAT_INTERVAL,
+            DEFAULT_IDLE_TIMEOUT,
+        );
+
+        // Enqueue live waiter 1
+        let (reply1, rx1) = tokio::sync::oneshot::channel();
+        pool.tx_cmd
+            .send(PoolCommand::Acquire(AcquireRequest {
+                target: None,
+                reply: reply1,
+            }))
+            .await
+            .unwrap();
+
+        // Enqueue cancelled waiter 2 and waiter 3 (receivers dropped)
+        let (reply2, rx2) = tokio::sync::oneshot::channel();
+        drop(rx2);
+        pool.tx_cmd
+            .send(PoolCommand::Acquire(AcquireRequest {
+                target: None,
+                reply: reply2,
+            }))
+            .await
+            .unwrap();
+
+        let (reply3, rx3) = tokio::sync::oneshot::channel();
+        drop(rx3);
+        pool.tx_cmd
+            .send(PoolCommand::Acquire(AcquireRequest {
+                target: None,
+                reply: reply3,
+            }))
+            .await
+            .unwrap();
+
+        // Wait slightly more than POOL_HEARTBEAT_TICK_INTERVAL (1s) for heartbeat tick
+        tokio::time::sleep(Duration::from_millis(1150)).await;
+
+        // Fulfill live waiter 1 with a stream
+        let (raw_c1, _raw_s1) = tokio::io::duplex(1024);
+        pool.push_idle(Box::new(raw_c1));
+
+        let res1 = rx1.await.expect("waiter 1 must receive stream").unwrap();
+        drop(res1);
+
+        // Now pending_requests MUST be empty because cancelled waiters 2 and 3
+        // were pruned. Pushing another stream should land in idle_streams immediately!
+        let (raw_c2, _raw_s2) = tokio::io::duplex(1024);
+        pool.push_idle(Box::new(raw_c2));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            pool.stats().idle_count,
+            1,
+            "cancelled requests were not pruned and trapped second stream"
+        );
+
+        cancel_token.cancel();
+    }
+
+    /// High-concurrency acquire with churn and cancellation: 30 tasks call
+    /// acquire concurrently; some complete while others cancel with short timeouts.
+    /// Invariants: active_count + idle_count <= POOL_MAX_CAPACITY at all times,
+    /// no counter corruption, and the pool recovers to target_size.
+    #[tokio::test]
+    async fn test_high_concurrency_acquire_cancel_churn() {
+        let connector = Arc::new(MockSuccessfulConnector);
+        let cancel_token = CancellationToken::new();
+        let target_size = 4;
+        let pool = ReplenishingStreamPool::new_shared(
+            connector,
+            target_size,
+            cancel_token.clone(),
+            DEFAULT_HEARTBEAT_INTERVAL,
+            DEFAULT_IDLE_TIMEOUT,
+        );
+
+        // Wait for prewarm
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pool.stats().idle_count < target_size {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("prewarm failed");
+
+        let mut handles = Vec::new();
+        for i in 0..30 {
+            let p = pool.clone();
+            handles.push(tokio::spawn(async move {
+                if i % 2 == 0 {
+                    // Fast caller with immediate acquisition
+                    if let Ok(stream) = p.acquire(None).await {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        drop(stream);
+                        p.on_stream_closed();
+                    }
+                } else {
+                    // Impatient caller with tight timeout that may cancel
+                    let res = tokio::time::timeout(Duration::from_millis(1), p.acquire(None)).await;
+                    if let Ok(Ok(stream)) = res {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        drop(stream);
+                        p.on_stream_closed();
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            let _ = h.await;
+        }
+
+        // Wait for pool to settle back
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while pool.stats().idle_count < target_size || pool.stats().active_count > 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("pool failed to recover to target_size after cancel churn");
+
+        assert_eq!(pool.stats().active_count, 0);
+        assert_eq!(pool.stats().idle_count, target_size);
 
         cancel_token.cancel();
     }
