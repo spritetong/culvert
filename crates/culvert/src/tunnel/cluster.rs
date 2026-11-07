@@ -32,8 +32,9 @@ pub async fn run_tunnel_cluster(
         "Starting tunnel cluster mappings"
     );
 
-    // Shared connection pool for all forward mappings under this tunnel
-    let pool = if let Some(size) = config.pool_size.filter(|&s| s > 0) {
+    // Shared connection pool for all forward mappings under this tunnel (only created when forward mappings exist)
+    let has_forward_mappings = mappings.iter().any(|m| m.mode == TunnelMode::Forward);
+    let pool = if has_forward_mappings && let Some(size) = config.pool_size.filter(|&s| s > 0) {
         let connector: Arc<dyn TransportConnector> =
             Arc::from(transport_registry.create_connector(
                 &endpoint_ctx,
