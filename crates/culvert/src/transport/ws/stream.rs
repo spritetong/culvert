@@ -715,73 +715,32 @@ impl TunnelStream for WsTunnelStream {
     }
 
     fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
-        match &mut self.read_state {
-            ReadState::Eof | ReadState::Failed => Poll::Ready(HeartbeatStatus::Dead),
-            ReadState::Buffered { .. } => Poll::Ready(HeartbeatStatus::Alive),
-            ReadState::Idle(_) => {
-                // Peek a read poll to check if underlying connection died or closed
-                let mut empty = [0u8; 0];
-                let mut buf = ReadBuf::new(&mut empty);
-                match Pin::new(&mut *self).poll_read(cx, &mut buf) {
-                    Poll::Ready(Err(_)) => Poll::Ready(HeartbeatStatus::Dead),
-                    // Never re-poll the future that `poll_read` just created with
-                    // the same `cx`: a buffered frame can make that second poll
-                    // return Ready, which used to drop both the read half and the
-                    // payload while leaving a completed future in `Reading`.
-                    // The state is now `Reading` with a registered waker, so the
-                    // next liveness check (or the relay's own poll_read) will
-                    // consume and preserve the frame normally.
-                    Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
-                    Poll::Ready(Ok(())) => match self.read_state {
-                        ReadState::Eof | ReadState::Failed => Poll::Ready(HeartbeatStatus::Dead),
-                        _ => Poll::Ready(HeartbeatStatus::Alive),
-                    },
-                }
-            }
-            ReadState::Reading(fut) => match fut.as_mut().poll(cx) {
-                Poll::Ready((_rx, obligated, Ok((OpCode::Close, payload)))) => {
-                    if !obligated.is_empty() {
-                        self.control_queue.extend(obligated);
-                    }
-                    self.peer_closed = true;
-                    if !self.close_sent {
-                        let close_frame = if payload.is_empty() {
-                            Frame::close(1000, &[])
-                        } else {
-                            Frame::close_raw(Payload::Owned(payload.to_vec()))
-                        };
-                        self.control_queue.push_back(close_frame);
-                        self.close_sent = true;
-                    }
-                    let _ = self.poll_flush_control(cx);
-                    self.read_state = ReadState::Eof;
-                    Poll::Ready(HeartbeatStatus::Dead)
-                }
-                Poll::Ready((_rx, obligated, Err(_))) => {
-                    if !obligated.is_empty() {
-                        self.control_queue.extend(obligated);
-                        let _ = self.poll_flush_control(cx);
-                    }
-                    self.read_state = ReadState::Failed;
-                    Poll::Ready(HeartbeatStatus::Dead)
-                }
-                Poll::Ready((rx, obligated, Ok((_, payload)))) => {
-                    if !obligated.is_empty() {
-                        self.control_queue.extend(obligated);
-                        let _ = self.poll_flush_control(cx);
-                    }
-                    if payload.is_empty() {
-                        self.read_state = ReadState::Idle(rx);
-                    } else {
-                        self.read_state = ReadState::Buffered {
-                            rx,
-                            payload,
-                            cursor: 0,
-                        };
-                    }
-                    Poll::Ready(HeartbeatStatus::Alive)
-                }
-                Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
+        // Drive the *same* read state machine the relay uses, with a zero-capacity
+        // `ReadBuf`. This is the WebSocket equivalent of `BufferedTlsStream`'s
+        // one-byte pushback: payload frames land in `ReadState::Buffered`, a
+        // zero-length binary FIN lands in `ReadState::Eof`, a Close frame queues
+        // its obligated reply, and read errors land in `ReadState::Failed`.
+        //
+        // Never poll the in-flight `WsReadFuture` directly here. Doing so used to
+        // re-implement frame handling with a foreign waker and, crucially, turned
+        // an empty binary payload back into `ReadState::Idle` -- silently eating
+        // the logical FIN. The relay then waited for an EOF that could never
+        // arrive until the idle timeout, which is the "curl pauses before exit"
+        // symptom. It also discarded the read half on Close/error paths.
+        let mut empty = [0u8; 0];
+        let mut buf = ReadBuf::new(&mut empty);
+        match Pin::new(&mut *self).poll_read(cx, &mut buf) {
+            Poll::Ready(Err(_)) => Poll::Ready(HeartbeatStatus::Dead),
+            Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
+            Poll::Ready(Ok(())) => match self.read_state {
+                // A clean in-band FIN is a half-close, not a failure: the relay
+                // still has buffered tail bytes to drain in the other direction.
+                // Reporting Dead here made the relay abort with "unresponsive to
+                // heartbeats" and truncate the response. Only an RFC 6455 Close
+                // (`peer_closed`) or a broken read half is a real teardown.
+                ReadState::Eof if !self.peer_closed => Poll::Ready(HeartbeatStatus::Alive),
+                ReadState::Eof | ReadState::Failed => Poll::Ready(HeartbeatStatus::Dead),
+                _ => Poll::Ready(HeartbeatStatus::Alive),
             },
         }
     }
@@ -1131,6 +1090,132 @@ mod tests {
             HeartbeatStatus::Alive,
             "PONG is optional and must not be load-bearing for liveness"
         );
+    }
+
+    /// A liveness sweep that lands exactly while a read future is in flight must
+    /// consume the in-band logical FIN into `ReadState::Eof`, not silently drop
+    /// it and reset to `Idle`. Losing the FIN leaves the relay waiting for a
+    /// frame that will never arrive, so curl stalls until the idle timeout.
+    #[tokio::test]
+    async fn test_ws_liveness_check_preserves_in_band_fin() {
+        use std::future::poll_fn;
+
+        let (raw_client, raw_server) = duplex(65536);
+        let mut client = WsTunnelStream::new(raw_client, Role::Client);
+        let mut server = WsTunnelStream::new(raw_server, Role::Server);
+
+        // Park the server in ReadState::Reading with no frame available yet.
+        assert_eq!(
+            poll_fn(|cx| server.poll_check_alive(cx)).await,
+            HeartbeatStatus::Alive
+        );
+        assert!(matches!(server.read_state, ReadState::Reading(_)));
+
+        // Peer half-closes its write direction while that future is in flight.
+        client.shutdown().await.unwrap();
+        tokio::task::yield_now().await;
+
+        // The liveness sweep consumes the FIN. It must NOT report a fatal error
+        // (the opposite direction may still be draining), but the following
+        // real read must observe EOF immediately.
+        let status = poll_fn(|cx| server.poll_check_alive(cx)).await;
+        assert_eq!(status, HeartbeatStatus::Alive);
+
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(std::time::Duration::from_millis(500), server.read(&mut buf))
+            .await
+            .expect("in-band FIN was swallowed by poll_check_alive")
+            .unwrap();
+        assert_eq!(n, 0, "server must observe EOF after peer half-close");
+    }
+
+    /// A liveness sweep that lands on an in-flight read must keep the payload,
+    /// not just the read half. This protects the pool reactor, which polls
+    /// `poll_check_alive` on idle streams on every reactor turn.
+    #[tokio::test]
+    async fn test_ws_liveness_check_preserves_in_flight_data_frame() {
+        use std::future::poll_fn;
+
+        let (raw_client, raw_server) = duplex(65536);
+        let mut client = WsTunnelStream::new(raw_client, Role::Client);
+        let mut server = WsTunnelStream::new(raw_server, Role::Server);
+
+        assert_eq!(
+            poll_fn(|cx| server.poll_check_alive(cx)).await,
+            HeartbeatStatus::Alive
+        );
+        assert!(matches!(server.read_state, ReadState::Reading(_)));
+
+        client.write_all(b"late payload").await.unwrap();
+        client.flush().await.unwrap();
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            poll_fn(|cx| server.poll_check_alive(cx)).await,
+            HeartbeatStatus::Alive
+        );
+
+        let mut buf = [0u8; 12];
+        server.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"late payload");
+    }
+
+    /// End-to-end reproduction of "curl pauses before exit": the relay has an
+    /// in-flight WS read future while heartbeat liveness sweeps run, then the
+    /// peer sends a response tail followed by the in-band FIN. The FIN must
+    /// reach the relay so it can half-close the visitor side and terminate
+    /// promptly instead of waiting for the idle timeout.
+    #[tokio::test]
+    async fn test_ws_liveness_sweep_does_not_stall_relay_exit() {
+        use crate::core::relay::RelayEngine;
+        use tokio_util::sync::CancellationToken;
+
+        let (raw_client, raw_server) = duplex(65536);
+        let mut client = WsTunnelStream::new(raw_client, Role::Client);
+        let server = WsTunnelStream::new(raw_server, Role::Server);
+
+        let (mut visitor, visitor_side) = duplex(65536);
+        let cancel = CancellationToken::new();
+        let relay = tokio::spawn(RelayEngine::relay_with_heartbeat(
+            Box::new(visitor_side),
+            Box::new(server),
+            cancel.clone(),
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(600),
+        ));
+
+        visitor.write_all(b"request").await.unwrap();
+        let mut req = [0u8; 7];
+        client.read_exact(&mut req).await.unwrap();
+        assert_eq!(&req, b"request");
+
+        // Let several heartbeat liveness sweeps land on the relay's parked
+        // WsReadFuture before the peer half-closes.
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+
+        client.write_all(b"response tail").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut tail = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            visitor.read_to_end(&mut tail),
+        )
+        .await
+        .expect("relay stalled instead of delivering the response tail and EOF")
+        .unwrap();
+        assert_eq!(&tail, b"response tail");
+
+        visitor.shutdown().await.unwrap();
+        let (to_ws, to_visitor) = tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay did not exit after both half-closes")
+            .unwrap()
+            .unwrap();
+        assert_eq!(to_ws, 7);
+        assert_eq!(to_visitor, 13);
+
+        cancel.cancel();
     }
 
     #[tokio::test]

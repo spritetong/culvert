@@ -147,7 +147,9 @@ struct AcquireRequest {
 enum PoolCommand {
     Acquire(AcquireRequest),
     PushIdle(Box<dyn TunnelStream>),
-    StreamClosed,
+    /// Pure wake-up hint sent when a caller releases a stream. The authoritative
+    /// active count is the shared atomic, so this command may be dropped safely.
+    ActiveReleased,
 }
 
 /// Internal events driven by the unified reactor poll.
@@ -219,6 +221,12 @@ impl ReplenishingStreamPool {
         let stats = Arc::new(Mutex::new(PoolStats::default()));
         let stats_clone = Arc::clone(&stats);
         let active_count = Arc::new(AtomicUsize::new(0));
+        // The actor reads the very same atomic that `acquire()` / `on_stream_closed()`
+        // maintain. It must never keep a second, message-driven copy: a dropped
+        // `StreamClosed` command used to leak that copy upward forever, and once
+        // it reached POOL_MAX_CAPACITY replenishment stopped for the tunnel's
+        // whole lifetime.
+        let active_count_clone = Arc::clone(&active_count);
 
         tokio::spawn(async move {
             let mut idle_streams: VecDeque<ManagedStream> = VecDeque::new();
@@ -244,33 +252,44 @@ impl ReplenishingStreamPool {
             tokio::pin!(cancel_fut);
 
             loop {
-                // 1. Replenish connecting futures if needed (idle streams < target_size OR waiters in pending_requests)
+                // 1. Replenish connecting futures up to every slot currently allowed.
+                //    Adding only one connect per reactor turn serialized the entire
+                //    refill behind one handshake RTT: after a burst drained the pool
+                //    it took N round-trips (plus a 1 s ticker stall for slow dials)
+                //    to get back to target_size. Fill the backlog in one turn while
+                //    still respecting the capacity, in-flight and backoff gates.
                 let now = Instant::now();
-                let in_flight = connecting_futures.len();
-                let current_total = idle_streams.len() + in_flight;
-                let active = stats_clone.lock().active_count;
-                let total_allocated = active + current_total;
+                loop {
+                    let in_flight = connecting_futures.len();
+                    let current_total = idle_streams.len() + in_flight;
+                    let active = active_count_clone.load(Ordering::Relaxed);
+                    let total_allocated = active + current_total;
 
-                let has_waiters = !pending_requests.is_empty();
-                let needed = (current_total < target_size)
-                    || (has_waiters && in_flight < pending_requests.len());
-                let capacity_available =
-                    total_allocated < POOL_MAX_CAPACITY && in_flight < POOL_MAX_CONCURRENT_CONNECTS;
+                    let has_waiters = !pending_requests.is_empty();
+                    let needed = (current_total < target_size)
+                        || (has_waiters && in_flight < pending_requests.len());
+                    let capacity_available = total_allocated < POOL_MAX_CAPACITY
+                        && in_flight < POOL_MAX_CONCURRENT_CONNECTS;
 
-                // When recovering from failures (backoff > POOL_BACKOFF_BASE), limit in_flight to 1 probe
-                // to avoid slamming or serializing gate locks until a connection succeeds.
-                let throttled_by_failure = backoff > POOL_BACKOFF_BASE && in_flight >= 1;
+                    // When recovering from failures (backoff > POOL_BACKOFF_BASE),
+                    // keep at most one probe in flight so a broken endpoint is not
+                    // slammed by a full parallel batch on every retry.
+                    let throttled_by_failure = backoff > POOL_BACKOFF_BASE && in_flight >= 1;
 
-                if needed && capacity_available && !throttled_by_failure {
-                    if now >= next_retry_at {
-                        let c = Arc::clone(&connector);
-                        let t = dummy_target.clone();
-                        connecting_futures
-                            .push(Box::pin(async move { c.connect_pooled(&t).await }));
-                    } else if in_flight == 0 && retry_timer.is_none() {
-                        retry_timer =
-                            Some(Box::pin(tokio::time::sleep_until(next_retry_at.into())));
+                    if !(needed && capacity_available && !throttled_by_failure) {
+                        break;
                     }
+                    if now < next_retry_at {
+                        if in_flight == 0 && retry_timer.is_none() {
+                            retry_timer =
+                                Some(Box::pin(tokio::time::sleep_until(next_retry_at.into())));
+                        }
+                        break;
+                    }
+
+                    let c = Arc::clone(&connector);
+                    let t = dummy_target.clone();
+                    connecting_futures.push(Box::pin(async move { c.connect_pooled(&t).await }));
                 }
 
                 // 2. Drive single unified event reactor
@@ -403,9 +422,9 @@ impl ReplenishingStreamPool {
                                     if let Some(s) = cur_stream.take() {
                                         match pending_req.reply.send(Ok(s)) {
                                             Ok(()) => {
-                                                let mut st = stats_clone.lock();
-                                                st.active_count += 1;
-                                                st.total_created += 1;
+                                                // The caller increments the shared active
+                                                // counter in `acquire()`; do not count here.
+                                                stats_clone.lock().total_created += 1;
                                                 break;
                                             }
                                             Err(returned_res) => {
@@ -478,9 +497,7 @@ impl ReplenishingStreamPool {
                                 }
 
                                 if let Some(stream) = acquired {
-                                    let mut st = stats_clone.lock();
-                                    st.idle_count = idle_streams.len();
-                                    st.active_count += 1;
+                                    stats_clone.lock().idle_count = idle_streams.len();
                                     let _ = req.reply.send(Ok(stream));
                                 } else {
                                     // If pool has no idle streams and no connects currently in-flight,
@@ -503,8 +520,6 @@ impl ReplenishingStreamPool {
                                     if let Some(s) = cur_stream.take() {
                                         match pending_req.reply.send(Ok(s)) {
                                             Ok(()) => {
-                                                let mut st = stats_clone.lock();
-                                                st.active_count += 1;
                                                 break;
                                             }
                                             Err(returned_res) => {
@@ -520,15 +535,14 @@ impl ReplenishingStreamPool {
 
                                 if let Some(s) = cur_stream {
                                     idle_streams.push_back(ManagedStream::new(s));
-                                    let mut st = stats_clone.lock();
-                                    st.idle_count = idle_streams.len();
+                                    stats_clone.lock().idle_count = idle_streams.len();
                                 }
                             }
-                            Some(PoolCommand::StreamClosed) => {
-                                let mut st = stats_clone.lock();
-                                if st.active_count > 0 {
-                                    st.active_count -= 1;
-                                }
+                            Some(PoolCommand::ActiveReleased) => {
+                                // Wake-up hint only. The shared atomic is authoritative,
+                                // so losing this message under channel pressure is safe;
+                                // the reactor simply re-evaluates the refill gates now
+                                // instead of on the next 1 s heartbeat tick.
                             }
                             None => break,
                         }
@@ -616,7 +630,9 @@ impl ReplenishingStreamPool {
             .try_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
                 Some(n.saturating_sub(1))
             });
-        let _ = self.tx_cmd.try_send(PoolCommand::StreamClosed);
+        // Best-effort wake-up only: the atomic decrement above is the real
+        // accounting, so a full command channel cannot leak active count.
+        let _ = self.tx_cmd.try_send(PoolCommand::ActiveReleased);
     }
 
     /// Pushes an idle stream back into the pool.
@@ -692,14 +708,16 @@ mod tests {
             DEFAULT_IDLE_TIMEOUT,
         );
 
-        // Sleep 400ms. In the buggy implementation without backoff, 400ms with instant failures
-        // resulted in >100,000 reconnect attempts. With 200ms base backoff, call count must be <= 3.
+        // Sleep 400ms. Without backoff, instant failures produced >100,000
+        // reconnect attempts. The first turn may now fill all allowed dial slots
+        // in parallel (bounded by POOL_MAX_CONCURRENT_CONNECTS), but the
+        // exponential backoff gate must still stop any further retry burst.
         tokio::time::sleep(Duration::from_millis(400)).await;
         cancel_token.cancel();
 
         let count = call_count.load(Ordering::SeqCst);
         assert!(
-            count <= 3,
+            count <= POOL_MAX_CONCURRENT_CONNECTS,
             "Reconnect rate must be throttled by backoff gate, got {count}"
         );
         assert!(
@@ -801,6 +819,144 @@ mod tests {
             0,
             "Handed-off stream must bypass idle_streams"
         );
+
+        cancel_token.cancel();
+    }
+
+    /// Reproduces the permanent "one tunnel goes dark" stall. The actor used to
+    /// keep a second active counter driven by `StreamClosed` commands sent with
+    /// `try_send`; a single dropped command leaked that counter forever, and
+    /// once it reached `POOL_MAX_CAPACITY`, `capacity_available` was false for
+    /// the rest of the tunnel's life. Simulate the leaked value directly: the
+    /// shared atomic is authoritative, so replenishment must still happen.
+    #[tokio::test]
+    async fn test_replenishment_survives_stale_actor_active_count() {
+        let connector = Arc::new(MockSuccessfulConnector);
+        let cancel_token = CancellationToken::new();
+        let pool = ReplenishingStreamPool::new_shared(
+            connector,
+            2,
+            cancel_token.clone(),
+            DEFAULT_HEARTBEAT_INTERVAL,
+            DEFAULT_IDLE_TIMEOUT,
+        );
+
+        pool.stats.lock().active_count = POOL_MAX_CAPACITY;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pool.stats().idle_count < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("pool stayed starved by a stale active counter");
+        assert_eq!(pool.stats().active_count, 0);
+
+        cancel_token.cancel();
+    }
+
+    /// A burst that drains the pool must refill all allowed dial slots in one
+    /// reactor turn. Launching one connect per turn serialized the refill behind
+    /// a full handshake RTT per slot (or a 1 s ticker stall for slow dials).
+    struct BarrierConnector {
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    impl TransportConnector for BarrierConnector {
+        fn protocol_scheme(&self) -> &'static str {
+            "mock"
+        }
+
+        fn connect<'a>(
+            &'a self,
+            _target: &'a TargetAddr,
+            _session_id: Option<&'a str>,
+        ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+            self.connect_pooled(_target)
+        }
+
+        fn connect_pooled<'a>(
+            &'a self,
+            _target: &'a TargetAddr,
+        ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+            let barrier = Arc::clone(&self.barrier);
+            Box::pin(async move {
+                // Only completes when every allowed slot is dialing concurrently.
+                barrier.wait().await;
+                let (client, _server) = tokio::io::duplex(1024);
+                Ok(Box::new(client) as Box<dyn TunnelStream>)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pool_refills_all_slots_in_one_reactor_turn() {
+        let slots = POOL_MAX_CONCURRENT_CONNECTS;
+        let connector = Arc::new(BarrierConnector {
+            barrier: Arc::new(tokio::sync::Barrier::new(slots)),
+        });
+        let cancel_token = CancellationToken::new();
+        let pool = ReplenishingStreamPool::new_shared(
+            connector,
+            slots,
+            cancel_token.clone(),
+            DEFAULT_HEARTBEAT_INTERVAL,
+            DEFAULT_IDLE_TIMEOUT,
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pool.stats().idle_count < slots {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("replenishment serialized dials behind one RTT per slot");
+
+        cancel_token.cancel();
+    }
+
+    /// High-concurrency acquire/release must return the active counter to zero
+    /// and let the idle population recover, even when release notifications are
+    /// lost to channel pressure.
+    #[tokio::test]
+    async fn test_high_concurrency_release_recovers_active_count_and_idle_pool() {
+        let connector = Arc::new(MockSuccessfulConnector);
+        let cancel_token = CancellationToken::new();
+        let pool = ReplenishingStreamPool::new_shared(
+            connector,
+            2,
+            cancel_token.clone(),
+            DEFAULT_HEARTBEAT_INTERVAL,
+            DEFAULT_IDLE_TIMEOUT,
+        );
+        // Wait for the initial warm population.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pool.stats().idle_count < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("initial prewarm failed");
+
+        let mut held = Vec::new();
+        for _ in 0..12 {
+            held.push(pool.acquire(None).await.expect("acquire must succeed"));
+        }
+        assert_eq!(pool.stats().active_count, 12);
+
+        drop(held);
+        for _ in 0..12 {
+            pool.on_stream_closed();
+        }
+        assert_eq!(pool.stats().active_count, 0);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pool.stats().idle_count < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("pool did not replenish after the concurrency burst");
 
         cancel_token.cancel();
     }

@@ -9,7 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use tokio::time::interval;
+use tokio::time::{interval, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -19,6 +19,7 @@ use crate::consts::{
     ACTIVATE_STREAM_MAGIC, DEFAULT_REVERSE_BACKOFF_INITIAL, DEFAULT_REVERSE_BACKOFF_MAX,
     POOL_BACKOFF_BASE, POOL_BACKOFF_MAX, POOL_MAX_CONCURRENT_CONNECTS,
     REVERSE_BACKOFF_RESET_THRESHOLD, REVERSE_CONTROL_TARGET_HOST, clamp_reverse_pool_size,
+    reverse_frame_timeout,
 };
 use crate::control::stream::{ControlMessage, FramedControlStream};
 use crate::core::error::TunnelError;
@@ -47,6 +48,11 @@ pub async fn run_reverse_mapping(
     );
 
     let dummy_target = TargetAddr::Domain(REVERSE_CONTROL_TARGET_HOST.to_string(), 0);
+    let hb_interval = endpoint_ctx.heartbeat_interval();
+    let idle_timeout = endpoint_ctx.idle_timeout();
+    // One derived deadline for every control-channel frame: a high-RTT link
+    // inherits the configured idle window instead of a LAN-scale constant.
+    let frame_timeout = reverse_frame_timeout(idle_timeout);
     // Clamp once and advertise the effective worker count: the server derives
     // its soft cap from exactly this value instead of an independent constant.
     let pool_workers = clamp_reverse_pool_size(pool_size);
@@ -109,11 +115,21 @@ pub async fn run_reverse_mapping(
             pool_size: pool_workers,
         };
 
-        let Some(send_res) = ctrl_stream.send(reg_msg).cancel_with(&cancel_token).await else {
-            break;
+        // Every control-channel send is bounded. `SinkExt::send` flushes, so a
+        // peer that stops reading can otherwise wedge this loop forever: the
+        // idle deadline lives in the enclosing select! and cannot fire while a
+        // branch body is awaiting.
+        let send_result = timeout(frame_timeout, ctrl_stream.send(reg_msg))
+            .cancel_with(&cancel_token)
+            .await;
+        let send_error = match send_result {
+            None => break,
+            Some(Ok(Ok(()))) => None,
+            Some(Ok(Err(e))) => Some(e.to_string()),
+            Some(Err(_)) => Some(format!("timed out after {frame_timeout:?}")),
         };
-        if let Err(e) = send_res {
-            warn!(tag = %tag, "Failed to send RegisterReverse: {:?}. Retrying in {:?}...", e, backoff);
+        if let Some(reason) = send_error {
+            warn!(tag = %tag, "Failed to send RegisterReverse: {}. Retrying in {:?}...", reason, backoff);
             if !cancel_token.sleep_or_cancel(backoff).await {
                 break;
             }
@@ -121,9 +137,21 @@ pub async fn run_reverse_mapping(
             continue;
         }
 
-        // Await RegisterAck from remote server
-        let Some(ack_res) = ctrl_stream.next().cancel_with(&cancel_token).await else {
-            break;
+        // Await RegisterAck from remote server, bounded by the same idle window.
+        let ack_res = match timeout(idle_timeout, ctrl_stream.next())
+            .cancel_with(&cancel_token)
+            .await
+        {
+            None => break,
+            Some(Ok(res)) => res,
+            Some(Err(_)) => {
+                warn!(tag = %tag, "Timed out waiting for RegisterAck; reconnecting");
+                if !cancel_token.sleep_or_cancel(backoff).await {
+                    break;
+                }
+                backoff = (backoff * 2).min(DEFAULT_REVERSE_BACKOFF_MAX);
+                continue;
+            }
         };
         match ack_res {
             Some(Ok(ControlMessage::RegisterAck {
@@ -157,8 +185,6 @@ pub async fn run_reverse_mapping(
         }
 
         let loop_start = tokio::time::Instant::now();
-        let hb_interval = endpoint_ctx.heartbeat_interval();
-        let idle_timeout = endpoint_ctx.idle_timeout();
         let mut heartbeat = interval(hb_interval);
         // Liveness is pure activity: any RX or real TX refreshes the deadline.
         // Probe PINGs are deliberately excluded, otherwise our own keepalives
@@ -343,12 +369,20 @@ pub async fn run_reverse_mapping(
                         idle_timeout,
                     );
                     if send_probe {
-                        let Some(send_ping) = ctrl_stream.send(ControlMessage::Ping).cancel_with(&cancel_token).await else {
-                            break;
-                        };
-                        if let Err(e) = send_ping {
-                            debug!(tag = %tag, "Failed to send heartbeat ping: {}", e);
-                            break;
+                        let ping = timeout(frame_timeout, ctrl_stream.send(ControlMessage::Ping))
+                            .cancel_with(&cancel_token)
+                            .await;
+                        match ping {
+                            Some(Ok(Ok(()))) => {}
+                            Some(Ok(Err(e))) => {
+                                debug!(tag = %tag, "Failed to send heartbeat ping: {}", e);
+                                break;
+                            }
+                            Some(Err(_)) => {
+                                warn!(tag = %tag, "Heartbeat ping stalled on control channel; reconnecting");
+                                break;
+                            }
+                            None => break,
                         }
                     }
                 }
@@ -425,10 +459,16 @@ pub async fn run_reverse_mapping(
                             ControlMessage::Ping => {
                                 // Optional echo: it only exists to give the peer
                                 // some RX. Correctness never depends on a PONG.
-                                let Some(res) = ctrl_stream.send(ControlMessage::Pong).cancel_with(&cancel_token).await else {
+                                // Bounded like every other control-frame send:
+                                // a stalled flush here would stop NewConnection
+                                // handling for the whole generation.
+                                let pong = timeout(frame_timeout, ctrl_stream.send(ControlMessage::Pong))
+                                    .cancel_with(&cancel_token)
+                                    .await;
+                                if !matches!(pong, Some(Ok(Ok(())))) {
+                                    debug!(tag = %tag, "Control channel Pong stalled; reconnecting");
                                     break;
-                                };
-                                let _ = res;
+                                }
                             }
                             _ => {}
                         },
@@ -499,7 +539,7 @@ pub async fn run_reverse_tunnel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::model::{AppConfig, EndpointConfig};
+    use crate::config::model::{AppConfig, DialerConfig, EndpointConfig};
     use crate::core::stream::{BoxFuture, TunnelStream};
     use crate::transport::{TargetAddr, TransportConnector, TransportDriver, TransportListener};
     use std::time::Duration;
@@ -735,5 +775,117 @@ mod tests {
             POOL_MAX_CONCURRENT_CONNECTS
         );
         assert!(peak > 0, "At least one pre-warm dial should have completed");
+    }
+
+    /// A peer that accepts the connection but never reads a single byte. The
+    /// server halves are kept alive in `held` (never dropped, never polled), so
+    /// a control-frame flush against the 1-byte duplex buffer can never finish.
+    struct StalledPeerConnector {
+        held: Arc<std::sync::Mutex<Vec<tokio::io::DuplexStream>>>,
+    }
+
+    impl TransportConnector for StalledPeerConnector {
+        fn connect<'a>(
+            &'a self,
+            _target: &'a TargetAddr,
+            _session_id: Option<&'a str>,
+        ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+            Box::pin(async move {
+                let (client, server) = tokio::io::duplex(1);
+                {
+                    let mut guard = self.held.lock().unwrap();
+                    guard.push(server);
+                }
+                Ok(Box::new(client) as Box<dyn TunnelStream>)
+            })
+        }
+
+        fn protocol_scheme(&self) -> &'static str {
+            "ws"
+        }
+    }
+
+    struct StalledPeerDriver {
+        held: Arc<std::sync::Mutex<Vec<tokio::io::DuplexStream>>>,
+    }
+
+    impl TransportDriver for StalledPeerDriver {
+        fn schemes(&self) -> &[&'static str] {
+            &["ws"]
+        }
+
+        fn build_connector(
+            &self,
+            _endpoint: &EndpointContext,
+            _auth_token: &str,
+            _mode: TunnelMode,
+        ) -> Result<Box<dyn TransportConnector>, TunnelError> {
+            Ok(Box::new(StalledPeerConnector {
+                held: Arc::clone(&self.held),
+            }))
+        }
+
+        fn build_listener(
+            &self,
+            _listen_addr: &str,
+            _auth_token: Option<&str>,
+            _path: Option<&str>,
+            _tls: Option<&crate::config::model::TlsConfig>,
+        ) -> Result<Box<dyn TransportListener>, TunnelError> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reverse_control_register_send_is_bounded_by_stalled_peer() {
+        let held = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut reg = TransportRegistry::new();
+        reg.register(StalledPeerDriver {
+            held: Arc::clone(&held),
+        });
+        let reg = Arc::new(reg);
+
+        // A short idle window keeps reverse_frame_timeout() short as well, so
+        // this regression does not have to wait for the WAN-scale default.
+        let app_cfg = AppConfig {
+            dialer: Some(DialerConfig {
+                idle_timeout: Some(Duration::from_millis(300)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let ep_cfg = EndpointConfig::Simple("ws://127.0.0.1:8080".to_string());
+        let ep_ctx = EndpointContext::build(&ep_cfg, &app_cfg).unwrap();
+
+        let cancel_token = CancellationToken::new();
+        let cancel_clone = cancel_token.clone();
+        let handle = tokio::spawn(async move {
+            run_reverse_mapping(
+                "test_stalled_register".to_string(),
+                "127.0.0.1:9090".to_string(),
+                "127.0.0.1:9091".to_string(),
+                None,
+                ep_ctx,
+                reg,
+                Some(1),
+                cancel_clone,
+            )
+            .await
+        });
+
+        // Let the control loop reach the wedged RegisterReverse flush.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !held.lock().unwrap().is_empty(),
+            "stalled peer should have been dialed"
+        );
+
+        cancel_token.cancel();
+        let res = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(
+            res.is_ok(),
+            "run_reverse_mapping wedged on an unbounded RegisterReverse send"
+        );
+        assert!(res.unwrap().unwrap().is_ok());
     }
 }

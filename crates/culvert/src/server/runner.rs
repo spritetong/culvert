@@ -454,14 +454,16 @@ impl ServerRunner {
             Ok(l) => l,
             Err(e) => {
                 warn!(addr = %listen_addr, "Failed to bind reverse listener: {}", e);
-                let _ = ctrl_stream
-                    .send(ControlMessage::RegisterAck {
+                let _ = tokio::time::timeout(
+                    frame_timeout,
+                    ctrl_stream.send(ControlMessage::RegisterAck {
                         listen_addr: listen_addr.clone(),
                         success: false,
                         error_msg: Some(e.to_string()),
-                    })
-                    .cancel_with(&cancel_token)
-                    .await;
+                    }),
+                )
+                .cancel_with(&cancel_token)
+                .await;
                 return;
             }
         };
@@ -473,15 +475,17 @@ impl ServerRunner {
         // so both ends size the same pool.
         let idle_pool = session_mgr.register_pool(&listen_addr, reverse_pool_soft_cap(pool_size));
 
-        let ack_sent = ctrl_stream
-            .send(ControlMessage::RegisterAck {
+        let ack_sent = tokio::time::timeout(
+            frame_timeout,
+            ctrl_stream.send(ControlMessage::RegisterAck {
                 listen_addr: listen_addr.clone(),
                 success: true,
                 error_msg: None,
-            })
-            .cancel_with(&cancel_token)
-            .await;
-        if !matches!(ack_sent, Some(Ok(()))) {
+            }),
+        )
+        .cancel_with(&cancel_token)
+        .await;
+        if !matches!(ack_sent, Some(Ok(Ok(())))) {
             warn!(addr = %listen_addr, "Failed to send RegisterAck; dropping reverse listener");
             session_mgr.unregister_pool(&listen_addr, &idle_pool);
             return;
@@ -659,11 +663,21 @@ impl ServerRunner {
                     match msg_opt {
                         Some(Ok(ControlMessage::Ping)) => {
                             // Optional echo to give the peer some RX; correctness
-                            // never depends on a PONG.
-                            let Some(res) = ctrl_stream.send(ControlMessage::Pong).cancel_with(&cancel_token).await else {
+                            // never depends on a PONG. The send must be bounded:
+                            // this body runs outside tokio::select!, so an
+                            // unbounded flush against a peer that stopped reading
+                            // would wedge the accept loop (and its idle deadline)
+                            // indefinitely.
+                            let pong = tokio::time::timeout(
+                                frame_timeout,
+                                ctrl_stream.send(ControlMessage::Pong),
+                            )
+                            .cancel_with(&cancel_token)
+                            .await;
+                            if !matches!(pong, Some(Ok(Ok(())))) {
+                                warn!(addr = %listen_addr, "Control channel Pong stalled; closing reverse listener");
                                 break;
-                            };
-                            let _ = res;
+                            }
                         }
                         Some(Ok(ControlMessage::Pong)) => {}
                         _ => {
@@ -753,6 +767,118 @@ mod tests {
             res.is_ok(),
             "handle_reverse_control did not time out on silent client within idle_timeout!"
         );
+    }
+
+    /// A peer that stops reading must not wedge the control channel forever.
+    /// `SinkExt::send` flushes, so with a tiny duplex buffer the RegisterAck
+    /// write blocks; before the fix this happened outside any timeout and the
+    /// idle deadline (which lives in the enclosing select!) could never fire.
+    #[tokio::test]
+    async fn test_reverse_control_ack_send_is_bounded_by_stalled_peer() {
+        use futures_util::SinkExt;
+
+        let (client, server) = tokio::io::duplex(16);
+        let mut ctrl_client = FramedControlStream::new(client);
+        let session_mgr = Arc::new(SessionManager::new());
+        let cancel_token = CancellationToken::new();
+
+        let free_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let listen_addr = format!("127.0.0.1:{free_port}");
+
+        let handle = tokio::spawn({
+            let addr = listen_addr.clone();
+            async move {
+                ServerRunner::handle_reverse_control(
+                    Box::new(server),
+                    session_mgr,
+                    cancel_token,
+                    Duration::from_millis(300),
+                    crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
+                )
+                .await;
+                let _ = addr;
+            }
+        });
+
+        ctrl_client
+            .send(ControlMessage::RegisterReverse {
+                listen_addr: listen_addr.clone(),
+                target_addr: "127.0.0.1:9099".to_string(),
+                pool_size: None,
+            })
+            .await
+            .unwrap();
+
+        // Deliberately never read the ack. The 16-byte duplex fills and the
+        // server's flush stalls until the derived frame deadline fires.
+        tokio::time::timeout(Duration::from_secs(3), handle)
+            .await
+            .expect("unbounded RegisterAck send wedged the reverse control channel")
+            .unwrap();
+    }
+
+    /// Same class of stall inside the select! branch body: a peer floods PINGs
+    /// but never reads the PONGs, filling the server->client buffer. The loop
+    /// must break on the bounded Pong send instead of stopping visitor accepts.
+    #[tokio::test]
+    async fn test_reverse_control_pong_send_is_bounded_by_stalled_peer() {
+        use futures_util::{SinkExt, StreamExt};
+
+        let (client, server) = tokio::io::duplex(64);
+        let mut ctrl_client = FramedControlStream::new(client);
+        let session_mgr = Arc::new(SessionManager::new());
+        let cancel_token = CancellationToken::new();
+
+        let free_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let listen_addr = format!("127.0.0.1:{free_port}");
+
+        let handle = tokio::spawn(async move {
+            ServerRunner::handle_reverse_control(
+                Box::new(server),
+                session_mgr,
+                cancel_token,
+                Duration::from_millis(300),
+                crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
+            )
+            .await;
+        });
+
+        ctrl_client
+            .send(ControlMessage::RegisterReverse {
+                listen_addr: listen_addr.clone(),
+                target_addr: "127.0.0.1:9099".to_string(),
+                pool_size: None,
+            })
+            .await
+            .unwrap();
+        let ack = ctrl_client.next().await.unwrap().unwrap();
+        assert!(matches!(
+            ack,
+            ControlMessage::RegisterAck { success: true, .. }
+        ));
+
+        // Keep the client's read half idle from here on so PONGs accumulate.
+        let pinger = tokio::spawn(async move {
+            for _ in 0..200 {
+                if ctrl_client.send(ControlMessage::Ping).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), handle)
+            .await
+            .expect("unbounded Pong send wedged the reverse control loop")
+            .unwrap();
+        let _ = pinger.await;
     }
 
     #[tokio::test]
