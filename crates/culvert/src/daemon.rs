@@ -29,7 +29,7 @@ pub async fn run_daemon(app_config: AppConfig) -> Result<(), Box<dyn std::error:
         return Err(Box::new(e));
     }
 
-    info!("Culvert daemon exited cleanly.");
+    info!("Culvert daemon stopped cleanly");
     // Disarm the hard deadline and await the watchdog thread. Without this,
     // the watchdog would force-exit 10s after the first signal even on a
     // perfectly clean shutdown.

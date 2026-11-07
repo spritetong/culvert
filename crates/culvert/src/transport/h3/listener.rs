@@ -186,7 +186,7 @@ impl H3Listener {
         let quinn_endpoint =
             quinn::Endpoint::server(server_config, addr).map_err(TunnelError::Io)?;
 
-        info!(addr = %addr, is_quic_listener, "Bound HTTP/3 & QUIC listener on UDP socket");
+        info!(addr = %addr, "Bound HTTP/3 & QUIC listener on UDP socket");
 
         let (tx_streams, rx_streams) = mpsc::channel(ACCEPTED_STREAM_QUEUE_SIZE);
         let cancel_token = cancel.child_token();
@@ -269,7 +269,7 @@ impl H3Listener {
                                                             debug!("QUIC handshake error: {:?}", e);
                                                         }
                                                         Err(_) => {
-                                                            warn!("QUIC incoming connection handshake timed out (10s)");
+                                                            debug!("QUIC incoming connection handshake timed out (10s)");
                                                         }
                                                     }
                                                 } => {}
@@ -585,7 +585,7 @@ impl H3Listener {
                                         debug!("Raw QUIC handshake aborted due to protocol error");
                                     }
                                     TimeoutOrCancel::TimedOut => {
-                                        warn!("Raw QUIC inbound handshake timed out (10s)");
+                                        debug!("Raw QUIC inbound handshake timed out (10s)");
                                     }
                                     TimeoutOrCancel::Cancelled => {}
                                 }

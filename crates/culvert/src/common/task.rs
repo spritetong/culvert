@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{debug, error};
 
 use crate::consts::DEFAULT_GRACE_PERIOD;
 
@@ -115,7 +115,7 @@ impl<T: 'static> TaskTracker<T> {
     /// Signals cancellation and awaits completion until a specified instant deadline.
     /// This prevents nested trackers from compounding multiple 5s delays.
     pub async fn shutdown_and_wait_until(&mut self, deadline: tokio::time::Instant) {
-        info!("Initiating graceful task shutdown via cancellation token...");
+        debug!("Initiating task shutdown via cancellation token");
         self.cancel_token.cancel();
 
         let sleep = tokio::time::sleep_until(deadline);
@@ -140,7 +140,7 @@ impl<T: 'static> TaskTracker<T> {
                 }
             }
         }
-        info!("All tracked tasks completed cleanly.");
+        debug!("All tracked tasks completed cleanly");
     }
 }
 

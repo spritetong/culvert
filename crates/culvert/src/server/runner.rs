@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::common::{CancelFutureExt, TaskTracker, TimeoutOrCancel};
 use crate::config::model::{ServerConfig, TlsConfig, TunnelMode};
@@ -185,13 +185,13 @@ impl ServerRunner {
                                                             {
                                                                 TimeoutOrCancel::Ok(r) => r,
                                                                 TimeoutOrCancel::TimedOut => {
-                                                                    warn!("Timed out reading activation target length (10s)");
+                                                                    debug!("Timed out reading activation target length (10s)");
                                                                     return;
                                                                 }
                                                                 TimeoutOrCancel::Cancelled => return,
                                                             };
                                                             if let Err(e) = read_len_res {
-                                                                warn!("Failed to read activation target length: {:?}", e);
+                                                                debug!("Failed to read activation target length: {}", e);
                                                                 return;
                                                             }
                                                             let target_len = u16::from_be_bytes(len_bytes) as usize;
@@ -208,13 +208,13 @@ impl ServerRunner {
                                                                 {
                                                                     TimeoutOrCancel::Ok(r) => r,
                                                                     TimeoutOrCancel::TimedOut => {
-                                                                        warn!("Timed out reading activation target payload (10s)");
+                                                                        debug!("Timed out reading activation target payload (10s)");
                                                                         return;
                                                                     }
                                                                     TimeoutOrCancel::Cancelled => return,
                                                                 };
                                                                 if let Err(e) = read_target_res {
-                                                                    warn!("Failed to read activation target payload: {:?}", e);
+                                                                    debug!("Failed to read activation target payload: {}", e);
                                                                     return;
                                                                 }
                                                                         if let Ok(t_str) = std::str::from_utf8(&target_bytes)
@@ -224,7 +224,7 @@ impl ServerRunner {
                                                                     }
                                                                 }
                                                                 Ok(_) => {
-                                                                    warn!("Received invalid activation magic from pool stream: {:02x}", magic[0]);
+                                                                    debug!("Received invalid activation magic from pool stream: {:02x}", magic[0]);
                                                                     return;
                                                                 }
                                                                 Err(_) => {
@@ -252,7 +252,7 @@ impl ServerRunner {
                                                     }
                                                 };
 
-                                                info!(target = %target, "Dialing forward target in local/internal network");
+                                                debug!(target = %target, "Dialing forward target in internal network");
                                                 let Some(target_res) = crate::platform::connect_target(&target)
                                                     .cancel_with(&conn_token)
                                                     .await
@@ -347,7 +347,7 @@ impl ServerRunner {
             tokio::select! {
                 biased;
                 _ = cancel_token.cancelled() => {
-                    info!("Server ingress runner received cancellation signal");
+                    debug!("Server ingress runner stopping on cancellation signal");
                     break;
                 }
                 res = tracker.join_next() => {
@@ -448,12 +448,12 @@ impl ServerRunner {
             _ => return,
         };
 
-        info!(addr = %listen_addr, target = %target_addr, "Attempting to bind reverse listening port on server");
+        debug!(addr = %listen_addr, target = %target_addr, "Binding reverse listening port on server");
 
         let mut listener = match crate::platform::GenericListener::bind(&listen_addr).await {
             Ok(l) => l,
             Err(e) => {
-                warn!(addr = %listen_addr, "Failed to bind reverse listener: {:?}", e);
+                warn!(addr = %listen_addr, "Failed to bind reverse listener: {}", e);
                 let _ = ctrl_stream
                     .send(ControlMessage::RegisterAck {
                         listen_addr: listen_addr.clone(),
@@ -487,7 +487,7 @@ impl ServerRunner {
             return;
         }
 
-        info!(addr = %listen_addr, "Server bound reverse port successfully. Waiting for external traffic...");
+        info!(addr = %listen_addr, "Bound reverse listener port");
         let mut local_tracker = TaskTracker::<()>::new(cancel_token.clone());
         // Activity-based deadline: inbound control frames AND real outbound
         // notifications (NewConnection / Pong) both prove the channel is in use.
@@ -533,18 +533,18 @@ impl ServerRunner {
                                         break;
                                     }
                                     Ok(Err(e)) => {
-                                        warn!(addr = %listen_addr, "Discarding dead pooled reverse stream: {:?}", e);
+                                        debug!(addr = %listen_addr, "Discarding dead pooled reverse stream: {}", e);
                                     }
                                     Err(_) => {
-                                        warn!(addr = %listen_addr, "Discarding stalled pooled reverse stream");
+                                        debug!(addr = %listen_addr, "Discarding stalled pooled reverse stream");
                                     }
                                 }
                             }
 
                             if let Some(data_stream) = fast_paired_stream {
-                                info!(
+                                debug!(
                                     visitor = %visitor_addr,
-                                    "0-RTT Fast Path: Paired reverse visitor with idle pooled stream"
+                                    "Paired reverse visitor with idle pooled stream (0-RTT)"
                                 );
                                 idle_deadline
                                     .as_mut()
@@ -568,10 +568,10 @@ impl ServerRunner {
                                 REVERSE_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed)
                             );
 
-                            info!(
+                            debug!(
                                 session = %session_id,
                                 visitor = %visitor_addr,
-                                "External visitor connected to reverse port. Notifying client..."
+                                "External visitor connected to reverse port, notifying client"
                             );
 
                             // Register in session manager before notifying client
@@ -626,7 +626,7 @@ impl ServerRunner {
                             local_tracker.spawn_with_cancel(move |token| async move {
                                 match timeout(DEFAULT_SESSION_PAIR_TIMEOUT, pair_rx).await {
                                     Ok(Ok(data_stream)) => {
-                                        info!(session = %session_id_clone, "Reverse data stream paired successfully. Starting relay.");
+                                        debug!(session = %session_id_clone, "Reverse data stream paired, starting relay");
                                         let _ = RelayEngine::relay_with_heartbeat(
                                             visitor_stream,
                                             data_stream,
@@ -644,7 +644,7 @@ impl ServerRunner {
                         }
                         Err(e) => {
                             if !cancel_token.is_cancelled() && !matches!(e, TunnelError::Shutdown) {
-                                warn!(addr = %listen_addr, "Error accepting visitor on reverse port: {:?}", e);
+                                warn!(addr = %listen_addr, "Error accepting visitor on reverse port: {}", e);
                             }
                             break;
                         }
@@ -667,7 +667,7 @@ impl ServerRunner {
                         }
                         Some(Ok(ControlMessage::Pong)) => {}
                         _ => {
-                            info!(addr = %listen_addr, "Reverse control channel disconnected by client");
+                            debug!(addr = %listen_addr, "Reverse control channel disconnected by client");
                             break;
                         }
                     }
@@ -683,7 +683,7 @@ impl ServerRunner {
         session_mgr.unregister_pool(&listen_addr, &idle_pool);
 
         local_tracker.shutdown_and_wait().await;
-        info!(addr = %listen_addr, "Reverse listener closed.");
+        debug!(addr = %listen_addr, "Reverse listener closed");
     }
 }
 

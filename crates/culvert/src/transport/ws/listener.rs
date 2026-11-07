@@ -162,7 +162,7 @@ impl WsListener {
                                     return;
                                 }
                                 Err(_) => {
-                                    tracing::warn!("WSS server TLS handshake timed out (10s)");
+                                    tracing::debug!("WSS server TLS handshake timed out (10s)");
                                     return;
                                 }
                             }

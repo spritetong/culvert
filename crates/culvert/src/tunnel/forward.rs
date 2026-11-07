@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::common::{CancelFutureExt, TaskTracker};
 use crate::config::model::{TunnelConfig, TunnelMode};
@@ -135,7 +135,7 @@ pub async fn run_forward_mapping(
         tag = %tag,
         listen = %listen,
         target = %target_str,
-        "Starting forward tunnel listener"
+        "Forward tunnel listener started"
     );
 
     let mut listener = crate::platform::GenericListener::bind(&listen).await?;
@@ -164,18 +164,19 @@ pub async fn run_forward_mapping(
         tokio::select! {
             biased;
             _ = &mut cancel_fut => {
-                info!(tag = %tag, "Forward tunnel received cancellation signal");
+                debug!(tag = %tag, "Forward tunnel stopping on cancellation signal");
                 break;
             }
             Some(_) = conn_tracker.join_next(), if !conn_tracker.is_empty() => {}
             accept_res = listener.accept() => {
                 match accept_res {
                     Ok((inbound_stream, peer_addr)) => {
-                        info!(tag = %tag, peer = %peer_addr, "Inbound connection accepted");
+                        debug!(tag = %tag, peer = %peer_addr, "Accepted inbound connection");
                         let target = target.clone();
                         let pool_clone = pool.clone();
                         let connector_clone = shared_connector.clone();
                         let pool_for_close = pool.clone();
+                        let tag_for_task = tag.clone();
 
                         // `Duration` is `Copy`; the `move` task captures its own
                         // values without shadowing the loop-scoped originals.
@@ -212,7 +213,7 @@ pub async fn run_forward_mapping(
                                         };
 
                                         if let Err(e) = write_act_res {
-                                            error!("Failed to write stream activation packet: {:?}", e);
+                                            debug!("Failed to write stream activation packet: {}", e);
                                             return;
                                         }
                                     }
@@ -226,14 +227,16 @@ pub async fn run_forward_mapping(
                                     ).await;
                                 }
                                 Err(e) => {
-                                    error!("Failed to open remote tunnel stream: {:?}", e);
+                                    if !conn_token.is_cancelled() {
+                                        warn!(tag = %tag_for_task, "Failed to open remote tunnel stream: {}", e);
+                                    }
                                 }
                             }
                         });
                     }
                     Err(e) => {
                         if !cancel_token.is_cancelled() && !matches!(e, TunnelError::Shutdown) {
-                            error!(tag = %tag, "Listener accept failed: {:?}", e);
+                            error!(tag = %tag, "Listener accept failed: {}", e);
                         }
                     }
                 }

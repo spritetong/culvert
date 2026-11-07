@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::common::{CancellationTokenExt, TaskTracker};
 use crate::config::model::{AppConfig, TunnelConfig};
@@ -81,17 +81,14 @@ impl ClientRunner {
             });
         }
 
-        info!(
-            count = tracker.len(),
-            "All configured client tunnels successfully spawned"
-        );
+        info!(count = tracker.len(), "Spawned client tunnels");
 
         let mut exit_err: Option<TunnelError> = None;
         loop {
             tokio::select! {
                 biased;
                 _ = cancel_token.cancelled() => {
-                    info!("Client runner received shutdown signal.");
+                    debug!("Client runner stopping on shutdown signal");
                     break;
                 }
                 res = tracker.join_next() => {
@@ -177,11 +174,11 @@ impl ClientRunner {
             .await
             {
                 Ok(()) => {
-                    info!(tag = %config.tag, "Tunnel exited cleanly");
+                    debug!(tag = %config.tag, "Tunnel stopped cleanly");
                     break;
                 }
                 Err(TunnelError::Shutdown) => {
-                    info!(tag = %config.tag, "Tunnel shutdown cleanly");
+                    debug!(tag = %config.tag, "Tunnel stopped cleanly");
                     break;
                 }
                 Err(_) if token.is_cancelled() => {
@@ -191,7 +188,7 @@ impl ClientRunner {
                     if e.is_permanent() {
                         error!(
                             tag = %config.tag,
-                            "Permanent tunnel execution error encountered, aborting without retry: {:?}",
+                            "Permanent tunnel error, aborting without retry: {}",
                             e
                         );
                         return Err(e);
@@ -205,7 +202,7 @@ impl ClientRunner {
                             tag = %config.tag,
                             attempts,
                             max,
-                            "Tunnel exceeded maximum retry attempts, giving up: {:?}",
+                            "Tunnel exceeded maximum retry attempts: {}",
                             e
                         );
                         return Err(e);
@@ -215,7 +212,7 @@ impl ClientRunner {
                         tag = %config.tag,
                         attempts,
                         retry_in = ?retry_delay,
-                        "Tunnel execution error: {:?}. Retrying...",
+                        "Tunnel error: {}. Retrying...",
                         e
                     );
 

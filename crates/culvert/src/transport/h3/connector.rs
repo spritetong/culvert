@@ -13,7 +13,7 @@ use bytes::Bytes;
 use http::{Request, StatusCode};
 use parking_lot::RwLock;
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::config::model::TunnelMode;
 use crate::consts::{
@@ -185,7 +185,7 @@ impl H3Connector {
             .and_then(|t| t.server_name.as_deref())
             .unwrap_or(self.endpoint.endpoint.host.as_str());
 
-        info!(server = %resolved_addr, sni = %sni, "Dialing QUIC transport endpoint");
+        debug!(server = %resolved_addr, sni = %sni, "Dialing QUIC transport endpoint");
         let connecting = self
             .quinn_endpoint
             .connect(resolved_addr, sni)

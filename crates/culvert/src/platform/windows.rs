@@ -29,7 +29,7 @@ fn wsa_last_error() -> io::Error {
 pub async fn wait_for_shutdown_signal() {
     match tokio::signal::ctrl_c().await {
         Ok(()) => {
-            tracing::info!("Received termination signal (Ctrl+C). Initiating shutdown...");
+            tracing::info!("Received termination signal (Ctrl+C), initiating shutdown");
         }
         Err(e) => {
             // Never mistake a handler failure for a received signal.

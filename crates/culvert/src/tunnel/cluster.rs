@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::common::task::TaskTracker;
 use crate::config::model::{PortMappingConfig, TunnelConfig, TunnelMode};
@@ -103,7 +103,7 @@ pub async fn run_tunnel_cluster(
     tokio::select! {
         biased;
         _ = cancel_token.cancelled() => {
-            info!(tag = %config.tag, "Tunnel cluster received cancellation signal");
+            debug!(tag = %config.tag, "Tunnel cluster stopping on cancellation signal");
         }
         res = tracker.join_next() => {
             if let Some(Ok(Err(e))) = res

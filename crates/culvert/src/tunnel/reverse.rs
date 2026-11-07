@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::common::{CancelFutureExt, CancellationTokenExt, TaskTracker};
 use crate::config::model::{TunnelConfig, TunnelMode};
@@ -43,7 +43,7 @@ pub async fn run_reverse_mapping(
         tag = %tag,
         listen = %listen,
         target = %target_addr,
-        "Starting reverse tunnel control loop"
+        "Reverse tunnel worker started"
     );
 
     let dummy_target = TargetAddr::Domain(REVERSE_CONTROL_TARGET_HOST.to_string(), 0);
@@ -79,7 +79,7 @@ pub async fn run_reverse_mapping(
             TunnelMode::Reverse,
         )?;
 
-        info!(tag = %tag, "Connecting reverse control channel to remote server...");
+        debug!(tag = %tag, "Connecting reverse control channel to remote server");
         let Some(conn_res) = connector
             .connect(&dummy_target, None)
             .cancel_with(&cancel_token)
@@ -91,7 +91,7 @@ pub async fn run_reverse_mapping(
         let raw_stream = match conn_res {
             Ok(s) => s,
             Err(e) => {
-                warn!(tag = %tag, "Failed to connect control channel: {:?}. Retrying in {:?}...", e, backoff);
+                warn!(tag = %tag, "Failed to connect control channel: {}. Retrying in {:?}...", e, backoff);
                 if !cancel_token.sleep_or_cancel(backoff).await {
                     break;
                 }
@@ -144,7 +144,7 @@ pub async fn run_reverse_mapping(
                     backoff = (backoff * 2).min(DEFAULT_REVERSE_BACKOFF_MAX);
                     continue;
                 }
-                info!(tag = %tag, addr = %ack_addr, "Remote server bound reverse port successfully");
+                info!(tag = %tag, addr = %ack_addr, "Remote server bound reverse port");
             }
             other => {
                 warn!(tag = %tag, "Unexpected response to RegisterReverse: {:?}. Retrying in {:?}...", other, backoff);
@@ -175,10 +175,10 @@ pub async fn run_reverse_mapping(
             // value would spawn an unbounded number of dialing tasks.
             let listen_target = crate::tunnel::forward::parse_target_addr(&listen)
                 .unwrap_or_else(|_| dummy_target.clone());
-            info!(
+            debug!(
                 tag = %tag,
                 size,
-                "Pre-warming reverse inbound pool connections to remote server"
+                "Pre-warming reverse inbound pool connections"
             );
 
             // Throttle concurrent outbound dial handshakes across all workers in this
@@ -319,7 +319,7 @@ pub async fn run_reverse_mapping(
             tokio::select! {
                 biased;
                 _ = cancel_token.cancelled() => {
-                    info!(tag = %tag, "Reverse tunnel received cancellation signal");
+                    debug!(tag = %tag, "Reverse tunnel stopping on cancellation signal");
                     break;
                 }
                 Some(_) = conn_tracker.join_next(), if !conn_tracker.is_empty() => {}
@@ -328,7 +328,7 @@ pub async fn run_reverse_mapping(
                     warn!(
                         tag = %tag,
                         idle_timeout = ?idle_timeout,
-                        "Reverse control channel idle timeout: no inbound or outbound activity. Reconnecting..."
+                        "Reverse control channel idle timeout: no activity, reconnecting..."
                     );
                     break;
                 }
@@ -347,7 +347,7 @@ pub async fn run_reverse_mapping(
                             break;
                         };
                         if let Err(e) = send_ping {
-                            warn!(tag = %tag, "Failed to send heartbeat ping: {:?}", e);
+                            debug!(tag = %tag, "Failed to send heartbeat ping: {}", e);
                             break;
                         }
                     }
@@ -360,17 +360,18 @@ pub async fn run_reverse_mapping(
                     match msg_opt {
                         Some(Ok(msg)) => match msg {
                             ControlMessage::NewConnection { session_id, client_addr } => {
-                                info!(
+                                debug!(
                                     tag = %tag,
                                     session = %session_id,
                                     client = %client_addr,
-                                    "New reverse connection arrival notification from server"
+                                    "Received new connection notification"
                                 );
 
                                 let connector = Arc::clone(&data_connector);
                                 let target_clone = target_addr.clone();
                                 let session_id_clone = session_id.clone();
                                 let dummy_target = dummy_target.clone();
+                                let tag_clone = tag.clone();
 
                                 conn_tracker.spawn_with_cancel(move |token| async move {
                                     // 1. Dial local target service
@@ -383,7 +384,9 @@ pub async fn run_reverse_mapping(
                                     let local_stream = match local_res {
                                         Ok(s) => s,
                                         Err(e) => {
-                                            error!("Failed to connect to local target {}: {:?}", target_clone, e);
+                                            if !token.is_cancelled() {
+                                                warn!(tag = %tag_clone, "Failed to connect to local target {}: {}", target_clone, e);
+                                            }
                                             return;
                                         }
                                     };
@@ -399,7 +402,9 @@ pub async fn run_reverse_mapping(
                                     let data_stream = match remote_res {
                                         Ok(s) => s,
                                         Err(e) => {
-                                            error!("Failed to connect reverse data stream for session {}: {:?}", session_id_clone, e);
+                                            if !token.is_cancelled() {
+                                                warn!(tag = %tag_clone, "Failed to connect reverse data stream for session {}: {}", session_id_clone, e);
+                                            }
                                             return;
                                         }
                                     };
@@ -428,11 +433,19 @@ pub async fn run_reverse_mapping(
                             _ => {}
                         },
                         Some(Err(e)) => {
-                            warn!(tag = %tag, "Control stream error: {:?}. Reconnecting...", e);
+                            if !cancel_token.is_cancelled() {
+                                warn!(tag = %tag, "Control channel error: {}. Reconnecting...", e);
+                            } else {
+                                debug!(tag = %tag, "Control channel closed on shutdown");
+                            }
                             break;
                         }
                         None => {
-                            warn!(tag = %tag, "Control stream EOF from server. Reconnecting...");
+                            if !cancel_token.is_cancelled() {
+                                warn!(tag = %tag, "Control channel disconnected by server. Reconnecting...");
+                            } else {
+                                debug!(tag = %tag, "Control channel closed on shutdown");
+                            }
                             break;
                         }
                     }

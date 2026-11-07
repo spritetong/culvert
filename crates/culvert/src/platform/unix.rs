@@ -40,7 +40,7 @@ pub async fn wait_for_shutdown_signal() {
                 None => std::future::pending::<()>().await,
             }
         } => {
-            tracing::info!("Received SIGINT signal. Initiating graceful shutdown...");
+            tracing::info!("Received SIGINT signal, initiating shutdown");
         }
         _ = async {
             match sigterm.as_mut() {
@@ -48,7 +48,7 @@ pub async fn wait_for_shutdown_signal() {
                 None => std::future::pending::<()>().await,
             }
         } => {
-            tracing::info!("Received SIGTERM signal. Initiating graceful shutdown...");
+            tracing::info!("Received SIGTERM signal, initiating shutdown");
         }
     }
 }

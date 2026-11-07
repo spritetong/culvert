@@ -15,7 +15,7 @@ use std::time::Instant;
 use hickory_resolver::config::{NameServerConfig, ResolverConfig};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::{Resolver, TokioResolver};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::config::model::{DnsConfig, DnsResolverConfig, DnsServerConfig, DnsStrategy};
 use crate::consts::{
@@ -79,7 +79,7 @@ impl CachedDnsResolver {
             {
                 Ok(res) => Some(Arc::new(res)),
                 Err(e) => {
-                    warn!(
+                    debug!(
                         error = ?e,
                         "Failed to build custom Hickory DNS resolver, falling back to system"
                     );

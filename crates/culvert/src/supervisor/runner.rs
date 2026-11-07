@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::common::TaskTracker;
 use crate::config::model::{AppConfig, TunnelConfig};
@@ -76,10 +76,7 @@ impl TunnelSupervisor {
             });
         }
 
-        info!(
-            count = tracker.len(),
-            "All configured tunnels successfully spawned"
-        );
+        info!(count = tracker.len(), "Spawned tunnel workers");
 
         // Wait for cancellation signal or worker termination
         let mut exit_err: Option<TunnelError> = None;
@@ -87,7 +84,7 @@ impl TunnelSupervisor {
             tokio::select! {
                 biased;
                 _ = self.cancel_token.cancelled() => {
-                    info!("Supervisor received shutdown signal.");
+                    debug!("Supervisor stopping on shutdown signal");
                     break;
                 }
                 res = tracker.join_next() => {

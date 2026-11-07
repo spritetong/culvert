@@ -207,10 +207,9 @@ impl MuxSession {
                             "Multiplexer inbound stream backlog full; rejecting SYN with RST"
                         );
                         if let Err(e) = tx_frames.try_send(MuxFrame::rst(stream_id)) {
-                            warn!(
+                            debug!(
                                 stream_id,
-                                "Failed to enqueue RST frame on SYN reject (queue full/closed): {:?}",
-                                e
+                                "Failed to enqueue RST frame on SYN reject: {:?}", e
                             );
                         }
                         if let Some((_, (_, closed_flag))) = active_streams.remove(&stream_id) {
@@ -248,7 +247,7 @@ impl MuxSession {
                                 "Multiplexer stream buffer full; resetting slow stream to prevent session HOL blocking"
                             );
                             if let Err(e) = tx_frames.try_send(MuxFrame::rst(stream_id)) {
-                                warn!(
+                                debug!(
                                     stream_id,
                                     "Failed to enqueue RST frame on slow stream reset: {:?}", e
                                 );
