@@ -111,6 +111,7 @@ async fn test_forward_tunnel_ws_e2e() {
             target: format!("127.0.0.1:{}", echo_port),
         }],
         retry: None,
+        http_headers: None,
     };
 
     let app_config = AppConfig::default();
@@ -207,6 +208,7 @@ async fn test_reverse_tunnel_ws_e2e() {
             target: format!("127.0.0.1:{}", local_echo_port),
         }],
         retry: None,
+        http_headers: None,
     };
 
     let app_config = AppConfig::default();
@@ -302,6 +304,7 @@ async fn test_reverse_tunnel_with_inbound_pool_e2e() {
             target: format!("127.0.0.1:{}", local_echo_port),
         }],
         retry: None,
+        http_headers: None,
     };
 
     let app_config = AppConfig::default();
@@ -406,6 +409,7 @@ async fn test_reverse_pool_burst_falls_back_to_signaling_e2e() {
             target: format!("127.0.0.1:{}", local_echo_port),
         }],
         retry: None,
+        http_headers: None,
     };
     let app_config = AppConfig::default();
     let endpoint_ctx = EndpointContext::build(&tunnel_config.endpoint, &app_config).unwrap();
@@ -489,6 +493,7 @@ async fn test_supervisor_multi_tunnel_concurrency_e2e() {
             target: format!("127.0.0.1:{}", echo_fwd_port),
         }],
         retry: None,
+        http_headers: None,
     });
 
     app_config.tunnels.push(TunnelConfig {
@@ -504,6 +509,7 @@ async fn test_supervisor_multi_tunnel_concurrency_e2e() {
             target: format!("127.0.0.1:{}", echo_rev_port),
         }],
         retry: None,
+        http_headers: None,
     });
 
     // 3. Launch supervisor

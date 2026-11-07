@@ -188,12 +188,16 @@ dns_resolver   : CachedDnsResolver from effective DnsConfig
 dialer         : DefaultDialer from effective DialerConfig + resolver
 dialer_config  : effective DialerConfig (used for heartbeat/idle/connect timeouts)
 tls_config     : Option<TlsConfig>
+http_headers   : Option<HashMap<String, String>>
 ```
 
 Merge order for `dns`, `dialer`, and `tls` fields is
 **endpoint override → global → built-in default**. TLS is activated purely by
 the scheme (`https`, `wss`, `h3`, `quic`, `wss+unix`); a `tls` block on any
 other scheme is an error. When no SNI is configured, the endpoint host is used.
+`http_headers` merges tunnel-level headers over endpoint-level headers,
+overriding keys case-insensitively. A configured `Host` header overrides the
+default `host:port` authority.
 Helpers `heartbeat_interval()`, `idle_timeout()`, and `connect_timeout()`
 return the effective values used by runtime timers.
 
@@ -207,6 +211,9 @@ return the effective values used by runtime timers.
 - Tokens are non-empty and at most 256 bytes (`TOKEN_MAX_LEN`).
 - `pool_size >= 1`, `retry.delay > 0`, `retry.max_retries > 0`,
   `dns.cache_capacity >= 1`.
+- `http_headers` header names and values are validated fail-fast: header names
+  cannot be empty and must conform to RFC 9110 token syntax; values must not
+  contain forbidden control characters or CRLF injection.
 - Server `default_target` parses; `certificate` and `key` come as a pair and
   PEM files are readable and valid; certificates are rejected if every
   listener is plaintext.

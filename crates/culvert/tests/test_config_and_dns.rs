@@ -711,3 +711,117 @@ tunnels:
         "unexpected error: {msg}"
     );
 }
+
+#[test]
+fn test_tunnel_http_headers_yaml_parsing_and_merging() {
+    let yaml = r#"
+server:
+  listen: "ws://127.0.0.1:8080/tunnel"
+
+tunnels:
+  - tag: "custom-headers-tunnel"
+    endpoint:
+      url: "ws://127.0.0.1:8080/tunnel"
+      http_headers:
+        Host: "vhost-endpoint.example.com"
+        X-Endpoint-Header: "endpoint-value"
+    http_headers:
+      host: "vhost-override.example.com"
+      User-Agent: "culvert-agent/1.0"
+      X-Custom-Auth: "custom-token-xyz"
+    mappings:
+      - mode: "forward"
+        listen: "127.0.0.1:18080"
+        target: "127.0.0.1:8080"
+"#;
+    let config = ConfigLoader::from_yaml_str(yaml).expect("Failed to parse config with http_headers");
+    let tunnel = &config.tunnels[0];
+
+    assert!(tunnel.http_headers.is_some());
+    let tunnel_headers = tunnel.http_headers.as_ref().unwrap();
+    assert_eq!(tunnel_headers.get("host").map(|s| s.as_str()), Some("vhost-override.example.com"));
+    assert_eq!(tunnel_headers.get("User-Agent").map(|s| s.as_str()), Some("culvert-agent/1.0"));
+
+    let endpoint_ctx = EndpointContext::build_for_tunnel(tunnel, &config).expect("build_for_tunnel failed");
+    let effective_headers = endpoint_ctx.http_headers.expect("effective headers must be present");
+
+    // "host" in tunnel should override "Host" in endpoint
+    let host_val = effective_headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+        .map(|(_, v)| v.as_str());
+    assert_eq!(host_val, Some("vhost-override.example.com"));
+
+    // Endpoint-specific headers should be retained
+    assert_eq!(
+        effective_headers.get("X-Endpoint-Header").map(|s| s.as_str()),
+        Some("endpoint-value")
+    );
+    assert_eq!(
+        effective_headers.get("User-Agent").map(|s| s.as_str()),
+        Some("culvert-agent/1.0")
+    );
+}
+
+#[test]
+fn test_tunnel_http_headers_validation_failures() {
+    // 1. Empty header name
+    let yaml_empty_name = r#"
+server:
+  listen: "ws://127.0.0.1:8080/tunnel"
+tunnels:
+  - tag: "bad-header"
+    endpoint: "ws://127.0.0.1:8080/tunnel"
+    http_headers:
+      "": "some-value"
+    mappings:
+      - mode: "forward"
+        listen: "127.0.0.1:18080"
+        target: "127.0.0.1:8080"
+"#;
+    let err = ConfigLoader::from_yaml_str(yaml_empty_name).unwrap_err();
+    assert!(
+        err.to_string().contains("HTTP header name must not be empty"),
+        "expected empty header name error, got: {err}"
+    );
+
+    // 2. Invalid header name characters (spaces or colon)
+    let yaml_invalid_name = r#"
+server:
+  listen: "ws://127.0.0.1:8080/tunnel"
+tunnels:
+  - tag: "bad-header"
+    endpoint: "ws://127.0.0.1:8080/tunnel"
+    http_headers:
+      "Invalid Header Name": "some-value"
+    mappings:
+      - mode: "forward"
+        listen: "127.0.0.1:18080"
+        target: "127.0.0.1:8080"
+"#;
+    let err = ConfigLoader::from_yaml_str(yaml_invalid_name).unwrap_err();
+    assert!(
+        err.to_string().contains("invalid HTTP header name"),
+        "expected invalid header name error, got: {err}"
+    );
+
+    // 3. Invalid header value characters (newline / CRLF injection)
+    let yaml_crlf_value = "
+server:
+  listen: \"ws://127.0.0.1:8080/tunnel\"
+tunnels:
+  - tag: \"bad-header\"
+    endpoint: \"ws://127.0.0.1:8080/tunnel\"
+    http_headers:
+      \"X-Injected\": \"line1\\r\\nInjected-Header: evil\"
+    mappings:
+      - mode: \"forward\"
+        listen: \"127.0.0.1:18080\"
+        target: \"127.0.0.1:8080\"
+";
+    let err = ConfigLoader::from_yaml_str(yaml_crlf_value).unwrap_err();
+    assert!(
+        err.to_string().contains("invalid HTTP header value"),
+        "expected invalid header value error, got: {err}"
+    );
+}

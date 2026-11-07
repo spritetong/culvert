@@ -389,14 +389,35 @@ impl H3Connector {
             &self.endpoint.endpoint.path
         };
 
-        let authority = format!(
-            "{}:{}",
-            self.endpoint.endpoint.host, self.endpoint.endpoint.port
-        );
+        let authority = self
+            .endpoint
+            .http_headers
+            .as_ref()
+            .and_then(|headers| {
+                headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+                    .map(|(_, v)| v.clone())
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "{}:{}",
+                    self.endpoint.endpoint.host, self.endpoint.endpoint.port
+                )
+            });
+
         let mut req_builder = Request::builder()
             .method("CONNECT")
             .uri(path)
             .header("host", &authority);
+
+        if let Some(ref custom_headers) = self.endpoint.http_headers {
+            for (key, val) in custom_headers {
+                if !key.eq_ignore_ascii_case("host") {
+                    req_builder = req_builder.header(key, val);
+                }
+            }
+        }
 
         if !self.auth_token.is_empty() {
             req_builder = req_builder

@@ -103,6 +103,7 @@ pub struct EndpointContext {
     pub dialer: Arc<dyn Dialer>,
     pub dialer_config: DialerConfig,
     pub tls_config: Option<TlsConfig>,
+    pub http_headers: Option<std::collections::HashMap<String, String>>,
 }
 
 impl EndpointContext {
@@ -136,11 +137,20 @@ impl EndpointContext {
         let endpoint = Endpoint::parse(raw_url)?;
 
         // Extract per-endpoint overrides if available
-        let (endpoint_dns, endpoint_dialer, endpoint_tls) = match endpoint_cfg {
-            EndpointConfig::Simple(_) => (None, None, None),
+        let (endpoint_dns, endpoint_dialer, endpoint_tls, endpoint_headers) = match endpoint_cfg {
+            EndpointConfig::Simple(_) => (None, None, None, None),
             EndpointConfig::Detailed {
-                dns, dialer, tls, ..
-            } => (dns.as_ref(), dialer.as_ref(), tls.as_ref()),
+                dns,
+                dialer,
+                tls,
+                http_headers,
+                ..
+            } => (
+                dns.as_ref(),
+                dialer.as_ref(),
+                tls.as_ref(),
+                http_headers.clone(),
+            ),
         };
 
         // Resolve effective DNS configuration
@@ -226,7 +236,41 @@ impl EndpointContext {
             dialer,
             dialer_config: effective_dialer,
             tls_config: effective_tls,
+            http_headers: endpoint_headers,
         })
+    }
+
+    /// Attaches or replaces custom HTTP headers sent during handshake.
+    pub fn with_http_headers(
+        mut self,
+        headers: Option<std::collections::HashMap<String, String>>,
+    ) -> Self {
+        self.http_headers = headers;
+        self
+    }
+
+    /// Merges custom HTTP headers into this endpoint context, overriding duplicates case-insensitively.
+    pub fn merge_http_headers(&mut self, headers: &std::collections::HashMap<String, String>) {
+        if let Some(ref mut existing) = self.http_headers {
+            for (k, v) in headers {
+                existing.retain(|ek, _| !ek.eq_ignore_ascii_case(k));
+                existing.insert(k.clone(), v.clone());
+            }
+        } else {
+            self.http_headers = Some(headers.clone());
+        }
+    }
+
+    /// Builds an `EndpointContext` for a specific `TunnelConfig`, incorporating tunnel-level overrides.
+    pub fn build_for_tunnel(
+        tunnel_cfg: &crate::config::model::TunnelConfig,
+        global_app: &AppConfig,
+    ) -> Result<Self, TunnelError> {
+        let mut ctx = Self::build(&tunnel_cfg.endpoint, global_app)?;
+        if let Some(ref headers) = tunnel_cfg.http_headers {
+            ctx.merge_http_headers(headers);
+        }
+        Ok(ctx)
     }
 }
 

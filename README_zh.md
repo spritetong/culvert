@@ -365,6 +365,9 @@ tunnels:
     endpoint: "wss://tunnel.example.com/tunnel" # 服务端 URL 或包含独立 dns/tls 的对象
     token: "SECURE_AUTH_TOKEN"        # 与服务端一致的验证令牌
     pool_size: 8                      # 开启 0-RTT 预热连接池大小 (正向与反向均支持)
+    http_headers:                     # 可选：连接服务端时携带的自定义 HTTP 头
+      Host: "tunnel.example.com"      # 覆盖 Host 标头 (用于反代 vhost 路由)
+      User-Agent: "culvert/1.0"
     retry:
       delay: "3s"                     # 重连尝试固定间隔
       max_retries: 10                 # 最大重试次数 (缺省表示无限重试)

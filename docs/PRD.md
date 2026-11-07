@@ -204,6 +204,7 @@ behavior is configurable, the configuration key is given.
   active-stream counter through a guard; the actor replenishes idle streams in
   the background. Streams are not returned to the idle queue after use.
 - **FR-4.7** In a cluster with both forward and reverse mappings, forward mappings share the Outbound Pool, while reverse mappings use the Inbound Pool. Reverse mappings never draw from the forward pool.
+- **FR-4.8** Tunnels support custom `http_headers: { <HeaderName>: <HeaderValue> }` configured at the tunnel root or under `endpoint`. Handshake connectors (WebSocket, HTTP/3, and UDS) attach these headers to outgoing connection requests. A configured `Host` (case-insensitive) overrides the default `host:port` authority header, enabling transparent routing through upstream reverse proxies (e.g. Caddy, Nginx, Traefik, Cloudflare). Reserved transport framing headers (e.g. `Upgrade`, `Sec-WebSocket-Key`) cannot be overwritten by custom headers. Header names and values are validated fail-fast during config loading against syntax and CRLF injection.
 
 ### FR-5 Reverse mappings, 0-RTT inbound pool, and control protocol
 
@@ -405,6 +406,7 @@ tunnels:
 | AC-6 | QUIC flow control does not stall unrelated streams. | `test_quic_flow_control_hol.rs`. |
 | AC-7 | Shutdown cancels and awaits all owned tasks; the watchdog is joined on clean exit. | `daemon.rs` tests, `common/task.rs` tests. |
 | AC-8 | DNS and configuration options parse as documented. | `test_config_and_dns.rs`. |
+| AC-9 | Custom HTTP headers and Host override are applied to outgoing handshakes and validated fail-fast. | `test_http_headers.rs`, `test_config_and_dns.rs`. |
 
 Run the suite with `cargo test --workspace`.
 

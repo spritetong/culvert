@@ -233,6 +233,10 @@ impl ConfigLoader {
                 }
             }
 
+            if let Some(ref headers) = tunnel.http_headers {
+                Self::validate_http_headers(headers, &format!("tunnel '{}'", tunnel.tag))?;
+            }
+
             if let Some(p) = tunnel.pool_size
                 && p == 0
             {
@@ -338,9 +342,14 @@ impl ConfigLoader {
                 ref tls,
                 ref dns,
                 ref dialer,
+                ref http_headers,
                 ..
             } = tunnel.endpoint
             {
+                if let Some(headers) = http_headers {
+                    Self::validate_http_headers(headers, &format!("tunnel '{}' endpoint", tunnel.tag))?;
+                }
+
                 if !is_tls && tls.is_some() {
                     return Err(TunnelError::Config(format!(
                         "tunnel '{}': endpoint uses non-TLS scheme '{}', but 'tls' options are configured. Use a TLS scheme (e.g. wss://, h3://) or remove the 'tls' block.",
@@ -386,7 +395,7 @@ impl ConfigLoader {
             }
 
             // Pre-flight check: ensure EndpointContext builds cleanly
-            crate::dialer::endpoint::EndpointContext::build(&tunnel.endpoint, config)?;
+            crate::dialer::endpoint::EndpointContext::build_for_tunnel(tunnel, config)?;
         }
 
         // 8. Effective heartbeat/idle timing validation (post-merge).
@@ -632,6 +641,34 @@ impl ConfigLoader {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Validates HTTP request headers for proper syntax and constraints.
+    pub fn validate_http_headers(
+        headers: &std::collections::HashMap<String, String>,
+        context: &str,
+    ) -> Result<(), TunnelError> {
+        for (name, value) in headers {
+            if name.trim().is_empty() {
+                return Err(TunnelError::Config(format!(
+                    "{}: HTTP header name must not be empty",
+                    context
+                )));
+            }
+            http::header::HeaderName::try_from(name.as_str()).map_err(|e| {
+                TunnelError::Config(format!(
+                    "{}: invalid HTTP header name '{}': {}",
+                    context, name, e
+                ))
+            })?;
+            http::header::HeaderValue::try_from(value.as_str()).map_err(|e| {
+                TunnelError::Config(format!(
+                    "{}: invalid HTTP header value for '{}': {}",
+                    context, name, e
+                ))
+            })?;
         }
         Ok(())
     }

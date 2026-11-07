@@ -88,12 +88,14 @@ async fn test_standalone_wss_server_self_signed_direct_termination() {
                 server_name: Some("localhost".to_string()),
                 ..Default::default()
             }),
+            http_headers: None,
         },
         token: Some("secret_wss_token".to_string()),
         pool_size: None,
         failover: None,
         multiplex: None,
         retry: None,
+        http_headers: None,
         mappings: vec![PortMappingConfig {
             mode: TunnelMode::Forward,
             listen: format!("127.0.0.1:{}", client_listen_port),

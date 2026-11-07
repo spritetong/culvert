@@ -65,6 +65,7 @@ async fn test_e2e_server_uds_url_and_mappings() {
             token: Some("secret123".to_string()),
             pool_size: Some(2),
             retry: None,
+            http_headers: None,
             failover: None,
             multiplex: None,
             mappings: vec![PortMappingConfig {
@@ -155,6 +156,7 @@ async fn test_e2e_reverse_mapping_uds() {
             token: Some("rev_secret".to_string()),
             pool_size: None,
             retry: None,
+            http_headers: None,
             failover: None,
             multiplex: None,
             mappings: vec![PortMappingConfig {
@@ -257,6 +259,7 @@ async fn test_e2e_server_ws_unix_with_query_path() {
             token: Some("token123".to_string()),
             pool_size: Some(2),
             retry: None,
+            http_headers: None,
             failover: None,
             multiplex: None,
             mappings: vec![PortMappingConfig {

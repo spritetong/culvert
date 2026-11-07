@@ -104,6 +104,7 @@ async fn test_high_volume_duplex_stream_integrity() {
             target: format!("127.0.0.1:{}", echo_port),
         }],
         retry: None,
+        http_headers: None,
         endpoint: EndpointConfig::Simple(format!("ws://{}/ws", server_ws_listen)),
     };
 
@@ -248,6 +249,7 @@ async fn test_stream_half_close_and_draining() {
             target: format!("127.0.0.1:{}", backend_service_port),
         }],
         retry: None,
+        http_headers: None,
         endpoint: EndpointConfig::Simple(format!("ws://{}/ws", server_ws_listen)),
     };
 
@@ -342,6 +344,7 @@ async fn test_pool_prewarm_and_reuse() {
             target: format!("127.0.0.1:{}", echo_port),
         }],
         retry: None,
+        http_headers: None,
         endpoint: EndpointConfig::Simple(format!("ws://{}/ws", server_ws_listen)),
     };
 
@@ -438,6 +441,7 @@ async fn test_pool_resilience_after_disconnect_and_high_churn() {
             target: format!("127.0.0.1:{}", echo_port),
         }],
         retry: None,
+        http_headers: None,
         endpoint: EndpointConfig::Simple(format!("ws://{}/ws", server_ws_listen)),
     };
 

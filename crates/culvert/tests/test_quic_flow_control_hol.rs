@@ -114,6 +114,7 @@ async fn test_quic_flow_control_hol_blocking_prevention() {
             server_name: Some("localhost".to_string()),
             ..Default::default()
         }),
+        http_headers: None,
     };
 
     let app_cfg = AppConfig::default();

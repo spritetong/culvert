@@ -106,10 +106,23 @@ impl WsConnector {
 
         // 3. Construct HTTP Upgrade Request with custom tunnel headers
         let key = handshake::generate_key();
+
+        let host_header = self
+            .endpoint
+            .http_headers
+            .as_ref()
+            .and_then(|headers| {
+                headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+                    .map(|(_, v)| v.clone())
+            })
+            .unwrap_or_else(|| format!("{}:{}", host, port));
+
         let mut req_builder = Request::builder()
             .method("GET")
             .uri(&self.endpoint.endpoint.path)
-            .header(HOST, format!("{}:{}", host, port))
+            .header(HOST, host_header)
             .header(UPGRADE, crate::consts::HEADER_VALUE_WEBSOCKET)
             .header(CONNECTION, crate::consts::HEADER_VALUE_UPGRADE)
             .header(crate::consts::HEADER_SEC_WEBSOCKET_KEY, key)
@@ -117,6 +130,19 @@ impl WsConnector {
                 crate::consts::HEADER_SEC_WEBSOCKET_VERSION,
                 crate::consts::SEC_WEBSOCKET_VERSION_13,
             );
+
+        if let Some(ref custom_headers) = self.endpoint.http_headers {
+            for (key, val) in custom_headers {
+                if !key.eq_ignore_ascii_case("host")
+                    && !key.eq_ignore_ascii_case("upgrade")
+                    && !key.eq_ignore_ascii_case("connection")
+                    && !key.eq_ignore_ascii_case("sec-websocket-key")
+                    && !key.eq_ignore_ascii_case("sec-websocket-version")
+                {
+                    req_builder = req_builder.header(key, val);
+                }
+            }
+        }
 
         let headers = WsHandshakeHeaders::new(self.auth_token.clone(), self.mode)
             .with_session_id(session_id.map(|s| s.to_string()))

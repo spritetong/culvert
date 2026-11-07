@@ -514,10 +514,22 @@ impl UdsConnector {
             "/".to_string()
         };
 
-        let req_builder = Request::builder()
+        let host_header = self
+            .endpoint
+            .http_headers
+            .as_ref()
+            .and_then(|headers| {
+                headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+                    .map(|(_, v)| v.clone())
+            })
+            .unwrap_or_else(|| "localhost".to_string());
+
+        let mut req_builder = Request::builder()
             .method("GET")
             .uri(uri)
-            .header("Host", "localhost")
+            .header("Host", host_header)
             .header("Upgrade", "websocket")
             .header("Connection", "Upgrade")
             .header(
@@ -525,6 +537,19 @@ impl UdsConnector {
                 fastwebsockets::handshake::generate_key(),
             )
             .header("Sec-WebSocket-Version", "13");
+
+        if let Some(ref custom_headers) = self.endpoint.http_headers {
+            for (key, val) in custom_headers {
+                if !key.eq_ignore_ascii_case("host")
+                    && !key.eq_ignore_ascii_case("upgrade")
+                    && !key.eq_ignore_ascii_case("connection")
+                    && !key.eq_ignore_ascii_case("sec-websocket-key")
+                    && !key.eq_ignore_ascii_case("sec-websocket-version")
+                {
+                    req_builder = req_builder.header(key, val);
+                }
+            }
+        }
 
         let headers = WsHandshakeHeaders::new(self.auth_token.clone(), self.mode)
             .with_session_id(session_id.map(|s| s.to_string()))

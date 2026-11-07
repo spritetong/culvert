@@ -370,6 +370,9 @@ tunnels:
     endpoint: "wss://tunnel.example.com/tunnel" # Ingress URL or endpoint object
     token: "SECURE_AUTH_TOKEN"        # Must match server.token
     pool_size: 8                      # Pre-warmed 0-RTT stream pool size
+    http_headers:                     # Optional: custom HTTP headers sent during handshake
+      Host: "tunnel.example.com"      # Override Host header (e.g. for reverse proxy vhost routing)
+      User-Agent: "culvert/1.0"
     retry:
       delay: "3s"                     # Delay between reconnect attempts
       max_retries: 10                 # Maximum retry attempts (omit for infinite)

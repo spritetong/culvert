@@ -56,7 +56,7 @@ impl ClientRunner {
 
         let mut tunnels = Vec::with_capacity(app_config.tunnels.len());
         for tunnel_cfg in &app_config.tunnels {
-            let endpoint_ctx = EndpointContext::build(&tunnel_cfg.endpoint, app_config)?;
+            let endpoint_ctx = EndpointContext::build_for_tunnel(tunnel_cfg, app_config)?;
             tunnels.push((tunnel_cfg.clone(), endpoint_ctx));
         }
 

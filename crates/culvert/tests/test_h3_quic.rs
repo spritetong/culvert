@@ -161,6 +161,7 @@ async fn test_h3_transport_handshake_and_bidirectional_transfer() {
             server_name: Some("localhost".to_string()),
             ..Default::default()
         }),
+        http_headers: None,
     };
 
     let app_cfg = AppConfig::default();
@@ -214,6 +215,7 @@ async fn test_h3_transport_auth_failure() {
             server_name: Some("localhost".to_string()),
             ..Default::default()
         }),
+        http_headers: None,
     };
 
     let app_cfg = AppConfig::default();
@@ -265,6 +267,7 @@ async fn test_quic_raw_stream_bidirectional_transfer() {
             server_name: Some("localhost".to_string()),
             ..Default::default()
         }),
+        http_headers: None,
     };
 
     let app_cfg = AppConfig::default();
@@ -334,6 +337,7 @@ async fn test_h3_stream_multiplexing_over_single_quic_connection() {
             server_name: Some("localhost".to_string()),
             ..Default::default()
         }),
+        http_headers: None,
     };
 
     let app_cfg = AppConfig::default();
@@ -425,6 +429,7 @@ async fn test_h3_tunnel_pool_prewarm_and_activation_end_to_end() {
                 target: format!("127.0.0.1:{}", echo_port),
             }],
             retry: None,
+            http_headers: None,
         }],
         ..Default::default()
     };
@@ -524,6 +529,7 @@ async fn test_quic_raw_tunnel_pool_prewarm_and_activation_end_to_end() {
                 target: format!("127.0.0.1:{}", echo_port),
             }],
             retry: None,
+            http_headers: None,
         }],
         ..Default::default()
     };
@@ -651,6 +657,7 @@ async fn test_quic_raw_forward_stress_throughput() {
                 target: format!("127.0.0.1:{}", sink_port),
             }],
             retry: None,
+            http_headers: None,
         }],
         ..Default::default()
     };
@@ -750,6 +757,7 @@ async fn test_h3_concurrent_forward_stress() {
                 target: format!("127.0.0.1:{}", echo_port),
             }],
             retry: None,
+            http_headers: None,
         }],
         ..Default::default()
     };
@@ -862,6 +870,7 @@ async fn test_h3_sibling_streams_survive_sibling_abort() {
             server_name: Some("localhost".to_string()),
             ..Default::default()
         }),
+        http_headers: None,
     };
 
     let app_cfg = AppConfig::default();
@@ -924,6 +933,7 @@ async fn test_h3_stream_liveness_detects_closed_connection() {
             server_name: Some("localhost".to_string()),
             ..Default::default()
         }),
+        http_headers: None,
     };
 
     let app_cfg = AppConfig::default();
@@ -999,6 +1009,7 @@ async fn test_h3_connector_recovers_after_server_restart() {
             server_name: Some("localhost".to_string()),
             ..Default::default()
         }),
+        http_headers: None,
     };
 
     let app_cfg = AppConfig::default();

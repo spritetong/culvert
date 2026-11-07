@@ -69,7 +69,7 @@ impl TunnelSupervisor {
         for tunnel_cfg in &self.config.tunnels {
             let cfg = tunnel_cfg.clone();
             let registry = Arc::clone(&self.transport_registry);
-            let endpoint_ctx = EndpointContext::build(&cfg.endpoint, &self.config)?;
+            let endpoint_ctx = EndpointContext::build_for_tunnel(&cfg, &self.config)?;
 
             tracker.spawn_with_cancel(move |token| async move {
                 Self::run_tunnel_with_retry(cfg, endpoint_ctx, registry, token).await

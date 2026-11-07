@@ -83,6 +83,7 @@ async fn test_multi_mapping_shared_pool_and_path_matching_e2e() {
             delay: Some(Duration::from_millis(500)),
             max_retries: Some(5),
         }),
+        http_headers: None,
         mappings: vec![
             PortMappingConfig {
                 mode: TunnelMode::Forward,
@@ -171,6 +172,7 @@ async fn test_path_mismatch_rejection() {
         failover: None,
         multiplex: None,
         retry: None,
+        http_headers: None,
         mappings: vec![PortMappingConfig {
             mode: TunnelMode::Forward,
             listen: format!("127.0.0.1:{}", client_listen_port),
@@ -237,6 +239,7 @@ async fn test_cluster_mixed_forward_and_reverse_with_pool_e2e() {
         failover: None,
         multiplex: None,
         retry: None,
+        http_headers: None,
         mappings: vec![
             PortMappingConfig {
                 mode: TunnelMode::Forward,

@@ -672,6 +672,10 @@ pub struct TunnelConfig {
     pub multiplex: Option<MultiplexConfig>,
     pub retry: Option<TunnelRetryConfig>,
 
+    /// Custom HTTP request headers sent when connecting to the server (e.g. Host override, User-Agent).
+    #[serde(default)]
+    pub http_headers: Option<std::collections::HashMap<String, String>>,
+
     /// Multiple bidirectional port mappings sharing this endpoint and connection pool.
     #[serde(default)]
     pub mappings: Vec<PortMappingConfig>,
@@ -723,6 +727,7 @@ pub enum EndpointConfig {
         dns: Option<DnsConfig>,
         dialer: Option<DialerConfig>,
         tls: Option<TlsConfig>,
+        http_headers: Option<std::collections::HashMap<String, String>>,
     },
 }
 
@@ -748,9 +753,10 @@ impl Serialize for EndpointConfig {
                 dns,
                 dialer,
                 tls,
+                http_headers,
             } => {
                 use serde::ser::SerializeStruct;
-                let mut state = serializer.serialize_struct("EndpointConfig", 4)?;
+                let mut state = serializer.serialize_struct("EndpointConfig", 5)?;
                 state.serialize_field("url", url)?;
                 if let Some(d) = dns {
                     state.serialize_field("dns", d)?;
@@ -760,6 +766,9 @@ impl Serialize for EndpointConfig {
                 }
                 if let Some(t) = tls {
                     state.serialize_field("tls", t)?;
+                }
+                if let Some(h) = http_headers {
+                    state.serialize_field("http_headers", h)?;
                 }
                 state.end()
             }
@@ -809,6 +818,8 @@ impl<'de> Deserialize<'de> for EndpointConfig {
                     dialer: Option<DialerConfig>,
                     #[serde(default)]
                     tls: Option<TlsConfig>,
+                    #[serde(default)]
+                    http_headers: Option<std::collections::HashMap<String, String>>,
                 }
 
                 let helper =
@@ -818,6 +829,7 @@ impl<'de> Deserialize<'de> for EndpointConfig {
                     dns: helper.dns,
                     dialer: helper.dialer,
                     tls: helper.tls,
+                    http_headers: helper.http_headers,
                 })
             }
         }

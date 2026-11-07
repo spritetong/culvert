@@ -314,6 +314,7 @@ async fn test_wss_forward_tunnel_with_custom_ca_and_sni() {
             target: format!("127.0.0.1:{}", echo_port),
         }],
         retry: None,
+        http_headers: None,
         endpoint: EndpointConfig::Detailed {
             url: format!("wss://127.0.0.1:{}/tunnel", tls_ingress_port),
             dns: None,
@@ -324,6 +325,7 @@ async fn test_wss_forward_tunnel_with_custom_ca_and_sni() {
                 ca_certificate: Some(pki.ca_cert_path.clone()),
                 ..Default::default()
             }),
+            http_headers: None,
         },
     };
 
@@ -430,6 +432,7 @@ async fn test_wss_forward_tunnel_insecure_mode() {
             target: format!("127.0.0.1:{}", echo_port),
         }],
         retry: None,
+        http_headers: None,
         endpoint: EndpointConfig::Detailed {
             url: format!("wss://127.0.0.1:{}/tunnel", tls_ingress_port),
             dns: None,
@@ -439,6 +442,7 @@ async fn test_wss_forward_tunnel_insecure_mode() {
                 insecure: Some(true), // Should skip all cert validation!
                 ..Default::default()
             }),
+            http_headers: None,
         },
     };
 
@@ -544,6 +548,7 @@ async fn test_wss_mtls_mutual_authentication() {
             target: format!("127.0.0.1:{}", echo_port),
         }],
         retry: None,
+        http_headers: None,
         endpoint: EndpointConfig::Detailed {
             url: format!("wss://127.0.0.1:{}/tunnel", tls_ingress_port),
             dns: None,
@@ -556,6 +561,7 @@ async fn test_wss_mtls_mutual_authentication() {
                 client_key: Some(pki.client_key_path.clone()),
                 ..Default::default()
             }),
+            http_headers: None,
         },
     };
 
@@ -663,6 +669,7 @@ async fn test_wss_reverse_tunnel_e2e() {
             target: format!("127.0.0.1:{}", local_echo_port),
         }],
         retry: None,
+        http_headers: None,
         endpoint: EndpointConfig::Detailed {
             url: format!("wss://127.0.0.1:{}/tunnel", tls_ingress_port),
             dns: None,
@@ -673,6 +680,7 @@ async fn test_wss_reverse_tunnel_e2e() {
                 ca_certificate: Some(pki.ca_cert_path.clone()),
                 ..Default::default()
             }),
+            http_headers: None,
         },
     };
 
@@ -769,6 +777,7 @@ async fn test_wss_server_tls_version_enforcement() {
         dns: None,
         dialer: None,
         tls: Some(client_tls_12),
+        http_headers: None,
     };
     let ep_ctx = EndpointContext::build(&ep_cfg, &app_cfg).unwrap();
     let connector_12 = registry
@@ -794,6 +803,7 @@ async fn test_wss_server_tls_version_enforcement() {
         dns: None,
         dialer: None,
         tls: Some(client_tls_13),
+        http_headers: None,
     };
     let ep_ctx_13 = EndpointContext::build(&ep_cfg_13, &app_cfg).unwrap();
     let connector_13 = registry
@@ -869,6 +879,7 @@ async fn test_wss_server_inherits_global_tls_config() {
         dns: None,
         dialer: None,
         tls: Some(client_tls_12),
+        http_headers: None,
     };
     let ep_ctx = EndpointContext::build(&ep_cfg, &app_cfg).unwrap();
     let connector_12 = registry
@@ -894,6 +905,7 @@ async fn test_wss_server_inherits_global_tls_config() {
         dns: None,
         dialer: None,
         tls: Some(client_tls_13),
+        http_headers: None,
     };
     let ep_ctx_13 = EndpointContext::build(&ep_cfg_13, &app_cfg).unwrap();
     let connector_13 = registry

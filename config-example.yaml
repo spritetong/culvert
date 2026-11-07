@@ -91,10 +91,15 @@ tunnels:
         listen: "0.0.0.0:2222"
         target: "127.0.0.1:22"
 
-  # Tunnel 2: Multi-port tunnel with HTTP/3 & multiplexing
+  # Tunnel 2: Multi-port tunnel with HTTP/3 & custom HTTP headers
   - tag: "cloud-h3-forward"
     endpoint: "https://tunnel.example.com/tunnel"
     token: "SECURE_PRESHARED_TOKEN"
+    # Custom HTTP headers sent during handshake (e.g. override Host for reverse proxies, custom routing, or auth)
+    http_headers:
+      Host: "vhost.example.com"
+      User-Agent: "culvert/1.0"
+      # X-Custom-Auth: "secret"
     mappings:
       - mode: "forward"
         listen: "127.0.0.1:18080"
