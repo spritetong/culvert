@@ -347,7 +347,10 @@ impl ConfigLoader {
             } = tunnel.endpoint
             {
                 if let Some(headers) = http_headers {
-                    Self::validate_http_headers(headers, &format!("tunnel '{}' endpoint", tunnel.tag))?;
+                    Self::validate_http_headers(
+                        headers,
+                        &format!("tunnel '{}' endpoint", tunnel.tag),
+                    )?;
                 }
 
                 if !is_tls && tls.is_some() {

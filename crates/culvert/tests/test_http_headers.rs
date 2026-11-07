@@ -36,7 +36,10 @@ async fn test_ws_connector_sends_custom_host_and_http_headers() {
     });
 
     let mut custom_headers = HashMap::new();
-    custom_headers.insert("Host".to_string(), "vhost.corporate.internal:8080".to_string());
+    custom_headers.insert(
+        "Host".to_string(),
+        "vhost.corporate.internal:8080".to_string(),
+    );
     custom_headers.insert("User-Agent".to_string(), "culvert-test/2.0".to_string());
     custom_headers.insert("X-Custom-Auth".to_string(), "secret-auth-999".to_string());
 
@@ -161,7 +164,10 @@ async fn test_e2e_ws_tunnel_with_custom_host_and_headers() {
         .expect("Failed to connect to client forward port");
 
     let payload = b"Testing custom http_headers end-to-end echo payload!";
-    stream.write_all(payload).await.expect("Failed to write to client");
+    stream
+        .write_all(payload)
+        .await
+        .expect("Failed to write to client");
 
     let mut buf = vec![0u8; payload.len()];
     tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut buf))

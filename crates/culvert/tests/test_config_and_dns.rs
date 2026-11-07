@@ -734,16 +734,26 @@ tunnels:
         listen: "127.0.0.1:18080"
         target: "127.0.0.1:8080"
 "#;
-    let config = ConfigLoader::from_yaml_str(yaml).expect("Failed to parse config with http_headers");
+    let config =
+        ConfigLoader::from_yaml_str(yaml).expect("Failed to parse config with http_headers");
     let tunnel = &config.tunnels[0];
 
     assert!(tunnel.http_headers.is_some());
     let tunnel_headers = tunnel.http_headers.as_ref().unwrap();
-    assert_eq!(tunnel_headers.get("host").map(|s| s.as_str()), Some("vhost-override.example.com"));
-    assert_eq!(tunnel_headers.get("User-Agent").map(|s| s.as_str()), Some("culvert-agent/1.0"));
+    assert_eq!(
+        tunnel_headers.get("host").map(|s| s.as_str()),
+        Some("vhost-override.example.com")
+    );
+    assert_eq!(
+        tunnel_headers.get("User-Agent").map(|s| s.as_str()),
+        Some("culvert-agent/1.0")
+    );
 
-    let endpoint_ctx = EndpointContext::build_for_tunnel(tunnel, &config).expect("build_for_tunnel failed");
-    let effective_headers = endpoint_ctx.http_headers.expect("effective headers must be present");
+    let endpoint_ctx =
+        EndpointContext::build_for_tunnel(tunnel, &config).expect("build_for_tunnel failed");
+    let effective_headers = endpoint_ctx
+        .http_headers
+        .expect("effective headers must be present");
 
     // "host" in tunnel should override "Host" in endpoint
     let host_val = effective_headers
@@ -754,7 +764,9 @@ tunnels:
 
     // Endpoint-specific headers should be retained
     assert_eq!(
-        effective_headers.get("X-Endpoint-Header").map(|s| s.as_str()),
+        effective_headers
+            .get("X-Endpoint-Header")
+            .map(|s| s.as_str()),
         Some("endpoint-value")
     );
     assert_eq!(
@@ -781,7 +793,8 @@ tunnels:
 "#;
     let err = ConfigLoader::from_yaml_str(yaml_empty_name).unwrap_err();
     assert!(
-        err.to_string().contains("HTTP header name must not be empty"),
+        err.to_string()
+            .contains("HTTP header name must not be empty"),
         "expected empty header name error, got: {err}"
     );
 
