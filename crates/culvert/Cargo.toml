@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
-description = "High-performance, lightweight, production-ready bidirectional TCP tunneling system engineered to pair seamlessly with modern edge reverse proxies"
+description = "High-performance, transparent TCP tunneling tool designed for standardized and compliant servers"
 readme = "../../README.md"
 
 [dependencies]
