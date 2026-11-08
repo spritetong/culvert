@@ -17,7 +17,7 @@ use crate::common::{CancelFutureExt, CancellationTokenExt, TaskTracker};
 use crate::config::model::{TunnelConfig, TunnelMode};
 use crate::consts::{
     ACTIVATE_STREAM_MAGIC, DEFAULT_REVERSE_BACKOFF_INITIAL, DEFAULT_REVERSE_BACKOFF_MAX,
-    POOL_BACKOFF_BASE, POOL_BACKOFF_MAX, POOL_MAX_CONCURRENT_CONNECTS,
+    POOL_BACKOFF_ACTIVE_WAITERS_MAX, POOL_BACKOFF_BASE, POOL_MAX_CONCURRENT_CONNECTS,
     REVERSE_BACKOFF_RESET_THRESHOLD, REVERSE_CONTROL_TARGET_HOST, clamp_reverse_pool_size,
     reverse_frame_timeout,
 };
@@ -256,7 +256,7 @@ pub async fn run_reverse_mapping(
                                 if !token.sleep_or_cancel(retry).await {
                                     break;
                                 }
-                                retry = (retry * 2).min(POOL_BACKOFF_MAX);
+                                retry = (retry * 2).min(POOL_BACKOFF_ACTIVE_WAITERS_MAX);
                                 continue;
                             }
                         };
@@ -747,7 +747,7 @@ mod tests {
         let app_cfg = AppConfig::default();
         let ep_ctx = EndpointContext::build(&ep_cfg, &app_cfg).unwrap();
 
-        // Spawn with pool_size = 12 (> POOL_MAX_CONCURRENT_CONNECTS = 4)
+        // Spawn with pool_size = 24 (> POOL_MAX_CONCURRENT_CONNECTS = 16)
         let handle = tokio::spawn(async move {
             run_reverse_mapping(
                 "test_throttle".to_string(),
@@ -756,7 +756,7 @@ mod tests {
                 None,
                 ep_ctx,
                 reg,
-                Some(12),
+                Some(24),
                 cancel_clone,
             )
             .await

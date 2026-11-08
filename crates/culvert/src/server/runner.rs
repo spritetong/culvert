@@ -512,6 +512,38 @@ impl ServerRunner {
                     );
                     break;
                 }
+                msg_opt = ctrl_stream.next() => {
+                    // ANY inbound frame counts, including Ping/Pong; no PONG
+                    // counter and no dependency on a specific reply.
+                    idle_deadline
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + idle_timeout);
+                    match msg_opt {
+                        Some(Ok(ControlMessage::Ping)) => {
+                            // Optional echo to give the peer some RX; correctness
+                            // never depends on a PONG. The send must be bounded:
+                            // this body runs outside tokio::select!, so an
+                            // unbounded flush against a peer that stopped reading
+                            // would wedge the accept loop (and its idle deadline)
+                            // indefinitely.
+                            let pong = tokio::time::timeout(
+                                frame_timeout,
+                                ctrl_stream.send(ControlMessage::Pong),
+                            )
+                            .cancel_with(&cancel_token)
+                            .await;
+                            if !matches!(pong, Some(Ok(Ok(())))) {
+                                warn!(addr = %listen_addr, "Control channel Pong stalled; closing reverse listener");
+                                break;
+                            }
+                        }
+                        Some(Ok(ControlMessage::Pong)) => {}
+                        _ => {
+                            debug!(addr = %listen_addr, "Reverse control channel disconnected by client");
+                            break;
+                        }
+                    }
+                }
                 accept_res = listener.accept() => {
                     match accept_res {
                         Ok((visitor_stream, visitor_addr)) => {
@@ -519,33 +551,9 @@ impl ServerRunner {
                             // fresh and still alive. A stale generation must fall
                             // through to signaling rather than blackhole the visitor.
                             // The server owns the idle-stream lifetime; entries are
-                            // removed under the pool lock before the activation byte
-                            // is written, so eviction can never hit a committed stream.
-                            let mut fast_paired_stream = None;
-                            while let Some(mut candidate) = idle_pool.pop_live(idle_timeout).await {
-                                let activate = async {
-                                    tokio::io::AsyncWriteExt::write_all(
-                                        &mut candidate,
-                                        &[ACTIVATE_STREAM_MAGIC],
-                                    )
-                                    .await?;
-                                    tokio::io::AsyncWriteExt::flush(&mut candidate).await
-                                };
-                                match tokio::time::timeout(frame_timeout, activate).await {
-                                    Ok(Ok(())) => {
-                                        fast_paired_stream = Some(candidate);
-                                        break;
-                                    }
-                                    Ok(Err(e)) => {
-                                        debug!(addr = %listen_addr, "Discarding dead pooled reverse stream: {}", e);
-                                    }
-                                    Err(_) => {
-                                        debug!(addr = %listen_addr, "Discarding stalled pooled reverse stream");
-                                    }
-                                }
-                            }
-
-                            if let Some(data_stream) = fast_paired_stream {
+                            // removed under the pool lock, and activation is driven
+                            // in the spawned task so WAN RTT never blocks the accept loop.
+                            if let Some(mut candidate) = idle_pool.pop_live(idle_timeout).await {
                                 debug!(
                                     visitor = %visitor_addr,
                                     "Paired reverse visitor with idle pooled stream (0-RTT)"
@@ -554,13 +562,35 @@ impl ServerRunner {
                                     .as_mut()
                                     .reset(tokio::time::Instant::now() + idle_timeout);
                                 local_tracker.spawn_with_cancel(move |token| async move {
-                                    let _ = RelayEngine::relay_with_heartbeat(
-                                        visitor_stream,
-                                        data_stream,
-                                        token,
-                                        heartbeat_interval,
-                                        idle_timeout,
-                                    ).await;
+                                    let activate = async {
+                                        tokio::io::AsyncWriteExt::write_all(
+                                            &mut candidate,
+                                            &[ACTIVATE_STREAM_MAGIC],
+                                        )
+                                        .await?;
+                                        tokio::io::AsyncWriteExt::flush(&mut candidate).await
+                                    };
+                                    match tokio::time::timeout(frame_timeout, activate)
+                                        .cancel_with(&token)
+                                        .await
+                                    {
+                                        Some(Ok(Ok(()))) => {
+                                            let _ = RelayEngine::relay_with_heartbeat(
+                                                visitor_stream,
+                                                candidate,
+                                                token,
+                                                heartbeat_interval,
+                                                idle_timeout,
+                                            ).await;
+                                        }
+                                        Some(Ok(Err(e))) => {
+                                            debug!("Discarding dead pooled reverse stream: {}", e);
+                                        }
+                                        Some(Err(_)) => {
+                                            debug!("Discarding stalled pooled reverse stream");
+                                        }
+                                        None => {}
+                                    }
                                 });
                                 continue;
                             }
@@ -589,8 +619,9 @@ impl ServerRunner {
 
                             // Bounded signaling: a stalled or dead control channel
                             // must never block the accept loop and starve later
-                            // visitors. Any failure closes the listener so the
-                            // client re-registers instead of leaking sessions.
+                            // visitors. Transport errors close the listener, but
+                            // an individual timeout drops the session and continues
+                            // without taking down the entire listening port.
                             let notify_res = tokio::time::timeout(
                                 frame_timeout,
                                 ctrl_stream.send(notify_msg),
@@ -605,9 +636,9 @@ impl ServerRunner {
                                     break;
                                 }
                                 Some(Err(_)) => {
-                                    warn!(session = %session_id, "Timed out signaling NewConnection; closing reverse listener");
+                                    warn!(session = %session_id, "Timed out signaling NewConnection; dropping session and continuing");
                                     session_mgr.remove(&session_id);
-                                    break;
+                                    continue;
                                 }
                                 None => {
                                     session_mgr.remove(&session_id);
@@ -650,38 +681,6 @@ impl ServerRunner {
                             if !cancel_token.is_cancelled() && !matches!(e, TunnelError::Shutdown) {
                                 warn!(addr = %listen_addr, "Error accepting visitor on reverse port: {}", e);
                             }
-                            break;
-                        }
-                    }
-                }
-                msg_opt = ctrl_stream.next() => {
-                    // ANY inbound frame counts, including Ping/Pong; no PONG
-                    // counter and no dependency on a specific reply.
-                    idle_deadline
-                        .as_mut()
-                        .reset(tokio::time::Instant::now() + idle_timeout);
-                    match msg_opt {
-                        Some(Ok(ControlMessage::Ping)) => {
-                            // Optional echo to give the peer some RX; correctness
-                            // never depends on a PONG. The send must be bounded:
-                            // this body runs outside tokio::select!, so an
-                            // unbounded flush against a peer that stopped reading
-                            // would wedge the accept loop (and its idle deadline)
-                            // indefinitely.
-                            let pong = tokio::time::timeout(
-                                frame_timeout,
-                                ctrl_stream.send(ControlMessage::Pong),
-                            )
-                            .cancel_with(&cancel_token)
-                            .await;
-                            if !matches!(pong, Some(Ok(Ok(())))) {
-                                warn!(addr = %listen_addr, "Control channel Pong stalled; closing reverse listener");
-                                break;
-                            }
-                        }
-                        Some(Ok(ControlMessage::Pong)) => {}
-                        _ => {
-                            debug!(addr = %listen_addr, "Reverse control channel disconnected by client");
                             break;
                         }
                     }
@@ -976,5 +975,158 @@ mod tests {
             rebind.is_ok(),
             "Port must be freed immediately for rebinding"
         );
+    }
+
+    /// Under a burst of visitor connections, control frames (like Ping) must not
+    /// be starved by `listener.accept()`. Prioritizing `ctrl_stream.next()` over
+    /// `listener.accept()` ensures keepalive Pongs are returned promptly.
+    #[tokio::test]
+    async fn test_server_reverse_control_prioritizes_control_messages_over_visitor_burst() {
+        use futures_util::{SinkExt, StreamExt};
+
+        let (client, server) = tokio::io::duplex(4096);
+        let mut ctrl_client = FramedControlStream::new(client);
+        let session_mgr = Arc::new(SessionManager::new());
+        let cancel_token = CancellationToken::new();
+
+        let listen_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let listen_addr = format!("127.0.0.1:{}", listen_port);
+
+        let s_mgr = Arc::clone(&session_mgr);
+        let c_token = cancel_token.clone();
+        let l_addr = listen_addr.clone();
+
+        let handle = tokio::spawn(async move {
+            ServerRunner::handle_reverse_control(
+                Box::new(server),
+                s_mgr,
+                c_token,
+                Duration::from_secs(30),
+                crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
+            )
+            .await;
+        });
+
+        // Register reverse port without pre-warmed pool
+        ctrl_client
+            .send(ControlMessage::RegisterReverse {
+                listen_addr: listen_addr.clone(),
+                target_addr: "127.0.0.1:9099".to_string(),
+                pool_size: None,
+            })
+            .await
+            .unwrap();
+
+        let ack = ctrl_client.next().await.unwrap().unwrap();
+        assert!(matches!(
+            ack,
+            ControlMessage::RegisterAck { success: true, .. }
+        ));
+
+        // Connect multiple visitors to flood accept backlog
+        let mut visitors = Vec::new();
+        for _ in 0..5 {
+            if let Ok(conn) = tokio::net::TcpStream::connect(&l_addr).await {
+                visitors.push(conn);
+            }
+        }
+
+        // Send a heartbeat Ping while accept loop is active
+        ctrl_client.send(ControlMessage::Ping).await.unwrap();
+
+        // Must receive Pong promptly without being starved by visitor accepts
+        let mut received_pong = false;
+        let timeout_pong = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(Ok(msg)) = ctrl_client.next().await {
+                if matches!(msg, ControlMessage::Pong) {
+                    received_pong = true;
+                    break;
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            timeout_pong.is_ok() && received_pong,
+            "Control channel Ping was starved by visitor accept queue; no Pong received"
+        );
+
+        drop(visitors);
+        cancel_token.cancel();
+        let _ = handle.await;
+    }
+
+    /// When a single NewConnection notification times out under channel congestion,
+    /// the server must NOT drop the reverse listener. It should remove the failed
+    /// session and continue serving other incoming connections.
+    #[tokio::test]
+    async fn test_server_reverse_control_new_connection_timeout_does_not_close_listener() {
+        use futures_util::{SinkExt, StreamExt};
+
+        // Small duplex buffer so a single unread frame easily fills it
+        let (client, server) = tokio::io::duplex(32);
+        let mut ctrl_client = FramedControlStream::new(client);
+        let session_mgr = Arc::new(SessionManager::new());
+        let cancel_token = CancellationToken::new();
+
+        let listen_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let listen_addr = format!("127.0.0.1:{}", listen_port);
+
+        let s_mgr = Arc::clone(&session_mgr);
+        let c_token = cancel_token.clone();
+        let l_addr = listen_addr.clone();
+
+        // 300 ms idle_timeout -> 100 ms frame_timeout
+        let handle = tokio::spawn(async move {
+            ServerRunner::handle_reverse_control(
+                Box::new(server),
+                s_mgr,
+                c_token,
+                Duration::from_millis(300),
+                crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
+            )
+            .await;
+        });
+
+        // Register reverse port
+        ctrl_client
+            .send(ControlMessage::RegisterReverse {
+                listen_addr: listen_addr.clone(),
+                target_addr: "127.0.0.1:9099".to_string(),
+                pool_size: None,
+            })
+            .await
+            .unwrap();
+
+        let ack = ctrl_client.next().await.unwrap().unwrap();
+        assert!(matches!(
+            ack,
+            ControlMessage::RegisterAck { success: true, .. }
+        ));
+
+        // Deliberately stop reading on ctrl_client.
+        // A visitor connects, triggering NewConnection send which stalls on the 32-byte duplex.
+        let visitor = tokio::net::TcpStream::connect(&l_addr).await.unwrap();
+
+        // Wait past the frame_timeout (100 ms) to let NewConnection send time out
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // The listener must still be alive (handle not finished!)
+        assert!(
+            !handle.is_finished(),
+            "Reverse listener unexpectedly broke out and terminated on NewConnection timeout!"
+        );
+
+        drop(visitor);
+        cancel_token.cancel();
+        let _ = handle.await;
     }
 }

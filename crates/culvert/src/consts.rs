@@ -78,9 +78,9 @@ pub const DEFAULT_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 /// Default timeout to wait for a reverse data stream pairing handshake.
 ///
-/// 10 seconds accommodates WAN latency, TLS/QUIC handshake roundtrips, and transient
+/// 15 seconds accommodates WAN latency, TLS/QUIC handshake roundtrips, and transient
 /// packet retransmissions when a NATed client establishes a paired reverse data channel.
-pub const DEFAULT_SESSION_PAIR_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_SESSION_PAIR_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Standard timeout for TLS accept, WebSocket upgrade, and QUIC/H3 inbound handshakes.
 ///
@@ -166,10 +166,10 @@ pub const MUX_GC_INTERVAL: Duration = Duration::from_secs(5);
 // =============================================================================
 
 /// Maximum number of concurrent outbound dialing futures in the connection pool.
-pub const POOL_MAX_CONCURRENT_CONNECTS: usize = 4;
+pub const POOL_MAX_CONCURRENT_CONNECTS: usize = 16;
 
 /// Upper bound on the total allocated streams (idle + active) in the connection pool.
-pub const POOL_MAX_CAPACITY: usize = 16;
+pub const POOL_MAX_CAPACITY: usize = 64;
 
 /// Dummy host domain used for pre-warmed connections awaiting dynamic target specification.
 pub const POOL_DUMMY_HOST: &str = "pool.idle";

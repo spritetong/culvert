@@ -990,6 +990,48 @@ mod tests {
         cancel_token.cancel();
     }
 
+    /// The pool capacity bound was increased from 16 to 64 to avoid starving
+    /// burst concurrency. Verify acquiring 32 streams concurrently (which previously
+    /// stalled on POOL_MAX_CAPACITY = 16) completes successfully.
+    #[tokio::test]
+    async fn test_pool_supports_high_concurrency_capacity() {
+        let connector = Arc::new(MockSuccessfulConnector);
+        let cancel_token = CancellationToken::new();
+        let pool = ReplenishingStreamPool::new_shared(
+            connector,
+            4,
+            cancel_token.clone(),
+            DEFAULT_HEARTBEAT_INTERVAL,
+            DEFAULT_IDLE_TIMEOUT,
+        );
+
+        let mut held = Vec::new();
+        for _ in 0..32 {
+            let stream = tokio::time::timeout(Duration::from_secs(3), pool.acquire(None))
+                .await
+                .expect("acquire timed out on high concurrency")
+                .expect("acquire failed");
+            held.push(stream);
+        }
+        assert_eq!(pool.stats().active_count, 32);
+
+        drop(held);
+        for _ in 0..32 {
+            pool.on_stream_closed();
+        }
+        assert_eq!(pool.stats().active_count, 0);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pool.stats().idle_count < 4 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("pool did not replenish back to target size after high concurrency burst");
+
+        cancel_token.cancel();
+    }
+
     #[tokio::test]
     async fn test_on_stream_closed_never_underflows_active_count() {
         let connector = Arc::new(MockSuccessfulConnector);
