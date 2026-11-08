@@ -294,6 +294,12 @@ termination boundary for listener-owned tasks.
 computes whether a probe is needed. Probes never refresh liveness by
 themselves; inbound frames and real outbound data do.
 
+WebSocket has no native transport-level half-close; culvert encodes half-close
+FIN as an in-band zero-length binary frame (`supports_half_close() == true`).
+`poll_check_alive(cx)` uses a zero-capacity `ReadBuf` to drive the underlying
+`poll_read` state machine non-destructively, ensuring that in-band FIN frames and
+in-flight data frames are never swallowed during idle liveness sweeps.
+
 ### 5.3 Driver registry
 
 `TransportRegistry::default()` registers three drivers:
@@ -433,25 +439,29 @@ new generation drains the previous pool, closing its stale idle streams.
 Teardown removes the pool only if it is still the same `Arc`, so an overlapping
 reconnect cannot delete the new generation.
 
+In the event loop, `ctrl_stream.next()` is prioritized above `listener.accept()`
+in `biased; select!`: this guarantees that control frames (such as keepalive
+`Ping` and `Pong`) are never starved during heavy visitor floods, preventing
+false 30-second idle timeout disconnections.
+
 For each inbound connection on the reverse listener:
 
 1. **Fast path (0-RTT Pool)**: `pop_live(idle_timeout)` takes the newest idle
    stream, drops entries older than the effective idle window, and verifies the
-   rest with `poll_check_alive`. The activation write and the `NewConnection`
-   send share one derived `reverse_frame_timeout(idle_timeout)` — one third of
-   the effective idle window, clamped to `[POOL_HEARTBEAT_TIMEOUT,
-   DEFAULT_SESSION_PAIR_TIMEOUT]` and never longer than the idle window. With
-   defaults this is 10 s, not a LAN-scale 2 s that would tear down the whole
-   listener on a slow link. On failure the next candidate is tried; a stream
-   that passes is relayed immediately with no control messages.
+   rest with `poll_check_alive`. To eliminate WAN RTT latency from the accept
+   loop, stream activation (`write_all(&[ACTIVATE_STREAM_MAGIC])` and `flush()`)
+   is offloaded directly into the spawned relay task in `local_tracker`. The
+   accept loop returns in 0 ms, allowing hundreds of visitors to be paired in
+   parallel without blocking subsequent accepts.
 2. **Fallback path (On-demand Signaling)**: If no live stream is available
    (empty pool, stale entries, or `pool_size` not set), the server allocates a
    session id (`REVERSE_SESSION_COUNTER`), registers a oneshot receiver in
-   `SessionManager`, and sends `NewConnection`. A stalled channel cannot block
-   the accept loop indefinitely; on failure the listener closes and the client
-   re-registers. The paired data stream is delivered by
-   `SessionManager::fulfill`; pairing is bounded by
-   `DEFAULT_SESSION_PAIR_TIMEOUT` (10 s). Both sides then relay.
+   `SessionManager`, and sends `NewConnection`. The frame send is bounded by
+   `reverse_frame_timeout(idle_timeout)` (10 s by default); if sending times out
+   on a congested channel, the visitor session is dropped and the accept loop
+   continues without tearing down the listening port. The paired data stream is
+   delivered by `SessionManager::fulfill`; pairing is bounded by
+   `DEFAULT_SESSION_PAIR_TIMEOUT` (15 s). Both sides then relay.
 
 The control loop also handles `Ping`/`Pong` and reconnect with exponential
 backoff.
@@ -485,7 +495,7 @@ flushed first. Both streams are then passed to `RelayEngine`. An
 control messages.
 
 When `pool_size` is configured, `clamp_reverse_pool_size` caps it at
-`POOL_MAX_CAPACITY` = 16 and one worker per slot maintains a pre-warmed idle
+`POOL_MAX_CAPACITY` = 64 and one worker per slot maintains a pre-warmed idle
 stream connected to the server (`mode = Reverse`, `pool_idle = true`,
 `target = listen_addr`). The worker waits cancellably for the `0xA5` activation
 byte and reaps its own relay tasks while waiting. It has **no independent
@@ -496,9 +506,10 @@ teardown all close idle streams from the server side; the worker sees EOF and
 re-dials. Upon activation it dials the local `mappings.target`, hands the relay
 to its own `TaskTracker` (never detached), and immediately dials a replacement
 — one dial RTT, with no server-side "pool low" message. Pre-warm dials are
-throttled to at most `POOL_MAX_CONCURRENT_CONNECTS` = 4 concurrent handshakes
+throttled to at most `POOL_MAX_CONCURRENT_CONNECTS` = 16 concurrent handshakes
 via a shared semaphore, protecting low-bandwidth links from connection storms.
 Dial failures back off exponentially from 200 ms up to 10 s (`POOL_BACKOFF_MAX`),
+capped at 1 s (`POOL_BACKOFF_ACTIVE_WAITERS_MAX`) when requests await replenishment,
 with worker-index stagger to prevent lockstep retries.
 
 Because each consumed slot is replenished by its own worker, an extra server
@@ -537,21 +548,23 @@ later.
 
 | Element | Behavior |
 | :--- | :--- |
-| `mpsc::Sender<PoolCommand>` | `Acquire`, `PushIdle`, `StreamClosed` on a 1024-slot channel. |
+| `mpsc::Sender<PoolCommand>` | `Acquire`, `PushIdle`, `StreamClosed` / `ActiveReleased` on a 1024-slot channel. |
 | `idle_streams: VecDeque<ManagedStream>` | Idle streams with per-stream `HeartbeatState`. |
 | `pending_requests: VecDeque<AcquireRequest>` | Waiters with timestamps; each has a `oneshot` reply. |
-| `connecting_futures: FuturesUnordered` | At most 4 concurrent dials (`POOL_MAX_CONCURRENT_CONNECTS`). |
+| `connecting_futures: FuturesUnordered` | At most 16 concurrent dials (`POOL_MAX_CONCURRENT_CONNECTS`). |
 | Reactor events | `Cancelled`, `ConnectionResult`, `Command`, `RetryTimerExpired`, `HeartbeatTick`, `StreamsEvicted`. |
-| Heartbeats | `poll_check_alive` sweeps on a 1-second tick with a 5-second probe interval and 5-second probe timeout. |
-| Replenishment | Backoff from 200 ms up to 10 s, capped at 1 s when waiters are queued. |
-| Limits | Total allocated streams (idle + active) capped at 16; acquire timeout 15 s. |
-| Statistics | `PoolStats { idle_count, active_count, total_created }`. |
+| Heartbeats | `poll_check_alive` sweeps on a 1-second tick with a 5-second probe interval and 5-second probe timeout. Non-destructive via zero-capacity read buffer. |
+| Replenishment | Parallel one-turn batch dialing up to `POOL_MAX_CONCURRENT_CONNECTS` (16); backoff from 200 ms up to 10 s, capped at 1 s when waiters are queued (`POOL_BACKOFF_ACTIVE_WAITERS_MAX`). |
+| Limits | Idle pre-warmed inventory bounded by `POOL_MAX_CAPACITY` = 64; `pool_size` acts as the 0-RTT minimum warm inventory floor. Active relay throughput is fully decoupled from replenishment gating; pending callers dial immediately in parallel batches up to 16. Acquire timeout 15 s. |
+| Statistics | `PoolStats { idle_count, active_count, total_created }`. Authoritative `active_count` is tracked atomically (`Arc<AtomicUsize>`). |
 
 Idle pooled streams are opened with the `pool.idle` dummy target and
 `x-tunnel-pool: idle`; the server never dials a backend for them. Acquired
 streams are **one-shot**: they are not returned to the idle queue after the
-relay ends. `ActiveStreamGuard` decrements the active counter on drop, and the
-actor replenishes the idle population. There is no draining/return protocol.
+relay ends. `ActiveStreamGuard` decrements the atomic active counter on drop and
+sends an `ActiveReleased` hint to wake the reactor. Cancelled `acquire()` requests
+restore any already-acquired idle stream back into the pool or hand it directly to
+waiting callers instead of discarding it. There is no draining/return protocol.
 
 `pool::connection_pool.rs` also contains `StreamPool` / `InMemoryStreamPool`,
 a simple standalone implementation; the runtime data path uses
@@ -594,8 +607,9 @@ this loop and in the pool reactor is deliberately retained.
 
 1. **On-demand Sessions**: A `DashMap<String, oneshot::Sender<Box<dyn TunnelStream>>>`.
    When no idle stream is available, the server calls `register(session_id)`,
-   waits up to 10 s, and the reverse data stream is delivered by
-   `fulfill(session_id, stream)`. `remove` clears timed-out entries.
+   waits up to 15 s (`DEFAULT_SESSION_PAIR_TIMEOUT`), and the reverse data stream
+   is delivered by `fulfill(session_id, stream)`. `remove` clears timed-out
+   entries.
 2. **Reverse Inbound Pools**: A `DashMap<String, Arc<ReverseInboundPool>>` keyed
    by the canonical `TargetAddr` string (host **and** port or UDS path, so two
    listeners sharing a port on different local addresses never collide).
@@ -650,15 +664,15 @@ effective configuration values.
 | `DEFAULT_HEARTBEAT_INTERVAL` | 15 s |
 | `DEFAULT_IDLE_TIMEOUT` | 30 s |
 | `DEFAULT_RETRY_DELAY` | 3 s |
-| `DEFAULT_SESSION_PAIR_TIMEOUT` | 10 s |
+| `DEFAULT_SESSION_PAIR_TIMEOUT` | 15 s |
 | `DEFAULT_ACTIVATION_READ_TIMEOUT` | 10 s |
 | `DEFAULT_RELAY_DRAIN_TIMEOUT` | 500 ms |
 | `DEFAULT_GRACE_PERIOD` | 5 s (shared absolute deadline) |
 | `DEFAULT_SHUTDOWN_HARD_DEADLINE` | 10 s |
 | `POOL_ACQUIRE_TIMEOUT` | 15 s |
-| `POOL_MAX_CAPACITY` / `POOL_MAX_CONCURRENT_CONNECTS` | 16 / 4 |
+| `POOL_MAX_CAPACITY` / `POOL_MAX_CONCURRENT_CONNECTS` | 64 / 16 |
 | `POOL_HEARTBEAT_TICK_INTERVAL` / `POOL_HEARTBEAT_INTERVAL` | 1 s / 5 s |
-| `POOL_BACKOFF_BASE` / `POOL_BACKOFF_MAX` | 200 ms / 10 s |
+| `POOL_BACKOFF_BASE` / `POOL_BACKOFF_MAX` / `ACTIVE_WAITERS_MAX` | 200 ms / 10 s / 1 s |
 | `DEFAULT_REVERSE_BACKOFF_INITIAL` / `MAX` / reset | 500 ms / 30 s / 30 s |
 | `MAX_ACTIVATION_TARGET_LEN` | 512 bytes |
 | `ACTIVATE_STREAM_MAGIC` | `0xA5` |

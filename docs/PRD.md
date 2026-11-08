@@ -198,11 +198,14 @@ behavior is configurable, the configuration key is given.
   magic byte closes the stream.
 - **FR-4.5** The pool is an actor with idle streams, pending acquire requests,
   concurrent dial limits, heartbeat sweeps, dead-stream eviction, and backoff
-  replenishment. Acquire requests wait at most 15 seconds. The pool caps total
-  allocated streams at 16 and concurrent dials at 4.
+  replenishment. Acquire requests wait at most 15 seconds. The pool caps idle
+  pre-warmed inventory at 64 (`POOL_MAX_CAPACITY`), decouples active relay
+  throughput from replenishment gating, and supports up to 16 concurrent dials
+  (`POOL_MAX_CONCURRENT_CONNECTS`).
 - **FR-4.6** An acquired stream is used once. Closing it decrements the pool's
-  active-stream counter through a guard; the actor replenishes idle streams in
-  the background. Streams are not returned to the idle queue after use.
+  atomic active-stream counter through a guard; the actor replenishes idle streams in
+  the background. Streams are not returned to the idle queue after use. Cancelled
+  acquire requests restore any popped idle stream back to the pool or waiters.
 - **FR-4.7** In a cluster with both forward and reverse mappings, forward mappings share the Outbound Pool, while reverse mappings use the Inbound Pool. Reverse mappings never draw from the forward pool.
 - **FR-4.8** Tunnels support custom `http_headers: { <HeaderName>: <HeaderValue> }` configured at the tunnel root or under `endpoint`. Handshake connectors (WebSocket, HTTP/3, and UDS) attach these headers to outgoing connection requests. A configured `Host` (case-insensitive) overrides the default `host:port` authority header, enabling transparent routing through upstream reverse proxies (e.g. Caddy, Nginx, Traefik, Cloudflare). Reserved transport framing headers (e.g. `Upgrade`, `Sec-WebSocket-Key`) cannot be overwritten by custom headers. Header names and values are validated fail-fast during config loading against syntax and CRLF injection.
 
@@ -233,7 +236,8 @@ behavior is configurable, the configuration key is given.
   `NewConnection { session_id, client_addr }` over the control channel. The
   client dials its local `mappings.target`, opens a `reverse-data` stream
   carrying `x-session-id`, and the server pairs it with the waiting inbound
-  connection through `SessionManager`. Pairing has a 10-second timeout.
+  connection through `SessionManager`. Pairing has a 15-second timeout
+  (`DEFAULT_SESSION_PAIR_TIMEOUT`).
 - **FR-5.6** Both sides relay bytes bidirectionally via `RelayEngine`. The
   control channel stays open with activity-gated `Ping`/`Pong` and an idle
   timeout; any inbound frame refreshes the activity deadline, while outbound
@@ -241,24 +245,25 @@ behavior is configurable, the configuration key is given.
 - **FR-5.7** Control-channel reconnection uses an exponential backoff from
   500 ms up to 30 s, reset after 30 s of stable operation.
 - **FR-5.8** Inbound pool bounds and single-owner lifetime: the client caps
-  pre-warm workers at 16 and advertises that clamped value; the server registers
-  each pool before `RegisterAck` with a soft cap of twice the negotiated count,
-  FIFO evicts the oldest entry on overflow, drains the previous generation on
-  re-registration, and keys pools by host and port (never guesses a target into
-  an unrelated listener). Only streams younger than the effective idle window
-  and passing a liveness check are paired. The server is the sole owner of an
-  idle stream's lifetime — the client worker has no independent recycle timer —
-  so a connection the server has committed to a visitor cannot be closed by the
-  peer. Activation writes and `NewConnection` sends share a deadline derived
-  from the configured idle window (1/3, clamped to 5–10 s and never above the
-  idle window), so high-RTT / low-bandwidth links do not tear down the listener.
-  Pre-warm dials are throttled to at most 4 concurrent handshakes across workers
-  with staggered exponential backoff up to 10 s, protecting low-bandwidth links
-  from dial storms. Listener teardown immediately drops the listening socket and
-  unregisters the pool before waiting for in-flight visitor relays, allowing prompt
-  reconnection without port binding conflicts. An empty or stale pool always
-  falls back to signaling instead of stalling visitors. Relay tasks are owned
-  and awaited by their worker; none are detached.
+  pre-warm workers at 64 (`POOL_MAX_CAPACITY`) and advertises that clamped value;
+  the server registers each pool before `RegisterAck` with a soft cap of twice
+  the negotiated count, FIFO evicts the oldest entry on overflow, drains the
+  previous generation on re-registration, and keys pools by host and port (never
+  guesses a target into an unrelated listener). Only streams younger than the
+  effective idle window and passing a liveness check are paired. The server is the
+  sole owner of an idle stream's lifetime — the client worker has no independent
+  recycle timer — so a connection the server has committed to a visitor cannot be
+  closed by the peer. Activation writes and `NewConnection` sends share a deadline
+  derived from the configured idle window (1/3, clamped to 5–15 s and never above
+  the idle window), so high-RTT / low-bandwidth links do not tear down the listener.
+  Pre-warm dials are throttled to at most 16 concurrent handshakes across workers
+  (`POOL_MAX_CONCURRENT_CONNECTS`) with staggered exponential backoff up to 10 s
+  (capped at 1 s when waiters queue), protecting low-bandwidth links from dial storms.
+  Listener teardown immediately drops the listening socket and unregisters the
+  pool before waiting for in-flight visitor relays, allowing prompt reconnection
+  without port binding conflicts. An empty or stale pool always falls back to
+  signaling instead of stalling visitors. Relay tasks are owned and awaited by
+  their worker; none are detached.
 
 ### FR-6 Relay engine
 
