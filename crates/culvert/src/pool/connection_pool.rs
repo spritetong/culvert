@@ -221,12 +221,8 @@ impl ReplenishingStreamPool {
         let stats = Arc::new(Mutex::new(PoolStats::default()));
         let stats_clone = Arc::clone(&stats);
         let active_count = Arc::new(AtomicUsize::new(0));
-        // The actor reads the very same atomic that `acquire()` / `on_stream_closed()`
-        // maintain. It must never keep a second, message-driven copy: a dropped
-        // `StreamClosed` command used to leak that copy upward forever, and once
-        // it reached POOL_MAX_CAPACITY replenishment stopped for the tunnel's
-        // whole lifetime.
-        let active_count_clone = Arc::clone(&active_count);
+        // Active relay count is decoupled from replenishment and maintained as an authoritative
+        // atomic shared between callers (`acquire()` / `on_stream_closed()`) and `stats()`.
 
         tokio::spawn(async move {
             let mut idle_streams: VecDeque<ManagedStream> = VecDeque::new();
@@ -253,23 +249,22 @@ impl ReplenishingStreamPool {
 
             loop {
                 // 1. Replenish connecting futures up to every slot currently allowed.
-                //    Adding only one connect per reactor turn serialized the entire
-                //    refill behind one handshake RTT: after a burst drained the pool
-                //    it took N round-trips (plus a 1 s ticker stall for slow dials)
-                //    to get back to target_size. Fill the backlog in one turn while
-                //    still respecting the capacity, in-flight and backoff gates.
                 let now = Instant::now();
                 loop {
                     let in_flight = connecting_futures.len();
                     let current_total = idle_streams.len() + in_flight;
-                    let active = active_count_clone.load(Ordering::Relaxed);
-                    let total_allocated = active + current_total;
 
                     let has_waiters = !pending_requests.is_empty();
                     let needed = (current_total < target_size)
                         || (has_waiters && in_flight < pending_requests.len());
-                    let capacity_available = total_allocated < POOL_MAX_CAPACITY
-                        && in_flight < POOL_MAX_CONCURRENT_CONNECTS;
+
+                    // Active relay connections represent live user traffic and do not block
+                    // new dials for waiting callers. Callers in pending_requests are dialed
+                    // immediately, subject only to the linear in-flight rate limit.
+                    // Background idle inventory is capped at POOL_MAX_CAPACITY.
+                    let dial_throttled = in_flight >= POOL_MAX_CONCURRENT_CONNECTS;
+                    let capacity_available =
+                        !dial_throttled && (has_waiters || current_total < POOL_MAX_CAPACITY);
 
                     // When recovering from failures (backoff > POOL_BACKOFF_BASE),
                     // keep at most one probe in flight so a broken endpoint is not
@@ -1029,6 +1024,73 @@ mod tests {
         .await
         .expect("pool did not replenish back to target size after high concurrency burst");
 
+        cancel_token.cancel();
+    }
+
+    /// Dynamic elasticity: when a burst depletes the pool, dynamic_target_size scales up
+    /// to absorb demand. Active connections do not block dialing for waiting callers.
+    /// When traffic subsides, the pool smoothly decays back down to base_target_size.
+    #[tokio::test]
+    async fn test_pool_elastic_burst_scaling_and_decay() {
+        let connector = Arc::new(MockSuccessfulConnector);
+        let cancel_token = CancellationToken::new();
+        let base_target = 2;
+        let pool = ReplenishingStreamPool::new_shared(
+            connector,
+            base_target,
+            cancel_token.clone(),
+            DEFAULT_HEARTBEAT_INTERVAL,
+            DEFAULT_IDLE_TIMEOUT,
+        );
+
+        // 1. Wait for base pre-warm floor
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pool.stats().idle_count < base_target {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("base pre-warm failed");
+
+        // 2. High concurrency burst: acquire 10 streams simultaneously
+        let mut held = Vec::new();
+        for _ in 0..10 {
+            held.push(
+                tokio::time::timeout(Duration::from_secs(2), pool.acquire(None))
+                    .await
+                    .expect("timed out")
+                    .expect("failed to acquire"),
+            );
+        }
+        assert_eq!(pool.stats().active_count, 10);
+
+        // 3. Decoupling verification: with 10 streams actively held, another caller
+        // can still acquire a stream without being blocked by active_count!
+        let extra_stream = tokio::time::timeout(Duration::from_secs(2), pool.acquire(None))
+            .await
+            .expect("active count blocked new acquire")
+            .expect("extra acquire failed");
+        assert_eq!(pool.stats().active_count, 11);
+        held.push(extra_stream);
+
+        // 4. Release all active streams
+        drop(held);
+        for _ in 0..11 {
+            pool.on_stream_closed();
+        }
+        assert_eq!(pool.stats().active_count, 0);
+
+        // 5. Decoupled recovery: pool recovers to base_target
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pool.stats().idle_count < base_target {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("pool failed to recover to base_target after burst");
+
+        assert_eq!(pool.stats().idle_count, base_target);
+        assert_eq!(pool.stats().active_count, 0);
         cancel_token.cancel();
     }
 
