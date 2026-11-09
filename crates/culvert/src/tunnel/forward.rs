@@ -17,6 +17,7 @@ use crate::core::relay::RelayEngine;
 use crate::dialer::endpoint::EndpointContext;
 use crate::pool::ReplenishingStreamPool;
 use crate::transport::{TargetAddr, TransportConnector, TransportRegistry};
+use reusable_future::ReusableFutureRef;
 
 struct ActiveStreamGuard(Option<Arc<ReplenishingStreamPool>>);
 
@@ -159,8 +160,13 @@ pub async fn run_forward_mapping(
 
     let hb_interval = endpoint_ctx.heartbeat_interval();
     let idle_timeout = endpoint_ctx.idle_timeout();
+    let mut accept_slot = ReusableFutureRef::default();
 
     loop {
+        if accept_slot.is_empty() {
+            listener.accept(&mut accept_slot);
+        }
+
         tokio::select! {
             biased;
             _ = &mut cancel_fut => {
@@ -168,7 +174,8 @@ pub async fn run_forward_mapping(
                 break;
             }
             Some(_) = conn_tracker.join_next(), if !conn_tracker.is_empty() => {}
-            accept_res = listener.accept() => {
+            accept_res = &mut accept_slot, if !accept_slot.is_empty() => {
+                accept_slot.reset();
                 match accept_res {
                     Ok((inbound_stream, peer_addr)) => {
                         debug!(tag = %tag, peer = %peer_addr, "Accepted inbound connection");
@@ -244,6 +251,7 @@ pub async fn run_forward_mapping(
         }
     }
 
+    accept_slot.reset();
     conn_tracker.shutdown_and_wait().await;
     Ok(())
 }

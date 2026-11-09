@@ -30,7 +30,10 @@ use crate::consts::{
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, TunnelStream};
 use crate::transport::h3::stream::{H3TunnelStream, QuinnTunnelStream};
-use crate::transport::{ACCEPTED_STREAM_QUEUE_SIZE, StreamMetadata, TargetAddr, TransportListener};
+use crate::transport::{
+    ACCEPTED_STREAM_QUEUE_SIZE, AcceptOutput, StreamMetadata, TargetAddr, TransportListener,
+};
+use reusable_future::ReusableFutureRef;
 
 /// Resolves a hostname listen address without pinning a Tokio worker.
 fn resolve_listen_socket_addr(
@@ -64,9 +67,12 @@ fn resolve_listen_socket_addr(
     }
 }
 
+type H3StreamReceiver =
+    Arc<tokio::sync::Mutex<mpsc::Receiver<(Box<dyn TunnelStream>, StreamMetadata)>>>;
+
 /// HTTP/3 and QUIC transport listener.
 pub struct H3Listener {
-    rx_streams: mpsc::Receiver<(Box<dyn TunnelStream>, StreamMetadata)>,
+    rx_streams: H3StreamReceiver,
     cancel_token: CancellationToken,
     server_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -201,7 +207,7 @@ impl H3Listener {
         );
 
         Ok(Self {
-            rx_streams,
+            rx_streams: Arc::new(tokio::sync::Mutex::new(rx_streams)),
             cancel_token,
             server_task: Some(server_task),
         })
@@ -603,19 +609,25 @@ impl H3Listener {
 }
 
 impl TransportListener for H3Listener {
-    fn accept<'a>(
-        &'a mut self,
-    ) -> BoxFuture<'a, Result<(Box<dyn TunnelStream>, StreamMetadata), TunnelError>> {
-        Box::pin(async move {
+    fn accept(&mut self, slot: &mut ReusableFutureRef<'static, AcceptOutput>) {
+        if !slot.is_empty() {
+            return;
+        }
+
+        let rx = Arc::clone(&self.rx_streams);
+        let cancel = self.cancel_token.clone();
+
+        slot.set(move || async move {
+            let mut guard = rx.lock().await;
             tokio::select! {
                 biased;
-                _ = self.cancel_token.cancelled() => Err(TunnelError::Shutdown),
-                item = self.rx_streams.recv() => match item {
+                _ = cancel.cancelled() => Err(TunnelError::Shutdown),
+                item = guard.recv() => match item {
                     Some((stream, meta)) => Ok((stream, meta)),
                     None => Err(TunnelError::Shutdown),
                 },
             }
-        })
+        });
     }
 
     fn shutdown<'a>(&'a mut self) -> BoxFuture<'a, ()> {

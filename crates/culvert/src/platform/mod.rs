@@ -16,6 +16,8 @@ mod unix;
 pub use unix::*;
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use reusable_future::ReusableFutureRef;
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::common::net::SocketTuner;
@@ -67,10 +69,13 @@ pub fn normalize_uds_path(s: &str) -> PathBuf {
     PathBuf::from(normalized_str)
 }
 
+/// Result type produced when accepting a stream from a `GenericListener`.
+pub type GenericAcceptOutput = Result<(Box<dyn TunnelStream>, String), TunnelError>;
+
 /// Generic listener capable of accepting incoming connections over TCP or Unix Domain Sockets.
 pub enum GenericListener {
-    Tcp(TcpListener),
-    Uds(PlatformUdsListener),
+    Tcp(Arc<TcpListener>),
+    Uds(Arc<tokio::sync::Mutex<PlatformUdsListener>>),
 }
 
 impl GenericListener {
@@ -81,34 +86,55 @@ impl GenericListener {
         match target {
             TargetAddr::Path(path) => {
                 let listener = PlatformUdsListener::bind(&path).map_err(TunnelError::Io)?;
-                Ok(GenericListener::Uds(listener))
+                Ok(GenericListener::Uds(Arc::new(tokio::sync::Mutex::new(listener))))
             }
             TargetAddr::Ip(sa) => {
                 let listener = TcpListener::bind(sa).await.map_err(TunnelError::Io)?;
-                Ok(GenericListener::Tcp(listener))
+                Ok(GenericListener::Tcp(Arc::new(listener)))
             }
             TargetAddr::Domain(host, port) => {
                 let listener = TcpListener::bind((host.as_str(), port))
                     .await
                     .map_err(TunnelError::Io)?;
-                Ok(GenericListener::Tcp(listener))
+                Ok(GenericListener::Tcp(Arc::new(listener)))
             }
         }
     }
 
-    /// Asynchronously accepts an incoming connection stream and reports the peer identifier.
-    pub async fn accept(&mut self) -> Result<(Box<dyn TunnelStream>, String), TunnelError> {
+    /// Asynchronously awaits and accepts the next incoming connection stream into `slot`.
+    ///
+    /// By taking `&mut ReusableFutureRef` instead of returning a Future, this signature
+    /// structurally prevents direct and unsafe invocation in `tokio::select!` branches.
+    pub fn accept(&mut self, slot: &mut ReusableFutureRef<'static, GenericAcceptOutput>) {
+        if !slot.is_empty() {
+            return;
+        }
+
         match self {
             GenericListener::Tcp(l) => {
-                let (stream, addr) = l.accept().await.map_err(TunnelError::Io)?;
-                let _ = SocketTuner::tune_tcp_stream(&stream, true);
-                Ok((Box::new(stream), addr.to_string()))
+                let listener = Arc::clone(l);
+                slot.set(move || async move {
+                    let (stream, addr) = listener.accept().await.map_err(TunnelError::Io)?;
+                    let _ = SocketTuner::tune_tcp_stream(&stream, true);
+                    Ok((Box::new(stream) as Box<dyn TunnelStream>, addr.to_string()))
+                });
             }
             GenericListener::Uds(l) => {
-                let (stream, peer_addr) = l.accept().await.map_err(TunnelError::Io)?;
-                Ok((stream, peer_addr))
+                let listener = Arc::clone(l);
+                slot.set(move || async move {
+                    let mut guard = listener.lock().await;
+                    let (stream, peer_addr) = guard.accept().await.map_err(TunnelError::Io)?;
+                    Ok((stream, peer_addr))
+                });
             }
         }
+    }
+
+    /// Convenience helper for single-shot / non-loop awaiting.
+    pub async fn accept_one(&mut self) -> GenericAcceptOutput {
+        let mut slot = ReusableFutureRef::default();
+        self.accept(&mut slot);
+        slot.await
     }
 }
 
@@ -218,7 +244,7 @@ mod tests {
 
         let sock_str_clone = sock_str.clone();
         let srv_task = tokio::spawn(async move {
-            let (mut stream, _peer) = listener.accept().await.unwrap();
+            let (mut stream, _peer) = listener.accept_one().await.unwrap();
             let mut buf = [0u8; 4];
             stream.read_exact(&mut buf).await.unwrap();
             assert_eq!(&buf, b"echo");

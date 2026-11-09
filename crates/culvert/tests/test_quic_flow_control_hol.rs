@@ -79,7 +79,7 @@ async fn test_quic_flow_control_hol_blocking_prevention() {
         let mut probe_tx_opt = Some(probe_tx);
 
         for stream_idx in 0..3 {
-            let (mut stream, _meta) = match listener.accept().await {
+            let (mut stream, _meta) = match listener.accept_one().await {
                 Ok(pair) => pair,
                 Err(e) => {
                     panic!("Server accept error at stream {}: {:?}", stream_idx, e);

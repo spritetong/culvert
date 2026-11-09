@@ -757,6 +757,22 @@ impl TunnelStream for WsTunnelStream {
     }
 
     fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+        // Fast-path: if write half is failed or connection teardown flags are already set,
+        // the stream is dead and cannot accept any outbound traffic.
+        if self.peer_closed
+            || self.close_sent
+            || self.fin_sent
+            || self.fin_queued
+            || matches!(self.write_state, WriteState::Failed)
+        {
+            return Poll::Ready(HeartbeatStatus::Dead);
+        }
+
+        // Opportunistically flush control frames; failure indicates broken write half.
+        if let Poll::Ready(Err(_)) = self.poll_flush_control(cx) {
+            return Poll::Ready(HeartbeatStatus::Dead);
+        }
+
         // Drive the *same* read state machine the relay uses, with a zero-capacity
         // `ReadBuf`. This is the WebSocket equivalent of `BufferedTlsStream`'s
         // one-byte pushback: payload frames land in `ReadState::Buffered`, a

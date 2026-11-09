@@ -131,7 +131,7 @@ mod tests {
         let target = TargetAddr::Domain("127.0.0.1".to_string(), 80);
 
         let listener_handle = tokio::spawn(async move {
-            let (server_stream, meta) = listener.accept().await.unwrap();
+            let (server_stream, meta) = listener.accept_one().await.unwrap();
             assert_eq!(meta.mode, TunnelMode::Forward);
             server_stream
         });

@@ -25,6 +25,7 @@ use crate::core::error::TunnelError;
 use crate::core::relay::RelayEngine;
 use crate::session::SessionManager;
 use crate::transport::{TargetAddr, TransportRegistry};
+use reusable_future::ReusableFutureRef;
 
 static REVERSE_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -146,13 +147,19 @@ impl ServerRunner {
 
                 let mut conn_tracker = TaskTracker::<()>::new(token.clone());
                 let mut accept_err: Option<TunnelError> = None;
+                let mut accept_slot = ReusableFutureRef::default();
 
                 loop {
+                    if accept_slot.is_empty() {
+                        listener.accept(&mut accept_slot);
+                    }
+
                     tokio::select! {
                         biased;
                         _ = token.cancelled() => break,
                         Some(_) = conn_tracker.join_next(), if !conn_tracker.is_empty() => {}
-                        accept_res = listener.accept() => {
+                        accept_res = &mut accept_slot, if !accept_slot.is_empty() => {
+                            accept_slot.reset();
                             match accept_res {
                                 Ok((stream, metadata)) => {
                                     let session_mgr = Arc::clone(&session_mgr);
@@ -331,6 +338,7 @@ impl ServerRunner {
                     }
                 }
 
+                accept_slot.reset();
                 conn_tracker.shutdown_and_wait().await;
                 listener.shutdown().await;
                 match accept_err {
@@ -498,8 +506,13 @@ impl ServerRunner {
         // A probe PING never refreshes it.
         let idle_deadline = tokio::time::sleep(idle_timeout);
         tokio::pin!(idle_deadline);
+        let mut accept_slot = ReusableFutureRef::default();
 
         loop {
+            if accept_slot.is_empty() {
+                listener.accept(&mut accept_slot);
+            }
+
             tokio::select! {
                 biased;
                 _ = cancel_token.cancelled() => break,
@@ -544,7 +557,8 @@ impl ServerRunner {
                         }
                     }
                 }
-                accept_res = listener.accept() => {
+                accept_res = &mut accept_slot, if !accept_slot.is_empty() => {
+                    accept_slot.reset();
                     match accept_res {
                         Ok((visitor_stream, visitor_addr)) => {
                             // 1. FAST PATH (0-RTT Pool): only pair streams that are
@@ -687,6 +701,8 @@ impl ServerRunner {
                 }
             }
         }
+
+        accept_slot.reset();
 
         // Immediately drop the listening socket and unregister the inbound pool.
         // This frees the port and pool key instantly so a reconnecting client

@@ -24,7 +24,10 @@ use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, BufferedTlsStream, TunnelStream};
 use crate::transport::ws::model::WsHandshakeHeaders;
 use crate::transport::ws::stream::WsTunnelStream;
-use crate::transport::{ACCEPTED_STREAM_QUEUE_SIZE, StreamMetadata, TransportListener};
+use crate::transport::{
+    ACCEPTED_STREAM_QUEUE_SIZE, AcceptOutput, StreamMetadata, TransportListener,
+};
+use reusable_future::ReusableFutureRef;
 
 /// Result of an accepted WebSocket connection on the listener.
 type AcceptedResult = Result<(Box<dyn TunnelStream>, StreamMetadata), TunnelError>;
@@ -39,7 +42,7 @@ pub struct WsListener {
     auth_token: Option<String>,
     path: Option<String>,
     tls_acceptor: Option<TlsAcceptor>,
-    incoming_rx: Option<mpsc::Receiver<AcceptedResult>>,
+    incoming_rx: Option<Arc<tokio::sync::Mutex<mpsc::Receiver<AcceptedResult>>>>,
     cancel_token: CancellationToken,
     server_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -95,7 +98,11 @@ impl WsListener {
     }
 
     /// Spawns the background HTTP server accepting WebSocket upgrades.
-    async fn start_server(&mut self) -> Result<(), TunnelError> {
+    fn ensure_server_started(&mut self) -> Result<(), TunnelError> {
+        if self.incoming_rx.is_some() {
+            return Ok(());
+        }
+
         let clean_addr = if let Some(idx) = self.listen_addr.find("://") {
             let without_scheme = &self.listen_addr[idx + 3..];
             without_scheme.split('/').next().unwrap_or(without_scheme)
@@ -103,9 +110,11 @@ impl WsListener {
             &self.listen_addr
         };
 
-        let listener = TcpListener::bind(clean_addr).await?;
+        let std_listener = std::net::TcpListener::bind(clean_addr)?;
+        std_listener.set_nonblocking(true)?;
+        let listener = TcpListener::from_std(std_listener)?;
         let (tx, rx) = mpsc::channel(ACCEPTED_STREAM_QUEUE_SIZE);
-        self.incoming_rx = Some(rx);
+        self.incoming_rx = Some(Arc::new(tokio::sync::Mutex::new(rx)));
 
         let auth_token = Arc::new(self.auth_token.clone());
         let expected_path = Arc::new(self.path.clone());
@@ -309,24 +318,29 @@ impl WsListener {
 }
 
 impl TransportListener for WsListener {
-    fn accept<'a>(
-        &'a mut self,
-    ) -> BoxFuture<'a, Result<(Box<dyn TunnelStream>, StreamMetadata), TunnelError>> {
-        Box::pin(async move {
-            if self.incoming_rx.is_none() {
-                self.start_server().await?;
-            }
+    fn accept(&mut self, slot: &mut ReusableFutureRef<'static, AcceptOutput>) {
+        if !slot.is_empty() {
+            return;
+        }
 
-            if let Some(ref mut rx) = self.incoming_rx {
-                tokio::select! {
-                    biased;
-                    _ = self.cancel_token.cancelled() => Err(TunnelError::Shutdown),
-                    item = rx.recv() => item.unwrap_or(Err(TunnelError::Shutdown)),
-                }
-            } else {
-                Err(TunnelError::Shutdown)
+        if self.incoming_rx.is_none()
+            && let Err(e) = self.ensure_server_started()
+        {
+            slot.set(move || async move { Err(e) });
+            return;
+        }
+
+        let rx = Arc::clone(self.incoming_rx.as_ref().unwrap());
+        let cancel = self.cancel_token.clone();
+
+        slot.set(move || async move {
+            let mut guard = rx.lock().await;
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(TunnelError::Shutdown),
+                item = guard.recv() => item.unwrap_or(Err(TunnelError::Shutdown)),
             }
-        })
+        });
     }
 
     fn shutdown<'a>(&'a mut self) -> BoxFuture<'a, ()> {
@@ -370,7 +384,7 @@ mod tests {
             None,
             cancel.clone(),
         );
-        listener.start_server().await.unwrap();
+        listener.ensure_server_started().unwrap();
 
         let _client = tokio::net::TcpStream::connect(addr.as_str()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;

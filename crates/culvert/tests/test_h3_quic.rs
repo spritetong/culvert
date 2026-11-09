@@ -130,7 +130,7 @@ async fn test_h3_transport_handshake_and_bidirectional_transfer() {
 
     // Spawn server accept task
     let server_task = tokio::spawn(async move {
-        let (mut stream, metadata) = listener.accept().await.unwrap();
+        let (mut stream, metadata) = listener.accept_one().await.unwrap();
         assert_eq!(metadata.mode, TunnelMode::Forward);
         assert_eq!(metadata.session_id.as_deref(), Some("sess_h3_test_1"));
         assert_eq!(
@@ -244,7 +244,7 @@ async fn test_quic_raw_stream_bidirectional_transfer() {
     let (tx_done, rx_done) = tokio::sync::oneshot::channel::<()>();
 
     let server_task = tokio::spawn(async move {
-        let (mut stream, metadata) = listener.accept().await.unwrap();
+        let (mut stream, metadata) = listener.accept_one().await.unwrap();
         assert_eq!(metadata.mode, TunnelMode::Forward);
         assert_eq!(metadata.session_id.as_deref(), Some("sess_quic_raw_1"));
 
@@ -316,7 +316,7 @@ async fn test_h3_stream_multiplexing_over_single_quic_connection() {
     // Spawn server accepting 3 streams
     let server_task = tokio::spawn(async move {
         for _ in 0..STREAMS {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let (mut stream, _) = listener.accept_one().await.unwrap();
             tokio::spawn(async move {
                 let mut data = Vec::new();
                 read_to_end_timed(&mut stream, &mut data).await.unwrap();
@@ -840,7 +840,7 @@ async fn test_h3_sibling_streams_survive_sibling_abort() {
     // Server accepts multiple streams
     let server_task = tokio::spawn(async move {
         // Stream 1 handler: echo
-        let (mut stream1, _) = listener.accept().await.unwrap();
+        let (mut stream1, _) = listener.accept_one().await.unwrap();
         let s1_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 16 * 1024];
             read_exact_timed(&mut stream1, &mut buf).await.unwrap();
@@ -850,7 +850,7 @@ async fn test_h3_sibling_streams_survive_sibling_abort() {
         });
 
         // Stream 2 handler: just accepted, then client will abruptly drop
-        let (mut stream2, _) = listener.accept().await.unwrap();
+        let (mut stream2, _) = listener.accept_one().await.unwrap();
         let s2_handle = tokio::spawn(async move {
             let mut buf = [0u8; 1024];
             let _ = stream2.read(&mut buf).await;
@@ -917,7 +917,7 @@ async fn test_h3_stream_liveness_detects_closed_connection() {
         H3Listener::bind(&listen_addr, Some(auth_token), None, server_rustls).unwrap();
 
     let server_task = tokio::spawn(async move {
-        if let Ok((mut stream, _)) = listener.accept().await {
+        if let Ok((mut stream, _)) = listener.accept_one().await {
             // Keep stream open until client reads or terminates
             let mut buf = [0u8; 16];
             let _ = stream.read(&mut buf).await;
@@ -983,7 +983,7 @@ async fn test_h3_connector_recovers_after_server_restart() {
         loop {
             tokio::select! {
                 _ = s1_cancel.cancelled() => break,
-                res = listener_1.accept() => {
+                res = listener_1.accept_one() => {
                     let (mut stream, _) = match res {
                         Ok(pair) => pair,
                         Err(_) => break,
@@ -1063,7 +1063,7 @@ async fn test_h3_connector_recovers_after_server_restart() {
         loop {
             tokio::select! {
                 _ = s2_cancel.cancelled() => break,
-                res = listener_2.accept() => {
+                res = listener_2.accept_one() => {
                     let (mut stream, _) = match res {
                         Ok(pair) => pair,
                         Err(_) => break,

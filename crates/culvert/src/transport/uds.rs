@@ -29,9 +29,10 @@ use crate::platform::{PlatformUdsListener, connect_uds, normalize_uds_path};
 use crate::transport::ws::model::WsHandshakeHeaders;
 use crate::transport::ws::stream::WsTunnelStream;
 use crate::transport::{
-    ACCEPTED_STREAM_QUEUE_SIZE, StreamMetadata, TargetAddr, TransportConnector, TransportDriver,
-    TransportListener,
+    ACCEPTED_STREAM_QUEUE_SIZE, AcceptOutput, StreamMetadata, TargetAddr, TransportConnector,
+    TransportDriver, TransportListener,
 };
+use reusable_future::ReusableFutureRef;
 
 type AcceptedResult = Result<(Box<dyn TunnelStream>, StreamMetadata), TunnelError>;
 
@@ -155,7 +156,7 @@ impl TransportDriver for UdsTransportDriver {
 
 pub struct UdsListener {
     cancel_token: CancellationToken,
-    incoming_rx: Option<mpsc::Receiver<AcceptedResult>>,
+    incoming_rx: Option<Arc<tokio::sync::Mutex<mpsc::Receiver<AcceptedResult>>>>,
     server_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -393,7 +394,7 @@ impl UdsListener {
 
         Ok(Self {
             cancel_token,
-            incoming_rx: Some(rx),
+            incoming_rx: Some(Arc::new(tokio::sync::Mutex::new(rx))),
             server_task: Some(task),
         })
     }
@@ -409,19 +410,25 @@ impl UdsListener {
 }
 
 impl TransportListener for UdsListener {
-    fn accept<'a>(
-        &'a mut self,
-    ) -> BoxFuture<'a, Result<(Box<dyn TunnelStream>, StreamMetadata), TunnelError>> {
-        Box::pin(async move {
-            let Some(rx) = self.incoming_rx.as_mut() else {
-                return Err(TunnelError::Shutdown);
-            };
+    fn accept(&mut self, slot: &mut ReusableFutureRef<'static, AcceptOutput>) {
+        if !slot.is_empty() {
+            return;
+        }
+
+        let Some(rx_arc) = self.incoming_rx.as_ref().map(Arc::clone) else {
+            slot.set(|| async move { Err(TunnelError::Shutdown) });
+            return;
+        };
+        let cancel = self.cancel_token.clone();
+
+        slot.set(move || async move {
+            let mut guard = rx_arc.lock().await;
             tokio::select! {
                 biased;
-                _ = self.cancel_token.cancelled() => Err(TunnelError::Shutdown),
-                item = rx.recv() => item.unwrap_or(Err(TunnelError::Shutdown)),
+                _ = cancel.cancelled() => Err(TunnelError::Shutdown),
+                item = guard.recv() => item.unwrap_or(Err(TunnelError::Shutdown)),
             }
-        })
+        });
     }
 
     fn shutdown<'a>(&'a mut self) -> BoxFuture<'a, ()> {
@@ -617,7 +624,7 @@ mod tests {
             UdsListener::new(&sock_str, Some("test_token"), None::<String>, None).unwrap();
 
         let srv_task = tokio::spawn(async move {
-            let (stream, meta) = listener.accept().await.unwrap();
+            let (stream, meta) = listener.accept_one().await.unwrap();
             assert_eq!(meta.mode, TunnelMode::Forward);
             stream
         });

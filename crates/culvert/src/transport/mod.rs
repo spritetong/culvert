@@ -9,6 +9,7 @@ use crate::config::model::TunnelMode;
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, TunnelStream};
 use crate::dialer::endpoint::EndpointContext;
+use reusable_future::ReusableFutureRef;
 use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
@@ -76,13 +77,26 @@ pub trait TransportConnector: Send + Sync {
     fn invalidate_broken_sessions(&self) {}
 }
 
+/// Result type produced when accepting a stream from a `TransportListener`.
+pub type AcceptOutput = Result<(Box<dyn TunnelStream>, StreamMetadata), TunnelError>;
+
 /// Dynamic trait object for accepting inbound tunnel streams from clients.
 pub trait TransportListener: Send + Sync {
-    /// Asynchronously awaits and accepts the next incoming tunnel stream.
-    #[allow(clippy::type_complexity)]
-    fn accept<'a>(
-        &'a mut self,
-    ) -> BoxFuture<'a, Result<(Box<dyn TunnelStream>, StreamMetadata), TunnelError>>;
+    /// Asynchronously awaits and accepts the next incoming tunnel stream into `slot`.
+    ///
+    /// By taking `&mut ReusableFutureRef` instead of returning a Future, this signature
+    /// structurally prevents direct and unsafe invocation in `tokio::select!` branches,
+    /// ensuring zero-allocation across loop turns and full cancellation safety.
+    fn accept(&mut self, slot: &mut ReusableFutureRef<'static, AcceptOutput>);
+
+    /// Convenience helper for single-shot / non-loop awaiting.
+    fn accept_one<'a>(&'a mut self) -> BoxFuture<'a, AcceptOutput> {
+        Box::pin(async move {
+            let mut slot = ReusableFutureRef::default();
+            self.accept(&mut slot);
+            slot.await
+        })
+    }
 
     /// Explicit termination boundary for the listener's own background tasks.
     ///

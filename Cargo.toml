@@ -1,8 +1,5 @@
 [workspace]
-members = [
-    "crates/culvert",
-    "crates/culvert-cli",
-]
+members = ["crates/culvert", "crates/culvert-cli"]
 default-members = ["crates/culvert", "crates/culvert-cli"]
 resolver = "2"
 

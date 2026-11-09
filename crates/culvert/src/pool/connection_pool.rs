@@ -460,14 +460,16 @@ impl ReplenishingStreamPool {
                             Some(PoolCommand::Acquire(req)) => {
                                 let mut acquired: Option<Box<dyn TunnelStream>> = None;
 
-                                while let Some(mut managed) = idle_streams.pop_front() {
+                                // LIFO order favours fresh streams to minimize silent NAT/pinhole expiration.
+                                while let Some(mut managed) = idle_streams.pop_back() {
                                     let (_, expired) = heartbeat_timing(
                                         managed.stream.last_activity_ms(),
                                         activity_now_ms(),
                                         heartbeat_interval,
                                         idle_timeout,
                                     );
-                                    let mut dead = expired;
+                                    let mut dead = expired
+                                        || matches!(managed.state, HeartbeatState::SendingPing(_));
                                     if !dead {
                                         let _ = std::future::poll_fn(|cx| {
                                             if let Poll::Ready(HeartbeatStatus::Dead) =

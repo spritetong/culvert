@@ -158,6 +158,11 @@ impl TunnelStream for Box<dyn TunnelStream> {
 // Implement TunnelStream for tokio::net::TcpStream using poll_peek to detect EOF/RST without consuming bytes.
 impl TunnelStream for tokio::net::TcpStream {
     fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+        // Query SO_ERROR to immediately catch OS-level asynchronous errors (e.g. RST received).
+        if let Ok(Some(_)) | Err(_) = self.take_error() {
+            return Poll::Ready(HeartbeatStatus::Dead);
+        }
+
         let mut b = [0u8; 1];
         let mut buf = ReadBuf::new(&mut b);
         match self.poll_peek(cx, &mut buf) {
