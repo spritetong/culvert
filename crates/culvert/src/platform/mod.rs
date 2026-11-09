@@ -15,9 +15,9 @@ mod unix;
 #[cfg(not(windows))]
 pub use unix::*;
 
+use reusable_future::ReusableFutureRef;
 use std::path::PathBuf;
 use std::sync::Arc;
-use reusable_future::ReusableFutureRef;
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::common::net::SocketTuner;
@@ -86,7 +86,9 @@ impl GenericListener {
         match target {
             TargetAddr::Path(path) => {
                 let listener = PlatformUdsListener::bind(&path).map_err(TunnelError::Io)?;
-                Ok(GenericListener::Uds(Arc::new(tokio::sync::Mutex::new(listener))))
+                Ok(GenericListener::Uds(Arc::new(tokio::sync::Mutex::new(
+                    listener,
+                ))))
             }
             TargetAddr::Ip(sa) => {
                 let listener = TcpListener::bind(sa).await.map_err(TunnelError::Io)?;
@@ -103,8 +105,10 @@ impl GenericListener {
 
     /// Asynchronously awaits and accepts the next incoming connection stream into `slot`.
     ///
-    /// By taking `&mut ReusableFutureRef` instead of returning a Future, this signature
-    /// structurally prevents direct and unsafe invocation in `tokio::select!` branches.
+    /// Loop callers keep `slot` outside `tokio::select!` and poll `&mut slot` in a
+    /// branch, so an in-flight accept survives other branches winning. The future
+    /// installed here must be non-zero-sized: `is_empty()` uses its layout as the
+    /// idle signal.
     pub fn accept(&mut self, slot: &mut ReusableFutureRef<'static, GenericAcceptOutput>) {
         if !slot.is_empty() {
             return;

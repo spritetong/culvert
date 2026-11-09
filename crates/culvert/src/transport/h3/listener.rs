@@ -42,7 +42,7 @@ fn resolve_listen_socket_addr(
 ) -> Result<SocketAddr, TunnelError> {
     use std::net::ToSocketAddrs;
 
-    let resolve = || {
+    crate::transport::run_blocking_addr_op(|| {
         clean_addr
             .to_socket_addrs()
             .map_err(|e| {
@@ -55,16 +55,7 @@ fn resolve_listen_socket_addr(
                     listen_addr
                 ))
             })
-    };
-
-    // `getaddrinfo` is a blocking libc call with no timeout. On a multi-thread
-    // runtime hand the worker off to the blocking pool first.
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(resolve)
-        }
-        _ => resolve(),
-    }
+    })
 }
 
 type H3StreamReceiver =

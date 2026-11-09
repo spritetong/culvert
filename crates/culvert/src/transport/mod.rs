@@ -17,6 +17,20 @@ use tokio_util::sync::CancellationToken;
 
 pub use crate::consts::ACCEPTED_STREAM_QUEUE_SIZE;
 
+/// Runs a blocking address operation (DNS resolution plus socket bind) off the
+/// async worker when the runtime has a blocking pool. `getaddrinfo` has no
+/// timeout, so pinning a Tokio worker with it can stall unrelated tasks. On a
+/// current-thread runtime there is no blocking pool to hand off to, so the
+/// operation has to run inline.
+pub(crate) fn run_blocking_addr_op<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 pub mod h3;
 pub mod registry;
 pub mod uds;
@@ -84,12 +98,16 @@ pub type AcceptOutput = Result<(Box<dyn TunnelStream>, StreamMetadata), TunnelEr
 pub trait TransportListener: Send + Sync {
     /// Asynchronously awaits and accepts the next incoming tunnel stream into `slot`.
     ///
-    /// By taking `&mut ReusableFutureRef` instead of returning a Future, this signature
-    /// structurally prevents direct and unsafe invocation in `tokio::select!` branches,
-    /// ensuring zero-allocation across loop turns and full cancellation safety.
+    /// Loop callers keep the slot outside `tokio::select!` and poll `&mut slot`
+    /// in a branch, so an in-flight accept survives other branches winning and
+    /// no allocation is needed per loop turn. Implementations must install a
+    /// non-zero-sized future: `is_empty()` uses the concrete future's layout as
+    /// its idle signal.
     fn accept(&mut self, slot: &mut ReusableFutureRef<'static, AcceptOutput>);
 
-    /// Convenience helper for single-shot / non-loop awaiting.
+    /// Convenience helper for single-shot / non-loop awaiting. Must not be used
+    /// inside a `tokio::select!` branch, where the fresh future would be dropped
+    /// on every losing iteration.
     fn accept_one<'a>(&'a mut self) -> BoxFuture<'a, AcceptOutput> {
         Box::pin(async move {
             let mut slot = ReusableFutureRef::default();

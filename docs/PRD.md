@@ -201,7 +201,10 @@ behavior is configurable, the configuration key is given.
   replenishment. Acquire requests wait at most 15 seconds. The pool caps idle
   pre-warmed inventory at 64 (`POOL_MAX_CAPACITY`), decouples active relay
   throughput from replenishment gating, and supports up to 16 concurrent dials
-  (`POOL_MAX_CONCURRENT_CONNECTS`).
+  (`POOL_MAX_CONCURRENT_CONNECTS`). Acquire prefers the freshest idle stream
+  (LIFO); a stream with a probe write in flight is skipped, not destroyed. Only
+  over-age or confirmed-dead streams are evicted, and shared transport sessions
+  are invalidated at most once per Acquire on a real eviction.
 - **FR-4.6** An acquired stream is used once. Closing it decrements the pool's
   atomic active-stream counter through a guard; the actor replenishes idle streams in
   the background. Streams are not returned to the idle queue after use. Cancelled
@@ -271,10 +274,14 @@ behavior is configurable, the configuration key is given.
   single `poll_fn` state machine with two 64 KB buffers.
 - **FR-6.2** A probe is emitted only when neither direction has moved data for
   one `heartbeat_interval`; a stream silent for `idle_timeout` is closed.
-  `idle_timeout` must exceed `heartbeat_interval`.
+  `idle_timeout` must exceed `heartbeat_interval`. An OS-level `SO_ERROR`
+  counts as death only for terminal connection failures; a failed socket query
+  or transient status falls through to the peek/EOF check.
 - **FR-6.3** Half-close is supported: a finished read direction flushes its
   buffered bytes and shuts down its write side while the other direction can
-  continue.
+  continue. A half-closed stream must remain `Alive` under liveness sweeps
+  until the opposite direction finishes; treating local FIN flags as dead
+  truncates the remaining response tail.
 - **FR-6.4** On cancellation, the relay drains in-flight data for at most
   500 ms before terminating.
 

@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::Poll;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -134,6 +134,61 @@ impl ManagedStream {
             state: HeartbeatState::Idle(Instant::now()),
         }
     }
+}
+
+/// Inspects idle streams in LIFO order (freshest first, to avoid silently
+/// expired NAT/QUIC pinholes) and removes the first one that can be handed out.
+///
+/// A stream with an in-flight probe write is healthy but busy, so it is skipped
+/// and *kept* in the queue. Only an over-age stream or one whose liveness probe
+/// reports `Dead` is evicted. The boolean reports whether any stream was
+/// actually evicted, so the caller can invalidate shared transport sessions
+/// once instead of once per eviction.
+fn take_live_idle_stream(
+    idle_streams: &mut VecDeque<ManagedStream>,
+    cx: &mut Context<'_>,
+    heartbeat_interval: Duration,
+    idle_timeout: Duration,
+) -> (Option<Box<dyn TunnelStream>>, bool) {
+    let mut evicted_dead = false;
+    let mut idx = idle_streams.len();
+    while idx > 0 {
+        idx -= 1;
+
+        if matches!(idle_streams[idx].state, HeartbeatState::SendingPing(_)) {
+            continue;
+        }
+
+        let (_, expired) = heartbeat_timing(
+            idle_streams[idx].stream.last_activity_ms(),
+            activity_now_ms(),
+            heartbeat_interval,
+            idle_timeout,
+        );
+        let mut dead = expired;
+        if !dead
+            && matches!(
+                idle_streams[idx].stream.poll_check_alive(cx),
+                Poll::Ready(HeartbeatStatus::Dead)
+            )
+        {
+            dead = true;
+        }
+
+        if dead {
+            idle_streams.remove(idx);
+            evicted_dead = true;
+            tracing::debug!("Evicted dead stream during acquire inspection");
+            continue;
+        }
+
+        if let Some(managed) = idle_streams.remove(idx) {
+            return (Some(managed.stream), evicted_dead);
+        }
+        break;
+    }
+
+    (None, evicted_dead)
 }
 
 /// Request sent to the pool actor to acquire a stream.
@@ -458,39 +513,22 @@ impl ReplenishingStreamPool {
                     PoolEvent::Command(cmd_opt) => {
                         match cmd_opt {
                             Some(PoolCommand::Acquire(req)) => {
-                                let mut acquired: Option<Box<dyn TunnelStream>> = None;
-
-                                // LIFO order favours fresh streams to minimize silent NAT/pinhole expiration.
-                                while let Some(mut managed) = idle_streams.pop_back() {
-                                    let (_, expired) = heartbeat_timing(
-                                        managed.stream.last_activity_ms(),
-                                        activity_now_ms(),
+                                let (acquired, evicted_dead) = std::future::poll_fn(|cx| {
+                                    Poll::Ready(take_live_idle_stream(
+                                        &mut idle_streams,
+                                        cx,
                                         heartbeat_interval,
                                         idle_timeout,
-                                    );
-                                    let mut dead = expired
-                                        || matches!(managed.state, HeartbeatState::SendingPing(_));
-                                    if !dead {
-                                        let _ = std::future::poll_fn(|cx| {
-                                            if let Poll::Ready(HeartbeatStatus::Dead) =
-                                                managed.stream.poll_check_alive(cx)
-                                            {
-                                                dead = true;
-                                            }
-                                            Poll::Ready(())
-                                        })
-                                        .await;
-                                    }
+                                    ))
+                                })
+                                .await;
 
-                                    if !dead {
-                                        acquired = Some(managed.stream);
-                                        break;
-                                    } else {
-                                        tracing::debug!(
-                                            "Evicted dead stream during acquire inspection"
-                                        );
-                                        connector.invalidate_broken_sessions();
-                                    }
+                                // Invalidate shared sessions once, and only after a
+                                // stream was actually proven dead. Closing the cached
+                                // QUIC/H3 connection for a healthy-but-busy stream
+                                // would tear down every sibling multiplexed stream.
+                                if evicted_dead {
+                                    connector.invalidate_broken_sessions();
                                 }
 
                                 if let Some(stream) = acquired {
@@ -678,6 +716,7 @@ impl ReplenishingStreamPool {
 mod tests {
     use super::*;
     use crate::consts::{DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_IDLE_TIMEOUT};
+    use std::io;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
@@ -1305,5 +1344,168 @@ mod tests {
         assert_eq!(pool.stats().idle_count, target_size);
 
         cancel_token.cancel();
+    }
+
+    /// A stream that reports a broken transport on the very first liveness
+    /// probe, so Acquire's eviction path can be driven without real sockets.
+    struct FailingProbeStream {
+        inner: tokio::io::DuplexStream,
+    }
+
+    impl tokio::io::AsyncRead for FailingProbeStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for FailingProbeStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl TunnelStream for FailingProbeStream {
+        fn poll_check_alive(&mut self, _cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+            Poll::Ready(HeartbeatStatus::Dead)
+        }
+    }
+
+    struct CountingInvalidationConnector {
+        invalidations: Arc<AtomicUsize>,
+    }
+
+    impl TransportConnector for CountingInvalidationConnector {
+        fn protocol_scheme(&self) -> &'static str {
+            "mock"
+        }
+
+        fn connect<'a>(
+            &'a self,
+            _target: &'a TargetAddr,
+            _session_id: Option<&'a str>,
+        ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+            Box::pin(async {
+                let (client, _server) = tokio::io::duplex(1024);
+                Ok(Box::new(client) as Box<dyn TunnelStream>)
+            })
+        }
+
+        fn connect_pooled<'a>(
+            &'a self,
+            _target: &'a TargetAddr,
+        ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+            Box::pin(async {
+                let (client, _server) = tokio::io::duplex(1024);
+                Ok(Box::new(client) as Box<dyn TunnelStream>)
+            })
+        }
+
+        fn invalidate_broken_sessions(&self) {
+            self.invalidations.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Acquire evicts every dead idle stream, but invalidates the shared
+    /// transport session exactly once. Invalidating once per evicted stream
+    /// repeatedly closes the cached QUIC/H3 connection and its sibling streams.
+    #[tokio::test]
+    async fn test_acquire_invalidates_shared_session_once_for_many_dead_streams() {
+        let invalidations = Arc::new(AtomicUsize::new(0));
+        let connector = Arc::new(CountingInvalidationConnector {
+            invalidations: Arc::clone(&invalidations),
+        });
+        let cancel_token = CancellationToken::new();
+        // target_size 0 keeps background replenishment out of the picture.
+        let pool = ReplenishingStreamPool::new_shared(
+            connector,
+            0,
+            cancel_token.clone(),
+            DEFAULT_HEARTBEAT_INTERVAL,
+            DEFAULT_IDLE_TIMEOUT,
+        );
+
+        // Queue the dead streams and the Acquire back-to-back without yielding,
+        // so the actor drains all commands before its heartbeat sweep runs.
+        for _ in 0..3 {
+            let (client, _server) = tokio::io::duplex(1024);
+            pool.push_idle(Box::new(FailingProbeStream { inner: client }));
+        }
+
+        let mut stream = tokio::time::timeout(Duration::from_secs(2), pool.acquire(None))
+            .await
+            .expect("Acquire stalled after evicting dead streams")
+            .expect("Acquire failed after evicting dead streams");
+
+        assert_eq!(
+            invalidations.load(Ordering::SeqCst),
+            1,
+            "shared sessions must be invalidated once per Acquire, not once per evicted stream"
+        );
+        // The handed-out stream is a fresh healthy dial, never a dead one.
+        assert_eq!(
+            std::future::poll_fn(|cx| stream.poll_check_alive(cx)).await,
+            HeartbeatStatus::Alive
+        );
+
+        cancel_token.cancel();
+    }
+
+    /// A stream with an in-flight probe write is healthy but busy: Acquire must
+    /// skip it and leave it pooled, handing out the next freshest idle stream.
+    /// `pop_back()` followed by a "dead" verdict destroyed these streams and
+    /// invalidated the shared QUIC/H3 session they belonged to.
+    #[tokio::test]
+    async fn test_acquire_skips_but_retains_busy_probe_stream() {
+        let healthy_stream = || -> Box<dyn TunnelStream> {
+            let (client, _server) = tokio::io::duplex(1024);
+            Box::new(client)
+        };
+
+        let mut idle = VecDeque::new();
+        idle.push_back(ManagedStream::new(healthy_stream()));
+        let mut busy = ManagedStream::new(healthy_stream());
+        busy.state = HeartbeatState::SendingPing(Instant::now());
+        idle.push_back(busy);
+
+        let (acquired, evicted) = std::future::poll_fn(|cx| {
+            Poll::Ready(take_live_idle_stream(
+                &mut idle,
+                cx,
+                DEFAULT_HEARTBEAT_INTERVAL,
+                DEFAULT_IDLE_TIMEOUT,
+            ))
+        })
+        .await;
+
+        assert!(
+            acquired.is_some(),
+            "the healthy idle stream must be handed out"
+        );
+        assert!(!evicted, "no stream was dead, so none may be evicted");
+        assert_eq!(
+            idle.len(),
+            1,
+            "the busy-but-healthy stream must remain pooled"
+        );
+        assert!(
+            matches!(idle[0].state, HeartbeatState::SendingPing(_)),
+            "the retained stream must be the one with the in-flight probe"
+        );
     }
 }

@@ -682,6 +682,12 @@ impl TunnelStream for WsTunnelStream {
         if let Poll::Ready(Err(e)) = self.poll_flush_control(cx) {
             return Poll::Ready(Err(e));
         }
+        if self.fin_queued || self.fin_sent {
+            // The write half is logically closed. A probe must not be emitted
+            // after the in-band FIN frame, but the read half is still draining
+            // and the stream must not be treated as dead.
+            return Poll::Ready(Ok(()));
+        }
         loop {
             match std::mem::replace(&mut self.write_state, WriteState::Failed) {
                 WriteState::Idle(mut tx) => {
@@ -757,19 +763,15 @@ impl TunnelStream for WsTunnelStream {
     }
 
     fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
-        // Fast-path: if write half is failed or connection teardown flags are already set,
-        // the stream is dead and cannot accept any outbound traffic.
-        if self.peer_closed
-            || self.close_sent
-            || self.fin_sent
-            || self.fin_queued
-            || matches!(self.write_state, WriteState::Failed)
-        {
-            return Poll::Ready(HeartbeatStatus::Dead);
-        }
-
-        // Opportunistically flush control frames; failure indicates broken write half.
-        if let Poll::Ready(Err(_)) = self.poll_flush_control(cx) {
+        // Only a *failed* write half is a transport failure. Local half-close
+        // flags (`fin_queued` / `fin_sent`) are not: `RelayEngine` calls
+        // `poll_shutdown()` on this stream as soon as one direction drains,
+        // while the opposite direction may still have a long tail to deliver.
+        // Reporting Dead in that window aborts the relay with "unresponsive to
+        // heartbeats" and truncates the response. `peer_closed` / `close_sent`
+        // are likewise decided by the read state machine below, which must
+        // still get its chance to flush the queued RFC 6455 Close reply.
+        if matches!(self.write_state, WriteState::Failed) {
             return Poll::Ready(HeartbeatStatus::Dead);
         }
 
@@ -787,7 +789,7 @@ impl TunnelStream for WsTunnelStream {
         // symptom. It also discarded the read half on Close/error paths.
         let mut empty = [0u8; 0];
         let mut buf = ReadBuf::new(&mut empty);
-        match Pin::new(&mut *self).poll_read(cx, &mut buf) {
+        let status = match Pin::new(&mut *self).poll_read(cx, &mut buf) {
             Poll::Ready(Err(_)) => Poll::Ready(HeartbeatStatus::Dead),
             Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
             Poll::Ready(Ok(())) => match self.read_state {
@@ -800,7 +802,17 @@ impl TunnelStream for WsTunnelStream {
                 ReadState::Eof | ReadState::Failed => Poll::Ready(HeartbeatStatus::Dead),
                 _ => Poll::Ready(HeartbeatStatus::Alive),
             },
+        };
+
+        // `poll_read` performs its own opportunistic control flush but ignores
+        // the result. Surface a broken write half via the state it leaves
+        // behind instead of polling the in-flight write future a second time
+        // from this liveness hook.
+        if matches!(self.write_state, WriteState::Failed) {
+            return Poll::Ready(HeartbeatStatus::Dead);
         }
+
+        status
     }
 }
 
@@ -1273,6 +1285,99 @@ mod tests {
         assert_eq!(to_ws, 7);
         assert_eq!(to_visitor, 13);
 
+        cancel.cancel();
+    }
+
+    /// A local half-close closes only the write direction. The relay still
+    /// drains the opposite direction, so repeated liveness sweeps must keep
+    /// reporting Alive instead of tearing the relay down.
+    #[tokio::test]
+    async fn test_ws_liveness_check_survives_local_half_close() {
+        use std::future::poll_fn;
+
+        let (raw_client, raw_server) = duplex(65536);
+        let mut client = WsTunnelStream::new(raw_client, Role::Client);
+        let mut server = WsTunnelStream::new(raw_server, Role::Server);
+
+        server.shutdown().await.unwrap();
+        assert!(
+            server.fin_sent,
+            "test must exercise a half-closed write direction"
+        );
+
+        for _ in 0..4 {
+            assert_eq!(
+                poll_fn(|cx| server.poll_check_alive(cx)).await,
+                HeartbeatStatus::Alive
+            );
+            tokio::task::yield_now().await;
+        }
+
+        // The peer may still send a response tail after our FIN.
+        client.write_all(b"tail").await.unwrap();
+        client.flush().await.unwrap();
+        let mut buf = [0u8; 4];
+        server.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"tail");
+    }
+
+    /// End-to-end regression for the "curl pauses / truncates" class of bug:
+    /// the request direction half-closes first, so the WS stream carries
+    /// `fin_queued` / `fin_sent` while the response tail is still streaming.
+    /// Every heartbeat sweep in that window must leave the relay running.
+    #[tokio::test]
+    async fn test_ws_liveness_after_half_close_does_not_truncate_response() {
+        use crate::core::relay::RelayEngine;
+        use tokio_util::sync::CancellationToken;
+
+        let (raw_client, raw_server) = duplex(65536);
+        let mut client = WsTunnelStream::new(raw_client, Role::Client);
+        let server = WsTunnelStream::new(raw_server, Role::Server);
+
+        let (mut visitor, visitor_side) = duplex(65536);
+        let cancel = CancellationToken::new();
+        let relay = tokio::spawn(RelayEngine::relay_with_heartbeat(
+            Box::new(visitor_side),
+            Box::new(server),
+            cancel.clone(),
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(2000),
+        ));
+
+        // Visitor sends its request and immediately half-closes its write side;
+        // the relay in turn half-closes the WS stream's write side.
+        visitor.write_all(b"request").await.unwrap();
+        visitor.shutdown().await.unwrap();
+
+        let mut req = [0u8; 7];
+        client.read_exact(&mut req).await.unwrap();
+        assert_eq!(&req, b"request");
+
+        // Let several heartbeat sweeps land while the WS stream is half-closed.
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+        client.write_all(b"response ").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        client.write_all(b"tail").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut tail = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            visitor.read_to_end(&mut tail),
+        )
+        .await
+        .expect("relay truncated or stalled after local half-close")
+        .unwrap();
+        assert_eq!(&tail, b"response tail");
+
+        let (to_ws, to_visitor) = tokio::time::timeout(std::time::Duration::from_secs(2), relay)
+            .await
+            .expect("relay did not exit after both half-closes")
+            .unwrap()
+            .unwrap();
+        assert_eq!(to_ws, 7);
+        assert_eq!(to_visitor, 13);
         cancel.cancel();
     }
 

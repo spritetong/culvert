@@ -158,8 +158,23 @@ impl TunnelStream for Box<dyn TunnelStream> {
 // Implement TunnelStream for tokio::net::TcpStream using poll_peek to detect EOF/RST without consuming bytes.
 impl TunnelStream for tokio::net::TcpStream {
     fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
-        // Query SO_ERROR to immediately catch OS-level asynchronous errors (e.g. RST received).
-        if let Ok(Some(_)) | Err(_) = self.take_error() {
+        // Catch OS-level asynchronous connection failures (e.g. RST) that a
+        // later peek may not surface. Only terminal socket errors count: a
+        // failed getsockopt or a transient status such as WouldBlock is not
+        // evidence that the peer is gone, and a false Dead aborts a live relay.
+        // Everything else falls through to `poll_peek`, which remains the
+        // authoritative EOF/error check.
+        if let Ok(Some(err)) = self.take_error()
+            && matches!(
+                err.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::NotConnected
+                    | io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::TimedOut
+            )
+        {
             return Poll::Ready(HeartbeatStatus::Dead);
         }
 

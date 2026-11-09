@@ -300,6 +300,18 @@ FIN as an in-band zero-length binary frame (`supports_half_close() == true`).
 `poll_read` state machine non-destructively, ensuring that in-band FIN frames and
 in-flight data frames are never swallowed during idle liveness sweeps.
 
+Liveness is a read-side question. A local half-close (`fin_queued` / `fin_sent`)
+or a queued RFC 6455 Close reply means "this direction cannot write any more",
+not "the stream is dead": the relay sets those flags as soon as one direction
+drains and may still be streaming the opposite direction for a long time.
+Reporting `Dead` in that window aborts the relay with "unresponsive to
+heartbeats" and truncates the response. Only a failed write half
+(`WriteState::Failed`) or a broken/failed read state is fatal. The hook never
+polls the in-flight write future itself: `poll_read` performs the opportunistic
+control flush, and `poll_check_alive` inspects the write state it leaves behind.
+`poll_send_ping` likewise stops emitting probes after a local FIN, without
+marking the stream dead.
+
 ### 5.3 Driver registry
 
 `TransportRegistry::default()` registers three drivers:
@@ -554,6 +566,7 @@ later.
 | `connecting_futures: FuturesUnordered` | At most 16 concurrent dials (`POOL_MAX_CONCURRENT_CONNECTS`). |
 | Reactor events | `Cancelled`, `ConnectionResult`, `Command`, `RetryTimerExpired`, `HeartbeatTick`, `StreamsEvicted`. |
 | Heartbeats | `poll_check_alive` sweeps on a 1-second tick with a 5-second probe interval and 5-second probe timeout. Non-destructive via zero-capacity read buffer. |
+| Acquire order | LIFO (freshest first) to avoid silently expired NAT/QUIC pinholes. A stream with an in-flight probe write (`HeartbeatState::SendingPing`) is skipped but kept in the pool; only over-age or `poll_check_alive == Dead` streams are evicted. Shared transport sessions are invalidated once per Acquire and only after a real eviction, so a healthy-but-busy stream cannot close the cached QUIC/H3 connection and its sibling multiplexed streams. |
 | Replenishment | Parallel one-turn batch dialing up to `POOL_MAX_CONCURRENT_CONNECTS` (16); backoff from 200 ms up to 10 s, capped at 1 s when waiters are queued (`POOL_BACKOFF_ACTIVE_WAITERS_MAX`). |
 | Limits | Idle pre-warmed inventory bounded by `POOL_MAX_CAPACITY` = 64; `pool_size` acts as the 0-RTT minimum warm inventory floor. Active relay throughput is fully decoupled from replenishment gating; pending callers dial immediately in parallel batches up to 16. Acquire timeout 15 s. |
 | Statistics | `PoolStats { idle_count, active_count, total_created }`. Authoritative `active_count` is tracked atomically (`Arc<AtomicUsize>`). |

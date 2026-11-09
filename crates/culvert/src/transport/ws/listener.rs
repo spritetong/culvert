@@ -36,6 +36,34 @@ type AcceptedResult = Result<(Box<dyn TunnelStream>, StreamMetadata), TunnelErro
 /// task. It is never spawned without an owner.
 type UpgradeWork = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
 
+/// Binds the TCP listener for a `host:port` listen address. All resolved
+/// addresses are tried in order (matching `tokio::net::TcpListener::bind`),
+/// and the blocking DNS lookup is kept off the async worker.
+fn bind_std_tcp_listener(
+    clean_addr: &str,
+    listen_addr: &str,
+) -> Result<std::net::TcpListener, TunnelError> {
+    use std::net::ToSocketAddrs;
+
+    crate::transport::run_blocking_addr_op(|| {
+        let mut last_err: Option<std::io::Error> = None;
+        for addr in clean_addr.to_socket_addrs().map_err(|e| {
+            TunnelError::Config(format!("Invalid listen address '{}': {}", listen_addr, e))
+        })? {
+            match std::net::TcpListener::bind(addr) {
+                Ok(listener) => return Ok(listener),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.map(TunnelError::Io).unwrap_or_else(|| {
+            TunnelError::Config(format!(
+                "Listen address '{}' resolved to no socket addresses",
+                listen_addr
+            ))
+        }))
+    })
+}
+
 /// WebSocket server listener.
 pub struct WsListener {
     listen_addr: String,
@@ -110,7 +138,7 @@ impl WsListener {
             &self.listen_addr
         };
 
-        let std_listener = std::net::TcpListener::bind(clean_addr)?;
+        let std_listener = bind_std_tcp_listener(clean_addr, &self.listen_addr)?;
         std_listener.set_nonblocking(true)?;
         let listener = TcpListener::from_std(std_listener)?;
         let (tx, rx) = mpsc::channel(ACCEPTED_STREAM_QUEUE_SIZE);

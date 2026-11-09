@@ -5,6 +5,7 @@
 //! Comprehensive integration test suite for HTTP/3 and raw QUIC transport.
 //! All comments and docstrings must be in English.
 
+use reusable_future::ReusableFutureRef;
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -980,10 +981,18 @@ async fn test_h3_connector_recovers_after_server_restart() {
     let server_1_cancel = tokio_util::sync::CancellationToken::new();
     let s1_cancel = server_1_cancel.clone();
     let server_1_task = tokio::spawn(async move {
+        // Keep the in-flight accept across loop turns: a fresh `accept_one()`
+        // future in a select branch is dropped whenever cancellation wins.
+        let mut accept_slot = ReusableFutureRef::default();
         loop {
+            if accept_slot.is_empty() {
+                listener_1.accept(&mut accept_slot);
+            }
             tokio::select! {
+                biased;
                 _ = s1_cancel.cancelled() => break,
-                res = listener_1.accept_one() => {
+                res = &mut accept_slot, if !accept_slot.is_empty() => {
+                    accept_slot.reset();
                     let (mut stream, _) = match res {
                         Ok(pair) => pair,
                         Err(_) => break,
@@ -998,6 +1007,7 @@ async fn test_h3_connector_recovers_after_server_restart() {
                 }
             }
         }
+        accept_slot.reset();
     });
 
     let endpoint_cfg = EndpointConfig::Detailed {
@@ -1060,10 +1070,16 @@ async fn test_h3_connector_recovers_after_server_restart() {
     let server_2_cancel = tokio_util::sync::CancellationToken::new();
     let s2_cancel = server_2_cancel.clone();
     let server_2_task = tokio::spawn(async move {
+        let mut accept_slot = ReusableFutureRef::default();
         loop {
+            if accept_slot.is_empty() {
+                listener_2.accept(&mut accept_slot);
+            }
             tokio::select! {
+                biased;
                 _ = s2_cancel.cancelled() => break,
-                res = listener_2.accept_one() => {
+                res = &mut accept_slot, if !accept_slot.is_empty() => {
+                    accept_slot.reset();
                     let (mut stream, _) = match res {
                         Ok(pair) => pair,
                         Err(_) => break,
@@ -1078,6 +1094,7 @@ async fn test_h3_connector_recovers_after_server_restart() {
                 }
             }
         }
+        accept_slot.reset();
     });
 
     // 5. Connect again. When the first attempt detects or times out against the dead session,
