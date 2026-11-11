@@ -12,7 +12,7 @@ pub mod error;
 pub mod pump;
 pub mod stream;
 
-pub use addr::{L4Protocol, MappingSpec, TargetAddr, parse_target_addr};
+pub use addr::{L4Protocol, MappingSpec, PeerAddr, TargetAddr, parse_target_addr};
 pub use channel::{ChannelKind, Datagram, DatagramIo, FlowKey, IoChannel};
 pub use error::TunnelError;
 pub use pump::{Pump, PumpCtx, PumpRegistry, PumpRequest, StreamStreamPump, pump_registry};

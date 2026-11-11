@@ -6,7 +6,7 @@
 //! Core only sees `Frontend` and the neutral `IoChannel`.
 //! All comments and docstrings must be in English.
 
-use crate::io::addr::{L4Protocol, MappingSpec};
+use crate::io::addr::{L4Protocol, MappingSpec, PeerAddr};
 use crate::io::channel::IoChannel;
 use crate::io::error::TunnelError;
 use crate::io::stream::BoxFuture;
@@ -19,7 +19,7 @@ pub mod tcp;
 /// One accepted frontend connection or datagram flow.
 pub struct FrontendAccept {
     pub channel: IoChannel,
-    pub peer: String,
+    pub peer: PeerAddr,
 }
 
 pub type FrontendOutput = Result<FrontendAccept, TunnelError>;

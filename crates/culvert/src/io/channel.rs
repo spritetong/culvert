@@ -5,10 +5,11 @@
 //! The one I/O product shared by frontend, core, and backend.
 //! All comments and docstrings must be in English.
 
-use crate::io::addr::{L4Protocol, TargetAddr};
+use crate::io::addr::{L4Protocol, PeerAddr, TargetAddr};
 use crate::io::error::TunnelError;
 use crate::io::stream::{HeartbeatStatus, StreamCaps, TunnelStream};
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io;
 use std::pin::Pin;
@@ -16,7 +17,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// The I/O shape of a channel. `PumpRegistry` is keyed by a pair of these.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ChannelKind {
     Stream,
     Datagram,
@@ -24,9 +25,9 @@ pub enum ChannelKind {
 
 /// Identifies one logical datagram flow. A datagram pump uses it to map
 /// replies back to their originating peer.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FlowKey {
-    pub peer: String,
+    pub peer: PeerAddr,
     pub target: Option<TargetAddr>,
     pub protocol: L4Protocol,
 }
@@ -197,5 +198,22 @@ impl TunnelStream for IoChannel {
             IoChannel::Stream(stream) => stream.poll_check_alive(cx),
             IoChannel::Datagram(_) => Poll::Ready(HeartbeatStatus::Alive),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_flow_key_msgpack_roundtrip() {
+        let key = FlowKey {
+            peer: PeerAddr::Socket("10.0.0.1:5353".parse().unwrap()),
+            target: Some(TargetAddr::Ip("8.8.8.8:53".parse().unwrap())),
+            protocol: L4Protocol::Udp,
+        };
+        let bytes = rmp_serde::to_vec_named(&key).unwrap();
+        let decoded: FlowKey = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(key, decoded);
     }
 }

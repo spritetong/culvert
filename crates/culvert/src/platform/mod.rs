@@ -24,10 +24,10 @@ use crate::core::error::TunnelError;
 use crate::core::stream::TunnelStream;
 use crate::io::addr::TargetAddr;
 
-pub use crate::io::addr::{is_uds_path, normalize_uds_path, parse_target_addr};
+pub use crate::io::addr::{PeerAddr, is_uds_path, normalize_uds_path, parse_target_addr};
 
 /// Result type produced when accepting a stream from a `GenericListener`.
-pub type GenericAcceptOutput = Result<(Box<dyn TunnelStream>, String), TunnelError>;
+pub type GenericAcceptOutput = Result<(Box<dyn TunnelStream>, PeerAddr), TunnelError>;
 
 /// Generic listener capable of accepting incoming connections over TCP or Unix Domain Sockets.
 #[derive(Clone)]
@@ -71,12 +71,20 @@ impl GenericListener {
                 GenericListener::Tcp(l) => {
                     let (stream, addr) = l.accept().await.map_err(TunnelError::Io)?;
                     let _ = SocketTuner::tune_tcp_stream(&stream, true);
-                    Ok((Box::new(stream) as Box<dyn TunnelStream>, addr.to_string()))
+                    Ok((
+                        Box::new(stream) as Box<dyn TunnelStream>,
+                        PeerAddr::Socket(addr),
+                    ))
                 }
                 GenericListener::Uds(l) => {
                     let mut guard = l.lock().await;
                     let (stream, peer_addr) = guard.accept().await.map_err(TunnelError::Io)?;
-                    Ok((stream, peer_addr))
+                    let peer = if peer_addr.is_empty() {
+                        PeerAddr::Path(std::path::PathBuf::from("unnamed"))
+                    } else {
+                        PeerAddr::Path(std::path::PathBuf::from(peer_addr))
+                    };
+                    Ok((stream, peer))
                 }
             }
         }

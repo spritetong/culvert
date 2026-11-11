@@ -14,7 +14,7 @@ use std::path::PathBuf;
 ///
 /// `Udp` is vocabulary only in this release: no configuration field, frontend,
 /// or datagram driver constructs it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum L4Protocol {
     #[default]
     Tcp,
@@ -40,8 +40,90 @@ impl MappingSpec {
     }
 }
 
+/// Neutral address representing an inbound or outbound peer.
+///
+/// Standard network traffic uses `Socket(SocketAddr)` which requires zero heap
+/// allocations and is trivial to serialize via MessagePack or serde.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PeerAddr {
+    /// Standard IP socket address (TCP/UDP).
+    Socket(SocketAddr),
+    /// Unix domain socket peer or filesystem path.
+    Path(PathBuf),
+    /// Future P2P / WebRTC or opaque peer identifier.
+    P2p(String),
+}
+
+impl Default for PeerAddr {
+    fn default() -> Self {
+        Self::Socket(SocketAddr::from(([0, 0, 0, 0], 0)))
+    }
+}
+
+impl std::fmt::Display for PeerAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Socket(addr) => write!(f, "{}", addr),
+            Self::Path(path) => write!(f, "unix://{}", path.display()),
+            Self::P2p(id) => write!(f, "p2p://{}", id),
+        }
+    }
+}
+
+impl From<SocketAddr> for PeerAddr {
+    #[inline]
+    fn from(addr: SocketAddr) -> Self {
+        Self::Socket(addr)
+    }
+}
+
+impl From<PathBuf> for PeerAddr {
+    #[inline]
+    fn from(path: PathBuf) -> Self {
+        Self::Path(path)
+    }
+}
+
+impl std::str::FromStr for PeerAddr {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Ok(sa) = s.parse::<SocketAddr>() {
+            Ok(Self::Socket(sa))
+        } else if is_uds_path(s) {
+            Ok(Self::Path(normalize_uds_path(s)))
+        } else {
+            Ok(Self::P2p(s.to_string()))
+        }
+    }
+}
+
+impl From<&str> for PeerAddr {
+    fn from(s: &str) -> Self {
+        if let Ok(sa) = s.parse::<SocketAddr>() {
+            Self::Socket(sa)
+        } else if is_uds_path(s) {
+            Self::Path(normalize_uds_path(s))
+        } else {
+            Self::P2p(s.to_string())
+        }
+    }
+}
+
+impl From<String> for PeerAddr {
+    fn from(s: String) -> Self {
+        if let Ok(sa) = s.parse::<SocketAddr>() {
+            Self::Socket(sa)
+        } else if is_uds_path(&s) {
+            Self::Path(normalize_uds_path(&s))
+        } else {
+            Self::P2p(s)
+        }
+    }
+}
+
 /// Target address abstraction for remote forwarding.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TargetAddr {
     Ip(SocketAddr),
     Domain(String, u16),
@@ -191,4 +273,45 @@ pub fn parse_target_addr(target_str: &str) -> Result<TargetAddr, TunnelError> {
         "Invalid mapping address '{}'. Expected 'ip:port', 'hostname:port', or 'unix://path'",
         target_str
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_peer_addr_msgpack_roundtrip() {
+        let sa: SocketAddr = "192.168.1.100:8080".parse().unwrap();
+        let peer_socket = PeerAddr::Socket(sa);
+        let bytes = rmp_serde::to_vec_named(&peer_socket).unwrap();
+        let decoded: PeerAddr = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(peer_socket, decoded);
+
+        let peer_path = PeerAddr::Path(PathBuf::from("/var/run/test.sock"));
+        let bytes = rmp_serde::to_vec_named(&peer_path).unwrap();
+        let decoded: PeerAddr = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(peer_path, decoded);
+
+        let peer_p2p = PeerAddr::P2p("QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco".into());
+        let bytes = rmp_serde::to_vec_named(&peer_p2p).unwrap();
+        let decoded: PeerAddr = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(peer_p2p, decoded);
+    }
+
+    #[test]
+    fn test_peer_addr_conversions_and_display() {
+        let sa: SocketAddr = "127.0.0.1:9090".parse().unwrap();
+        let peer: PeerAddr = sa.into();
+        assert_eq!(peer.to_string(), "127.0.0.1:9090");
+
+        let from_str: PeerAddr = "127.0.0.1:9090".into();
+        assert_eq!(peer, from_str);
+
+        let uds_peer: PeerAddr = "unix:///tmp/test.sock".into();
+        assert!(matches!(uds_peer, PeerAddr::Path(_)));
+
+        let p2p_peer: PeerAddr = "node_abc123".into();
+        assert_eq!(p2p_peer, PeerAddr::P2p("node_abc123".into()));
+        assert_eq!(p2p_peer.to_string(), "p2p://node_abc123");
+    }
 }
