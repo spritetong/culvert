@@ -110,7 +110,7 @@ crates/culvert/src/
   server/runner.rs             ingress accept loop and stream dispatch
   tunnel/{cluster,forward,reverse}.rs
   pool/connection_pool.rs      ReplenishingStreamPool actor
-  control/stream.rs            MessagePack control protocol
+  control/{channel,stream}.rs  SignalingChannel actor and MessagePack protocol
   session/manager.rs           reverse data-stream pairing
   dialer/{endpoint,dns,tls,unified}.rs
   transport/                   backend driver implementations only
@@ -614,25 +614,34 @@ branches (control framing, session fulfillment, idle pools) call
   popped idle reverse stream to trigger activation on the client. Target address
   is already statically configured on the client.
 
-### 6.2 Reverse control channel & Inbound Pool
+### 6.2 Reverse control channel, SignalingChannel & Inbound Pool
 
-`handle_reverse_control` wraps the accepted stream in `FramedControlStream`,
-reads `RegisterReverse { listen_addr, target_addr, pool_size }`, binds the
-requested listener through `frontend::bind(&MappingSpec::tcp(...))`, registers
-an `inbound_pool` with
-`SessionManager` **before** replying `RegisterAck` (the client starts
-pre-warming immediately on the ack), and starts accepting inbound connections.
-`pool_size` is the effective, already-clamped worker count, so the server's
-soft cap is derived from the same number the client uses; the field is
-`#[serde(default)]` for interoperability with older peers. Registration of a
-new generation drains the previous pool, closing its stale idle streams.
-Teardown removes the pool only if it is still the same `Arc`, so an overlapping
-reconnect cannot delete the new generation.
+`handle_reverse_control` decouples the physical transport stream from the visitor
+accept loop by wrapping the accepted stream into a `SignalingChannel` actor
+(`SignalingChannel::spawn`). This actor encapsulates `FramedControlStream`,
+autonomous keepalive heartbeats (`Ping`/`Pong`), derived bounded timeouts
+(`reverse_frame_timeout`), and idle deadline enforcement. The accept loop
+interacts with the channel purely via a decoupled `SignalingHandle` (bounded
+command transmission) and `SignalingReceiver` (yielding application-level control
+events: `RegisterReverse`, `RegisterAck`, `NewConnection`).
 
-In the event loop, `ctrl_stream.next()` is prioritized above `listener.accept()`
-in `biased; select!`: this guarantees that control frames (such as keepalive
-`Ping` and `Pong`) are never starved during heavy visitor floods, preventing
-false 30-second idle timeout disconnections.
+1. `handle_reverse_control` receives `RegisterReverse { listen_addr, target_addr, pool_size }`
+   from `SignalingReceiver`, binds the requested listener through
+   `frontend::bind(&MappingSpec::tcp(...))`, registers an `inbound_pool` with
+   `SessionManager` **before** replying `RegisterAck` via `SignalingHandle` (the
+   client starts pre-warming immediately on the ack), and enters the accept loop.
+2. `pool_size` is the effective, already-clamped worker count, so the server's
+   soft cap is derived from the same number the client uses; the field is
+   `#[serde(default)]` for interoperability with older peers. Registration of a
+   new generation drains the previous pool, closing its stale idle streams.
+   Teardown removes the pool only if it is still the same `Arc`, so an overlapping
+   reconnect cannot delete the new generation.
+3. In the event loop, `SignalingReceiver::recv()` is prioritized above
+   `frontend.accept()` in `biased; select!`: this guarantees that control events
+   and disconnect alerts are handled promptly without starvation during visitor floods.
+   Protocol-level keepalive frames (`Ping` and `Pong`) are answered and driven
+   autonomously within the background `SignalingChannel` actor, completely
+   insulating the visitor accept loop from keepalive overhead.
 
 For each inbound connection on the reverse listener:
 
@@ -646,15 +655,24 @@ For each inbound connection on the reverse listener:
 2. **Fallback path (On-demand Signaling)**: If no live stream is available
    (empty pool, stale entries, or `pool_size` not set), the server allocates a
    session id (`REVERSE_SESSION_COUNTER`), registers a oneshot receiver in
-   `SessionManager`, and sends `NewConnection`. The frame send is bounded by
-   `reverse_frame_timeout(idle_timeout)` (10 s by default); if sending times out
-   on a congested channel, the visitor session is dropped and the accept loop
-   continues without tearing down the listening port. The paired data stream is
-   delivered by `SessionManager::fulfill`; pairing is bounded by
-   `DEFAULT_SESSION_PAIR_TIMEOUT` (15 s). Both channels then go to `core::serve`.
+   `SessionManager`, and sends `NewConnection` via `SignalingHandle::send`.
+   The send is bounded by `reverse_frame_timeout(idle_timeout)` (10 s by default);
+   if sending times out on a congested channel, the visitor session is dropped
+   and the accept loop continues without tearing down the listening port. The
+   paired data stream is delivered by `SessionManager::fulfill`; pairing is
+   bounded by `DEFAULT_SESSION_PAIR_TIMEOUT` (15 s). Both channels then go to
+   `core::serve`.
 
-The control loop also handles `Ping`/`Pong` and reconnect with exponential
-backoff.
+On the client side (`run_reverse_mapping`), `SignalingChannel::spawn` is similarly
+used to manage the outbound control connection. The client event loop simply
+drives incoming `NewConnection` events from `SignalingReceiver`, completely
+decoupled from periodic `heartbeat.tick()` and idle timer accounting.
+
+Extension point: Because the business loop depends only on `SignalingHandle` and
+`SignalingReceiver`, `SignalingChannel` can be internally extended to manage
+multiple concurrent physical channels (active-standby multi-path signaling) or
+promote idle connections from `ReplenishingStreamPool` / `ReverseInboundPool`
+upon connection failure without changing the visitor loop.
 
 `FramedControlStream` is a `tokio_util::codec::LengthDelimitedCodec` over any
 `AsyncRead + AsyncWrite` stream, implementing `Stream<Item =

@@ -5,11 +5,10 @@
 //! Reverse tunnel worker (`-R` mode).
 //! All comments and docstrings must be in English.
 
-use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use tokio::time::{interval, timeout};
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -19,12 +18,10 @@ use crate::consts::{
     ACTIVATE_STREAM_MAGIC, DEFAULT_REVERSE_BACKOFF_INITIAL, DEFAULT_REVERSE_BACKOFF_MAX,
     POOL_BACKOFF_ACTIVE_WAITERS_MAX, POOL_BACKOFF_BASE, POOL_MAX_CONCURRENT_CONNECTS,
     REVERSE_BACKOFF_RESET_THRESHOLD, REVERSE_CONTROL_TARGET_HOST, clamp_reverse_pool_size,
-    reverse_frame_timeout,
 };
-use crate::control::stream::{ControlMessage, FramedControlStream};
+use crate::control::{ControlMessage, SignalingChannel, SignalingConfig};
 use crate::core::error::TunnelError;
 use crate::core::serve::serve;
-use crate::core::stream::{activity_now_ms, heartbeat_timing};
 use crate::dialer::endpoint::EndpointContext;
 use crate::io::pump::{PumpCtx, PumpRequest};
 use crate::transport::{TargetAddr, TransportConnector, TransportRegistry};
@@ -51,9 +48,6 @@ pub async fn run_reverse_mapping(
     let dummy_target = TargetAddr::Domain(REVERSE_CONTROL_TARGET_HOST.to_string(), 0);
     let hb_interval = endpoint_ctx.heartbeat_interval();
     let idle_timeout = endpoint_ctx.idle_timeout();
-    // One derived deadline for every control-channel frame: a high-RTT link
-    // inherits the configured idle window instead of a LAN-scale constant.
-    let frame_timeout = reverse_frame_timeout(idle_timeout);
     // Clamp once and advertise the effective worker count: the server derives
     // its soft cap from exactly this value instead of an independent constant.
     let pool_workers = clamp_reverse_pool_size(pool_size);
@@ -107,7 +101,12 @@ pub async fn run_reverse_mapping(
             }
         };
 
-        let mut ctrl_stream = FramedControlStream::new(raw_stream);
+        let sig_config = SignalingConfig {
+            heartbeat_interval: hb_interval,
+            idle_timeout,
+        };
+        let (signaling, mut sig_rx) =
+            SignalingChannel::spawn(raw_stream, sig_config, cancel_token.child_token());
 
         // Send RegisterReverse request to remote server
         let reg_msg = ControlMessage::RegisterReverse {
@@ -116,21 +115,9 @@ pub async fn run_reverse_mapping(
             pool_size: pool_workers,
         };
 
-        // Every control-channel send is bounded. `SinkExt::send` flushes, so a
-        // peer that stops reading can otherwise wedge this loop forever: the
-        // idle deadline lives in the enclosing select! and cannot fire while a
-        // branch body is awaiting.
-        let send_result = timeout(frame_timeout, ctrl_stream.send(reg_msg))
-            .cancel_with(&cancel_token)
-            .await;
-        let send_error = match send_result {
-            None => break,
-            Some(Ok(Ok(()))) => None,
-            Some(Ok(Err(e))) => Some(e.to_string()),
-            Some(Err(_)) => Some(format!("timed out after {frame_timeout:?}")),
-        };
-        if let Some(reason) = send_error {
-            warn!(tag = %tag, "Failed to send RegisterReverse: {}. Retrying in {:?}...", reason, backoff);
+        let send_result = signaling.send(reg_msg).await;
+        if let Err(e) = send_result {
+            warn!(tag = %tag, "Failed to send RegisterReverse: {}. Retrying in {:?}...", e, backoff);
             if !cancel_token.sleep_or_cancel(backoff).await {
                 break;
             }
@@ -139,27 +126,16 @@ pub async fn run_reverse_mapping(
         }
 
         // Await RegisterAck from remote server, bounded by the same idle window.
-        let ack_res = match timeout(idle_timeout, ctrl_stream.next())
+        match timeout(idle_timeout, sig_rx.recv())
             .cancel_with(&cancel_token)
             .await
         {
             None => break,
-            Some(Ok(res)) => res,
-            Some(Err(_)) => {
-                warn!(tag = %tag, "Timed out waiting for RegisterAck; reconnecting");
-                if !cancel_token.sleep_or_cancel(backoff).await {
-                    break;
-                }
-                backoff = (backoff * 2).min(DEFAULT_REVERSE_BACKOFF_MAX);
-                continue;
-            }
-        };
-        match ack_res {
-            Some(Ok(ControlMessage::RegisterAck {
+            Some(Ok(Some(Ok(ControlMessage::RegisterAck {
                 listen_addr: ack_addr,
                 success,
                 error_msg,
-            })) => {
+            })))) => {
                 if !success {
                     error!(
                         tag = %tag,
@@ -175,7 +151,7 @@ pub async fn run_reverse_mapping(
                 }
                 info!(tag = %tag, addr = %ack_addr, "Remote server bound reverse port");
             }
-            other => {
+            Some(Ok(Some(other))) => {
                 warn!(tag = %tag, "Unexpected response to RegisterReverse: {:?}. Retrying in {:?}...", other, backoff);
                 if !cancel_token.sleep_or_cancel(backoff).await {
                     break;
@@ -183,17 +159,17 @@ pub async fn run_reverse_mapping(
                 backoff = (backoff * 2).min(DEFAULT_REVERSE_BACKOFF_MAX);
                 continue;
             }
-        }
+            _ => {
+                warn!(tag = %tag, "Timed out waiting for RegisterAck; reconnecting");
+                if !cancel_token.sleep_or_cancel(backoff).await {
+                    break;
+                }
+                backoff = (backoff * 2).min(DEFAULT_REVERSE_BACKOFF_MAX);
+                continue;
+            }
+        };
 
         let loop_start = tokio::time::Instant::now();
-        let mut heartbeat = interval(hb_interval);
-        // Liveness is pure activity: any RX or real TX refreshes the deadline.
-        // Probe PINGs are deliberately excluded, otherwise our own keepalives
-        // would keep a silently dead peer marked alive forever.
-        let mut last_activity_ms = activity_now_ms();
-        let idle_deadline = tokio::time::sleep(idle_timeout);
-        tokio::pin!(idle_deadline);
-
         let pool_cancel = cancel_token.child_token();
         let mut pool_tracker = TaskTracker::<()>::new(pool_cancel.clone());
 
@@ -352,140 +328,73 @@ pub async fn run_reverse_mapping(
                 }
                 Some(_) = conn_tracker.join_next(), if !conn_tracker.is_empty() => {}
                 Some(_) = pool_tracker.join_next(), if !pool_tracker.is_empty() => {}
-                _ = &mut idle_deadline => {
-                    warn!(
-                        tag = %tag,
-                        idle_timeout = ?idle_timeout,
-                        "Reverse control channel idle timeout: no activity, reconnecting..."
-                    );
-                    break;
-                }
-                _ = heartbeat.tick() => {
-                    // Recent TX/RX already proves liveness; a probe would be pure
-                    // overhead. PING only exists to provoke RX and never proves
-                    // anything by itself, so it must not refresh the clock.
-                    let (send_probe, _) = heartbeat_timing(
-                        Some(last_activity_ms),
-                        activity_now_ms(),
-                        hb_interval,
-                        idle_timeout,
-                    );
-                    if send_probe {
-                        let ping = timeout(frame_timeout, ctrl_stream.send(ControlMessage::Ping))
-                            .cancel_with(&cancel_token)
-                            .await;
-                        match ping {
-                            Some(Ok(Ok(()))) => {}
-                            Some(Ok(Err(e))) => {
-                                debug!(tag = %tag, "Failed to send heartbeat ping: {}", e);
-                                break;
-                            }
-                            Some(Err(_)) => {
-                                warn!(tag = %tag, "Heartbeat ping stalled on control channel; reconnecting");
-                                break;
-                            }
-                            None => break,
-                        }
-                    }
-                }
-                msg_opt = ctrl_stream.next() => {
-                    // ANY inbound frame counts, including Ping/Pong. PONG is not
-                    // load-bearing for liveness: it is merely one possible RX.
-                    last_activity_ms = activity_now_ms();
-                    idle_deadline.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+                msg_opt = sig_rx.recv() => {
                     match msg_opt {
-                        Some(Ok(msg)) => match msg {
-                            ControlMessage::NewConnection { session_id, client_addr } => {
-                                debug!(
-                                    tag = %tag,
-                                    session = %session_id,
-                                    client = %client_addr,
-                                    "Received new connection notification"
-                                );
+                        Some(Ok(ControlMessage::NewConnection { session_id, client_addr })) => {
+                            debug!(
+                                tag = %tag,
+                                session = %session_id,
+                                client = %client_addr,
+                                "Received new connection notification"
+                            );
 
-                                let connector = Arc::clone(&data_connector);
-                                let target_clone = target_addr.clone();
-                                let session_id_clone = session_id.clone();
-                                let dummy_target = dummy_target.clone();
-                                let tag_clone = tag.clone();
+                            let connector = Arc::clone(&data_connector);
+                            let target_clone = target_addr.clone();
+                            let session_id_clone = session_id.clone();
+                            let dummy_target = dummy_target.clone();
+                            let tag_clone = tag.clone();
 
-                                conn_tracker.spawn_with_cancel(move |token| async move {
-                                    // 1. Dial local target service
-                                    let Some(local_res) = crate::platform::connect_target_str(&target_clone)
-                                        .cancel_with(&token)
-                                        .await
-                                    else {
-                                        return;
-                                    };
-                                    let local_stream = match local_res {
-                                        Ok(s) => s,
-                                        Err(e) => {
-                                            if !token.is_cancelled() {
-                                                warn!(tag = %tag_clone, "Failed to connect to local target {}: {}", target_clone, e);
-                                            }
-                                            return;
+                            conn_tracker.spawn_with_cancel(move |token| async move {
+                                // 1. Dial local target service
+                                let Some(local_res) = crate::platform::connect_target_str(&target_clone)
+                                    .cancel_with(&token)
+                                    .await
+                                else {
+                                    return;
+                                };
+                                let local_stream = match local_res {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        if !token.is_cancelled() {
+                                            warn!(tag = %tag_clone, "Failed to connect to local target {}: {}", target_clone, e);
                                         }
-                                    };
-
-                                    // 2. Open reverse data stream to server matching session_id
-                                    let Some(remote_res) = connector
-                                        .connect(&dummy_target, Some(&session_id_clone))
-                                        .cancel_with(&token)
-                                        .await
-                                    else {
                                         return;
-                                    };
-                                    let data_stream = match remote_res {
-                                        Ok(s) => s,
-                                        Err(e) => {
-                                            if !token.is_cancelled() {
-                                                warn!(tag = %tag_clone, "Failed to connect reverse data stream for session {}: {}", session_id_clone, e);
-                                            }
-                                            return;
-                                        }
-                                    };
+                                    }
+                                };
 
-                                    // 3. Relay bidirectionally
-                                    let _ = serve(
-                                        PumpRequest::new(local_stream, data_stream),
-                                        PumpCtx {
-                                            cancel: token,
-                                            heartbeat_interval: hb_interval,
-                                            idle_timeout,
-                                        },
-                                    ).await;
-                                });
-                            }
-                            ControlMessage::Pong => {
-                                tracing::trace!(tag = %tag, "Heartbeat pong received");
-                            }
-                            ControlMessage::Ping => {
-                                // Optional echo: it only exists to give the peer
-                                // some RX. Correctness never depends on a PONG.
-                                // Bounded like every other control-frame send:
-                                // a stalled flush here would stop NewConnection
-                                // handling for the whole generation.
-                                let pong = timeout(frame_timeout, ctrl_stream.send(ControlMessage::Pong))
-                                    .cancel_with(&cancel_token)
-                                    .await;
-                                if !matches!(pong, Some(Ok(Ok(())))) {
-                                    debug!(tag = %tag, "Control channel Pong stalled; reconnecting");
-                                    break;
-                                }
-                            }
-                            _ => {}
-                        },
-                        Some(Err(e)) => {
-                            if !cancel_token.is_cancelled() {
-                                warn!(tag = %tag, "Control channel error: {}. Reconnecting...", e);
-                            } else {
-                                debug!(tag = %tag, "Control channel closed on shutdown");
-                            }
-                            break;
+                                // 2. Open reverse data stream to server matching session_id
+                                let Some(remote_res) = connector
+                                    .connect(&dummy_target, Some(&session_id_clone))
+                                    .cancel_with(&token)
+                                    .await
+                                else {
+                                    return;
+                                };
+                                let data_stream = match remote_res {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        if !token.is_cancelled() {
+                                            warn!(tag = %tag_clone, "Failed to connect reverse data stream for session {}: {}", session_id_clone, e);
+                                        }
+                                        return;
+                                    }
+                                };
+
+                                // 3. Relay bidirectionally
+                                let _ = serve(
+                                    PumpRequest::new(local_stream, data_stream),
+                                    PumpCtx {
+                                        cancel: token,
+                                        heartbeat_interval: hb_interval,
+                                        idle_timeout,
+                                    },
+                                ).await;
+                            });
                         }
-                        None => {
+                        Some(Ok(_)) => {}
+                        _ => {
                             if !cancel_token.is_cancelled() {
-                                warn!(tag = %tag, "Control channel disconnected by server. Reconnecting...");
+                                warn!(tag = %tag, "Control channel disconnected or timed out. Reconnecting...");
                             } else {
                                 debug!(tag = %tag, "Control channel closed on shutdown");
                             }
@@ -543,6 +452,7 @@ pub async fn run_reverse_tunnel(
 mod tests {
     use super::*;
     use crate::config::model::{AppConfig, DialerConfig, EndpointConfig};
+    use crate::control::FramedControlStream;
     use crate::core::stream::BoxFuture;
     use crate::io::channel::IoChannel;
     use crate::transport::{TargetAddr, TransportConnector, TransportDriver, TransportListener};

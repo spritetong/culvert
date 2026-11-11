@@ -5,7 +5,6 @@
 //! Ingress server daemon handling forward proxying and reverse tunnel pairing.
 //! All comments and docstrings must be in English.
 
-use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -20,7 +19,7 @@ use crate::consts::{
     ACTIVATE_STREAM_MAGIC, DEFAULT_ACTIVATION_READ_TIMEOUT, DEFAULT_SESSION_PAIR_TIMEOUT,
     MAX_ACTIVATION_TARGET_LEN, POOL_DUMMY_HOST, reverse_frame_timeout, reverse_pool_soft_cap,
 };
-use crate::control::stream::{ControlMessage, FramedControlStream};
+use crate::control::{ControlMessage, SignalingChannel, SignalingConfig};
 use crate::core::error::TunnelError;
 use crate::core::serve::serve;
 use crate::frontend::{self, FrontendOutput};
@@ -433,14 +432,15 @@ impl ServerRunner {
         idle_timeout: Duration,
         heartbeat_interval: Duration,
     ) {
-        let mut ctrl_stream = FramedControlStream::new(stream);
-        // One derived deadline for both the activation byte and NewConnection:
-        // a high-RTT link inherits the configured idle window instead of a
-        // hard-coded LAN-scale timeout that would tear down the listener.
-        let frame_timeout = reverse_frame_timeout(idle_timeout);
+        let sig_config = SignalingConfig {
+            heartbeat_interval,
+            idle_timeout,
+        };
+        let (signaling, mut sig_rx) =
+            SignalingChannel::spawn(stream, sig_config, cancel_token.child_token());
 
         // Await RegisterReverse bounded by idle_timeout
-        let (listen_addr, target_addr, pool_size) = match timeout(idle_timeout, ctrl_stream.next())
+        let (listen_addr, target_addr, pool_size) = match timeout(idle_timeout, sig_rx.recv())
             .cancel_with(&cancel_token)
             .await
         {
@@ -473,16 +473,13 @@ impl ServerRunner {
             Ok(l) => l,
             Err(e) => {
                 warn!(addr = %listen_addr, "Failed to bind reverse listener: {}", e);
-                let _ = tokio::time::timeout(
-                    frame_timeout,
-                    ctrl_stream.send(ControlMessage::RegisterAck {
+                let _ = signaling
+                    .send(ControlMessage::RegisterAck {
                         listen_addr: listen_addr.clone(),
                         success: false,
                         error_msg: Some(e.to_string()),
-                    }),
-                )
-                .cancel_with(&cancel_token)
-                .await;
+                    })
+                    .await;
                 return;
             }
         };
@@ -494,17 +491,14 @@ impl ServerRunner {
         // so both ends size the same pool.
         let idle_pool = session_mgr.register_pool(&listen_addr, reverse_pool_soft_cap(pool_size));
 
-        let ack_sent = tokio::time::timeout(
-            frame_timeout,
-            ctrl_stream.send(ControlMessage::RegisterAck {
+        let ack_sent = signaling
+            .send(ControlMessage::RegisterAck {
                 listen_addr: listen_addr.clone(),
                 success: true,
                 error_msg: None,
-            }),
-        )
-        .cancel_with(&cancel_token)
-        .await;
-        if !matches!(ack_sent, Some(Ok(Ok(())))) {
+            })
+            .await;
+        if ack_sent.is_err() {
             warn!(addr = %listen_addr, "Failed to send RegisterAck; dropping reverse listener");
             session_mgr.unregister_pool(&listen_addr, &idle_pool);
             return;
@@ -512,11 +506,7 @@ impl ServerRunner {
 
         info!(addr = %listen_addr, "Bound reverse listener port");
         let mut local_tracker = TaskTracker::<()>::new(cancel_token.clone());
-        // Activity-based deadline: inbound control frames AND real outbound
-        // notifications (NewConnection / Pong) both prove the channel is in use.
-        // A probe PING never refreshes it.
-        let idle_deadline = tokio::time::sleep(idle_timeout);
-        tokio::pin!(idle_deadline);
+        let frame_timeout = reverse_frame_timeout(idle_timeout);
         let mut accept_slot: ReusableFutureRef<'static, FrontendOutput> =
             ReusableFutureRef::default();
 
@@ -529,40 +519,10 @@ impl ServerRunner {
                 biased;
                 _ = cancel_token.cancelled() => break,
                 Some(_) = local_tracker.join_next(), if !local_tracker.is_empty() => {}
-                _ = &mut idle_deadline => {
-                    warn!(
-                        addr = %listen_addr,
-                        idle_timeout = ?idle_timeout,
-                        "Reverse control channel idle timeout: no inbound or outbound activity. Closing reverse listener."
-                    );
-                    break;
-                }
-                msg_opt = ctrl_stream.next() => {
-                    // ANY inbound frame counts, including Ping/Pong; no PONG
-                    // counter and no dependency on a specific reply.
-                    idle_deadline
-                        .as_mut()
-                        .reset(tokio::time::Instant::now() + idle_timeout);
+                msg_opt = sig_rx.recv() => {
                     match msg_opt {
-                        Some(Ok(ControlMessage::Ping)) => {
-                            // Optional echo to give the peer some RX; correctness
-                            // never depends on a PONG. The send must be bounded:
-                            // this body runs outside tokio::select!, so an
-                            // unbounded flush against a peer that stopped reading
-                            // would wedge the accept loop (and its idle deadline)
-                            // indefinitely.
-                            let pong = tokio::time::timeout(
-                                frame_timeout,
-                                ctrl_stream.send(ControlMessage::Pong),
-                            )
-                            .cancel_with(&cancel_token)
-                            .await;
-                            if !matches!(pong, Some(Ok(Ok(())))) {
-                                warn!(addr = %listen_addr, "Control channel Pong stalled; closing reverse listener");
-                                break;
-                            }
-                        }
-                        Some(Ok(ControlMessage::Pong)) => {}
+                        Some(Ok(ControlMessage::Ping)) | Some(Ok(ControlMessage::Pong)) => {}
+                        Some(Ok(_)) => {}
                         _ => {
                             debug!(addr = %listen_addr, "Reverse control channel disconnected by client");
                             break;
@@ -586,9 +546,6 @@ impl ServerRunner {
                                     visitor = %visitor_addr,
                                     "Paired reverse visitor with idle pooled stream (0-RTT)"
                                 );
-                                idle_deadline
-                                    .as_mut()
-                                    .reset(tokio::time::Instant::now() + idle_timeout);
                                 local_tracker.spawn_with_cancel(move |token| async move {
                                     let activate = async {
                                         tokio::io::AsyncWriteExt::write_all(
@@ -651,37 +608,20 @@ impl ServerRunner {
                             // visitors. Transport errors close the listener, but
                             // an individual timeout drops the session and continues
                             // without taking down the entire listening port.
-                            let notify_res = tokio::time::timeout(
-                                frame_timeout,
-                                ctrl_stream.send(notify_msg),
-                            )
-                            .cancel_with(&cancel_token)
-                            .await;
+                            let notify_res = signaling.send(notify_msg).await;
                             match notify_res {
-                                Some(Ok(Ok(()))) => {}
-                                Some(Ok(Err(e))) => {
-                                    warn!(session = %session_id, "Failed to notify client over control channel: {:?}", e);
-                                    session_mgr.remove(&session_id);
-                                    break;
-                                }
-                                Some(Err(_)) => {
+                                Ok(()) => {}
+                                Err(TunnelError::ControlProtocol(ref e)) if e.contains("timed out") => {
                                     warn!(session = %session_id, "Timed out signaling NewConnection; dropping session and continuing");
                                     session_mgr.remove(&session_id);
                                     continue;
                                 }
-                                None => {
+                                Err(e) => {
+                                    warn!(session = %session_id, "Failed to notify client over control channel: {:?}", e);
                                     session_mgr.remove(&session_id);
                                     break;
                                 }
                             }
-
-                            // Real TX is activity too. A busy reverse port with a
-                            // quiet client must not be declared dead: the client
-                            // suppresses its probe PING while it keeps receiving
-                            // NewConnection notifications from us.
-                            idle_deadline
-                                .as_mut()
-                                .reset(tokio::time::Instant::now() + idle_timeout);
 
                             // Spawn pairing relay task
                             let session_mgr_clone = Arc::clone(&session_mgr);
@@ -736,6 +676,7 @@ impl ServerRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::FramedControlStream;
     use std::time::Duration;
 
     #[tokio::test]
