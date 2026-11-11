@@ -575,7 +575,11 @@ read/write calls. `PumpRegistry` is a process-wide
 with `StreamStreamPump` for `(Stream, Stream)`, `DatagramStreamPump` for
 `(Datagram, Stream)`, `StreamDatagramPump` for `(Stream, Datagram)`, and
 `DatagramDatagramPump` for `(Datagram, Datagram)`; `register()` allows adding or
-overriding pairs. `FlowKey` identifies one datagram flow and lives on each `Datagram`.
+overriding pairs. `FlowKey` provides per-datagram flow metadata for multiplexed
+`DatagramIo` channels; current flow-scoped `DatagramIo` drivers
+(`UdpFlowChannel`, `ConnectedUdpSocket`) already route by their captured peer
+address and ignore `Datagram.flow`, while `[u16 len | payload]` stream framing
+drops `FlowKey` across stream hops (`Default::default()` on decode).
 
 The frontend is an abstraction, not a concrete enum:
 
@@ -596,7 +600,9 @@ pub async fn bind(spec: &MappingSpec) -> Result<Box<dyn Frontend>, TunnelError>;
 channel is the single authoritative key that `core::serve` dispatches on, so a
 declared kind could not drift out of sync with what the frontend actually
 yields. `FrontendAccept` carries no `FlowKey` either — stream flows use `peer`,
-and datagram flows carry their key per envelope in `Datagram.flow`.
+and current UDP frontends hand each visitor flow a dedicated flow-scoped
+`DatagramIo` channel (while `Datagram.flow` carries optional metadata for future
+multiplexed datagram drivers).
 
 `frontend::bind` consults `FrontendRegistry` keyed by `L4Protocol`, with both
 `TcpFrontendFactory` (`L4Protocol::Tcp`) and `UdpFrontendFactory` (`L4Protocol::Udp`)
@@ -723,7 +729,7 @@ decoupled from periodic `heartbeat.tick()` and idle timer accounting.
 Extension point: Because the business loop depends only on `SignalingHandle` and
 `SignalingReceiver`, `SignalingChannel` can be internally extended to manage
 multiple concurrent physical channels (active-standby multi-path signaling) or
-promote idle connections from `ReplenishingStreamPool` / `ReverseInboundPool`
+promote idle connections from `ReverseInboundPool` into active control channels
 upon connection failure without changing the visitor loop.
 
 `FramedControlStream` is a `tokio_util::codec::LengthDelimitedCodec` over any
@@ -733,22 +739,23 @@ Result<ControlMessage, TunnelError>>` and `Sink<ControlMessage>` with
 
 ### 6.3 Dual-Channel Emergency Promotion & Command Deduplication
 
-To eliminate port-teardown downtime and WAN reconnection latency upon control channel disruption, culvert incorporates **Bidirectional Emergency Promotion** and **Multi-Channel Coordination**:
+To eliminate port-teardown downtime and WAN reconnection latency upon control channel disruption, culvert incorporates **Server-Initiated 0-RTT Emergency Promotion** and **Multi-Channel Coordination**:
 
 1. **Emergency Promotion Protocol (`ACTIVATE_STREAM_PROMOTE`)**:
    - `0xA5` (`ACTIVATE_STREAM_MAGIC`): standard pool stream activation for data relay.
-   - `0xA6` (`ACTIVATE_STREAM_PROMOTE`): emergency control channel promotion.
-   - When the primary control channel disconnects, either peer holding an idle pool (the Server via `ReverseInboundPool` or the Client via `ReplenishingStreamPool`) can pop a healthy, pre-warmed transport stream and transmit `0xA6`.
-   - The recipient decodes `0xA6` and immediately promotes the stream into a new `SignalingChannel` without terminating the visitor listener. This drops control recovery latency from several RTTs (DNS + TCP SYN + TLS 1.3 handshake) down to 0-RTT.
+   - `0xA6` (`ACTIVATE_STREAM_PROMOTE`): server-initiated emergency control channel promotion.
+   - When the primary control channel disconnects, the server's `ReverseInboundPool` pops a healthy, pre-warmed inbound pool stream and transmits `0xA6`.
+   - The client pool worker decodes `0xA6` and immediately promotes the stream into a `SignalingChannel` attached to the session's `SignalingRouter`, keeping the tunnel and visitor listener alive without reconnecting. This drops control recovery latency from several RTTs (DNS + TCP SYN + TLS 1.3 handshake) down to 0-RTT.
 
 2. **Frontend Listener Grace Period**:
-   - When the primary control channel drops, the server listener does not immediately unregister its listening port. Instead, it enters an active grace period (`DEFAULT_REVERSE_GRACE_PERIOD`, 10 s).
-   - If an emergency promotion stream attaches within the grace period, visitor connections continue uninterrupted. If no replacement channel arrives before the grace period expires, the listener is cleanly shut down.
+   - When the primary control channel drops and no pooled stream is available for immediate `0xA6` promotion, the server does not immediately unregister its public listening port. Instead, the reverse listener enters a bounded grace period (`DEFAULT_REVERSE_GRACE_PERIOD`, `10 s`, capped by `idle_timeout` via `reverse_grace_period()`).
+   - During the grace window, existing data flows (and UDP datagram relays) remain active, and control recovers seamlessly if either a newly pushed `ReverseInboundPool` stream arrives for `0xA6` promotion or a reconnecting control stream sends `RegisterReverse` for the same `(protocol, listen_addr)` (`SessionManager::try_reattach_grace_listener`), reclaiming the already-bound frontend without `EADDRINUSE`.
+   - If the grace period expires (or the server shuts down) before control recovers, the listener is shut down and its grace slot finishes only after the socket closes.
 
 3. **Multi-Channel & Anti-Split-Brain Coordination**:
    - Senders enforce **Active-Standby routing**: only the designated `Primary` channel transmits application control commands (`NewConnection`, `RegisterReverse`). The `Standby` channel autonomously runs keepalive heartbeats (`Ping`/`Pong`) to stay warm and validated.
-   - If the `Primary` channel faults, the signaling router atomically fails over to the `Standby` channel and marks it `Primary`.
-   - Simultaneous promotion by both peers is safely resolved without split-brain: both channels are absorbed into the session router as a primary/standby pair.
+   - If the `Primary` channel faults or closes, `SignalingRouter` atomically fails over to any open `Standby` channel and promotes it to `Primary`, while pruning closed handles before attachment.
+   - Concurrent `0xA6` promotions or control attachments are safely absorbed into `SignalingRouter` as a primary/standby pair without split-brain.
 
 4. **Command Deduplication Guarantee (`CommandDeduplicator`)**:
    - Dual-channel failover or out-of-order delivery must never produce duplicate command execution.

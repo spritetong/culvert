@@ -274,9 +274,12 @@ behavior is configurable, the configuration key is given.
 - **FR-5.6** Both sides are handed to `core::serve` as `IoChannel`s. The
   control channel stays open inside a `SignalingChannel` actor with
   activity-gated `Ping`/`Pong` and an idle timeout, backed by a `SignalingRouter`
-  capable of dual-channel emergency promotion (`0xA6`) and sliding-window
-  `session_id` deduplication (`CommandDeduplicator`); any inbound frame
-  refreshes the activity deadline, while outbound probes alone do not.
+  capable of server-initiated emergency promotion (`0xA6`), reverse-listener
+  grace retention (`DEFAULT_REVERSE_GRACE_PERIOD`, 10 s capped by `idle_timeout`,
+  resumable via `ReverseInboundPool` promotion or `RegisterReverse` reattach),
+  and sliding-window `session_id` deduplication (`CommandDeduplicator`); any
+  inbound frame refreshes the activity deadline, while outbound probes alone
+  do not.
 - **FR-5.7** Control-channel reconnection uses an exponential backoff from
   500 ms up to 30 s, reset after 30 s of stable operation.
 - **FR-5.8** Inbound pool bounds and single-owner lifetime: the client caps

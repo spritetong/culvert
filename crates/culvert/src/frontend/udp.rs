@@ -65,7 +65,7 @@ impl Drop for UdpFrontend {
 
 impl UdpFrontend {
     /// Binds a UDP socket at `listen_addr` and starts the packet demultiplexer task.
-    pub async fn bind(listen_addr: &str, target_str: Option<&str>) -> Result<Self, TunnelError> {
+    pub async fn bind(listen_addr: &str, _target_str: Option<&str>) -> Result<Self, TunnelError> {
         let listen_target = parse_target_addr(listen_addr)?;
         let socket = match listen_target {
             TargetAddr::Ip(sa) => UdpSocket::bind(sa).await.map_err(TunnelError::Io)?,
@@ -80,7 +80,6 @@ impl UdpFrontend {
             }
         };
 
-        let target_addr = target_str.and_then(|t| parse_target_addr(t).ok());
         let socket = Arc::new(socket);
         let sessions: Arc<Mutex<UdpSessionMap>> = Arc::new(Mutex::new(HashMap::new()));
         let (accept_tx, accept_rx) = mpsc::channel(ACCEPTED_STREAM_QUEUE_SIZE);
@@ -114,7 +113,8 @@ impl UdpFrontend {
                 let dgram = Datagram {
                     flow: FlowKey {
                         peer: PeerAddr::Socket(peer_addr),
-                        target: target_addr.clone(),
+                        // `UdpFlowChannel` is per-peer flow-scoped; avoid cloning TargetAddr per packet.
+                        target: None,
                         protocol: L4Protocol::Udp,
                     },
                     payload: Bytes::copy_from_slice(&buf[..n]),

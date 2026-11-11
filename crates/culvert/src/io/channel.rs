@@ -23,8 +23,16 @@ pub enum ChannelKind {
     Datagram,
 }
 
-/// Identifies one logical datagram flow. A datagram pump uses it to map
-/// replies back to their originating peer.
+/// Identifies one logical datagram flow (peer, optional target, and protocol).
+///
+/// Flow-scoped `DatagramIo` channels (such as `UdpFlowChannel` and
+/// `ConnectedUdpSocket`) bind a single peer per channel instance and route
+/// packets to that bound peer without consulting `Datagram.flow`. Likewise,
+/// `DatagramStreamPump` and `StreamDatagramPump` frame `[u16 len | payload]`
+/// only without transmitting `FlowKey` on the wire, yielding `FlowKey::default()`
+/// on decode. Multiplexed `DatagramIo` drivers that share one channel across
+/// multiple peers must use a `FlowKey`-preserving pump or carry peer metadata
+/// internally.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FlowKey {
     pub peer: PeerAddr,
@@ -32,7 +40,7 @@ pub struct FlowKey {
     pub protocol: L4Protocol,
 }
 
-/// One datagram envelope.
+/// One datagram envelope carrying payload bytes and optional `FlowKey` metadata.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Datagram {
     pub flow: FlowKey,

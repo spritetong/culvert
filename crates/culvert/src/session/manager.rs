@@ -10,11 +10,15 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::Duration;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
+use crate::common::CancelFutureExt;
+use crate::control::FramedControlStream;
 use crate::core::error::TunnelError;
 use crate::core::stream::{HeartbeatStatus, TunnelStream};
 use crate::io::addr::L4Protocol;
@@ -53,6 +57,7 @@ struct IdleEntry {
 pub struct ReverseInboundPool {
     idle: Mutex<VecDeque<IdleEntry>>,
     capacity: usize,
+    notify: Arc<Notify>,
 }
 
 impl ReverseInboundPool {
@@ -61,7 +66,13 @@ impl ReverseInboundPool {
         Self {
             idle: Mutex::new(VecDeque::new()),
             capacity,
+            notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Returns an owned future that resolves when a new idle stream is pushed into the pool.
+    pub fn notified_owned(&self) -> tokio::sync::futures::OwnedNotified {
+        Arc::clone(&self.notify).notified_owned()
     }
 
     /// Enqueues an idle stream, evicting the oldest entry when at capacity.
@@ -69,16 +80,19 @@ impl ReverseInboundPool {
         if self.capacity == 0 {
             return false;
         }
-        let mut idle = self.idle.lock();
-        if idle.len() >= self.capacity {
-            // Dropping the handle closes the transport; the client worker sees
-            // EOF and re-dials. No visitor has been paired with this stream.
-            idle.pop_front();
+        {
+            let mut idle = self.idle.lock();
+            if idle.len() >= self.capacity {
+                // Dropping the handle closes the transport; the client worker sees
+                // EOF and re-dials. No visitor has been paired with this stream.
+                idle.pop_front();
+            }
+            idle.push_back(IdleEntry {
+                stream,
+                enqueued_at: Instant::now(),
+            });
         }
-        idle.push_back(IdleEntry {
-            stream,
-            enqueued_at: Instant::now(),
-        });
+        self.notify.notify_one();
         true
     }
 
@@ -143,12 +157,71 @@ impl ReverseInboundPool {
     }
 }
 
+/// Reconnected reverse control stream handed over to a listener currently in its grace period.
+pub struct ReverseGraceReattach {
+    pub ctrl_stream: FramedControlStream<Box<dyn TunnelStream>>,
+    pub pool_size: Option<usize>,
+}
+
+struct GraceSlot {
+    id: u64,
+    tx: mpsc::Sender<ReverseGraceReattach>,
+    closed: Arc<Notify>,
+}
+
+/// Active grace-period registration keeping a bound reverse listener discoverable
+/// for incoming `RegisterReverse` reattachment without re-binding the OS socket.
+pub struct ReverseGraceHandle {
+    key: String,
+    slot_id: u64,
+    rx: mpsc::Receiver<ReverseGraceReattach>,
+    closed: Arc<Notify>,
+    registry: Arc<DashMap<String, GraceSlot>>,
+    finished: bool,
+}
+
+impl ReverseGraceHandle {
+    /// Awaits a reconnected control stream targeting this grace-period listener.
+    pub async fn recv(&mut self) -> Option<ReverseGraceReattach> {
+        self.rx.recv().await
+    }
+
+    /// Closes the reattach channel and drains any stream already queued right before expiry.
+    pub fn close_and_try_recv(&mut self) -> Option<ReverseGraceReattach> {
+        self.rx.close();
+        self.rx.try_recv().ok()
+    }
+
+    /// Unregisters the grace slot and notifies any concurrent reconnector after socket teardown.
+    pub fn finish(mut self) {
+        self.cleanup();
+    }
+
+    fn cleanup(&mut self) {
+        if !self.finished {
+            self.finished = true;
+            self.rx.close();
+            self.registry
+                .remove_if(&self.key, |_, slot| slot.id == self.slot_id);
+            self.closed.notify_waiters();
+        }
+    }
+}
+
+impl Drop for ReverseGraceHandle {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
 /// Thread-safe in-memory routing table for matching incoming reverse data streams
 /// and managing pre-warmed inbound stream pools.
 #[derive(Clone, Default)]
 pub struct SessionManager {
     pending_sessions: Arc<DashMap<String, oneshot::Sender<Box<dyn TunnelStream>>>>,
     reverse_pools: Arc<DashMap<String, Arc<ReverseInboundPool>>>,
+    grace_listeners: Arc<DashMap<String, GraceSlot>>,
+    next_grace_id: Arc<AtomicU64>,
 }
 
 impl SessionManager {
@@ -157,6 +230,8 @@ impl SessionManager {
         Self {
             pending_sessions: Arc::new(DashMap::new()),
             reverse_pools: Arc::new(DashMap::new()),
+            grace_listeners: Arc::new(DashMap::new()),
+            next_grace_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -263,6 +338,82 @@ impl SessionManager {
     /// Returns the number of registered reverse inbound pools.
     pub fn pool_count(&self) -> usize {
         self.reverse_pools.len()
+    }
+
+    /// Registers a reverse listener entering its grace period so incoming
+    /// `RegisterReverse` reconnects can reattach without re-binding the port.
+    pub fn register_grace_listener(
+        &self,
+        protocol: L4Protocol,
+        listen_addr: &str,
+    ) -> ReverseGraceHandle {
+        let key = canonical_reverse_key(protocol, listen_addr);
+        let slot_id = self.next_grace_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel(1);
+        let closed = Arc::new(Notify::new());
+        if let Some(prev) = self.grace_listeners.insert(
+            key.clone(),
+            GraceSlot {
+                id: slot_id,
+                tx,
+                closed: Arc::clone(&closed),
+            },
+        ) {
+            prev.closed.notify_waiters();
+        }
+        ReverseGraceHandle {
+            key,
+            slot_id,
+            rx,
+            closed,
+            registry: Arc::clone(&self.grace_listeners),
+            finished: false,
+        }
+    }
+
+    /// Attempts to hand over a newly connected `RegisterReverse` control stream
+    /// to an existing listener currently in its grace period.
+    ///
+    /// Returns `Ok(())` on successful handoff, or `Err(Box<ReverseGraceReattach>)`
+    /// if no grace listener exists (or once an expiring grace listener has finished
+    /// closing its socket).
+    pub async fn try_reattach_grace_listener(
+        &self,
+        protocol: L4Protocol,
+        listen_addr: &str,
+        mut reattach: ReverseGraceReattach,
+        cancel_token: &CancellationToken,
+    ) -> Result<(), Box<ReverseGraceReattach>> {
+        let key = canonical_reverse_key(protocol, listen_addr);
+        loop {
+            let slot = self
+                .grace_listeners
+                .get(&key)
+                .map(|entry| (entry.tx.clone(), Arc::clone(&entry.closed)));
+            let Some((tx, closed)) = slot else {
+                return Err(Box::new(reattach));
+            };
+            let notified = closed.notified();
+            tokio::pin!(notified);
+
+            match tx.send(reattach).await {
+                Ok(()) => return Ok(()),
+                Err(mpsc::error::SendError(returned)) => {
+                    reattach = returned;
+                    // Wait until the expiring grace listener finishes shutting
+                    // down and dropping its bound `Frontend` before retrying or
+                    // binding fresh, avoiding EADDRINUSE races.
+                    if notified.cancel_with(cancel_token).await.is_none() {
+                        return Err(Box::new(reattach));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Returns the number of reverse listeners currently in their grace period.
+    pub fn grace_listener_count(&self) -> usize {
+        self.grace_listeners.len()
     }
 }
 
@@ -515,5 +666,78 @@ mod tests {
         let uds_path = uds_a.strip_prefix("tcp:").unwrap();
         let uds_b = canonical_reverse_key(L4Protocol::Tcp, uds_path);
         assert_eq!(uds_a, uds_b);
+    }
+
+    #[tokio::test]
+    async fn test_grace_listener_reattach_and_expiry_coordination() {
+        let manager = SessionManager::new();
+        let cancel = CancellationToken::new();
+
+        let mut grace = manager.register_grace_listener(L4Protocol::Udp, "127.0.0.1:5353");
+        assert_eq!(manager.grace_listener_count(), 1);
+
+        let (c1, _s1) = duplex(1024);
+        let reattach = ReverseGraceReattach {
+            ctrl_stream: FramedControlStream::new(Box::new(c1) as Box<dyn TunnelStream>),
+            pool_size: Some(4),
+        };
+        assert!(
+            manager
+                .try_reattach_grace_listener(L4Protocol::Udp, "127.0.0.1:5353", reattach, &cancel)
+                .await
+                .is_ok()
+        );
+        let received = grace
+            .recv()
+            .await
+            .expect("should receive reattached stream");
+        assert_eq!(received.pool_size, Some(4));
+        grace.finish();
+        assert_eq!(manager.grace_listener_count(), 0);
+
+        // Concurrent expiry: close_and_try_recv closes rx; reconnector waits until finish()
+        let mut expiring = manager.register_grace_listener(L4Protocol::Udp, "127.0.0.1:5354");
+        assert!(expiring.close_and_try_recv().is_none());
+
+        let mgr_clone = manager.clone();
+        let cancel_clone = cancel.clone();
+        let waiter = tokio::spawn(async move {
+            let (c2, _s2) = duplex(1024);
+            let req = ReverseGraceReattach {
+                ctrl_stream: FramedControlStream::new(Box::new(c2) as Box<dyn TunnelStream>),
+                pool_size: None,
+            };
+            mgr_clone
+                .try_reattach_grace_listener(L4Protocol::Udp, "127.0.0.1:5354", req, &cancel_clone)
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !waiter.is_finished(),
+            "must wait until finish() releases socket"
+        );
+        expiring.finish();
+
+        let res = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter must unblock on finish")
+            .unwrap();
+        assert!(
+            res.is_err(),
+            "expired grace must hand stream back for fresh bind"
+        );
+        assert_eq!(manager.grace_listener_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_inbound_pool_notifies_on_push() {
+        let pool = ReverseInboundPool::new(4);
+        let notified = pool.notified_owned();
+        let (c, _s) = duplex(64);
+        assert!(pool.push(Box::new(c)));
+        tokio::time::timeout(Duration::from_millis(200), notified)
+            .await
+            .expect("push must wake owned notifier");
     }
 }

@@ -16,9 +16,9 @@ use crate::common::{CancelFutureExt, CancellationTokenExt, TaskTracker};
 use crate::config::model::{TunnelConfig, TunnelMode};
 use crate::consts::{
     ACTIVATE_STREAM_MAGIC, ACTIVATE_STREAM_UDP, DEFAULT_REVERSE_BACKOFF_INITIAL,
-    DEFAULT_REVERSE_BACKOFF_MAX, POOL_BACKOFF_ACTIVE_WAITERS_MAX, POOL_BACKOFF_BASE,
-    POOL_MAX_CONCURRENT_CONNECTS, REVERSE_BACKOFF_RESET_THRESHOLD, REVERSE_CONTROL_TARGET_HOST,
-    clamp_reverse_pool_size,
+    DEFAULT_REVERSE_BACKOFF_MAX, DEFAULT_REVERSE_PROMOTE_WAIT, POOL_BACKOFF_ACTIVE_WAITERS_MAX,
+    POOL_BACKOFF_BASE, POOL_MAX_CONCURRENT_CONNECTS, REVERSE_BACKOFF_RESET_THRESHOLD,
+    REVERSE_CONTROL_TARGET_HOST, clamp_reverse_pool_size,
 };
 use crate::control::{ControlMessage, SignalingChannel, SignalingConfig, SignalingRouter};
 use crate::core::error::TunnelError;
@@ -306,8 +306,8 @@ pub async fn run_reverse_mapping(
                                     token.child_token(),
                                 );
                                 router_worker.attach(new_handle);
-                                continue;
                             }
+                            continue;
                         } else if activation_kind != expected_activation_magic {
                             if !token.sleep_or_cancel(Duration::from_millis(100)).await {
                                 break;
@@ -433,6 +433,47 @@ pub async fn run_reverse_mapping(
                         }
                         Some(Ok(_)) => {}
                         _ => {
+                            if router.promote_standby_if_closed() || router.has_active_channel() {
+                                debug!(tag = %tag, "Primary signaling channel ended while standby remains active");
+                                continue;
+                            }
+
+                            if pool_workers.is_some() && !cancel_token.is_cancelled() {
+                                let wait_window = DEFAULT_REVERSE_PROMOTE_WAIT.min(idle_timeout);
+                                let promote_deadline = tokio::time::sleep(wait_window);
+                                tokio::pin!(promote_deadline);
+                                let mut promoted = false;
+                                loop {
+                                    let attached = router.notified();
+                                    tokio::pin!(attached);
+                                    if router.promote_standby_if_closed()
+                                        || router.has_active_channel()
+                                    {
+                                        promoted = true;
+                                        break;
+                                    }
+                                    tokio::select! {
+                                        biased;
+                                        _ = cancel_token.cancelled() => break,
+                                        _ = &mut promote_deadline => break,
+                                        _ = &mut attached => {
+                                            if router.promote_standby_if_closed()
+                                                || router.has_active_channel()
+                                            {
+                                                promoted = true;
+                                                break;
+                                            }
+                                        }
+                                        Some(_) = conn_tracker.join_next(), if !conn_tracker.is_empty() => {}
+                                        Some(_) = pool_tracker.join_next(), if !pool_tracker.is_empty() => {}
+                                    }
+                                }
+                                if promoted {
+                                    debug!(tag = %tag, "Recovered reverse signaling via server 0xA6 promotion");
+                                    continue;
+                                }
+                            }
+
                             if !cancel_token.is_cancelled() {
                                 warn!(tag = %tag, "Control channel disconnected or timed out. Reconnecting...");
                             } else {

@@ -126,8 +126,13 @@ pub const POOL_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Grace period retention window for reverse listener sockets when the control channel drops.
 ///
-/// 10 seconds retains the bound port while an emergency promoted stream attaches to resume signaling.
+/// 10 seconds retains the bound port while an emergency promoted stream or reconnected
+/// control stream attaches to resume signaling.
 pub const DEFAULT_REVERSE_GRACE_PERIOD: Duration = Duration::from_secs(10);
+
+/// Brief client-side wait window on primary control loss to allow an in-flight
+/// server-initiated `0xA6` emergency promotion stream to attach before full reconnect.
+pub const DEFAULT_REVERSE_PROMOTE_WAIT: Duration = Duration::from_millis(1000);
 
 // =============================================================================
 // 3. Heartbeats, Intervals & Backoff Parameters
@@ -217,6 +222,14 @@ pub fn reverse_frame_timeout(idle_timeout: Duration) -> Duration {
     (idle_timeout / 3)
         .clamp(POOL_HEARTBEAT_TIMEOUT, DEFAULT_SESSION_PAIR_TIMEOUT)
         .min(idle_timeout)
+}
+
+/// Retention grace window for a reverse listener socket after signaling drops.
+///
+/// Bounded by `DEFAULT_REVERSE_GRACE_PERIOD` (10 s) and never exceeds `idle_timeout`
+/// so short-lived sessions and test fixtures tear down within their configured idle budget.
+pub fn reverse_grace_period(idle_timeout: Duration) -> Duration {
+    DEFAULT_REVERSE_GRACE_PERIOD.min(idle_timeout)
 }
 
 // =============================================================================

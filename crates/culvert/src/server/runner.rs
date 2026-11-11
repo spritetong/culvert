@@ -5,11 +5,14 @@
 //! Ingress server daemon handling forward proxying and reverse tunnel pairing.
 //! All comments and docstrings must be in English.
 
+use futures_util::{SinkExt, StreamExt};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use tokio::time::timeout;
+use tokio::sync::futures::OwnedNotified;
+use tokio::time::{Instant, Sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -18,15 +21,20 @@ use crate::config::model::{ServerConfig, TlsConfig, TunnelMode};
 use crate::consts::{
     ACTIVATE_STREAM_MAGIC, ACTIVATE_STREAM_UDP, DEFAULT_ACTIVATION_READ_TIMEOUT,
     DEFAULT_SESSION_PAIR_TIMEOUT, MAX_ACTIVATION_TARGET_LEN, POOL_DUMMY_HOST,
-    reverse_frame_timeout, reverse_pool_soft_cap,
+    reverse_frame_timeout, reverse_grace_period, reverse_pool_soft_cap,
 };
-use crate::control::{ControlMessage, SignalingChannel, SignalingConfig, SignalingRouter};
+use crate::control::{
+    ControlMessage, FramedControlStream, SignalingChannel, SignalingConfig, SignalingReceiver,
+    SignalingRouter,
+};
 use crate::core::error::TunnelError;
 use crate::core::serve::serve;
+use crate::core::stream::TunnelStream;
 use crate::frontend::{self, FrontendOutput};
 use crate::io::addr::{L4Protocol, MappingSpec};
 use crate::io::pump::{PumpCtx, PumpRequest};
-use crate::session::SessionManager;
+use crate::session::manager::ReverseInboundPool;
+use crate::session::{ReverseGraceHandle, ReverseGraceReattach, SessionManager};
 use crate::transport::{TargetAddr, TransportRegistry};
 use reusable_future::ReusableFutureRef;
 
@@ -443,6 +451,174 @@ impl ServerRunner {
         Ok(())
     }
 
+    /// Reads the initial `RegisterReverse` frame bounded by an absolute `idle_timeout` deadline.
+    async fn read_initial_register_reverse(
+        ctrl_stream: &mut FramedControlStream<Box<dyn TunnelStream>>,
+        idle_timeout: Duration,
+        cancel_token: &CancellationToken,
+    ) -> Option<(String, String, Option<usize>, L4Protocol)> {
+        let deadline = Instant::now() + idle_timeout;
+        let frame_timeout = reverse_frame_timeout(idle_timeout);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                warn!(
+                    idle_timeout = ?idle_timeout,
+                    "Reverse control channel registration timed out waiting for client request"
+                );
+                return None;
+            }
+            match timeout(remaining, ctrl_stream.next())
+                .cancel_with(cancel_token)
+                .await
+            {
+                Some(Ok(Some(Ok(ControlMessage::RegisterReverse {
+                    listen_addr,
+                    target_addr,
+                    pool_size,
+                    protocol,
+                })))) => return Some((listen_addr, target_addr, pool_size, protocol)),
+                Some(Ok(Some(Ok(ControlMessage::Ping)))) => {
+                    let pong = timeout(frame_timeout, ctrl_stream.send(ControlMessage::Pong))
+                        .cancel_with(cancel_token)
+                        .await;
+                    if !matches!(pong, Some(Ok(Ok(())))) {
+                        return None;
+                    }
+                }
+                Some(Err(_)) => {
+                    warn!(
+                        idle_timeout = ?idle_timeout,
+                        "Reverse control channel registration timed out waiting for client request"
+                    );
+                    return None;
+                }
+                Some(Ok(Some(other))) => {
+                    warn!(
+                        "Expected RegisterReverse on reverse control channel, got: {:?}",
+                        other
+                    );
+                    return None;
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Attempts immediate standby promotion or `0xA6` idle-stream promotion;
+    /// if unavailable, retains the listener in the bounded grace period.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_signaling_disconnect(
+        listen_addr: &str,
+        protocol: L4Protocol,
+        idle_timeout: Duration,
+        grace_period: Duration,
+        sig_config: SignalingConfig,
+        cancel_token: &CancellationToken,
+        session_mgr: &SessionManager,
+        idle_pool: &ReverseInboundPool,
+        router: &SignalingRouter,
+        sig_rx: &SignalingReceiver,
+        grace_handle: &mut Option<ReverseGraceHandle>,
+        grace_deadline: &mut Option<Pin<Box<Sleep>>>,
+        pool_notify: &mut Option<Pin<Box<OwnedNotified>>>,
+    ) {
+        if router.promote_standby_if_closed() {
+            debug!(addr = %listen_addr, "Primary reverse signaling channel closed; failed over to standby");
+            return;
+        }
+
+        // Arm the pool notifier BEFORE calling `promote_idle` so an inbound idle
+        // stream pushed concurrently is never missed between the check and select!
+        let next_notify = Box::pin(idle_pool.notified_owned());
+        debug!(addr = %listen_addr, "Reverse control channel disconnected; checking for emergency promotion");
+        if let Some(promoted_stream) = idle_pool.promote_idle(idle_timeout).await
+            && let Some(sink) = sig_rx.event_sink()
+        {
+            info!(addr = %listen_addr, "Promoted idle pool stream to replacement signaling channel (0-RTT)");
+            let new_handle = SignalingChannel::spawn_with_event_sink(
+                promoted_stream,
+                sig_config,
+                sink,
+                cancel_token.child_token(),
+            );
+            router.attach(new_handle);
+            if let Some(g) = grace_handle.take() {
+                g.finish();
+            }
+            *grace_deadline = None;
+            *pool_notify = None;
+            return;
+        }
+
+        if grace_handle.is_none() {
+            info!(
+                addr = %listen_addr,
+                protocol = %protocol,
+                grace = ?grace_period,
+                "No idle stream available for promotion; retaining reverse listener for grace period"
+            );
+            *grace_handle = Some(session_mgr.register_grace_listener(protocol, listen_addr));
+            *grace_deadline = Some(Box::pin(tokio::time::sleep(grace_period)));
+        }
+        *pool_notify = Some(next_notify);
+    }
+
+    /// Reattaches a newly connected `RegisterReverse` control stream into an existing
+    /// listener in its grace period without re-binding the frontend socket.
+    #[allow(clippy::too_many_arguments)]
+    async fn attach_reconnected_control(
+        reattach: ReverseGraceReattach,
+        listen_addr: &str,
+        protocol: L4Protocol,
+        sig_config: SignalingConfig,
+        cancel_token: &CancellationToken,
+        session_mgr: &SessionManager,
+        idle_pool: &mut Arc<ReverseInboundPool>,
+        router: &SignalingRouter,
+        sig_rx: &SignalingReceiver,
+        grace_handle: &mut Option<ReverseGraceHandle>,
+        grace_deadline: &mut Option<Pin<Box<Sleep>>>,
+        pool_notify: &mut Option<Pin<Box<OwnedNotified>>>,
+    ) {
+        if let Some(g) = grace_handle.take() {
+            g.finish();
+        }
+        *grace_deadline = None;
+        *pool_notify = None;
+
+        // Register the new pool generation BEFORE sending RegisterAck so the
+        // client's freshly spawned pre-warm workers never race ahead of registration.
+        *idle_pool = session_mgr.register_pool(
+            protocol,
+            listen_addr,
+            reverse_pool_soft_cap(reattach.pool_size),
+        );
+
+        if let Some(sink) = sig_rx.event_sink() {
+            let new_handle = SignalingChannel::spawn_framed_with_event_sink(
+                reattach.ctrl_stream,
+                sig_config,
+                sink,
+                cancel_token.child_token(),
+            );
+            router.attach(new_handle);
+            if router
+                .send(ControlMessage::RegisterAck {
+                    listen_addr: listen_addr.to_string(),
+                    success: true,
+                    error_msg: None,
+                })
+                .await
+                .is_ok()
+            {
+                info!(addr = %listen_addr, protocol = %protocol, "Reattached reverse control channel within grace period");
+            } else {
+                warn!(addr = %listen_addr, "Failed to send RegisterAck on reattached reverse control channel");
+            }
+        }
+    }
+
     /// Handles a reverse control channel: binds requested port on server and notifies client.
     pub(crate) async fn handle_reverse_control(
         stream: Box<dyn crate::core::stream::TunnelStream>,
@@ -452,45 +628,39 @@ impl ServerRunner {
         heartbeat_interval: Duration,
         udp_idle_timeout: Duration,
     ) {
-        let sig_config = SignalingConfig {
-            heartbeat_interval,
-            idle_timeout,
-        };
-        let (signaling, mut sig_rx) =
-            SignalingChannel::spawn(stream, sig_config, cancel_token.child_token());
-        let router = SignalingRouter::new(signaling);
-
-        // Await RegisterReverse bounded by idle_timeout
-        let (listen_addr, target_addr, pool_size, protocol) =
-            match timeout(idle_timeout, sig_rx.recv())
-                .cancel_with(&cancel_token)
+        let mut ctrl_stream = FramedControlStream::new(stream);
+        let Some((listen_addr, target_addr, pool_size, protocol)) =
+            Self::read_initial_register_reverse(&mut ctrl_stream, idle_timeout, &cancel_token)
                 .await
-            {
-                Some(Ok(Some(Ok(ControlMessage::RegisterReverse {
-                    listen_addr,
-                    target_addr,
-                    pool_size,
-                    protocol,
-                })))) => (listen_addr, target_addr, pool_size, protocol),
-                Some(Err(_)) => {
-                    warn!(
-                        idle_timeout = ?idle_timeout,
-                        "Reverse control channel registration timed out waiting for client request"
-                    );
-                    return;
-                }
-                Some(Ok(Some(other))) => {
-                    warn!(
-                        "Expected RegisterReverse on reverse control channel, got: {:?}",
-                        other
-                    );
-                    return;
-                }
-                _ => return,
-            };
+        else {
+            return;
+        };
+
+        // If the previous control channel for this listener dropped recently and
+        // is still inside its 10s grace window, hand this stream directly to it so
+        // the bound frontend socket (and active UDP NAT flows) never tear down.
+        let reattach = ReverseGraceReattach {
+            ctrl_stream,
+            pool_size,
+        };
+        let mut ctrl_stream = match session_mgr
+            .try_reattach_grace_listener(protocol, &listen_addr, reattach, &cancel_token)
+            .await
+        {
+            Ok(()) => {
+                info!(addr = %listen_addr, protocol = %protocol, "Reattached incoming reverse control stream to grace-period listener");
+                return;
+            }
+            Err(returned) => returned.ctrl_stream,
+        };
+
+        if cancel_token.is_cancelled() {
+            return;
+        }
 
         debug!(addr = %listen_addr, target = %target_addr, protocol = %protocol, "Binding reverse listening port on server");
 
+        let frame_timeout = reverse_frame_timeout(idle_timeout);
         let mut frontend = match frontend::bind(&MappingSpec::new(
             protocol,
             &listen_addr,
@@ -501,13 +671,16 @@ impl ServerRunner {
             Ok(l) => l,
             Err(e) => {
                 warn!(addr = %listen_addr, protocol = %protocol, "Failed to bind reverse listener: {}", e);
-                let _ = router
-                    .send(ControlMessage::RegisterAck {
+                let _ = timeout(
+                    frame_timeout,
+                    ctrl_stream.send(ControlMessage::RegisterAck {
                         listen_addr: listen_addr.clone(),
                         success: false,
                         error_msg: Some(e.to_string()),
-                    })
-                    .await;
+                    }),
+                )
+                .cancel_with(&cancel_token)
+                .await;
                 return;
             }
         };
@@ -517,8 +690,16 @@ impl ServerRunner {
         // would discard the whole first generation and delay the first 0-RTT pair.
         // The soft cap is derived from the worker count the client negotiated,
         // so both ends size the same pool.
-        let idle_pool =
+        let mut idle_pool =
             session_mgr.register_pool(protocol, &listen_addr, reverse_pool_soft_cap(pool_size));
+
+        let sig_config = SignalingConfig {
+            heartbeat_interval,
+            idle_timeout,
+        };
+        let (signaling, mut sig_rx) =
+            SignalingChannel::spawn_framed(ctrl_stream, sig_config, cancel_token.child_token());
+        let router = SignalingRouter::new(signaling);
 
         let ack_sent = router
             .send(ControlMessage::RegisterAck {
@@ -529,6 +710,8 @@ impl ServerRunner {
             .await;
         if ack_sent.is_err() {
             warn!(addr = %listen_addr, "Failed to send RegisterAck; dropping reverse listener");
+            frontend.shutdown().await;
+            drop(frontend);
             session_mgr.unregister_pool(protocol, &listen_addr, &idle_pool);
             return;
         }
@@ -542,8 +725,11 @@ impl ServerRunner {
             L4Protocol::Tcp => ACTIVATE_STREAM_MAGIC,
             L4Protocol::Udp => ACTIVATE_STREAM_UDP,
         };
+        let grace_period = reverse_grace_period(idle_timeout);
+        let mut grace_handle: Option<ReverseGraceHandle> = None;
+        let mut grace_deadline: Option<Pin<Box<Sleep>>> = None;
+        let mut pool_notify: Option<Pin<Box<OwnedNotified>>> = None;
         let mut local_tracker = TaskTracker::<()>::new(cancel_token.clone());
-        let frame_timeout = reverse_frame_timeout(idle_timeout);
         let mut accept_slot: ReusableFutureRef<'static, FrontendOutput> =
             ReusableFutureRef::default();
 
@@ -556,27 +742,101 @@ impl ServerRunner {
                 biased;
                 _ = cancel_token.cancelled() => break,
                 Some(_) = local_tracker.join_next(), if !local_tracker.is_empty() => {}
-                msg_opt = sig_rx.recv() => {
+                Some(reattach) = async {
+                    match grace_handle.as_mut() {
+                        Some(g) => g.recv().await,
+                        None => None,
+                    }
+                }, if grace_handle.is_some() => {
+                    Self::attach_reconnected_control(
+                        reattach,
+                        &listen_addr,
+                        protocol,
+                        sig_config,
+                        &cancel_token,
+                        &session_mgr,
+                        &mut idle_pool,
+                        &router,
+                        &sig_rx,
+                        &mut grace_handle,
+                        &mut grace_deadline,
+                        &mut pool_notify,
+                    )
+                    .await;
+                }
+                _ = async {
+                    if let Some(notify) = pool_notify.as_mut() {
+                        notify.as_mut().await;
+                    }
+                }, if grace_handle.is_some() && pool_notify.is_some() => {
+                    let next_notify = Box::pin(idle_pool.notified_owned());
+                    if let Some(promoted_stream) = idle_pool.promote_idle(idle_timeout).await
+                        && let Some(sink) = sig_rx.event_sink()
+                    {
+                        info!(addr = %listen_addr, "Promoted newly arrived idle stream to signaling channel during grace period (0-RTT)");
+                        let new_handle = SignalingChannel::spawn_with_event_sink(
+                            promoted_stream,
+                            sig_config,
+                            sink,
+                            cancel_token.child_token(),
+                        );
+                        router.attach(new_handle);
+                        if let Some(g) = grace_handle.take() {
+                            g.finish();
+                        }
+                        grace_deadline = None;
+                        pool_notify = None;
+                    } else {
+                        pool_notify = Some(next_notify);
+                    }
+                }
+                _ = async {
+                    if let Some(deadline) = grace_deadline.as_mut() {
+                        deadline.as_mut().await;
+                    }
+                }, if grace_deadline.is_some() => {
+                    if let Some(reattach) = grace_handle.as_mut().and_then(|g| g.close_and_try_recv()) {
+                        Self::attach_reconnected_control(
+                            reattach,
+                            &listen_addr,
+                            protocol,
+                            sig_config,
+                            &cancel_token,
+                            &session_mgr,
+                            &mut idle_pool,
+                            &router,
+                            &sig_rx,
+                            &mut grace_handle,
+                            &mut grace_deadline,
+                            &mut pool_notify,
+                        )
+                        .await;
+                        continue;
+                    }
+                    debug!(addr = %listen_addr, protocol = %protocol, "Reverse listener grace period expired; closing listener");
+                    break;
+                }
+                msg_opt = sig_rx.recv(), if grace_handle.is_none() => {
                     match msg_opt {
                         Some(Ok(ControlMessage::Ping)) | Some(Ok(ControlMessage::Pong)) => {}
                         Some(Ok(_)) => {}
                         _ => {
-                            debug!(addr = %listen_addr, "Reverse control channel disconnected; checking for emergency promotion");
-                            if let Some(promoted_stream) = idle_pool.promote_idle(idle_timeout).await
-                                && let Some(sink) = sig_rx.event_sink()
-                            {
-                                info!(addr = %listen_addr, "Promoted idle pool stream to replacement signaling channel (0-RTT)");
-                                let new_handle = SignalingChannel::spawn_with_event_sink(
-                                    promoted_stream,
-                                    sig_config,
-                                    sink,
-                                    cancel_token.child_token(),
-                                );
-                                router.attach(new_handle);
-                                continue;
-                            }
-                            debug!(addr = %listen_addr, "No idle stream available for promotion; closing listener");
-                            break;
+                            Self::handle_signaling_disconnect(
+                                &listen_addr,
+                                protocol,
+                                idle_timeout,
+                                grace_period,
+                                sig_config,
+                                &cancel_token,
+                                &session_mgr,
+                                &idle_pool,
+                                &router,
+                                &sig_rx,
+                                &mut grace_handle,
+                                &mut grace_deadline,
+                                &mut pool_notify,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -633,7 +893,19 @@ impl ServerRunner {
                                 continue;
                             }
 
-                            // 2. SLOW PATH (Fallback): Allocate session_id and notify client via control channel
+                            // 2. SLOW PATH (Fallback): if signaling is temporarily in
+                            // its grace window with an empty pool, drop only this
+                            // fallback visitor without tearing down the bound port.
+                            if !router.has_active_channel() {
+                                debug!(
+                                    visitor = %visitor_addr,
+                                    protocol = %protocol,
+                                    "Dropping fallback reverse visitor while control channel is in grace period"
+                                );
+                                continue;
+                            }
+
+                            // Allocate session_id and notify client via control channel
                             let session_id = format!(
                                 "sess_{}_{}",
                                 std::process::id(),
@@ -658,9 +930,8 @@ impl ServerRunner {
 
                             // Bounded signaling: a stalled or dead control channel
                             // must never block the accept loop and starve later
-                            // visitors. Transport errors close the listener, but
-                            // an individual timeout drops the session and continues
-                            // without taking down the entire listening port.
+                            // visitors. Individual timeouts drop the session;
+                            // transport failures transition to promotion / grace.
                             let notify_res = router.send(notify_msg).await;
                             match notify_res {
                                 Ok(()) => {}
@@ -672,7 +943,23 @@ impl ServerRunner {
                                 Err(e) => {
                                     warn!(session = %session_id, "Failed to notify client over control channel: {:?}", e);
                                     session_mgr.remove(&session_id);
-                                    break;
+                                    Self::handle_signaling_disconnect(
+                                        &listen_addr,
+                                        protocol,
+                                        idle_timeout,
+                                        grace_period,
+                                        sig_config,
+                                        &cancel_token,
+                                        &session_mgr,
+                                        &idle_pool,
+                                        &router,
+                                        &sig_rx,
+                                        &mut grace_handle,
+                                        &mut grace_deadline,
+                                        &mut pool_notify,
+                                    )
+                                    .await;
+                                    continue;
                                 }
                             }
 
@@ -713,13 +1000,15 @@ impl ServerRunner {
 
         accept_slot.reset();
 
-        // Immediately drop the listening socket and unregister the inbound pool.
-        // This frees the port and pool key instantly so a reconnecting client
-        // can re-bind the reverse listener without failing on "Address already in use",
-        // even while existing visitor relay tasks are winding down gracefully.
+        // Drop the listening socket and unregister the inbound pool BEFORE
+        // finishing any grace registration, so any waiting reconnector only
+        // binds after the OS socket has been released.
         frontend.shutdown().await;
         drop(frontend);
         session_mgr.unregister_pool(protocol, &listen_addr, &idle_pool);
+        if let Some(g) = grace_handle.take() {
+            g.finish();
+        }
 
         local_tracker.shutdown_and_wait().await;
         debug!(addr = %listen_addr, "Reverse listener closed");
@@ -945,7 +1234,237 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_server_reverse_control_immediate_port_release_on_disconnect() {
+    async fn test_server_reverse_control_grace_period_retains_port_and_reattaches() {
+        use futures_util::{SinkExt, StreamExt};
+
+        let (client1, server1) = tokio::io::duplex(4096);
+        let mut ctrl_client1 = FramedControlStream::new(client1);
+        let session_mgr = Arc::new(SessionManager::new());
+        let cancel_token = CancellationToken::new();
+
+        let listen_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let listen_addr = format!("127.0.0.1:{}", listen_port);
+
+        let s_mgr1 = Arc::clone(&session_mgr);
+        let c_token1 = cancel_token.clone();
+        let handle1 = tokio::spawn(async move {
+            ServerRunner::handle_reverse_control(
+                Box::new(server1),
+                s_mgr1,
+                c_token1,
+                Duration::from_secs(30),
+                crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
+                crate::consts::DEFAULT_UDP_IDLE_TIMEOUT,
+            )
+            .await;
+        });
+
+        ctrl_client1
+            .send(ControlMessage::RegisterReverse {
+                listen_addr: listen_addr.clone(),
+                target_addr: "127.0.0.1:9099".to_string(),
+                pool_size: Some(2),
+                protocol: L4Protocol::Tcp,
+            })
+            .await
+            .unwrap();
+
+        let ack1 = ctrl_client1.next().await.unwrap().unwrap();
+        assert!(matches!(
+            ack1,
+            ControlMessage::RegisterAck { success: true, .. }
+        ));
+
+        // Drop primary control stream; listener must remain bound during the 10s grace period.
+        drop(ctrl_client1);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !handle1.is_finished(),
+            "handle_reverse_control should remain alive inside the grace window"
+        );
+        assert_eq!(session_mgr.grace_listener_count(), 1);
+        assert!(
+            crate::platform::GenericListener::bind(&listen_addr)
+                .await
+                .is_err(),
+            "Port must remain retained during grace period"
+        );
+
+        // Reconnect a new control stream for the same listener and verify seamless reattach.
+        let (client2, server2) = tokio::io::duplex(4096);
+        let mut ctrl_client2 = FramedControlStream::new(client2);
+        let s_mgr2 = Arc::clone(&session_mgr);
+        let c_token2 = cancel_token.clone();
+        let handle2 = tokio::spawn(async move {
+            ServerRunner::handle_reverse_control(
+                Box::new(server2),
+                s_mgr2,
+                c_token2,
+                Duration::from_secs(30),
+                crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
+                crate::consts::DEFAULT_UDP_IDLE_TIMEOUT,
+            )
+            .await;
+        });
+
+        ctrl_client2
+            .send(ControlMessage::RegisterReverse {
+                listen_addr: listen_addr.clone(),
+                target_addr: "127.0.0.1:9099".to_string(),
+                pool_size: Some(2),
+                protocol: L4Protocol::Tcp,
+            })
+            .await
+            .unwrap();
+
+        let ack2 = ctrl_client2.next().await.unwrap().unwrap();
+        assert!(matches!(
+            ack2,
+            ControlMessage::RegisterAck { success: true, .. }
+        ));
+
+        // Incoming control handler hands ownership to the active grace listener and exits cleanly.
+        let reattach_res = tokio::time::timeout(Duration::from_secs(2), handle2).await;
+        assert!(
+            reattach_res.is_ok(),
+            "Incoming reattach handler must exit after handing off stream"
+        );
+        assert!(
+            !handle1.is_finished(),
+            "Retained grace listener handler must continue serving with the new control stream"
+        );
+        assert_eq!(session_mgr.grace_listener_count(), 0);
+
+        // Verify the retained TCP listener dispatches new visitors through ctrl_client2.
+        let _visitor = tokio::net::TcpStream::connect(&listen_addr).await.unwrap();
+        let next_msg = tokio::time::timeout(Duration::from_secs(2), ctrl_client2.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(next_msg, ControlMessage::NewConnection { .. }));
+
+        cancel_token.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle1).await;
+    }
+
+    #[tokio::test]
+    async fn test_server_reverse_control_grace_period_udp_retains_socket_and_reattaches() {
+        use futures_util::{SinkExt, StreamExt};
+
+        let (client1, server1) = tokio::io::duplex(4096);
+        let mut ctrl_client1 = FramedControlStream::new(client1);
+        let session_mgr = Arc::new(SessionManager::new());
+        let cancel_token = CancellationToken::new();
+
+        let listen_port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let listen_addr = format!("127.0.0.1:{}", listen_port);
+
+        let s_mgr1 = Arc::clone(&session_mgr);
+        let c_token1 = cancel_token.clone();
+        let handle1 = tokio::spawn(async move {
+            ServerRunner::handle_reverse_control(
+                Box::new(server1),
+                s_mgr1,
+                c_token1,
+                Duration::from_secs(30),
+                crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
+                crate::consts::DEFAULT_UDP_IDLE_TIMEOUT,
+            )
+            .await;
+        });
+
+        ctrl_client1
+            .send(ControlMessage::RegisterReverse {
+                listen_addr: listen_addr.clone(),
+                target_addr: "127.0.0.1:9099".to_string(),
+                pool_size: Some(2),
+                protocol: L4Protocol::Udp,
+            })
+            .await
+            .unwrap();
+
+        let ack1 = ctrl_client1.next().await.unwrap().unwrap();
+        assert!(matches!(
+            ack1,
+            ControlMessage::RegisterAck { success: true, .. }
+        ));
+
+        drop(ctrl_client1);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!handle1.is_finished());
+        assert_eq!(session_mgr.grace_listener_count(), 1);
+
+        let (client2, server2) = tokio::io::duplex(4096);
+        let mut ctrl_client2 = FramedControlStream::new(client2);
+        let s_mgr2 = Arc::clone(&session_mgr);
+        let c_token2 = cancel_token.clone();
+        let handle2 = tokio::spawn(async move {
+            ServerRunner::handle_reverse_control(
+                Box::new(server2),
+                s_mgr2,
+                c_token2,
+                Duration::from_secs(30),
+                crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
+                crate::consts::DEFAULT_UDP_IDLE_TIMEOUT,
+            )
+            .await;
+        });
+
+        ctrl_client2
+            .send(ControlMessage::RegisterReverse {
+                listen_addr: listen_addr.clone(),
+                target_addr: "127.0.0.1:9099".to_string(),
+                pool_size: Some(2),
+                protocol: L4Protocol::Udp,
+            })
+            .await
+            .unwrap();
+
+        let ack2 = ctrl_client2.next().await.unwrap().unwrap();
+        assert!(matches!(
+            ack2,
+            ControlMessage::RegisterAck { success: true, .. }
+        ));
+
+        let reattach_res = tokio::time::timeout(Duration::from_secs(2), handle2).await;
+        assert!(
+            reattach_res.is_ok(),
+            "Incoming UDP reattach handler must exit after handing off stream"
+        );
+        assert!(
+            !handle1.is_finished(),
+            "Retained UDP grace listener handler must continue serving with the new control stream"
+        );
+        assert_eq!(session_mgr.grace_listener_count(), 0);
+
+        // Verify the retained UDP socket dispatches new datagrams through ctrl_client2.
+        let visitor = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        visitor
+            .send_to(b"grace-udp-ping", &listen_addr)
+            .await
+            .unwrap();
+        let next_msg = tokio::time::timeout(Duration::from_secs(2), ctrl_client2.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(next_msg, ControlMessage::NewConnection { .. }));
+
+        cancel_token.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle1).await;
+    }
+
+    #[tokio::test]
+    async fn test_server_reverse_control_grace_period_expires_and_releases_port() {
         use futures_util::{SinkExt, StreamExt};
 
         let (client, server) = tokio::io::duplex(4096);
@@ -964,6 +1483,73 @@ mod tests {
         let c_token = cancel_token.clone();
         let l_addr = listen_addr.clone();
 
+        // Bound grace period to 120ms via idle_timeout so expiry happens deterministically.
+        let handle = tokio::spawn(async move {
+            ServerRunner::handle_reverse_control(
+                Box::new(server),
+                s_mgr,
+                c_token,
+                Duration::from_millis(120),
+                crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
+                crate::consts::DEFAULT_UDP_IDLE_TIMEOUT,
+            )
+            .await;
+        });
+
+        ctrl_client
+            .send(ControlMessage::RegisterReverse {
+                listen_addr: listen_addr.clone(),
+                target_addr: "127.0.0.1:9099".to_string(),
+                pool_size: Some(2),
+                protocol: L4Protocol::Tcp,
+            })
+            .await
+            .unwrap();
+
+        let ack = ctrl_client.next().await.unwrap().unwrap();
+        assert!(matches!(
+            ack,
+            ControlMessage::RegisterAck { success: true, .. }
+        ));
+
+        drop(ctrl_client);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!handle.is_finished());
+        assert_eq!(session_mgr.grace_listener_count(), 1);
+
+        let res = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(
+            res.is_ok(),
+            "handle_reverse_control should exit promptly after grace period expires"
+        );
+        assert_eq!(session_mgr.grace_listener_count(), 0);
+
+        let rebind = crate::platform::GenericListener::bind(&l_addr).await;
+        assert!(
+            rebind.is_ok(),
+            "Port must be released cleanly once the grace period expires"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_server_reverse_control_grace_period_promotes_newly_pushed_idle_stream() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::io::AsyncReadExt;
+
+        let (client, server) = tokio::io::duplex(4096);
+        let mut ctrl_client = FramedControlStream::new(client);
+        let session_mgr = Arc::new(SessionManager::new());
+        let cancel_token = CancellationToken::new();
+
+        let listen_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let listen_addr = format!("127.0.0.1:{}", listen_port);
+
+        let s_mgr = Arc::clone(&session_mgr);
+        let c_token = cancel_token.clone();
         let handle = tokio::spawn(async move {
             ServerRunner::handle_reverse_control(
                 Box::new(server),
@@ -976,7 +1562,6 @@ mod tests {
             .await;
         });
 
-        // Send RegisterReverse
         ctrl_client
             .send(ControlMessage::RegisterReverse {
                 listen_addr: listen_addr.clone(),
@@ -987,29 +1572,48 @@ mod tests {
             .await
             .unwrap();
 
-        // Await RegisterAck
         let ack = ctrl_client.next().await.unwrap().unwrap();
         assert!(matches!(
             ack,
             ControlMessage::RegisterAck { success: true, .. }
         ));
 
-        // Drop client control stream to trigger disconnect
         drop(ctrl_client);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(!handle.is_finished());
+        assert_eq!(session_mgr.grace_listener_count(), 1);
 
-        // Await handle termination
-        let res = tokio::time::timeout(Duration::from_secs(2), handle).await;
-        assert!(
-            res.is_ok(),
-            "handle_reverse_control should exit promptly on client disconnect"
-        );
+        // Push a fresh idle stream during the grace window; server must promote it via 0xA6.
+        let (mut client_idle, server_idle) = tokio::io::duplex(4096);
+        assert!(session_mgr.push_idle_stream(L4Protocol::Tcp, None, Box::new(server_idle)));
 
-        // The bound port must be released immediately so a reconnecting client can rebind
-        let rebind = crate::platform::GenericListener::bind(&l_addr).await;
-        assert!(
-            rebind.is_ok(),
-            "Port must be freed immediately for rebinding"
-        );
+        let mut magic = [0u8; 1];
+        tokio::time::timeout(Duration::from_secs(2), client_idle.read_exact(&mut magic))
+            .await
+            .expect("Must receive 0xA6 promotion magic during grace window")
+            .unwrap();
+        assert_eq!(magic[0], crate::consts::ACTIVATE_STREAM_PROMOTE);
+
+        let wait_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while session_mgr.grace_listener_count() > 0 && tokio::time::Instant::now() < wait_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(session_mgr.grace_listener_count(), 0);
+        assert!(!handle.is_finished());
+
+        // Promoted idle stream now serves FramedControlStream frames for incoming visitors.
+        let mut promoted_ctrl = FramedControlStream::new(client_idle);
+        let _visitor = tokio::net::TcpStream::connect(&listen_addr).await.unwrap();
+        let msg = tokio::time::timeout(Duration::from_secs(2), promoted_ctrl.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(msg, ControlMessage::NewConnection { .. }));
+
+        cancel_token.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
     }
 
     /// Under a burst of visitor connections, control frames (like Ping) must not

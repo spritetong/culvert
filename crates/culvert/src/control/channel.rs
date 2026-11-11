@@ -8,10 +8,10 @@
 use futures_util::{SinkExt, StreamExt};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::{Instant, interval, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -55,6 +55,11 @@ pub struct SignalingHandle {
 }
 
 impl SignalingHandle {
+    /// Returns `true` when the backing signaling actor has exited.
+    pub fn is_closed(&self) -> bool {
+        self.cmd_tx.is_closed()
+    }
+
     /// Transmits a control message using the session's derived frame timeout.
     pub async fn send(&self, msg: ControlMessage) -> Result<(), TunnelError> {
         self.send_timeout(msg, self.default_frame_timeout).await
@@ -148,6 +153,7 @@ pub struct SignalingRouter {
     primary: Arc<parking_lot::Mutex<Option<SignalingHandle>>>,
     standby: Arc<parking_lot::Mutex<Option<SignalingHandle>>>,
     epoch: Arc<AtomicU64>,
+    attach_notify: Arc<Notify>,
 }
 
 impl SignalingRouter {
@@ -157,19 +163,28 @@ impl SignalingRouter {
             primary: Arc::new(parking_lot::Mutex::new(Some(primary))),
             standby: Arc::new(parking_lot::Mutex::new(None)),
             epoch: Arc::new(AtomicU64::new(1)),
+            attach_notify: Arc::new(Notify::new()),
         }
     }
 
-    /// Attaches an additional channel as standby (or as primary if none exists).
+    /// Attaches an additional channel as standby (or as primary if none exists or primary is closed).
     pub fn attach(&self, handle: SignalingHandle) {
-        let mut prim = self.primary.lock();
-        if prim.is_none() {
-            *prim = Some(handle);
-            self.epoch.fetch_add(1, Ordering::SeqCst);
-        } else {
-            let mut sec = self.standby.lock();
-            *sec = Some(handle);
+        {
+            let mut prim = self.primary.lock();
+            if prim.as_ref().is_none_or(|h| h.is_closed()) {
+                *prim = Some(handle);
+                self.epoch.fetch_add(1, Ordering::SeqCst);
+            } else {
+                let mut sec = self.standby.lock();
+                *sec = Some(handle);
+            }
         }
+        self.attach_notify.notify_waiters();
+    }
+
+    /// Returns a future resolved when a new channel is attached to the router.
+    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.attach_notify.notified()
     }
 
     /// Returns the active epoch generation counter.
@@ -177,42 +192,37 @@ impl SignalingRouter {
         self.epoch.load(Ordering::Relaxed)
     }
 
-    /// Checks if at least one active channel is attached.
+    /// Checks if at least one live (non-closed) channel is attached.
     pub fn has_active_channel(&self) -> bool {
-        self.primary.lock().is_some() || self.standby.lock().is_some()
+        self.primary.lock().as_ref().is_some_and(|h| !h.is_closed())
+            || self.standby.lock().as_ref().is_some_and(|h| !h.is_closed())
+    }
+
+    /// Promotes a live standby channel to primary if primary is missing or closed.
+    ///
+    /// Returns `true` if a live primary channel is available after promotion.
+    pub fn promote_standby_if_closed(&self) -> bool {
+        let mut prim = self.primary.lock();
+        if prim.as_ref().is_some_and(|h| !h.is_closed()) {
+            return true;
+        }
+        let next = {
+            let mut sec = self.standby.lock();
+            sec.take().filter(|h| !h.is_closed())
+        };
+        if let Some(handle) = next {
+            *prim = Some(handle);
+            self.epoch.fetch_add(1, Ordering::SeqCst);
+            true
+        } else {
+            *prim = None;
+            false
+        }
     }
 
     /// Sends a message using the active primary channel, with automatic failover to standby.
     pub async fn send(&self, msg: ControlMessage) -> Result<(), TunnelError> {
-        let primary = { self.primary.lock().clone() };
-        if let Some(ref handle) = primary {
-            match handle.send(msg.clone()).await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    warn!("Primary channel send failed: {}; promoting standby", e);
-                    let mut p = self.primary.lock();
-                    *p = None;
-                }
-            }
-        }
-
-        // Failover: promote standby to primary
-        let standby = {
-            let mut sec = self.standby.lock();
-            sec.take()
-        };
-
-        if let Some(new_primary) = standby {
-            self.epoch.fetch_add(1, Ordering::SeqCst);
-            let res = new_primary.send(msg).await;
-            let mut p = self.primary.lock();
-            *p = Some(new_primary);
-            res
-        } else {
-            Err(TunnelError::ControlProtocol(
-                "No signaling channels available".into(),
-            ))
-        }
+        self.send_inner(msg, None).await
     }
 
     /// Sends a message with an explicit timeout.
@@ -221,28 +231,61 @@ impl SignalingRouter {
         msg: ControlMessage,
         timeout: Duration,
     ) -> Result<(), TunnelError> {
+        self.send_inner(msg, Some(timeout)).await
+    }
+
+    async fn send_inner(
+        &self,
+        msg: ControlMessage,
+        explicit_timeout: Option<Duration>,
+    ) -> Result<(), TunnelError> {
         let primary = { self.primary.lock().clone() };
         if let Some(ref handle) = primary {
-            match handle.send_timeout(msg.clone(), timeout).await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    warn!("Primary channel send failed: {}; promoting standby", e);
-                    let mut p = self.primary.lock();
+            if !handle.is_closed() {
+                let res = match explicit_timeout {
+                    Some(t) => handle.send_timeout(msg.clone(), t).await,
+                    None => handle.send(msg.clone()).await,
+                };
+                match res {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        warn!("Primary channel send failed: {}; promoting standby", e);
+                        let mut p = self.primary.lock();
+                        if p.as_ref()
+                            .is_some_and(|cur| cur.cmd_tx.same_channel(&handle.cmd_tx))
+                        {
+                            *p = None;
+                        }
+                    }
+                }
+            } else {
+                let mut p = self.primary.lock();
+                if p.as_ref()
+                    .is_some_and(|cur| cur.cmd_tx.same_channel(&handle.cmd_tx))
+                {
                     *p = None;
                 }
             }
         }
 
+        // Failover: promote standby to primary
         let standby = {
             let mut sec = self.standby.lock();
-            sec.take()
+            sec.take().filter(|h| !h.is_closed())
         };
 
         if let Some(new_primary) = standby {
             self.epoch.fetch_add(1, Ordering::SeqCst);
-            let res = new_primary.send_timeout(msg, timeout).await;
-            let mut p = self.primary.lock();
-            *p = Some(new_primary);
+            let res = match explicit_timeout {
+                Some(t) => new_primary.send_timeout(msg, t).await,
+                None => new_primary.send(msg).await,
+            };
+            if res.is_ok() {
+                let mut p = self.primary.lock();
+                if p.as_ref().is_none_or(|h| h.is_closed()) {
+                    *p = Some(new_primary);
+                }
+            }
             res
         } else {
             Err(TunnelError::ControlProtocol(
@@ -252,17 +295,44 @@ impl SignalingRouter {
     }
 }
 
+/// Clonable sink used to attach additional physical channels to an existing `SignalingReceiver`.
+#[derive(Clone)]
+pub struct SignalingSink {
+    tx: mpsc::Sender<Result<ControlMessage, TunnelError>>,
+    active_actors: Option<Arc<AtomicUsize>>,
+    actor_exit_notify: Option<Arc<Notify>>,
+}
+
+impl From<mpsc::Sender<Result<ControlMessage, TunnelError>>> for SignalingSink {
+    fn from(tx: mpsc::Sender<Result<ControlMessage, TunnelError>>) -> Self {
+        Self {
+            tx,
+            active_actors: None,
+            actor_exit_notify: None,
+        }
+    }
+}
+
 /// Receiver yielding incoming application-level control messages with automatic deduplication.
 pub struct SignalingReceiver {
     rx: mpsc::Receiver<Result<ControlMessage, TunnelError>>,
-    event_tx: mpsc::WeakSender<Result<ControlMessage, TunnelError>>,
+    event_tx: mpsc::Sender<Result<ControlMessage, TunnelError>>,
+    active_actors: Arc<AtomicUsize>,
+    actor_exit_notify: Arc<Notify>,
     dedup: CommandDeduplicator,
 }
 
 impl SignalingReceiver {
     /// Creates an event sink to attach additional physical channels into this receiver.
-    pub fn event_sink(&self) -> Option<mpsc::Sender<Result<ControlMessage, TunnelError>>> {
-        self.event_tx.upgrade()
+    ///
+    /// Keeping `event_tx` owned by `SignalingReceiver` allows new promoted or reattached
+    /// signaling actors to attach even across temporary gaps where zero actors are active.
+    pub fn event_sink(&self) -> Option<SignalingSink> {
+        Some(SignalingSink {
+            tx: self.event_tx.clone(),
+            active_actors: Some(Arc::clone(&self.active_actors)),
+            actor_exit_notify: Some(Arc::clone(&self.actor_exit_notify)),
+        })
     }
 
     /// Sets the deduplication history window capacity.
@@ -271,13 +341,42 @@ impl SignalingReceiver {
         self
     }
 
+    async fn recv_raw(&mut self) -> Option<Result<ControlMessage, TunnelError>> {
+        loop {
+            if let Ok(res) = self.rx.try_recv() {
+                return Some(res);
+            }
+
+            if self.active_actors.load(Ordering::SeqCst) == 0 {
+                return None;
+            }
+
+            let notified = self.actor_exit_notify.notified();
+            tokio::pin!(notified);
+
+            if self.active_actors.load(Ordering::SeqCst) == 0 {
+                return self.rx.try_recv().ok();
+            }
+
+            tokio::select! {
+                biased;
+                maybe_res = self.rx.recv() => {
+                    return maybe_res;
+                }
+                _ = &mut notified => {
+                    continue;
+                }
+            }
+        }
+    }
+
     /// Awaits the next application-level control message, automatically discarding duplicate commands.
     ///
     /// Heartbeat frames (`Ping` and `Pong`) are answered and accounted for
     /// automatically by the signaling actor and are never delivered here.
     pub async fn recv(&mut self) -> Option<Result<ControlMessage, TunnelError>> {
         loop {
-            let res = self.rx.recv().await?;
+            let res = self.recv_raw().await?;
             match res {
                 Ok(ControlMessage::NewConnection { ref session_id, .. }) => {
                     if !self.dedup.check_and_record(session_id) {
@@ -293,7 +392,7 @@ impl SignalingReceiver {
 
     /// Yields raw incoming events without applying deduplication filtering.
     pub async fn recv_unfiltered(&mut self) -> Option<Result<ControlMessage, TunnelError>> {
-        self.rx.recv().await
+        self.recv_raw().await
     }
 
     /// Convenience helper yielding `Ok(Some(msg))`, `Ok(None)` on EOF/clean close, or `Err(e)`.
@@ -302,6 +401,22 @@ impl SignalingReceiver {
             Some(Ok(msg)) => Ok(Some(msg)),
             Some(Err(e)) => Err(e),
             None => Ok(None),
+        }
+    }
+}
+
+struct ActorDropGuard {
+    active_actors: Option<Arc<AtomicUsize>>,
+    actor_exit_notify: Option<Arc<Notify>>,
+}
+
+impl Drop for ActorDropGuard {
+    fn drop(&mut self) {
+        if let Some(ref count) = self.active_actors {
+            count.fetch_sub(1, Ordering::SeqCst);
+        }
+        if let Some(ref notify) = self.actor_exit_notify {
+            notify.notify_waiters();
         }
     }
 }
@@ -319,27 +434,76 @@ impl SignalingChannel {
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
+        Self::spawn_framed(FramedControlStream::new(stream), config, cancel_token)
+    }
+
+    /// Spawns the signaling actor over an already-framed control stream.
+    pub fn spawn_framed<S>(
+        ctrl_stream: FramedControlStream<S>,
+        config: SignalingConfig,
+        cancel_token: CancellationToken,
+    ) -> (SignalingHandle, SignalingReceiver)
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
         let (event_tx, event_rx) = mpsc::channel::<Result<ControlMessage, TunnelError>>(32);
-        let weak_tx = event_tx.downgrade();
-        let handle = Self::spawn_with_event_sink(stream, config, event_tx, cancel_token);
+        let active_actors = Arc::new(AtomicUsize::new(0));
+        let actor_exit_notify = Arc::new(Notify::new());
+        let sink = SignalingSink {
+            tx: event_tx.clone(),
+            active_actors: Some(Arc::clone(&active_actors)),
+            actor_exit_notify: Some(Arc::clone(&actor_exit_notify)),
+        };
+        let handle = Self::spawn_framed_with_event_sink(ctrl_stream, config, sink, cancel_token);
         let receiver = SignalingReceiver {
             rx: event_rx,
-            event_tx: weak_tx,
+            event_tx,
+            active_actors,
+            actor_exit_notify,
             dedup: CommandDeduplicator::default(),
         };
         (handle, receiver)
     }
 
     /// Spawns a signaling actor attached to an existing shared event sink.
-    pub fn spawn_with_event_sink<S>(
+    pub fn spawn_with_event_sink<S, K>(
         stream: S,
         config: SignalingConfig,
-        event_tx: mpsc::Sender<Result<ControlMessage, TunnelError>>,
+        event_sink: K,
         cancel_token: CancellationToken,
     ) -> SignalingHandle
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+        K: Into<SignalingSink>,
     {
+        Self::spawn_framed_with_event_sink(
+            FramedControlStream::new(stream),
+            config,
+            event_sink,
+            cancel_token,
+        )
+    }
+
+    /// Spawns a signaling actor from an already-framed control stream attached to an existing event sink.
+    pub fn spawn_framed_with_event_sink<S, K>(
+        ctrl_stream: FramedControlStream<S>,
+        config: SignalingConfig,
+        event_sink: K,
+        cancel_token: CancellationToken,
+    ) -> SignalingHandle
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+        K: Into<SignalingSink>,
+    {
+        let sink = event_sink.into();
+        if let Some(ref count) = sink.active_actors {
+            count.fetch_add(1, Ordering::SeqCst);
+        }
+        let guard = ActorDropGuard {
+            active_actors: sink.active_actors,
+            actor_exit_notify: sink.actor_exit_notify,
+        };
+
         let frame_timeout = reverse_frame_timeout(config.idle_timeout);
         let (cmd_tx, cmd_rx) = mpsc::channel::<OutboundCommand>(32);
 
@@ -349,11 +513,12 @@ impl SignalingChannel {
         };
 
         tokio::spawn(Self::run_actor(
-            stream,
+            ctrl_stream,
             config,
             frame_timeout,
             cmd_rx,
-            event_tx,
+            sink.tx,
+            guard,
             cancel_token,
         ));
 
@@ -361,16 +526,17 @@ impl SignalingChannel {
     }
 
     async fn run_actor<S>(
-        stream: S,
+        mut ctrl_stream: FramedControlStream<S>,
         config: SignalingConfig,
         frame_timeout: Duration,
         mut cmd_rx: mpsc::Receiver<OutboundCommand>,
         event_tx: mpsc::Sender<Result<ControlMessage, TunnelError>>,
+        guard: ActorDropGuard,
         cancel_token: CancellationToken,
     ) where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
-        let mut ctrl_stream = FramedControlStream::new(stream);
+        let _guard = guard;
         let mut heartbeat = interval(config.heartbeat_interval);
         let mut last_activity_ms = activity_now_ms();
         let idle_deadline = sleep(config.idle_timeout);
@@ -472,7 +638,15 @@ impl SignalingChannel {
                             }
                         }
                         Some(Err(e)) => {
-                            let _ = event_tx.send(Err(e)).await;
+                            let is_last_actor = _guard
+                                .active_actors
+                                .as_ref()
+                                .is_none_or(|c| c.load(Ordering::SeqCst) <= 1);
+                            if is_last_actor {
+                                let _ = event_tx.send(Err(e)).await;
+                            } else {
+                                warn!(error = %e, "Signaling transport failed while sibling channel remains active");
+                            }
                             break;
                         }
                         None => {
@@ -724,6 +898,67 @@ mod tests {
         // No more messages in queue
         let third = timeout(Duration::from_millis(100), unified_rx.recv_msg()).await;
         assert!(third.is_err(), "Duplicate command must have been discarded");
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_signaling_receiver_survives_zero_actor_gap_and_primary_error() {
+        let cancel = CancellationToken::new();
+        let (ch1_tx, ch1_rx) = duplex(4096);
+        let (ch2_tx, ch2_rx) = duplex(4096);
+
+        let cfg = SignalingConfig {
+            heartbeat_interval: Duration::from_secs(15),
+            idle_timeout: Duration::from_secs(30),
+        };
+
+        let (h1, mut unified_rx) = SignalingChannel::spawn(ch1_rx, cfg, cancel.child_token());
+        let router = SignalingRouter::new(h1);
+        assert!(router.has_active_channel());
+
+        // Drop ch1_tx so primary exits with clean EOF -> zero active actors
+        drop(ch1_tx);
+        assert_eq!(
+            timeout(Duration::from_millis(500), unified_rx.recv_msg())
+                .await
+                .unwrap()
+                .unwrap(),
+            None
+        );
+
+        // Even after dropping to zero actors, event_sink remains usable for recovery
+        let sink = unified_rx
+            .event_sink()
+            .expect("event sink must remain valid across zero-actor gap");
+        let h2 = SignalingChannel::spawn_with_event_sink(ch2_rx, cfg, sink, cancel.child_token());
+        router.attach(h2);
+        assert!(router.has_active_channel());
+
+        // Attach a third channel carrying corrupted bytes; its decode error must not poison h2
+        let (mut bad_tx, bad_rx) = duplex(4096);
+        let bad_sink = unified_rx.event_sink().expect("sink");
+        let _h3 =
+            SignalingChannel::spawn_with_event_sink(bad_rx, cfg, bad_sink, cancel.child_token());
+
+        tokio::io::AsyncWriteExt::write_all(&mut bad_tx, &[0, 0, 0, 2, 0xFF, 0xFF])
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::flush(&mut bad_tx).await.unwrap();
+
+        let mut peer2 = FramedControlStream::new(ch2_tx);
+        let ok_msg = ControlMessage::NewConnection {
+            session_id: "post_recovery_1".into(),
+            client_addr: "127.0.0.1:4444".into(),
+        };
+        peer2.send(ok_msg.clone()).await.unwrap();
+
+        let delivered = timeout(Duration::from_millis(500), unified_rx.recv_msg())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered, ok_msg);
 
         cancel.cancel();
     }
