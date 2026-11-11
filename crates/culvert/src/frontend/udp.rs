@@ -330,11 +330,9 @@ mod tests {
         let mut slot = ReusableFutureRef::default();
         fe.accept(&mut slot);
         let acc1 = (&mut slot).await.unwrap();
-        slot.reset();
 
         fe.accept(&mut slot);
         let acc2 = (&mut slot).await.unwrap();
-        slot.reset();
 
         assert_ne!(acc1.peer, acc2.peer);
 

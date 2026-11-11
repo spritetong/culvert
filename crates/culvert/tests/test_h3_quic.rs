@@ -997,8 +997,7 @@ async fn test_h3_connector_recovers_after_server_restart() {
             tokio::select! {
                 biased;
                 _ = s1_cancel.cancelled() => break,
-                res = &mut accept_slot, if !accept_slot.is_empty() => {
-                    accept_slot.reset();
+                res = &mut accept_slot => {
                     let (mut stream, _) = match res {
                         Ok(pair) => pair,
                         Err(_) => break,
@@ -1084,8 +1083,7 @@ async fn test_h3_connector_recovers_after_server_restart() {
             tokio::select! {
                 biased;
                 _ = s2_cancel.cancelled() => break,
-                res = &mut accept_slot, if !accept_slot.is_empty() => {
-                    accept_slot.reset();
+                res = &mut accept_slot => {
                     let (mut stream, _) = match res {
                         Ok(pair) => pair,
                         Err(_) => break,

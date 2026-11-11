@@ -173,8 +173,7 @@ impl ServerRunner {
                         biased;
                         _ = token.cancelled() => break,
                         Some(_) = conn_tracker.join_next(), if !conn_tracker.is_empty() => {}
-                        accept_res = &mut accept_slot, if !accept_slot.is_empty() => {
-                            accept_slot.reset();
+                        accept_res = &mut accept_slot => {
                             match accept_res {
                                 Ok((stream, metadata)) => {
                                     let session_mgr = Arc::clone(&session_mgr);
@@ -901,8 +900,7 @@ impl ServerRunner {
                         }
                     }
                 }
-                accept_res = &mut accept_slot, if !accept_slot.is_empty() => {
-                    accept_slot.reset();
+                accept_res = &mut accept_slot => {
                     match accept_res {
                         Ok(accepted) => {
                             let visitor_stream = accepted.channel;

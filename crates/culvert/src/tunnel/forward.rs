@@ -95,8 +95,7 @@ pub async fn run_forward_mapping(
                 break;
             }
             Some(_) = conn_tracker.join_next(), if !conn_tracker.is_empty() => {}
-            accept_res = &mut accept_slot, if !accept_slot.is_empty() => {
-                accept_slot.reset();
+            accept_res = &mut accept_slot => {
                 match accept_res {
                     Ok(accepted) => {
                         let peer_addr = accepted.peer;
