@@ -299,18 +299,8 @@ impl SignalingRouter {
 #[derive(Clone)]
 pub struct SignalingSink {
     tx: mpsc::Sender<Result<ControlMessage, TunnelError>>,
-    active_actors: Option<Arc<AtomicUsize>>,
-    actor_exit_notify: Option<Arc<Notify>>,
-}
-
-impl From<mpsc::Sender<Result<ControlMessage, TunnelError>>> for SignalingSink {
-    fn from(tx: mpsc::Sender<Result<ControlMessage, TunnelError>>) -> Self {
-        Self {
-            tx,
-            active_actors: None,
-            actor_exit_notify: None,
-        }
-    }
+    active_actors: Arc<AtomicUsize>,
+    actor_exit_notify: Arc<Notify>,
 }
 
 /// Receiver yielding incoming application-level control messages with automatic deduplication.
@@ -330,8 +320,8 @@ impl SignalingReceiver {
     pub fn event_sink(&self) -> Option<SignalingSink> {
         Some(SignalingSink {
             tx: self.event_tx.clone(),
-            active_actors: Some(Arc::clone(&self.active_actors)),
-            actor_exit_notify: Some(Arc::clone(&self.actor_exit_notify)),
+            active_actors: Arc::clone(&self.active_actors),
+            actor_exit_notify: Arc::clone(&self.actor_exit_notify),
         })
     }
 
@@ -406,18 +396,14 @@ impl SignalingReceiver {
 }
 
 struct ActorDropGuard {
-    active_actors: Option<Arc<AtomicUsize>>,
-    actor_exit_notify: Option<Arc<Notify>>,
+    active_actors: Arc<AtomicUsize>,
+    actor_exit_notify: Arc<Notify>,
 }
 
 impl Drop for ActorDropGuard {
     fn drop(&mut self) {
-        if let Some(ref count) = self.active_actors {
-            count.fetch_sub(1, Ordering::SeqCst);
-        }
-        if let Some(ref notify) = self.actor_exit_notify {
-            notify.notify_waiters();
-        }
+        self.active_actors.fetch_sub(1, Ordering::SeqCst);
+        self.actor_exit_notify.notify_waiters();
     }
 }
 
@@ -451,8 +437,8 @@ impl SignalingChannel {
         let actor_exit_notify = Arc::new(Notify::new());
         let sink = SignalingSink {
             tx: event_tx.clone(),
-            active_actors: Some(Arc::clone(&active_actors)),
-            actor_exit_notify: Some(Arc::clone(&actor_exit_notify)),
+            active_actors: Arc::clone(&active_actors),
+            actor_exit_notify: Arc::clone(&actor_exit_notify),
         };
         let handle = Self::spawn_framed_with_event_sink(ctrl_stream, config, sink, cancel_token);
         let receiver = SignalingReceiver {
@@ -466,15 +452,14 @@ impl SignalingChannel {
     }
 
     /// Spawns a signaling actor attached to an existing shared event sink.
-    pub fn spawn_with_event_sink<S, K>(
+    pub fn spawn_with_event_sink<S>(
         stream: S,
         config: SignalingConfig,
-        event_sink: K,
+        event_sink: SignalingSink,
         cancel_token: CancellationToken,
     ) -> SignalingHandle
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
-        K: Into<SignalingSink>,
     {
         Self::spawn_framed_with_event_sink(
             FramedControlStream::new(stream),
@@ -485,23 +470,19 @@ impl SignalingChannel {
     }
 
     /// Spawns a signaling actor from an already-framed control stream attached to an existing event sink.
-    pub fn spawn_framed_with_event_sink<S, K>(
+    pub fn spawn_framed_with_event_sink<S>(
         ctrl_stream: FramedControlStream<S>,
         config: SignalingConfig,
-        event_sink: K,
+        event_sink: SignalingSink,
         cancel_token: CancellationToken,
     ) -> SignalingHandle
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
-        K: Into<SignalingSink>,
     {
-        let sink = event_sink.into();
-        if let Some(ref count) = sink.active_actors {
-            count.fetch_add(1, Ordering::SeqCst);
-        }
+        event_sink.active_actors.fetch_add(1, Ordering::SeqCst);
         let guard = ActorDropGuard {
-            active_actors: sink.active_actors,
-            actor_exit_notify: sink.actor_exit_notify,
+            active_actors: event_sink.active_actors,
+            actor_exit_notify: event_sink.actor_exit_notify,
         };
 
         let frame_timeout = reverse_frame_timeout(config.idle_timeout);
@@ -517,7 +498,7 @@ impl SignalingChannel {
             config,
             frame_timeout,
             cmd_rx,
-            sink.tx,
+            event_sink.tx,
             guard,
             cancel_token,
         ));
@@ -638,10 +619,7 @@ impl SignalingChannel {
                             }
                         }
                         Some(Err(e)) => {
-                            let is_last_actor = _guard
-                                .active_actors
-                                .as_ref()
-                                .is_none_or(|c| c.load(Ordering::SeqCst) <= 1);
+                            let is_last_actor = _guard.active_actors.load(Ordering::SeqCst) <= 1;
                             if is_last_actor {
                                 let _ = event_tx.send(Err(e)).await;
                             } else {

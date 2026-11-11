@@ -505,6 +505,68 @@ impl ServerRunner {
         }
     }
 
+    /// Pops and promotes a live idle stream into a signaling channel (`0xA6`),
+    /// resolving any concurrent `RegisterReverse` reattachment that arrived while
+    /// probing the promoted stream. Returns `true` if signaling recovered.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_promote_idle_signaling(
+        listen_addr: &str,
+        protocol: L4Protocol,
+        idle_timeout: Duration,
+        sig_config: SignalingConfig,
+        cancel_token: &CancellationToken,
+        session_mgr: &SessionManager,
+        idle_pool: &mut Arc<ReverseInboundPool>,
+        router: &SignalingRouter,
+        sig_rx: &SignalingReceiver,
+        grace_handle: &mut Option<ReverseGraceHandle>,
+        grace_deadline: &mut Option<Pin<Box<Sleep>>>,
+        pool_notify: &mut Option<Pin<Box<OwnedNotified>>>,
+        context_msg: &'static str,
+    ) -> bool {
+        // Arm the pool notifier BEFORE calling `promote_idle` so an inbound idle
+        // stream pushed concurrently is never missed between the check and select!
+        let next_notify = Box::pin(idle_pool.notified_owned());
+        if let Some(promoted_stream) = idle_pool.promote_idle(idle_timeout).await
+            && let Some(sink) = sig_rx.event_sink()
+        {
+            info!(addr = %listen_addr, "{}", context_msg);
+            let new_handle = SignalingChannel::spawn_with_event_sink(
+                promoted_stream,
+                sig_config,
+                sink,
+                cancel_token.child_token(),
+            );
+            router.attach(new_handle);
+            if let Some(reattach) = grace_handle.as_mut().and_then(|g| g.close_and_try_recv()) {
+                Self::attach_reconnected_control(
+                    reattach,
+                    listen_addr,
+                    protocol,
+                    sig_config,
+                    cancel_token,
+                    session_mgr,
+                    idle_pool,
+                    router,
+                    sig_rx,
+                    grace_handle,
+                    grace_deadline,
+                    pool_notify,
+                )
+                .await;
+                return true;
+            }
+            if let Some(g) = grace_handle.take() {
+                g.finish();
+            }
+            *grace_deadline = None;
+            *pool_notify = None;
+            return true;
+        }
+        *pool_notify = Some(next_notify);
+        false
+    }
+
     /// Attempts immediate standby promotion or `0xA6` idle-stream promotion;
     /// if unavailable, retains the listener in the bounded grace period.
     #[allow(clippy::too_many_arguments)]
@@ -516,7 +578,7 @@ impl ServerRunner {
         sig_config: SignalingConfig,
         cancel_token: &CancellationToken,
         session_mgr: &SessionManager,
-        idle_pool: &ReverseInboundPool,
+        idle_pool: &mut Arc<ReverseInboundPool>,
         router: &SignalingRouter,
         sig_rx: &SignalingReceiver,
         grace_handle: &mut Option<ReverseGraceHandle>,
@@ -528,40 +590,43 @@ impl ServerRunner {
             return;
         }
 
-        // Arm the pool notifier BEFORE calling `promote_idle` so an inbound idle
-        // stream pushed concurrently is never missed between the check and select!
-        let next_notify = Box::pin(idle_pool.notified_owned());
+        // Register the grace-period handoff slot synchronously BEFORE awaiting
+        // `promote_idle`, so an aggressive reconnect during the async probe cannot
+        // miss the slot and hit transient EADDRINUSE.
+        if grace_handle.is_none() {
+            *grace_handle = Some(session_mgr.register_grace_listener(protocol, listen_addr));
+        }
+
         debug!(addr = %listen_addr, "Reverse control channel disconnected; checking for emergency promotion");
-        if let Some(promoted_stream) = idle_pool.promote_idle(idle_timeout).await
-            && let Some(sink) = sig_rx.event_sink()
+        if Self::try_promote_idle_signaling(
+            listen_addr,
+            protocol,
+            idle_timeout,
+            sig_config,
+            cancel_token,
+            session_mgr,
+            idle_pool,
+            router,
+            sig_rx,
+            grace_handle,
+            grace_deadline,
+            pool_notify,
+            "Promoted idle pool stream to replacement signaling channel (0-RTT)",
+        )
+        .await
         {
-            info!(addr = %listen_addr, "Promoted idle pool stream to replacement signaling channel (0-RTT)");
-            let new_handle = SignalingChannel::spawn_with_event_sink(
-                promoted_stream,
-                sig_config,
-                sink,
-                cancel_token.child_token(),
-            );
-            router.attach(new_handle);
-            if let Some(g) = grace_handle.take() {
-                g.finish();
-            }
-            *grace_deadline = None;
-            *pool_notify = None;
             return;
         }
 
-        if grace_handle.is_none() {
+        if grace_deadline.is_none() {
             info!(
                 addr = %listen_addr,
                 protocol = %protocol,
                 grace = ?grace_period,
                 "No idle stream available for promotion; retaining reverse listener for grace period"
             );
-            *grace_handle = Some(session_mgr.register_grace_listener(protocol, listen_addr));
             *grace_deadline = Some(Box::pin(tokio::time::sleep(grace_period)));
         }
-        *pool_notify = Some(next_notify);
     }
 
     /// Reattaches a newly connected `RegisterReverse` control stream into an existing
@@ -769,26 +834,22 @@ impl ServerRunner {
                         notify.as_mut().await;
                     }
                 }, if grace_handle.is_some() && pool_notify.is_some() => {
-                    let next_notify = Box::pin(idle_pool.notified_owned());
-                    if let Some(promoted_stream) = idle_pool.promote_idle(idle_timeout).await
-                        && let Some(sink) = sig_rx.event_sink()
-                    {
-                        info!(addr = %listen_addr, "Promoted newly arrived idle stream to signaling channel during grace period (0-RTT)");
-                        let new_handle = SignalingChannel::spawn_with_event_sink(
-                            promoted_stream,
-                            sig_config,
-                            sink,
-                            cancel_token.child_token(),
-                        );
-                        router.attach(new_handle);
-                        if let Some(g) = grace_handle.take() {
-                            g.finish();
-                        }
-                        grace_deadline = None;
-                        pool_notify = None;
-                    } else {
-                        pool_notify = Some(next_notify);
-                    }
+                    let _ = Self::try_promote_idle_signaling(
+                        &listen_addr,
+                        protocol,
+                        idle_timeout,
+                        sig_config,
+                        &cancel_token,
+                        &session_mgr,
+                        &mut idle_pool,
+                        &router,
+                        &sig_rx,
+                        &mut grace_handle,
+                        &mut grace_deadline,
+                        &mut pool_notify,
+                        "Promoted newly arrived idle stream to signaling channel during grace period (0-RTT)",
+                    )
+                    .await;
                 }
                 _ = async {
                     if let Some(deadline) = grace_deadline.as_mut() {
@@ -829,7 +890,7 @@ impl ServerRunner {
                                 sig_config,
                                 &cancel_token,
                                 &session_mgr,
-                                &idle_pool,
+                                &mut idle_pool,
                                 &router,
                                 &sig_rx,
                                 &mut grace_handle,
@@ -951,7 +1012,7 @@ impl ServerRunner {
                                         sig_config,
                                         &cancel_token,
                                         &session_mgr,
-                                        &idle_pool,
+                                        &mut idle_pool,
                                         &router,
                                         &sig_rx,
                                         &mut grace_handle,

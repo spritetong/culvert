@@ -41,7 +41,7 @@ impl FrontendFactory for UdpFrontendFactory {
         spec: MappingSpec,
     ) -> BoxFuture<'static, Result<Box<dyn Frontend>, TunnelError>> {
         Box::pin(async move {
-            let frontend = UdpFrontend::bind(&spec.listen, Some(&spec.target)).await?;
+            let frontend = UdpFrontend::bind(&spec.listen).await?;
             Ok(Box::new(frontend) as Box<dyn Frontend>)
         })
     }
@@ -65,7 +65,7 @@ impl Drop for UdpFrontend {
 
 impl UdpFrontend {
     /// Binds a UDP socket at `listen_addr` and starts the packet demultiplexer task.
-    pub async fn bind(listen_addr: &str, _target_str: Option<&str>) -> Result<Self, TunnelError> {
+    pub async fn bind(listen_addr: &str) -> Result<Self, TunnelError> {
         let listen_target = parse_target_addr(listen_addr)?;
         let socket = match listen_target {
             TargetAddr::Ip(sa) => UdpSocket::bind(sa).await.map_err(TunnelError::Io)?,
@@ -318,9 +318,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_udp_frontend_demux_multi_peer_and_reply() {
-        let mut fe = UdpFrontend::bind(&get_ephemeral_udp_addr(), Some("127.0.0.1:9999"))
-            .await
-            .unwrap();
+        let mut fe = UdpFrontend::bind(&get_ephemeral_udp_addr()).await.unwrap();
         let listen_addr = fe.local_addr().unwrap();
 
         let client_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -381,9 +379,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_udp_frontend_with_serve_pump() {
-        let mut fe = UdpFrontend::bind(&get_ephemeral_udp_addr(), Some("127.0.0.1:9999"))
-            .await
-            .unwrap();
+        let mut fe = UdpFrontend::bind(&get_ephemeral_udp_addr()).await.unwrap();
         let listen_addr = fe.local_addr().unwrap();
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
