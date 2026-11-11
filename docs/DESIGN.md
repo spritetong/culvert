@@ -679,6 +679,30 @@ upon connection failure without changing the visitor loop.
 Result<ControlMessage, TunnelError>>` and `Sink<ControlMessage>` with
 `rmp_serde::to_vec_named` / `from_slice`.
 
+### 6.3 Dual-Channel Emergency Promotion & Command Deduplication
+
+To eliminate port-teardown downtime and WAN reconnection latency upon control channel disruption, culvert incorporates **Bidirectional Emergency Promotion** and **Multi-Channel Coordination**:
+
+1. **Emergency Promotion Protocol (`ACTIVATE_STREAM_PROMOTE`)**:
+   - `0xA5` (`ACTIVATE_STREAM_MAGIC`): standard pool stream activation for data relay.
+   - `0xA6` (`ACTIVATE_STREAM_PROMOTE`): emergency control channel promotion.
+   - When the primary control channel disconnects, either peer holding an idle pool (the Server via `ReverseInboundPool` or the Client via `ReplenishingStreamPool`) can pop a healthy, pre-warmed transport stream and transmit `0xA6`.
+   - The recipient decodes `0xA6` and immediately promotes the stream into a new `SignalingChannel` without terminating the visitor listener. This drops control recovery latency from several RTTs (DNS + TCP SYN + TLS 1.3 handshake) down to 0-RTT.
+
+2. **Frontend Listener Grace Period**:
+   - When the primary control channel drops, the server listener does not immediately unregister its listening port. Instead, it enters an active grace period (`DEFAULT_REVERSE_GRACE_PERIOD`, 10 s).
+   - If an emergency promotion stream attaches within the grace period, visitor connections continue uninterrupted. If no replacement channel arrives before the grace period expires, the listener is cleanly shut down.
+
+3. **Multi-Channel & Anti-Split-Brain Coordination**:
+   - Senders enforce **Active-Standby routing**: only the designated `Primary` channel transmits application control commands (`NewConnection`, `RegisterReverse`). The `Standby` channel autonomously runs keepalive heartbeats (`Ping`/`Pong`) to stay warm and validated.
+   - If the `Primary` channel faults, the signaling router atomically fails over to the `Standby` channel and marks it `Primary`.
+   - Simultaneous promotion by both peers is safely resolved without split-brain: both channels are absorbed into the session router as a primary/standby pair.
+
+4. **Command Deduplication Guarantee (`CommandDeduplicator`)**:
+   - Dual-channel failover or out-of-order delivery must never produce duplicate command execution.
+   - The receiver maintains a bounded sliding-window deduplication filter (`CommandDeduplicator`, capacity 256).
+   - Any `NewConnection` frame containing an already-observed `session_id` is identified as a duplicate and immediately discarded before any local backend dialing or resource allocation takes place.
+
 ---
 
 ## 7. Client Data Path

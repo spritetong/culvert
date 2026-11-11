@@ -6,6 +6,9 @@
 //! All comments and docstrings must be in English.
 
 use futures_util::{SinkExt, StreamExt};
+use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
@@ -14,7 +17,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::common::CancelFutureExt;
-use crate::consts::{DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_IDLE_TIMEOUT, reverse_frame_timeout};
+use crate::consts::{
+    DEFAULT_DEDUPLICATION_WINDOW_CAPACITY, DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_IDLE_TIMEOUT,
+    reverse_frame_timeout,
+};
 use crate::control::stream::{ControlMessage, FramedControlStream};
 use crate::core::error::TunnelError;
 use crate::io::stream::{activity_now_ms, heartbeat_timing};
@@ -76,23 +82,223 @@ impl SignalingHandle {
     }
 }
 
-/// Receiver yielding incoming application-level control messages.
+/// Bounded sliding-window deduplication filter ensuring idempotent command execution across dual channels.
+#[derive(Debug, Clone)]
+pub struct CommandDeduplicator {
+    seen: HashSet<String>,
+    queue: VecDeque<String>,
+    capacity: usize,
+}
+
+impl CommandDeduplicator {
+    /// Creates a deduplicator with the specified capacity limit.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            seen: HashSet::with_capacity(capacity),
+            queue: VecDeque::with_capacity(capacity),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Checks if an identifier has been processed. Returns `true` if new (unique), or `false` if duplicate.
+    pub fn check_and_record(&mut self, id: &str) -> bool {
+        if self.seen.contains(id) {
+            return false;
+        }
+        if self.queue.len() >= self.capacity
+            && let Some(oldest) = self.queue.pop_front()
+        {
+            self.seen.remove(&oldest);
+        }
+        self.seen.insert(id.to_string());
+        self.queue.push_back(id.to_string());
+        true
+    }
+
+    /// Clears the history buffer.
+    pub fn clear(&mut self) {
+        self.seen.clear();
+        self.queue.clear();
+    }
+
+    /// Number of tracked IDs currently in the sliding window.
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Whether the sliding window is empty.
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+}
+
+impl Default for CommandDeduplicator {
+    fn default() -> Self {
+        Self::new(DEFAULT_DEDUPLICATION_WINDOW_CAPACITY)
+    }
+}
+
+/// Multi-channel signaling router providing active-standby failover and single-flight dispatch.
+///
+/// Guarantees that at any given moment, commands are transmitted strictly over ONE channel,
+/// eliminating duplicate message dispatch. If the primary channel drops, it atomically
+/// promotes the standby channel and increments the generation epoch.
+#[derive(Clone)]
+pub struct SignalingRouter {
+    primary: Arc<parking_lot::Mutex<Option<SignalingHandle>>>,
+    standby: Arc<parking_lot::Mutex<Option<SignalingHandle>>>,
+    epoch: Arc<AtomicU64>,
+}
+
+impl SignalingRouter {
+    /// Creates a router with an initial primary channel.
+    pub fn new(primary: SignalingHandle) -> Self {
+        Self {
+            primary: Arc::new(parking_lot::Mutex::new(Some(primary))),
+            standby: Arc::new(parking_lot::Mutex::new(None)),
+            epoch: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// Attaches an additional channel as standby (or as primary if none exists).
+    pub fn attach(&self, handle: SignalingHandle) {
+        let mut prim = self.primary.lock();
+        if prim.is_none() {
+            *prim = Some(handle);
+            self.epoch.fetch_add(1, Ordering::SeqCst);
+        } else {
+            let mut sec = self.standby.lock();
+            *sec = Some(handle);
+        }
+    }
+
+    /// Returns the active epoch generation counter.
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Relaxed)
+    }
+
+    /// Checks if at least one active channel is attached.
+    pub fn has_active_channel(&self) -> bool {
+        self.primary.lock().is_some() || self.standby.lock().is_some()
+    }
+
+    /// Sends a message using the active primary channel, with automatic failover to standby.
+    pub async fn send(&self, msg: ControlMessage) -> Result<(), TunnelError> {
+        let primary = { self.primary.lock().clone() };
+        if let Some(ref handle) = primary {
+            match handle.send(msg.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    warn!("Primary channel send failed: {}; promoting standby", e);
+                    let mut p = self.primary.lock();
+                    *p = None;
+                }
+            }
+        }
+
+        // Failover: promote standby to primary
+        let standby = {
+            let mut sec = self.standby.lock();
+            sec.take()
+        };
+
+        if let Some(new_primary) = standby {
+            self.epoch.fetch_add(1, Ordering::SeqCst);
+            let res = new_primary.send(msg).await;
+            let mut p = self.primary.lock();
+            *p = Some(new_primary);
+            res
+        } else {
+            Err(TunnelError::ControlProtocol(
+                "No signaling channels available".into(),
+            ))
+        }
+    }
+
+    /// Sends a message with an explicit timeout.
+    pub async fn send_timeout(
+        &self,
+        msg: ControlMessage,
+        timeout: Duration,
+    ) -> Result<(), TunnelError> {
+        let primary = { self.primary.lock().clone() };
+        if let Some(ref handle) = primary {
+            match handle.send_timeout(msg.clone(), timeout).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    warn!("Primary channel send failed: {}; promoting standby", e);
+                    let mut p = self.primary.lock();
+                    *p = None;
+                }
+            }
+        }
+
+        let standby = {
+            let mut sec = self.standby.lock();
+            sec.take()
+        };
+
+        if let Some(new_primary) = standby {
+            self.epoch.fetch_add(1, Ordering::SeqCst);
+            let res = new_primary.send_timeout(msg, timeout).await;
+            let mut p = self.primary.lock();
+            *p = Some(new_primary);
+            res
+        } else {
+            Err(TunnelError::ControlProtocol(
+                "No signaling channels available".into(),
+            ))
+        }
+    }
+}
+
+/// Receiver yielding incoming application-level control messages with automatic deduplication.
 pub struct SignalingReceiver {
     rx: mpsc::Receiver<Result<ControlMessage, TunnelError>>,
+    event_tx: mpsc::WeakSender<Result<ControlMessage, TunnelError>>,
+    dedup: CommandDeduplicator,
 }
 
 impl SignalingReceiver {
-    /// Awaits the next application-level control message.
+    /// Creates an event sink to attach additional physical channels into this receiver.
+    pub fn event_sink(&self) -> Option<mpsc::Sender<Result<ControlMessage, TunnelError>>> {
+        self.event_tx.upgrade()
+    }
+
+    /// Sets the deduplication history window capacity.
+    pub fn with_dedup_capacity(mut self, capacity: usize) -> Self {
+        self.dedup = CommandDeduplicator::new(capacity);
+        self
+    }
+
+    /// Awaits the next application-level control message, automatically discarding duplicate commands.
     ///
     /// Heartbeat frames (`Ping` and `Pong`) are answered and accounted for
     /// automatically by the signaling actor and are never delivered here.
     pub async fn recv(&mut self) -> Option<Result<ControlMessage, TunnelError>> {
+        loop {
+            let res = self.rx.recv().await?;
+            match res {
+                Ok(ControlMessage::NewConnection { ref session_id, .. }) => {
+                    if !self.dedup.check_and_record(session_id) {
+                        debug!(session = %session_id, "Filtered duplicate NewConnection across channels");
+                        continue;
+                    }
+                    return Some(res);
+                }
+                other => return Some(other),
+            }
+        }
+    }
+
+    /// Yields raw incoming events without applying deduplication filtering.
+    pub async fn recv_unfiltered(&mut self) -> Option<Result<ControlMessage, TunnelError>> {
         self.rx.recv().await
     }
 
     /// Convenience helper yielding `Ok(Some(msg))`, `Ok(None)` on EOF/clean close, or `Err(e)`.
     pub async fn recv_msg(&mut self) -> Result<Option<ControlMessage>, TunnelError> {
-        match self.rx.recv().await {
+        match self.recv().await {
             Some(Ok(msg)) => Ok(Some(msg)),
             Some(Err(e)) => Err(e),
             None => Ok(None),
@@ -113,15 +319,34 @@ impl SignalingChannel {
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
+        let (event_tx, event_rx) = mpsc::channel::<Result<ControlMessage, TunnelError>>(32);
+        let weak_tx = event_tx.downgrade();
+        let handle = Self::spawn_with_event_sink(stream, config, event_tx, cancel_token);
+        let receiver = SignalingReceiver {
+            rx: event_rx,
+            event_tx: weak_tx,
+            dedup: CommandDeduplicator::default(),
+        };
+        (handle, receiver)
+    }
+
+    /// Spawns a signaling actor attached to an existing shared event sink.
+    pub fn spawn_with_event_sink<S>(
+        stream: S,
+        config: SignalingConfig,
+        event_tx: mpsc::Sender<Result<ControlMessage, TunnelError>>,
+        cancel_token: CancellationToken,
+    ) -> SignalingHandle
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
         let frame_timeout = reverse_frame_timeout(config.idle_timeout);
         let (cmd_tx, cmd_rx) = mpsc::channel::<OutboundCommand>(32);
-        let (event_tx, event_rx) = mpsc::channel::<Result<ControlMessage, TunnelError>>(32);
 
         let handle = SignalingHandle {
             cmd_tx,
             default_frame_timeout: frame_timeout,
         };
-        let receiver = SignalingReceiver { rx: event_rx };
 
         tokio::spawn(Self::run_actor(
             stream,
@@ -132,7 +357,7 @@ impl SignalingChannel {
             cancel_token,
         ));
 
-        (handle, receiver)
+        handle
     }
 
     async fn run_actor<S>(
@@ -320,5 +545,186 @@ mod tests {
         let res = timeout(Duration::from_millis(500), srv_rx.recv_msg()).await;
         assert!(res.is_ok());
         assert_eq!(res.unwrap().unwrap(), None);
+    }
+
+    #[test]
+    fn test_command_deduplicator_sliding_window_and_eviction() {
+        let mut dedup = CommandDeduplicator::new(3);
+        assert_eq!(dedup.len(), 0);
+
+        // Unique entries return true
+        assert!(dedup.check_and_record("cmd_1"));
+        assert!(dedup.check_and_record("cmd_2"));
+        assert!(dedup.check_and_record("cmd_3"));
+        assert_eq!(dedup.len(), 3);
+
+        // Duplicate entries within window return false
+        assert!(!dedup.check_and_record("cmd_1"));
+        assert!(!dedup.check_and_record("cmd_2"));
+        assert!(!dedup.check_and_record("cmd_3"));
+        assert_eq!(dedup.len(), 3);
+
+        // Fourth entry pushes out cmd_1
+        assert!(dedup.check_and_record("cmd_4"));
+        assert_eq!(dedup.len(), 3);
+
+        // cmd_1 is now evicted and can be accepted again
+        assert!(dedup.check_and_record("cmd_1"));
+        // But cmd_4 and cmd_1 are present, cmd_2 was evicted
+        assert!(!dedup.check_and_record("cmd_4"));
+        assert!(!dedup.check_and_record("cmd_1"));
+    }
+
+    #[tokio::test]
+    async fn test_dual_channel_router_single_flight_no_duplicate_dispatch() {
+        let (ch1_tx, ch1_rx) = duplex(4096);
+        let (ch2_tx, ch2_rx) = duplex(4096);
+        let cancel = CancellationToken::new();
+
+        let cfg = SignalingConfig {
+            heartbeat_interval: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(30),
+        };
+
+        let (h1, _rx1) = SignalingChannel::spawn(ch1_tx, cfg, cancel.child_token());
+        let (h2, _rx2) = SignalingChannel::spawn(ch2_tx, cfg, cancel.child_token());
+
+        let router = SignalingRouter::new(h1);
+        router.attach(h2);
+        assert_eq!(router.epoch(), 1);
+
+        let mut peer1 = FramedControlStream::new(ch1_rx);
+        let mut peer2 = FramedControlStream::new(ch2_rx);
+
+        // Send NewConnection via router
+        let msg = ControlMessage::NewConnection {
+            session_id: "uniq_1".into(),
+            client_addr: "10.0.0.1:1234".into(),
+        };
+        router.send(msg.clone()).await.unwrap();
+
+        // Primary (ch1) receives the message
+        let r1 = timeout(Duration::from_millis(500), peer1.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(r1, msg);
+
+        // Standby (ch2) MUST NOT receive any message (strictly single-flight dispatch, no duplicates)
+        let r2 = timeout(Duration::from_millis(100), peer2.next()).await;
+        assert!(
+            r2.is_err(),
+            "Standby channel must not receive duplicate command dispatch"
+        );
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_dual_channel_router_automatic_failover() {
+        let (ch1_tx, ch1_rx) = duplex(4096);
+        let (ch2_tx, ch2_rx) = duplex(4096);
+        let cancel = CancellationToken::new();
+
+        let cfg = SignalingConfig {
+            heartbeat_interval: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(30),
+        };
+
+        let (h1, _rx1) = SignalingChannel::spawn(ch1_tx, cfg, cancel.child_token());
+        let (h2, _rx2) = SignalingChannel::spawn(ch2_tx, cfg, cancel.child_token());
+
+        let router = SignalingRouter::new(h1);
+        router.attach(h2);
+
+        let peer1 = FramedControlStream::new(ch1_rx);
+        let mut peer2 = FramedControlStream::new(ch2_rx);
+
+        // Drop peer1 raw stream to cause primary channel send failure
+        drop(peer1);
+
+        // Send via router - should detect primary failure, failover to standby, and succeed
+        let msg = ControlMessage::NewConnection {
+            session_id: "failover_1".into(),
+            client_addr: "10.0.0.2:2345".into(),
+        };
+        router.send(msg.clone()).await.unwrap();
+        assert_eq!(router.epoch(), 2);
+
+        // Standby (ch2) receives the command
+        let r2 = timeout(Duration::from_millis(500), peer2.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(r2, msg);
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_dual_channel_receiver_deduplication_filters_identical_commands() {
+        let (ch1_tx, ch1_rx) = duplex(4096);
+        let (ch2_tx, ch2_rx) = duplex(4096);
+        let cancel = CancellationToken::new();
+
+        let cfg = SignalingConfig {
+            heartbeat_interval: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(30),
+        };
+
+        // Create receiver on Channel 1
+        let (_h1, mut unified_rx) = SignalingChannel::spawn(ch1_rx, cfg, cancel.child_token());
+
+        // Attach Channel 2 to the same unified receiver event sink
+        let _h2 = SignalingChannel::spawn_with_event_sink(
+            ch2_rx,
+            cfg,
+            unified_rx.event_sink().expect("event sink should be open"),
+            cancel.child_token(),
+        );
+
+        let mut client1 = FramedControlStream::new(ch1_tx);
+        let mut client2 = FramedControlStream::new(ch2_tx);
+
+        // Send duplicate NewConnection frames across Channel 1 and Channel 2
+        let dup_msg = ControlMessage::NewConnection {
+            session_id: "dup_sess_999".into(),
+            client_addr: "192.168.1.1:1111".into(),
+        };
+        let distinct_msg = ControlMessage::NewConnection {
+            session_id: "uniq_sess_1000".into(),
+            client_addr: "192.168.1.2:2222".into(),
+        };
+
+        // Channel 1 transmits dup_msg
+        client1.send(dup_msg.clone()).await.unwrap();
+        // Channel 2 ALSO transmits the exact same dup_msg (simulating retransmission / multi-channel race)
+        client2.send(dup_msg.clone()).await.unwrap();
+        // Channel 2 transmits distinct_msg
+        client2.send(distinct_msg.clone()).await.unwrap();
+
+        // 1st recv MUST be dup_msg
+        let first = timeout(Duration::from_millis(500), unified_rx.recv_msg())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, dup_msg);
+
+        // 2nd recv MUST be distinct_msg (the duplicate dup_msg was completely filtered out!)
+        let second = timeout(Duration::from_millis(500), unified_rx.recv_msg())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(second, distinct_msg);
+
+        // No more messages in queue
+        let third = timeout(Duration::from_millis(100), unified_rx.recv_msg()).await;
+        assert!(third.is_err(), "Duplicate command must have been discarded");
+
+        cancel.cancel();
     }
 }

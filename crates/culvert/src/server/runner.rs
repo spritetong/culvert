@@ -19,7 +19,7 @@ use crate::consts::{
     ACTIVATE_STREAM_MAGIC, DEFAULT_ACTIVATION_READ_TIMEOUT, DEFAULT_SESSION_PAIR_TIMEOUT,
     MAX_ACTIVATION_TARGET_LEN, POOL_DUMMY_HOST, reverse_frame_timeout, reverse_pool_soft_cap,
 };
-use crate::control::{ControlMessage, SignalingChannel, SignalingConfig};
+use crate::control::{ControlMessage, SignalingChannel, SignalingConfig, SignalingRouter};
 use crate::core::error::TunnelError;
 use crate::core::serve::serve;
 use crate::frontend::{self, FrontendOutput};
@@ -438,6 +438,7 @@ impl ServerRunner {
         };
         let (signaling, mut sig_rx) =
             SignalingChannel::spawn(stream, sig_config, cancel_token.child_token());
+        let router = SignalingRouter::new(signaling);
 
         // Await RegisterReverse bounded by idle_timeout
         let (listen_addr, target_addr, pool_size) = match timeout(idle_timeout, sig_rx.recv())
@@ -473,7 +474,7 @@ impl ServerRunner {
             Ok(l) => l,
             Err(e) => {
                 warn!(addr = %listen_addr, "Failed to bind reverse listener: {}", e);
-                let _ = signaling
+                let _ = router
                     .send(ControlMessage::RegisterAck {
                         listen_addr: listen_addr.clone(),
                         success: false,
@@ -491,7 +492,7 @@ impl ServerRunner {
         // so both ends size the same pool.
         let idle_pool = session_mgr.register_pool(&listen_addr, reverse_pool_soft_cap(pool_size));
 
-        let ack_sent = signaling
+        let ack_sent = router
             .send(ControlMessage::RegisterAck {
                 listen_addr: listen_addr.clone(),
                 success: true,
@@ -524,7 +525,21 @@ impl ServerRunner {
                         Some(Ok(ControlMessage::Ping)) | Some(Ok(ControlMessage::Pong)) => {}
                         Some(Ok(_)) => {}
                         _ => {
-                            debug!(addr = %listen_addr, "Reverse control channel disconnected by client");
+                            debug!(addr = %listen_addr, "Reverse control channel disconnected; checking for emergency promotion");
+                            if let Some(promoted_stream) = idle_pool.promote_idle(idle_timeout).await
+                                && let Some(sink) = sig_rx.event_sink()
+                            {
+                                info!(addr = %listen_addr, "Promoted idle pool stream to replacement signaling channel (0-RTT)");
+                                let new_handle = SignalingChannel::spawn_with_event_sink(
+                                    promoted_stream,
+                                    sig_config,
+                                    sink,
+                                    cancel_token.child_token(),
+                                );
+                                router.attach(new_handle);
+                                continue;
+                            }
+                            debug!(addr = %listen_addr, "No idle stream available for promotion; closing listener");
                             break;
                         }
                     }
@@ -608,7 +623,7 @@ impl ServerRunner {
                             // visitors. Transport errors close the listener, but
                             // an individual timeout drops the session and continues
                             // without taking down the entire listening port.
-                            let notify_res = signaling.send(notify_msg).await;
+                            let notify_res = router.send(notify_msg).await;
                             match notify_res {
                                 Ok(()) => {}
                                 Err(TunnelError::ControlProtocol(ref e)) if e.contains("timed out") => {

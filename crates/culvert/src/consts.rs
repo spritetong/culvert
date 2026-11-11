@@ -59,6 +59,9 @@ pub const MAX_ACTIVATION_TARGET_LEN: usize = 512;
 /// Maximum supported token length in bytes for constant-time comparison.
 pub const TOKEN_MAX_LEN: usize = 256;
 
+/// Default capacity for the command deduplication sliding window across dual channels.
+pub const DEFAULT_DEDUPLICATION_WINDOW_CAPACITY: usize = 256;
+
 // =============================================================================
 // 2. Timeouts, Deadlines & Grace Periods
 // =============================================================================
@@ -111,6 +114,11 @@ pub const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(15);
 /// 5 seconds avoids false-positive dead-connection classification caused by temporary
 /// packet loss or TCP/QUIC retransmission delay under weak network conditions.
 pub const POOL_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Grace period retention window for reverse listener sockets when the control channel drops.
+///
+/// 10 seconds retains the bound port while an emergency promoted stream attaches to resume signaling.
+pub const DEFAULT_REVERSE_GRACE_PERIOD: Duration = Duration::from_secs(10);
 
 // =============================================================================
 // 3. Heartbeats, Intervals & Backoff Parameters
@@ -374,6 +382,9 @@ pub const TUNNEL_POOL_IDLE: &str = "idle";
 
 /// Activation magic byte sent over pre-warmed pool streams to trigger target dialing.
 pub const ACTIVATE_STREAM_MAGIC: u8 = 0xA5;
+
+/// Activation magic byte sent over pre-warmed pool streams to promote the stream into a signaling channel.
+pub const ACTIVATE_STREAM_PROMOTE: u8 = 0xA6;
 
 // =============================================================================
 // 9. Process, CLI & Diagnostics Defaults

@@ -19,7 +19,7 @@ use crate::consts::{
     POOL_BACKOFF_ACTIVE_WAITERS_MAX, POOL_BACKOFF_BASE, POOL_MAX_CONCURRENT_CONNECTS,
     REVERSE_BACKOFF_RESET_THRESHOLD, REVERSE_CONTROL_TARGET_HOST, clamp_reverse_pool_size,
 };
-use crate::control::{ControlMessage, SignalingChannel, SignalingConfig};
+use crate::control::{ControlMessage, SignalingChannel, SignalingConfig, SignalingRouter};
 use crate::core::error::TunnelError;
 use crate::core::serve::serve;
 use crate::dialer::endpoint::EndpointContext;
@@ -107,6 +107,7 @@ pub async fn run_reverse_mapping(
         };
         let (signaling, mut sig_rx) =
             SignalingChannel::spawn(raw_stream, sig_config, cancel_token.child_token());
+        let router = SignalingRouter::new(signaling);
 
         // Send RegisterReverse request to remote server
         let reg_msg = ControlMessage::RegisterReverse {
@@ -115,7 +116,7 @@ pub async fn run_reverse_mapping(
             pool_size: pool_workers,
         };
 
-        let send_result = signaling.send(reg_msg).await;
+        let send_result = router.send(reg_msg).await;
         if let Err(e) = send_result {
             warn!(tag = %tag, "Failed to send RegisterReverse: {}. Retrying in {:?}...", e, backoff);
             if !cancel_token.sleep_or_cancel(backoff).await {
@@ -190,11 +191,17 @@ pub async fn run_reverse_mapping(
             let dial_semaphore =
                 Arc::new(tokio::sync::Semaphore::new(POOL_MAX_CONCURRENT_CONNECTS));
 
+            let event_sink = sig_rx.event_sink();
+            let router_clone = router.clone();
+
             for worker_idx in 0..size {
                 let connector = Arc::clone(&data_connector);
                 let listen_target = listen_target.clone();
                 let target_clone = target_addr.clone();
                 let dial_semaphore = Arc::clone(&dial_semaphore);
+                let router_worker = router_clone.clone();
+                let event_sink_worker = event_sink.clone();
+                let sig_cfg = sig_config;
                 let hb = hb_interval;
                 let idle = idle_timeout;
 
@@ -248,7 +255,7 @@ pub async fn run_reverse_mapping(
                         // then sees EOF (or cancellation) and re-dials.
                         // The inner scope releases the stream borrow before the
                         // stream is moved into the relay task.
-                        let activated = {
+                        let activation_kind = {
                             let activation = async {
                                 let mut magic = [0u8; 1];
                                 let res = stream.read_exact(&mut magic).await;
@@ -259,9 +266,12 @@ pub async fn run_reverse_mapping(
                             loop {
                                 tokio::select! {
                                     biased;
-                                    _ = token.cancelled() => break false,
+                                    _ = token.cancelled() => break 0u8,
                                     (res, magic) = &mut activation => {
-                                        break res.is_ok() && magic[0] == ACTIVATE_STREAM_MAGIC;
+                                        if res.is_ok() {
+                                            break magic[0];
+                                        }
+                                        break 0u8;
                                     }
                                     Some(_) = relays.join_next(), if !relays.is_empty() => {}
                                 }
@@ -271,7 +281,20 @@ pub async fn run_reverse_mapping(
                         if token.is_cancelled() {
                             break;
                         }
-                        if !activated {
+
+                        if activation_kind == crate::consts::ACTIVATE_STREAM_PROMOTE {
+                            if let Some(ref sink) = event_sink_worker {
+                                info!("Pre-warmed reverse stream promoted to signaling channel by remote server (0-RTT)");
+                                let new_handle = SignalingChannel::spawn_with_event_sink(
+                                    stream,
+                                    sig_cfg,
+                                    sink.clone(),
+                                    token.child_token(),
+                                );
+                                router_worker.attach(new_handle);
+                                continue;
+                            }
+                        } else if activation_kind != ACTIVATE_STREAM_MAGIC {
                             if !token.sleep_or_cancel(Duration::from_millis(100)).await {
                                 break;
                             }

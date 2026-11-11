@@ -8,5 +8,8 @@
 pub mod channel;
 pub mod stream;
 
-pub use channel::{SignalingChannel, SignalingConfig, SignalingHandle, SignalingReceiver};
+pub use channel::{
+    CommandDeduplicator, SignalingChannel, SignalingConfig, SignalingHandle, SignalingReceiver,
+    SignalingRouter,
+};
 pub use stream::{ControlMessage, ControlStream, FramedControlStream};

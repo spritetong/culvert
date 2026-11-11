@@ -668,6 +668,11 @@ impl ReplenishingStreamPool {
         pkt
     }
 
+    /// Encodes a stream promotion packet containing `ACTIVATE_STREAM_PROMOTE` (`0xA6`).
+    pub fn encode_promotion() -> [u8; 1] {
+        [crate::consts::ACTIVATE_STREAM_PROMOTE]
+    }
+
     /// Acquires a pre-warmed connection in 0-RTT, or falls back to dialing on demand.
     pub async fn acquire(
         &self,
@@ -1496,5 +1501,11 @@ mod tests {
             matches!(idle[0].state, HeartbeatState::SendingPing(_)),
             "the retained stream must be the one with the in-flight probe"
         );
+    }
+
+    #[test]
+    fn test_encode_promotion_format() {
+        let pkt = ReplenishingStreamPool::encode_promotion();
+        assert_eq!(pkt, [crate::consts::ACTIVATE_STREAM_PROMOTE]);
     }
 }

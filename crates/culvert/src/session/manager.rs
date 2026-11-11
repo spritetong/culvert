@@ -107,6 +107,24 @@ impl ReverseInboundPool {
         }
     }
 
+    /// Pops an idle stream and writes the emergency promotion magic byte (`ACTIVATE_STREAM_PROMOTE = 0xA6`).
+    ///
+    /// If successful, returns the promoted stream ready to serve as a replacement signaling channel.
+    pub async fn promote_idle(&self, max_age: Duration) -> Option<Box<dyn TunnelStream>> {
+        use tokio::io::AsyncWriteExt;
+        let mut stream = self.pop_live(max_age).await?;
+        if stream
+            .write_all(&[crate::consts::ACTIVATE_STREAM_PROMOTE])
+            .await
+            .is_ok()
+            && stream.flush().await.is_ok()
+        {
+            Some(stream)
+        } else {
+            None
+        }
+    }
+
     /// Closes every idle stream of a superseded control-channel generation.
     pub fn drain(&self) {
         self.idle.lock().clear();
@@ -404,6 +422,25 @@ mod tests {
         let target = TargetAddr::Domain("127.0.0.1".into(), 8080);
         assert!(manager.push_idle_stream(Some(&target), Box::new(client)));
         assert_eq!(new_pool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_promote_idle_writes_magic_byte() {
+        let pool = ReverseInboundPool::new(4);
+        let (client, mut server) = duplex(64);
+        assert!(pool.push(Box::new(client)));
+        assert_eq!(pool.len(), 1);
+
+        let promoted = pool.promote_idle(Duration::from_secs(5)).await;
+        assert!(promoted.is_some());
+        assert_eq!(pool.len(), 0);
+
+        // Server end must read ACTIVATE_STREAM_PROMOTE (0xA6)
+        let mut magic = [0u8; 1];
+        tokio::io::AsyncReadExt::read_exact(&mut server, &mut magic)
+            .await
+            .unwrap();
+        assert_eq!(magic[0], crate::consts::ACTIVATE_STREAM_PROMOTE);
     }
 
     #[test]
