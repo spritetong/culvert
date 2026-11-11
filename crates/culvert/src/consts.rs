@@ -59,8 +59,17 @@ pub const MAX_ACTIVATION_TARGET_LEN: usize = 512;
 /// Maximum supported token length in bytes for constant-time comparison.
 pub const TOKEN_MAX_LEN: usize = 256;
 
+/// Maximum payload size of a UDP datagram over IPv4/IPv6 without fragmentation (65507 bytes).
+pub const MAX_UDP_DATAGRAM_SIZE: usize = 65507;
+
 /// Default capacity for the command deduplication sliding window across dual channels.
 pub const DEFAULT_DEDUPLICATION_WINDOW_CAPACITY: usize = 256;
+
+/// Channel queue capacity per active UDP client NAT flow session.
+pub const UDP_SESSION_CHANNEL_SIZE: usize = 256;
+
+/// Default UDP NAT session idle timeout before expiring an inactive flow.
+pub const DEFAULT_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 // =============================================================================
 // 2. Timeouts, Deadlines & Grace Periods
@@ -347,6 +356,15 @@ pub const HEADER_TUNNEL_POOL: &str = "x-tunnel-pool";
 /// HTTP Header key for unified dynamic target forwarding.
 pub const HEADER_TUNNEL_TARGET: &str = "x-tunnel-target";
 
+/// HTTP Header key for the L4 transport protocol of a mapping (`tcp` or `udp`).
+pub const HEADER_TUNNEL_PROTO: &str = "x-tunnel-proto";
+
+/// Protocol value for TCP forwarding.
+pub const TUNNEL_PROTO_TCP: &str = "tcp";
+
+/// Protocol value for UDP forwarding.
+pub const TUNNEL_PROTO_UDP: &str = "udp";
+
 /// Standard WebSocket upgrade header: Sec-WebSocket-Key.
 pub const HEADER_SEC_WEBSOCKET_KEY: &str = "Sec-WebSocket-Key";
 
@@ -385,6 +403,9 @@ pub const ACTIVATE_STREAM_MAGIC: u8 = 0xA5;
 
 /// Activation magic byte sent over pre-warmed pool streams to promote the stream into a signaling channel.
 pub const ACTIVATE_STREAM_PROMOTE: u8 = 0xA6;
+
+/// Activation magic byte sent over pre-warmed pool streams to trigger UDP target dialing.
+pub const ACTIVATE_STREAM_UDP: u8 = 0xA7;
 
 // =============================================================================
 // 9. Process, CLI & Diagnostics Defaults

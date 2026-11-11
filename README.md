@@ -1,6 +1,6 @@
 # culvert
 
-> **High-performance, transparent TCP tunneling tool designed for standardized and compliant servers.**  
+> **High-performance, transparent TCP & UDP tunneling tool designed for standardized and compliant servers.**  
 > Built with Rust, supporting WebSocket, HTTP/3 (QUIC), and Unix Domain Sockets for ultra-low latency and clean architecture.
 
 English | [简体中文](README_zh.md)
@@ -44,17 +44,17 @@ In enterprise production environments and compliant server architectures, standa
   - **Least privilege and isolation**: `culvert` runs as an unprivileged system user (e.g., `culvert`), binds no external public ports, and minimizes the host attack surface.
   - **Natural and precise routing**: Ordinary web requests serve production websites or API portals. Only requests matching the authenticated tunnel path (e.g., `/tunnel`) with valid credentials are proxy-passed to `culvert`.
 
-### 2. Dedicated to Core TCP Tunneling & the Unix Philosophy
+### 2. Dedicated to Core TCP & UDP Tunneling & the Unix Philosophy
 
-- **Minimalist scope**: `culvert` focuses strictly on transparent, reliable, high-throughput TCP port forwarding (opaque byte streams). It intentionally avoids bloated SOCKS5/HTTP proxy semantics, custom encryption layers, or redundant certificate management.
+- **Minimalist scope**: `culvert` focuses strictly on transparent, reliable, high-throughput TCP and UDP port forwarding (opaque byte streams and `[u16 len | payload]` length-framed datagrams). It intentionally avoids bloated SOCKS5/HTTP proxy semantics, custom encryption layers, or redundant certificate management.
 - **Composable and decoupled**: When application-level authentication, traffic auditing, or access control is required, `culvert` can be chained with established, specialized tools. Each component does one thing well, ensuring high cohesion, loose coupling, and long-term maintainability.
-- **Three independent layers**: frontend (port mapping), core (session lifecycle), and backend (uniform relay I/O over WS/WSS/H3/QUIC/UDS) share a neutral `io` vocabulary. `core::serve` selects an I/O pump by channel kind and never moves bytes itself. UDP port mapping is **not implemented**; `L4Protocol::Udp`, `IoChannel::Datagram`, and datagram pumps exist only as extension points so a future UDP frontend needs no core change. See [DESIGN.md §5.7](docs/DESIGN.md#57-three-layer-boundaries-and-the-pump-registry).
+- **Three independent layers**: frontend (TCP/UDS & per-peer NAT-demuxed UDP port mapping), core (session lifecycle), and backend (uniform relay I/O over WS/WSS/H3/QUIC/UDS) share a neutral `io` vocabulary. `core::serve` selects an I/O pump (`StreamStreamPump`, `DatagramStreamPump`, `StreamDatagramPump`, `DatagramDatagramPump`) by channel kind and never moves bytes itself. See [DESIGN.md §5.7](docs/DESIGN.md#57-three-layer-boundaries-and-the-pump-registry).
 
 ---
 
 ## Key Highlights
 
-### 🌟 Highlight 1: HTTP/3 (H3 / QUIC) Reverse Proxy & TCP Tunneling (Breakthrough for TCP-Restricted Networks)
+### 🌟 Highlight 1: HTTP/3 (H3 / QUIC) Reverse Proxy & TCP/UDP Tunneling (Breakthrough for TCP-Restricted Networks)
 
 In production networking, engineers frequently encounter restrictive environments: enterprise firewalls or intermediate carriers may throttle, aggressively terminate, or limit concurrent long-lived TCP connections. On high-latency or packet-loss-heavy links (e.g., cross-region connections), standard TCP congestion control and head-of-line blocking cause severe throughput degradation.
 
@@ -66,13 +66,13 @@ In production networking, engineers frequently encounter restrictive environment
 
 ### ⚡ Highlight 2: Unique 0-RTT Connection Pool (Bidirectional Pre-Warmed Streams)
 
-Traditional tunneling tools initiate an end-to-end handshake (TCP + TLS + HTTP Upgrade/CONNECT) only after an inbound visitor arrives, adding 1 to 3 RTTs of latency before data can flow. This noticeable lag impairs interactive sessions like SSH or bursty short connections like MySQL queries.
+Traditional tunneling tools initiate an end-to-end handshake (TCP + TLS + HTTP Upgrade/CONNECT) only after an inbound visitor arrives, adding 1 to 3 RTTs of latency before data can flow. This noticeable lag impairs interactive sessions like SSH, DNS lookups, or bursty short connections like MySQL queries.
 
-`culvert` implements a **bidirectional pre-warmed stream pool**:
+`culvert` implements a **bidirectional pre-warmed stream pool** for both TCP and UDP:
 
-- **Forward Mode**: The client automatically maintains a pool of pre-warmed idle streams in the background. When a local application connects, an idle stream is acquired instantly (0-RTT), activated via a lightweight in-band packet (`0xA5` + target address), and data transfer begins immediately while the pool is replenished asynchronously.
-- **Reverse Mode**: The client pre-establishes idle reverse streams queued on the server. When an external visitor connects to the server port, the server pops an idle stream and activates it with a single `0xA5` byte without round-trip signaling.
-- **Storm protection**: Handshake concurrency is governed by a semaphore to prevent connection storms on reconnect, backed by exponential backoff and server-authoritative stream lifecycles.
+- **Forward Mode**: The client automatically maintains a pool of pre-warmed idle streams in the background. When a local TCP connection or UDP client flow arrives, an idle stream is acquired instantly (0-RTT), activated via a lightweight in-band packet (`0xA5` for TCP or `0xA7` for UDP + target address), and data transfer begins immediately while the pool is replenished asynchronously.
+- **Reverse Mode**: The client pre-establishes idle reverse streams queued per `(protocol, listen)` on the server. When an external TCP visitor or UDP peer arrives at the server port, the server pops an idle stream and activates it with a single byte (`0xA5` TCP / `0xA7` UDP) without round-trip signaling.
+- **Storm protection & emergency failover**: Handshake concurrency is governed by a semaphore to prevent connection storms on reconnect, backed by exponential backoff, server-authoritative stream lifecycles, and emergency control promotion (`0xA6`).
 
 ---
 
@@ -174,12 +174,15 @@ flowchart LR
 > `ws+unix:///run/culvert.sock?path=/tunnel&chmod=0o660`  
 > (`chmod` accepts octal values like `660`, `0660`, or `0o660`).
 
-### Port Mapping Modes
+### Port Mapping Modes & Protocols
 
-| Mode (`mode`) | Listener Bound On | Target Dialed By | Stream Pool (`pool_size`) | Primary Application |
-| :--- | :--- | :--- | :--- | :--- |
-| `forward` (default) | Client host | Ingress server | Shared pre-warmed pool | Access remote private resources (e.g., cloud database) |
-| `reverse` | Ingress server | Client host | Shared 0-RTT inbound pool | Expose private NAT services to the public (e.g., SSH) |
+| Mode (`mode`) | Supported Protocols (`protocol`) | Listener Bound On | Target Dialed By | Stream Pool (`pool_size`) | Primary Application |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `forward` (default) | `tcp` (default), `udp` | Client host | Ingress server | Shared pre-warmed pool (`0xA5` / `0xA7`) | Access remote private resources (DBs, internal DNS, APIs) |
+| `reverse` | `tcp` (default), `udp` | Ingress server | Client host | Per-mapping 0-RTT inbound pool (`0xA5` / `0xA7`) | Expose private NAT services to the public (SSH, WireGuard, game servers) |
+
+> [!TIP]
+> **Same-Port TCP + UDP Coexistence**: A single tunnel (or different tunnels) may bind both `protocol: "tcp"` and `protocol: "udp"` on the exact same `listen` IP and port, while duplicate binds on the same protocol are caught during `--check`. UDP mappings reject `unix://` addresses in `listen`/`target`, while still tunneling cleanly over `ws+unix://` and `wss+unix://` server endpoints.
 
 ---
 
@@ -326,6 +329,7 @@ dialer:
   bind_interface: "eth0"      # Bind outbound interface via SO_BINDTODEVICE (optional)
   heartbeat_interval: "15s"   # Heartbeat probe interval during inactivity
   idle_timeout: "30s"         # Idle timeout before connection teardown (> heartbeat_interval)
+  udp_idle_timeout: "30s"     # UDP NAT flow expiration timeout on inactivity (must be > 0; default: 30s)
 ```
 
 ---
@@ -356,7 +360,8 @@ server:
   token: "SECURE_AUTH_TOKEN"         # Pre-shared token (max 256 bytes)
   default_target: "127.0.0.1:5201"    # Fallback target if none supplied
   heartbeat_interval: "15s"          # Server keepalive interval
-  idle_timeout: "30s"                # Server idle timeout
+  idle_timeout: "30s"                # Server idle timeout (> heartbeat_interval)
+  udp_idle_timeout: "30s"            # Server-side idle timeout for UDP NAT flows (default: 30s)
   # certificate: "/path/to/cert.pem" # TLS cert (auto-generates self-signed if omitted)
   # key: "/path/to/key.pem"          # TLS private key
 ```
@@ -378,13 +383,29 @@ tunnels:
       delay: "3s"                     # Delay between reconnect attempts
       max_retries: 10                 # Maximum retry attempts (omit for infinite)
     mappings:
-      - mode: "forward"               # Forward mode
+      - mode: "forward"               # Forward TCP mode (protocol defaults to "tcp")
+        protocol: "tcp"               # Optional: "tcp" (default) or "udp"
         listen: "127.0.0.1:13306"
         target: "10.0.0.5:3306"
+      - mode: "forward"               # Forward UDP mode
+        protocol: "udp"
+        listen: "127.0.0.1:15353"
+        target: "1.1.1.1:53"
+        udp_idle_timeout: "15s"       # Optional: per-mapping override for UDP NAT idle expiry
       - mode: "reverse"               # Reverse mode
         listen: "0.0.0.0:2222"        # Bound on the remote server
         target: "127.0.0.1:22"        # Dialed by the local client
 ```
+
+Each entry in `mappings` accepts:
+
+| Key | Type | Required | Default | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| `mode` | string | No | `"forward"` | `"forward"` or `"reverse"`. |
+| `protocol` | string | No | `"tcp"` | `"tcp"` or `"udp"`. Same-port TCP+UDP forward mappings are allowed. |
+| `listen` | string | Yes | — | `ip:port`, `hostname:port`, `[ipv6]:port`, or `unix://path` (TCP only). |
+| `target` | string | Yes | — | `ip:port`, `hostname:port`, `[ipv6]:port`, or `unix://path` (TCP only). |
+| `udp_idle_timeout` | duration | No | `dialer.udp_idle_timeout` (`30s`) | Overrides `dialer.udp_idle_timeout` on the tunnel client side; server-side UDP flows use `server.udp_idle_timeout`. Must be `> 0`. |
 
 ---
 
@@ -487,7 +508,7 @@ Create `/etc/systemd/system/culvert.service`:
 
 ```ini
 [Unit]
-Description=culvert High-Performance TCP Tunnel Service
+Description=culvert High-Performance TCP & UDP Tunnel Service
 After=network.target network-online.target
 Wants=network-online.target
 
@@ -580,7 +601,7 @@ tunnels:
 
 ### 3. Multi-Mapping Cluster with Shared Connection Pool
 
-A single tunnel endpoint can aggregate multiple forward and reverse mappings, supporting both TCP and Unix domain sockets:
+A single tunnel endpoint can aggregate multiple forward and reverse mappings across TCP, UDP, and Unix domain sockets:
 
 ```yaml
 tunnels:
@@ -589,18 +610,49 @@ tunnels:
     token: "CHANGE_ME"
     pool_size: 8
     mappings:
-      # Forward mapping to remote MySQL database
+      # Forward mapping to remote MySQL database (TCP)
       - mode: "forward"
         listen: "127.0.0.1:13306"
         target: "10.0.0.5:3306"
-      # Forward mapping to remote Docker daemon socket
+      # Forward mapping to remote Docker daemon socket (TCP -> UDS)
       - mode: "forward"
         listen: "127.0.0.1:18000"
         target: "unix:///var/run/docker.sock"
-      # Reverse mapping exposing local dev server
+      # Forward UDP DNS traffic on the loopback resolver port
+      - mode: "forward"
+        protocol: "udp"
+        listen: "127.0.0.1:15353"
+        target: "1.1.1.1:53"
+        udp_idle_timeout: "15s"
+      # Reverse mapping exposing local dev server (TCP)
       - mode: "reverse"
         listen: "0.0.0.0:8000"
         target: "127.0.0.1:3000"
+```
+
+---
+
+### 4. Forward & Reverse UDP Tunneling (DNS / WireGuard)
+
+Forward local UDP DNS queries to a private resolver and expose a private NATed WireGuard UDP service on the remote relay, including sharing a port between TCP and UDP:
+
+```yaml
+tunnels:
+  - tag: "udp-services"
+    endpoint: "quic://server.example.com:8443/tunnel"
+    token: "CHANGE_ME"
+    pool_size: 4                     # Supports 0-RTT UDP activation (0xA7)
+    mappings:
+      - mode: "forward"
+        protocol: "udp"
+        listen: "127.0.0.1:1053"
+        target: "10.0.0.2:53"
+        udp_idle_timeout: "15s"      # Reclaim short-lived DNS NAT flows after 15s
+      - mode: "reverse"
+        protocol: "udp"
+        listen: "0.0.0.0:51820"      # Public WireGuard UDP port on server
+        target: "127.0.0.1:51820"    # Local WireGuard daemon behind NAT
+        udp_idle_timeout: "120s"     # Keep long-lived VPN peer sessions warm longer
 ```
 
 ---

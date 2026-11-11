@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
 pub mod tcp;
+pub mod udp;
 
 /// One accepted frontend connection or datagram flow.
 pub struct FrontendAccept {
@@ -75,18 +76,18 @@ impl Default for FrontendRegistry {
     }
 }
 
-/// Returns the process-wide frontend registry, seeded with TCP/UDS only.
+/// Returns the process-wide frontend registry, seeded with TCP/UDS and UDP frontends.
 pub fn frontend_registry() -> &'static FrontendRegistry {
     static REGISTRY: OnceLock<FrontendRegistry> = OnceLock::new();
     REGISTRY.get_or_init(|| {
         let registry = FrontendRegistry::new();
         registry.register(Arc::new(tcp::TcpFrontendFactory));
+        registry.register(Arc::new(udp::UdpFrontendFactory));
         registry
     })
 }
 
-/// Binds a mapping spec through the registry. An unregistered protocol fails
-/// before any socket is created; this is where UDP port mapping will plug in.
+/// Binds a mapping spec through the registry.
 pub async fn bind(spec: &MappingSpec) -> Result<Box<dyn Frontend>, TunnelError> {
     let factory = frontend_registry().lookup(spec.protocol).ok_or_else(|| {
         TunnelError::UnsupportedChannel(format!(
@@ -102,21 +103,23 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_udp_mapping_has_no_frontend() {
+    async fn test_udp_mapping_binds_frontend() {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
         let spec = MappingSpec {
             protocol: L4Protocol::Udp,
-            listen: "127.0.0.1:0".into(),
+            listen: format!("127.0.0.1:{}", port),
             target: "127.0.0.1:9".into(),
         };
-        assert!(matches!(
-            bind(&spec).await,
-            Err(TunnelError::UnsupportedChannel(_))
-        ));
+        let mut fe = bind(&spec).await.unwrap();
+        fe.shutdown().await;
     }
 
     #[test]
-    fn test_registry_seeds_only_tcp() {
+    fn test_registry_seeds_tcp_and_udp() {
         assert!(frontend_registry().lookup(L4Protocol::Tcp).is_some());
-        assert!(frontend_registry().lookup(L4Protocol::Udp).is_none());
+        assert!(frontend_registry().lookup(L4Protocol::Udp).is_some());
     }
 }

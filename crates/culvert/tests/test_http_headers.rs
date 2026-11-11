@@ -146,6 +146,7 @@ async fn test_e2e_ws_tunnel_with_custom_host_and_headers() {
             mode: TunnelMode::Forward,
             listen: format!("127.0.0.1:{}", client_port),
             target: format!("127.0.0.1:{}", echo_port),
+            ..Default::default()
         }],
     };
 

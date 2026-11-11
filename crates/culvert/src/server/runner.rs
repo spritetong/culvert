@@ -16,14 +16,15 @@ use tracing::{debug, error, info, warn};
 use crate::common::{CancelFutureExt, TaskTracker, TimeoutOrCancel};
 use crate::config::model::{ServerConfig, TlsConfig, TunnelMode};
 use crate::consts::{
-    ACTIVATE_STREAM_MAGIC, DEFAULT_ACTIVATION_READ_TIMEOUT, DEFAULT_SESSION_PAIR_TIMEOUT,
-    MAX_ACTIVATION_TARGET_LEN, POOL_DUMMY_HOST, reverse_frame_timeout, reverse_pool_soft_cap,
+    ACTIVATE_STREAM_MAGIC, ACTIVATE_STREAM_UDP, DEFAULT_ACTIVATION_READ_TIMEOUT,
+    DEFAULT_SESSION_PAIR_TIMEOUT, MAX_ACTIVATION_TARGET_LEN, POOL_DUMMY_HOST,
+    reverse_frame_timeout, reverse_pool_soft_cap,
 };
 use crate::control::{ControlMessage, SignalingChannel, SignalingConfig, SignalingRouter};
 use crate::core::error::TunnelError;
 use crate::core::serve::serve;
 use crate::frontend::{self, FrontendOutput};
-use crate::io::addr::MappingSpec;
+use crate::io::addr::{L4Protocol, MappingSpec};
 use crate::io::pump::{PumpCtx, PumpRequest};
 use crate::session::SessionManager;
 use crate::transport::{TargetAddr, TransportRegistry};
@@ -115,6 +116,10 @@ impl ServerRunner {
                 .config
                 .heartbeat_interval
                 .unwrap_or(crate::consts::DEFAULT_HEARTBEAT_INTERVAL);
+            let udp_idle_timeout = self
+                .config
+                .udp_idle_timeout
+                .unwrap_or(crate::consts::DEFAULT_UDP_IDLE_TIMEOUT);
 
             tracker.spawn_with_cancel(move |token| async move {
                 let mut listener = registry.create_listener(
@@ -168,6 +173,7 @@ impl ServerRunner {
                                     let default_target = default_target.clone();
                                     let idle_timeout = idle_timeout;
                                     let hb_interval = hb_interval;
+                                    let udp_idle_timeout = udp_idle_timeout;
 
                                     conn_tracker.spawn_with_cancel(move |conn_token| async move {
                                         match metadata.mode {
@@ -175,6 +181,7 @@ impl ServerRunner {
                                             TunnelMode::Forward => {
                                                 let mut stream = stream;
                                                 let mut dynamic_target: Option<TargetAddr> = None;
+                                                let mut activated_proto: Option<L4Protocol> = None;
 
                                                 // If this stream was pre-warmed as an idle connection in client pool,
                                                 // wait for the client activation signal before touching the target service.
@@ -184,7 +191,12 @@ impl ServerRunner {
                                                         return;
                                                     };
                                                     match res {
-                                                        Ok(_) if magic[0] == ACTIVATE_STREAM_MAGIC => {
+                                                        Ok(_) if magic[0] == ACTIVATE_STREAM_MAGIC || magic[0] == ACTIVATE_STREAM_UDP => {
+                                                            activated_proto = Some(if magic[0] == ACTIVATE_STREAM_UDP {
+                                                                L4Protocol::Udp
+                                                            } else {
+                                                                L4Protocol::Tcp
+                                                            });
                                                             // Activated! Check if dynamic target address is appended: [len: u16, target_str] with timeout
                                                             let mut len_bytes = [0u8; 2];
                                                             let read_len_res = match stream
@@ -243,6 +255,12 @@ impl ServerRunner {
                                                             }
                                                         }
 
+                                                let effective_proto = activated_proto.unwrap_or(metadata.protocol);
+                                                let relay_idle_timeout = match effective_proto {
+                                                    L4Protocol::Tcp => idle_timeout,
+                                                    L4Protocol::Udp => udp_idle_timeout,
+                                                };
+
                                                 let is_dummy_target = match &metadata.target {
                                                     Some(TargetAddr::Domain(host, _)) => host == POOL_DUMMY_HOST,
                                                     _ => false,
@@ -261,8 +279,8 @@ impl ServerRunner {
                                                     }
                                                 };
 
-                                                debug!(target = %target, "Dialing forward target in internal network");
-                                                let Some(target_res) = crate::platform::connect_target(&target)
+                                                debug!(target = %target, protocol = %effective_proto, "Dialing forward target in internal network");
+                                                let Some(target_res) = crate::platform::connect_target_channel(&target, effective_proto)
                                                     .cancel_with(&conn_token)
                                                     .await
                                                 else {
@@ -271,7 +289,7 @@ impl ServerRunner {
                                                 let target_conn = match target_res {
                                                     Ok(s) => s,
                                                     Err(e) => {
-                                                        error!(target = %target, "Failed to connect to forward target: {:?}", e);
+                                                        error!(target = %target, protocol = %effective_proto, "Failed to connect to forward target: {:?}", e);
                                                         return;
                                                     }
                                                 };
@@ -281,7 +299,7 @@ impl ServerRunner {
                                                     PumpCtx {
                                                         cancel: conn_token,
                                                         heartbeat_interval: hb_interval,
-                                                        idle_timeout,
+                                                        idle_timeout: relay_idle_timeout,
                                                     },
                                                 ).await;
                                             }
@@ -301,7 +319,7 @@ impl ServerRunner {
                                                     }
                                                 } else if metadata.pool_idle {
                                                     // Pre-warmed idle reverse stream arrival: push into inbound pool
-                                                    if !session_mgr.push_idle_stream(metadata.target.as_ref(), stream) {
+                                                    if !session_mgr.push_idle_stream(metadata.protocol, metadata.target.as_ref(), stream) {
                                                         // Expected briefly while a control channel reconnects:
                                                         // the orphaned worker will recycle after a short cooldown.
                                                         tracing::debug!("Dropped reverse idle pool stream: no matching listener");
@@ -314,6 +332,7 @@ impl ServerRunner {
                                                         conn_token,
                                                         idle_timeout,
                                                         hb_interval,
+                                                        udp_idle_timeout,
                                                     )
                                                     .await;
                                                 }
@@ -431,6 +450,7 @@ impl ServerRunner {
         cancel_token: CancellationToken,
         idle_timeout: Duration,
         heartbeat_interval: Duration,
+        udp_idle_timeout: Duration,
     ) {
         let sig_config = SignalingConfig {
             heartbeat_interval,
@@ -441,39 +461,46 @@ impl ServerRunner {
         let router = SignalingRouter::new(signaling);
 
         // Await RegisterReverse bounded by idle_timeout
-        let (listen_addr, target_addr, pool_size) = match timeout(idle_timeout, sig_rx.recv())
-            .cancel_with(&cancel_token)
-            .await
-        {
-            Some(Ok(Some(Ok(ControlMessage::RegisterReverse {
-                listen_addr,
-                target_addr,
-                pool_size,
-            })))) => (listen_addr, target_addr, pool_size),
-            Some(Err(_)) => {
-                warn!(
-                    idle_timeout = ?idle_timeout,
-                    "Reverse control channel registration timed out waiting for client request"
-                );
-                return;
-            }
-            Some(Ok(Some(other))) => {
-                warn!(
-                    "Expected RegisterReverse on reverse control channel, got: {:?}",
-                    other
-                );
-                return;
-            }
-            _ => return,
-        };
+        let (listen_addr, target_addr, pool_size, protocol) =
+            match timeout(idle_timeout, sig_rx.recv())
+                .cancel_with(&cancel_token)
+                .await
+            {
+                Some(Ok(Some(Ok(ControlMessage::RegisterReverse {
+                    listen_addr,
+                    target_addr,
+                    pool_size,
+                    protocol,
+                })))) => (listen_addr, target_addr, pool_size, protocol),
+                Some(Err(_)) => {
+                    warn!(
+                        idle_timeout = ?idle_timeout,
+                        "Reverse control channel registration timed out waiting for client request"
+                    );
+                    return;
+                }
+                Some(Ok(Some(other))) => {
+                    warn!(
+                        "Expected RegisterReverse on reverse control channel, got: {:?}",
+                        other
+                    );
+                    return;
+                }
+                _ => return,
+            };
 
-        debug!(addr = %listen_addr, target = %target_addr, "Binding reverse listening port on server");
+        debug!(addr = %listen_addr, target = %target_addr, protocol = %protocol, "Binding reverse listening port on server");
 
-        let mut frontend = match frontend::bind(&MappingSpec::tcp(&listen_addr, &target_addr)).await
+        let mut frontend = match frontend::bind(&MappingSpec::new(
+            protocol,
+            &listen_addr,
+            &target_addr,
+        ))
+        .await
         {
             Ok(l) => l,
             Err(e) => {
-                warn!(addr = %listen_addr, "Failed to bind reverse listener: {}", e);
+                warn!(addr = %listen_addr, protocol = %protocol, "Failed to bind reverse listener: {}", e);
                 let _ = router
                     .send(ControlMessage::RegisterAck {
                         listen_addr: listen_addr.clone(),
@@ -490,7 +517,8 @@ impl ServerRunner {
         // would discard the whole first generation and delay the first 0-RTT pair.
         // The soft cap is derived from the worker count the client negotiated,
         // so both ends size the same pool.
-        let idle_pool = session_mgr.register_pool(&listen_addr, reverse_pool_soft_cap(pool_size));
+        let idle_pool =
+            session_mgr.register_pool(protocol, &listen_addr, reverse_pool_soft_cap(pool_size));
 
         let ack_sent = router
             .send(ControlMessage::RegisterAck {
@@ -501,11 +529,19 @@ impl ServerRunner {
             .await;
         if ack_sent.is_err() {
             warn!(addr = %listen_addr, "Failed to send RegisterAck; dropping reverse listener");
-            session_mgr.unregister_pool(&listen_addr, &idle_pool);
+            session_mgr.unregister_pool(protocol, &listen_addr, &idle_pool);
             return;
         }
 
-        info!(addr = %listen_addr, "Bound reverse listener port");
+        info!(addr = %listen_addr, protocol = %protocol, "Bound reverse listener port");
+        let relay_idle_timeout = match protocol {
+            L4Protocol::Tcp => idle_timeout,
+            L4Protocol::Udp => udp_idle_timeout,
+        };
+        let activation_magic = match protocol {
+            L4Protocol::Tcp => ACTIVATE_STREAM_MAGIC,
+            L4Protocol::Udp => ACTIVATE_STREAM_UDP,
+        };
         let mut local_tracker = TaskTracker::<()>::new(cancel_token.clone());
         let frame_timeout = reverse_frame_timeout(idle_timeout);
         let mut accept_slot: ReusableFutureRef<'static, FrontendOutput> =
@@ -559,13 +595,14 @@ impl ServerRunner {
                             if let Some(mut candidate) = idle_pool.pop_live(idle_timeout).await {
                                 debug!(
                                     visitor = %visitor_addr,
+                                    protocol = %protocol,
                                     "Paired reverse visitor with idle pooled stream (0-RTT)"
                                 );
                                 local_tracker.spawn_with_cancel(move |token| async move {
                                     let activate = async {
                                         tokio::io::AsyncWriteExt::write_all(
                                             &mut candidate,
-                                            &[ACTIVATE_STREAM_MAGIC],
+                                            &[activation_magic],
                                         )
                                         .await?;
                                         tokio::io::AsyncWriteExt::flush(&mut candidate).await
@@ -580,7 +617,7 @@ impl ServerRunner {
                                                                 PumpCtx {
                                                                     cancel: token,
                                                                     heartbeat_interval,
-                                                                    idle_timeout,
+                                                                    idle_timeout: relay_idle_timeout,
                                                                 },
                                                             ).await;
                                                         }
@@ -606,6 +643,7 @@ impl ServerRunner {
                             debug!(
                                 session = %session_id,
                                 visitor = %visitor_addr,
+                                protocol = %protocol,
                                 "External visitor connected to reverse port, notifying client"
                             );
 
@@ -651,7 +689,7 @@ impl ServerRunner {
                                                             PumpCtx {
                                                                 cancel: token,
                                                                 heartbeat_interval,
-                                                                idle_timeout,
+                                                                idle_timeout: relay_idle_timeout,
                                                             },
                                                         ).await;
                                     }
@@ -681,7 +719,7 @@ impl ServerRunner {
         // even while existing visitor relay tasks are winding down gracefully.
         frontend.shutdown().await;
         drop(frontend);
-        session_mgr.unregister_pool(&listen_addr, &idle_pool);
+        session_mgr.unregister_pool(protocol, &listen_addr, &idle_pool);
 
         local_tracker.shutdown_and_wait().await;
         debug!(addr = %listen_addr, "Reverse listener closed");
@@ -718,6 +756,7 @@ mod tests {
                 cancel_clone,
                 Duration::from_secs(5),
                 crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
+                crate::consts::DEFAULT_UDP_IDLE_TIMEOUT,
             )
             .await;
         });
@@ -747,6 +786,7 @@ mod tests {
                 cancel_token,
                 Duration::from_millis(50),
                 crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
+                crate::consts::DEFAULT_UDP_IDLE_TIMEOUT,
             ),
         )
         .await;
@@ -786,6 +826,7 @@ mod tests {
                     cancel_token,
                     Duration::from_millis(300),
                     crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
+                    crate::consts::DEFAULT_UDP_IDLE_TIMEOUT,
                 )
                 .await;
                 let _ = addr;
@@ -797,6 +838,7 @@ mod tests {
                 listen_addr: listen_addr.clone(),
                 target_addr: "127.0.0.1:9099".to_string(),
                 pool_size: None,
+                protocol: L4Protocol::Tcp,
             })
             .await
             .unwrap();
@@ -835,6 +877,7 @@ mod tests {
                 cancel_token,
                 Duration::from_millis(300),
                 crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
+                crate::consts::DEFAULT_UDP_IDLE_TIMEOUT,
             )
             .await;
         });
@@ -844,6 +887,7 @@ mod tests {
                 listen_addr: listen_addr.clone(),
                 target_addr: "127.0.0.1:9099".to_string(),
                 pool_size: None,
+                protocol: L4Protocol::Tcp,
             })
             .await
             .unwrap();
@@ -927,6 +971,7 @@ mod tests {
                 c_token,
                 Duration::from_secs(30),
                 crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
+                crate::consts::DEFAULT_UDP_IDLE_TIMEOUT,
             )
             .await;
         });
@@ -937,6 +982,7 @@ mod tests {
                 listen_addr: listen_addr.clone(),
                 target_addr: "127.0.0.1:9099".to_string(),
                 pool_size: Some(2),
+                protocol: L4Protocol::Tcp,
             })
             .await
             .unwrap();
@@ -996,6 +1042,7 @@ mod tests {
                 c_token,
                 Duration::from_secs(30),
                 crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
+                crate::consts::DEFAULT_UDP_IDLE_TIMEOUT,
             )
             .await;
         });
@@ -1006,6 +1053,7 @@ mod tests {
                 listen_addr: listen_addr.clone(),
                 target_addr: "127.0.0.1:9099".to_string(),
                 pool_size: None,
+                protocol: L4Protocol::Tcp,
             })
             .await
             .unwrap();
@@ -1081,6 +1129,7 @@ mod tests {
                 c_token,
                 Duration::from_millis(300),
                 crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
+                crate::consts::DEFAULT_UDP_IDLE_TIMEOUT,
             )
             .await;
         });
@@ -1091,6 +1140,7 @@ mod tests {
                 listen_addr: listen_addr.clone(),
                 target_addr: "127.0.0.1:9099".to_string(),
                 pool_size: None,
+                protocol: L4Protocol::Tcp,
             })
             .await
             .unwrap();

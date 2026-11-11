@@ -54,9 +54,6 @@ pub trait DatagramIo: Send + Unpin + 'static {
 }
 
 /// A channel yielded by a `Frontend` or a `TransportConnector` / `TransportListener`.
-///
-/// The stream variant is the only one constructed today. The datagram variant
-/// plus `DatagramIo` are the extension point for a future UDP frontend.
 pub enum IoChannel {
     Stream(Box<dyn TunnelStream>),
     Datagram(Box<dyn DatagramIo>),
@@ -80,6 +77,16 @@ impl IoChannel {
     /// Wraps an already type-erased stream.
     pub fn from_boxed_stream(stream: Box<dyn TunnelStream>) -> Self {
         Self::Stream(stream)
+    }
+
+    /// Wraps any concrete datagram implementation.
+    pub fn from_datagram<D: DatagramIo>(datagram: D) -> Self {
+        Self::Datagram(Box::new(datagram))
+    }
+
+    /// Wraps an already type-erased datagram channel.
+    pub fn from_boxed_datagram(datagram: Box<dyn DatagramIo>) -> Self {
+        Self::Datagram(datagram)
     }
 
     pub fn kind(&self) -> ChannelKind {
@@ -109,11 +116,36 @@ impl IoChannel {
             )),
         }
     }
+
+    /// Explicit by-value conversion for datagram pumps.
+    pub fn into_datagram(self) -> Result<Box<dyn DatagramIo>, TunnelError> {
+        match self {
+            Self::Datagram(datagram) => Ok(datagram),
+            Self::Stream(_) => Err(TunnelError::UnsupportedChannel(
+                "a stream channel has no datagram view".into(),
+            )),
+        }
+    }
+
+    pub fn as_datagram_mut(&mut self) -> Result<&mut Box<dyn DatagramIo>, TunnelError> {
+        match self {
+            Self::Datagram(datagram) => Ok(datagram),
+            Self::Stream(_) => Err(TunnelError::UnsupportedChannel(
+                "a stream channel has no datagram view".into(),
+            )),
+        }
+    }
 }
 
 impl From<Box<dyn TunnelStream>> for IoChannel {
     fn from(stream: Box<dyn TunnelStream>) -> Self {
         Self::from_boxed_stream(stream)
+    }
+}
+
+impl From<Box<dyn DatagramIo>> for IoChannel {
+    fn from(datagram: Box<dyn DatagramIo>) -> Self {
+        Self::from_boxed_datagram(datagram)
     }
 }
 

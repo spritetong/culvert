@@ -16,47 +16,50 @@ data path are listed in [Section 13](#13-not-wired-into-the-runtime-data-path).
 
 ## 1. Design Summary
 
-culvert is a TCP port-forwarding daemon. A single process loads one YAML file,
-optionally starts ingress listeners (`server`), optionally starts one or more
-tunnel clients (`tunnels`), and supervises both. Traffic between a client and a
-server travels over one of three relay drivers (WebSocket, HTTP/3/QUIC,
-WebSocket over a Unix domain socket) as an opaque bidirectional byte stream.
+culvert is a TCP and UDP port-forwarding daemon. A single process loads one
+YAML file, optionally starts ingress listeners (`server`), optionally starts one
+or more tunnel clients (`tunnels`), and supervises both. Traffic between a
+client and a server travels over one of three relay drivers (WebSocket,
+HTTP/3/QUIC, WebSocket over a Unix domain socket) as an opaque bidirectional byte
+stream (for TCP/UDS) or `[u16 len | payload]` length-framed datagrams (for UDP).
 
 The runtime is split into three independent parts. Independence means the core
 depends **only** on the neutral `io` vocabulary — `core::serve` never names a
 `Frontend` or `Transport*` trait. The runtime layers (`tunnel/`, `server/`)
-build a `PumpRequest` from those traits and hand it to core. Adding a new
-frontend capability (UDP port mapping) requires a new `Frontend` implementation
-and a new `Pump` registration, not a change to core logic.
+build a `PumpRequest` from those traits and hand it to core. Adding UDP port
+mapping required only `UdpFrontend` (`frontend/udp.rs`), `ConnectedUdpSocket`
+(`platform/mod.rs`), registered datagram pumps (`io/pump.rs`), and `L4Protocol`
+metadata propagation — leaving `core/serve.rs`'s `serve()` completely unchanged.
 
 | Part | Owns | Module |
 | :--- | :--- | :--- |
-| **Frontend** | The mapping service exposed to the outside world. Today TCP and Unix domain sockets only. | `frontend/` |
+| **Frontend** | The mapping service exposed to the outside world: TCP/Unix domain sockets (`TcpFrontend`) and UDP with per-peer NAT flow demultiplexing (`UdpFrontend`). | `frontend/` |
 | **Core** | Session lifecycle: pairing, activation, cancellation, retry, statistics, and `core::serve` pump dispatch. It never moves bytes itself. | `core/`, `tunnel/`, `session/`, `pool/`, `control/` |
 | **Backend** | A uniform I/O interface over relay channels: WS, WSS, H3, QUIC, UDS, and future P2P/datagram transports. | `backend/` (traits + registry), `transport/` (drivers) |
 
-`io/` is a shared vocabulary with no business logic: `TargetAddr`,
-`L4Protocol`, `IoChannel`, `TunnelStream`, `TunnelError`, `PumpCtx`, and the
-capability types. All three parts depend on `io/`; none of them depends on
-another part's implementation. `platform/` holds OS-level socket primitives
-wrapped by the TCP frontend, `config/` holds the declarative schema, and
+`io/` is a shared vocabulary with no business logic: `TargetAddr`, `PeerAddr`,
+`L4Protocol`, `IoChannel`, `TunnelStream`, `DatagramIo`, `TunnelError`,
+`PumpCtx`, and the capability types. All three parts depend on `io/`; none of
+them depends on another part's implementation. `platform/` holds OS-level
+socket primitives wrapped by frontends and target dialers (`GenericListener`,
+`ConnectedUdpSocket`), `config/` holds the declarative schema, and
 `daemon` + `supervisor` + `common::task` own process lifecycle (one cancellation
 token, owned tasks, cancel then await).
 
-The reverse control plane (`control/`, `session/`, `pool/`) is **stream-scoped**
-today: activation bytes, `x-session-id` pairing, and idle-stream heartbeats only
-exist for connection-oriented relays. It is orchestration, not the byte-moving
-core, and it is reached only through `IoChannel`'s stream variant. A datagram
-frontend does not pass through it; it goes straight to its own `Pump`.
+The reverse control plane (`control/`, `session/`, `pool/`) manages signaling
+and idle stream pre-warming (`Stream`-scoped at the transport boundary while
+carrying `L4Protocol` metadata so both TCP and UDP listeners can pre-warm 0-RTT
+streams and fall back to `NewConnection`). Datagram payload framing and NAT flow
+idle expiry live inside the registered pumps, never in `core::serve`.
 
 ```mermaid
 flowchart TB
-    IO["io/<br/>TargetAddr · IoChannel · Pump traits"]
-    FE["frontend/<br/>Frontend · FrontendAccept · bind"]
+    IO["io/<br/>TargetAddr · PeerAddr · IoChannel · Pump traits"]
+    FE["frontend/<br/>TcpFrontend · UdpFrontend · bind"]
     CORE["core::serve<br/>session lifecycle + PumpRegistry"]
     BE["backend/<br/>Transport* traits · TransportRegistry"]
     DRV["transport/<br/>WS · WSS · H3 · QUIC · UDS drivers"]
-    PUMP["io::pump::StreamStreamPump<br/>poll_fn duplex relay"]
+    PUMP["io::pump::PumpRegistry<br/>StreamStream · DatagramStream · StreamDatagram · DatagramDatagram"]
 
     FE --> IO
     CORE --> IO
@@ -70,9 +73,8 @@ flowchart TB
 `core::serve(req: PumpRequest, ctx: PumpCtx)` looks up a `Pump` by
 `(req.frontend.kind(), req.backend.kind())` in a process-wide `PumpRegistry` and
 delegates the transfer. Core contains no `match` on channel variants and no
-byte-copying code. `StreamStreamPump` is the only registered pump today; its body
-is the hand-written `poll_fn` duplex state machine. A datagram frontend would
-register a second pump without touching `serve`. See
+byte-copying code. `PumpRegistry` is seeded with `StreamStreamPump`,
+`DatagramStreamPump`, `StreamDatagramPump`, and `DatagramDatagramPump`. See
 [Section 5.7](#57-three-layer-boundaries-and-the-pump-registry).
 
 ---
@@ -88,14 +90,15 @@ crates/culvert/src/
   consts.rs                    all constants and defaults
   io/
     mod.rs                     neutral vocabulary re-exports
-    addr.rs                    L4Protocol, MappingSpec, TargetAddr, parse_target_addr
-    channel.rs                 FlowKey, ChannelKind, IoChannel, DatagramIo
+    addr.rs                    L4Protocol, MappingSpec, TargetAddr, PeerAddr, parse_target_addr
+    channel.rs                 FlowKey, ChannelKind, IoChannel, Datagram, DatagramIo
     stream.rs                  TunnelStream, StreamCaps, liveness helpers
     error.rs                   TunnelError, is_permanent, is_shutdown
-    pump.rs                    Pump, PumpRegistry, PumpCtx, StreamStreamPump
+    pump.rs                    Pump, PumpRegistry, PumpCtx, StreamStreamPump, DatagramStreamPump, StreamDatagramPump, DatagramDatagramPump
   frontend/
     mod.rs                     Frontend, FrontendAccept, FrontendRegistry, bind
     tcp.rs                     TcpFrontend (TCP + Unix domain sockets)
+    udp.rs                     UdpFrontend, UdpFlowChannel (UDP NAT flow demultiplexing)
   backend/
     mod.rs                     TransportConnector/Listener/Driver, StreamMetadata
     registry.rs                TransportRegistry scheme dispatch
@@ -118,7 +121,7 @@ crates/culvert/src/
     ws/{mod,connector,listener,model,stream}.rs
     h3/{mod,connector,listener,stream}.rs
     uds.rs
-  platform/{mod,unix,windows}.rs  UDS listener, target dialing, OS primitives
+  platform/{mod,unix,windows}.rs  UDS listener, target dialing (TCP/UDS & ConnectedUdpSocket), OS primitives
   common/{auth,cancel,net,task}.rs
   mux/                         standalone module, not used by the data path
 crates/culvert/tests/          end-to-end and regression tests
@@ -182,15 +185,15 @@ structs are too. `EndpointConfig` and `DnsResolverConfig` implement custom
 | `log` | `LogConfig` (defaulted) | `level`, `output`, `no_color`. |
 | `worker_threads` | `Option<usize>` | Tokio worker count; `0` rejected. |
 | `dns` | `Option<DnsConfig>` | `strategy`, `resolvers`, `cache_capacity`. |
-| `dialer` | `Option<DialerConfig>` | `connect_timeout`, `tcp_nodelay`, `bind_interface`, `heartbeat_interval`, `idle_timeout`. |
+| `dialer` | `Option<DialerConfig>` | `connect_timeout`, `tcp_nodelay`, `bind_interface`, `heartbeat_interval`, `idle_timeout`, `udp_idle_timeout`. |
 | `tls` | `Option<TlsConfig>` | `server_name`, `insecure`, `alpn`, `ca_certificate`, `client_certificate`, `client_key`, `certificate`, `key`, `min_version`, `max_version`. |
-| `server` | `Option<ServerConfig>` | `listen`, `token`, `default_target`, `certificate`, `key`, `tls`, `heartbeat_interval`, `idle_timeout`. |
-| `tunnels` | `Vec<TunnelConfig>` (defaulted) | `tag`, `endpoint`, `token`, `pool_size`, `failover`, `multiplex`, `retry`, `mappings`. |
+| `server` | `Option<ServerConfig>` | `listen`, `token`, `default_target`, `certificate`, `key`, `tls`, `heartbeat_interval`, `idle_timeout`, `udp_idle_timeout`. |
+| `tunnels` | `Vec<TunnelConfig>` (defaulted) | `tag`, `endpoint`, `token`, `pool_size`, `http_headers`, `failover`, `multiplex`, `retry`, `mappings`. |
 
-`TunnelConfig` requires at least one `PortMappingConfig { mode, listen,
-target }`; `mode` defaults to `forward`. `TunnelRetryConfig { delay,
-max_retries }` uses a separate duration deserializer that accepts seconds,
-`Ns`, or `Nms`.
+`TunnelConfig` requires at least one `PortMappingConfig { mode, protocol, listen,
+target, udp_idle_timeout }`; `mode` defaults to `forward` and `protocol` defaults
+to `tcp`. `TunnelRetryConfig { delay, max_retries }` uses a separate duration
+deserializer that accepts seconds, `Ns`, or `Nms`.
 
 Durations (`dialer`, `server`, `retry`) accept a raw integer (seconds) or a
 string with `s` / `ms` suffix through `humantime_serde_opt` and the retry
@@ -216,13 +219,17 @@ must include a socket file path.
 in the neutral vocabulary layer: config, frontend, core, and backend refer to
 the same type without any of them owning it.
 
-`io::addr::L4Protocol` is `Tcp | Udp`. `io::addr::MappingSpec { protocol,
-listen, target }` is the neutral description of one port mapping handed to
-`frontend::bind`. `run_forward_mapping` builds the spec with
-`MappingSpec::tcp` from the `listen` / `target` strings returned by
-`TunnelConfig::canonical_mappings()`. `PortMappingConfig` has no `protocol`
-field and the configuration schema has no UDP constructor. UDP port mapping is
-not implemented in this release.
+`io::addr::L4Protocol` is `Tcp | Udp` (default `Tcp`, serialized lowercase
+`"tcp"` / `"udp"`). `io::addr::MappingSpec { protocol, listen, target }` is the
+neutral description of one port mapping handed to `frontend::bind` (`MappingSpec::new`,
+`MappingSpec::tcp`, `MappingSpec::udp`). `run_forward_mapping` and
+`ServerRunner::handle_reverse_control` pass the mapping's `L4Protocol` when
+building the spec from `PortMappingConfig` or `RegisterReverse`.
+
+`io::addr::PeerAddr` (`Socket(SocketAddr) | Path(PathBuf) | P2p(String)`)
+represents peer identities in `FrontendAccept` and `FlowKey`. Network TCP/UDP
+traffic uses `Socket(SocketAddr)` with zero heap allocations and compact
+MessagePack serialization.
 
 ### 4.3 EndpointContext merge
 
@@ -245,8 +252,9 @@ other scheme is an error. When no SNI is configured, the endpoint host is used.
 `http_headers` merges tunnel-level headers over endpoint-level headers,
 overriding keys case-insensitively. A configured `Host` header overrides the
 default `host:port` authority.
-Helpers `heartbeat_interval()`, `idle_timeout()`, and `connect_timeout()`
-return the effective values used by runtime timers.
+Helpers `heartbeat_interval()`, `idle_timeout()`, `connect_timeout()`, and
+`udp_idle_timeout()` return the effective values used by runtime timers
+(`udp_idle_timeout()` defaults to `DEFAULT_UDP_IDLE_TIMEOUT = 30s`).
 
 ### 4.4 Validation rules
 
@@ -266,13 +274,20 @@ return the effective values used by runtime timers.
   listener is plaintext.
 - TLS version strings are `1.2` or `1.3` and the min is not above max.
   mTLS certificate/key and CA files are validated.
-- All mapping `listen` / `target` values parse; forward listen addresses are
-  unique across all tunnels; tunnel tags are unique and non-empty.
+- All mapping `listen` / `target` values parse; when `protocol == udp`, `unix://`
+  addresses are rejected on both `listen` and `target`.
+- Forward `(protocol, listen)` pairs are unique across all tunnels (same-port
+  TCP and UDP forward mappings are permitted); tunnel tags are unique and
+  non-empty.
 - Endpoint schemes are in the supported set; detailed endpoints may not
   configure `tls` on a non-TLS scheme; all DNS resolvers parse;
   `EndpointContext::build` succeeds.
 - Effective `idle_timeout > heartbeat_interval` after defaults are merged,
   checked for global dialer, server, and each tunnel.
+- Any configured `udp_idle_timeout` (`dialer`, `server`, `endpoint.dialer`, or
+  `mappings[]`) must be greater than `0`. It is not restricted by
+  `heartbeat_interval` because UDP NAT session expiry tracks datagram activity
+  independently of transport probes.
 - `multiplex` and `failover` sections are rejected unconditionally with a
   message stating they are not wired into the data path.
 
@@ -292,7 +307,10 @@ pub struct StreamMetadata {
     pub mode: TunnelMode,
     pub session_id: Option<String>,
     pub target: Option<TargetAddr>,
+    #[serde(default)]
     pub pool_idle: bool,
+    #[serde(default)]
+    pub protocol: L4Protocol,
 }
 pub type AcceptOutput = Result<(IoChannel, StreamMetadata), TunnelError>;
 
@@ -301,6 +319,13 @@ pub trait TransportConnector: Send + Sync {
                    session_id: Option<&'a str>)
         -> BoxFuture<'a, Result<IoChannel, TunnelError>>;
     fn connect_pooled<'a>(&'a self, target: &'a TargetAddr)
+        -> BoxFuture<'a, Result<IoChannel, TunnelError>>;
+    fn connect_with_protocol<'a>(&'a self, target: &'a TargetAddr,
+                                 session_id: Option<&'a str>,
+                                 protocol: L4Protocol)
+        -> BoxFuture<'a, Result<IoChannel, TunnelError>>;
+    fn connect_pooled_with_protocol<'a>(&'a self, target: &'a TargetAddr,
+                                        protocol: L4Protocol)
         -> BoxFuture<'a, Result<IoChannel, TunnelError>>;
     fn invalidate_broken_sessions(&self) {}
 }
@@ -424,11 +449,14 @@ the root cancellation token. Unsupported schemes return
 | `x-target-host`, `x-target-port`, `x-target-path` | Split target form (WebSocket/UDS). |
 | `x-tunnel-target` | Unified `TargetAddr` string (HTTP/3). |
 | `x-tunnel-pool: idle` | Marks a pre-warmed stream awaiting activation. |
+| `x-tunnel-proto` | `tcp` (default) or `udp`; transmitted on WebSocket, UDS, and HTTP/3 handshakes. |
 
 `WsHandshakeHeaders` encodes and decodes these headers and produces
-`StreamMetadata`. On HTTP/3 listeners, equivalent headers are read from the
-`CONNECT` request. On raw QUIC, the same `StreamMetadata` is serialized with
-MessagePack and sent in a length-prefixed handshake:
+`StreamMetadata` (with `protocol` defaulting to `L4Protocol::Tcp` when
+omitted). On HTTP/3 listeners, equivalent headers are read from the `CONNECT`
+request. On raw QUIC, the same `StreamMetadata` (including `protocol`) is
+serialized with MessagePack (`#[serde(default)]` for compatibility) and sent
+in a length-prefixed handshake:
 
 ```
 4 bytes auth_len (big-endian) | auth_token bytes
@@ -476,9 +504,21 @@ The server caps `auth_len` at 1024 bytes and `meta_len` at 65536 bytes.
   `bind_interface` requires `SO_BINDTODEVICE` and is rejected elsewhere by
   `platform::validate_bind_interface`.
 - `platform::GenericListener` is either `Tcp(Arc<TcpListener>)` or
-  `Uds(Arc<Mutex<PlatformUdsListener>>)`. `frontend::tcp::TcpFrontend` is the
-  only wrapper that exposes it to the runtime, and it implements `Frontend`;
-  both forward and reverse port listeners go through `frontend::bind`, so no
+  `Uds(Arc<Mutex<PlatformUdsListener>>)`, exposed via `frontend::tcp::TcpFrontend`.
+- `frontend::udp::UdpFrontend` binds a single `tokio::net::UdpSocket`, runs a
+  background packet demultiplexer task keying client flows by `SocketAddr`,
+  spawns one bounded `mpsc` session (`UDP_SESSION_CHANNEL_SIZE = 256`, drop-tail
+  on burst saturation) wrapped in `UdpFlowChannel` (`IoChannel::Datagram`) for
+  each newly observed peer, and emits `FrontendAccept`. Dropping
+  `UdpFlowChannel` (e.g. on NAT idle expiration) removes that `(peer_addr,
+  flow_id)` entry under an identity guard so a subsequent packet from the same
+  client opens a fresh tunnel flow cleanly.
+- `platform::ConnectedUdpSocket` binds an ephemeral local UDP socket matching the
+  resolved target IP family (`0.0.0.0:0` or `[::]:0`), connects it to the
+  target `SocketAddr`, and implements `DatagramIo` for zero-header batched I/O;
+  `platform::connect_target_channel` / `connect_target_channel_str` dispatch
+  `L4Protocol::Tcp` to TCP/UDS and `L4Protocol::Udp` to `ConnectedUdpSocket`.
+- Both forward and reverse listeners bind through `frontend::bind`, so no
   runtime module binds a mapping listener directly. `normalize_uds_path` handles
   `unix://`, `ws+unix://`, `wss+unix://`, query strings, and drive-letter paths.
   The Windows UDS listener uses `uds_windows`, WSA events, and a dedicated OS
@@ -499,7 +539,7 @@ pub enum IoChannel {
     Stream(Box<dyn TunnelStream>),
     Datagram(Box<dyn DatagramIo>),
 }
-pub struct FlowKey { pub peer: String, pub target: Option<TargetAddr>, pub protocol: L4Protocol }
+pub struct FlowKey { pub peer: PeerAddr, pub target: Option<TargetAddr>, pub protocol: L4Protocol }
 pub struct Datagram { pub flow: FlowKey, pub payload: Bytes }
 pub trait DatagramIo: Send + Unpin + 'static {
     fn poll_recv(&mut self, cx: &mut Context<'_>, batch: &mut [Datagram])
@@ -532,8 +572,10 @@ pub async fn serve(req: PumpRequest, ctx: PumpCtx)
 pump is registered. It contains no `match` on `IoChannel` variants and no
 read/write calls. `PumpRegistry` is a process-wide
 `RwLock<HashMap<(ChannelKind, ChannelKind), Arc<dyn Pump>>>` seeded at first use
-with `StreamStreamPump` for `(Stream, Stream)`; `register()` is the extension
-point. `FlowKey` identifies one datagram flow and lives on each `Datagram`.
+with `StreamStreamPump` for `(Stream, Stream)`, `DatagramStreamPump` for
+`(Datagram, Stream)`, `StreamDatagramPump` for `(Stream, Datagram)`, and
+`DatagramDatagramPump` for `(Datagram, Datagram)`; `register()` allows adding or
+overriding pairs. `FlowKey` identifies one datagram flow and lives on each `Datagram`.
 
 The frontend is an abstraction, not a concrete enum:
 
@@ -541,10 +583,10 @@ The frontend is an abstraction, not a concrete enum:
 // frontend/mod.rs
 pub struct FrontendAccept {
     pub channel: IoChannel,
-    pub peer: String,
+    pub peer: PeerAddr,
 }
 pub trait Frontend: Send {
-    fn accept(&mut self, slot: &mut ReusableFutureRef<'static, Result<FrontendAccept, TunnelError>>);
+    fn accept(&mut self, slot: &mut ReusableFutureRef<'static, FrontendOutput>);
     fn shutdown<'a>(&'a mut self) -> BoxFuture<'a, ()>;
 }
 pub async fn bind(spec: &MappingSpec) -> Result<Box<dyn Frontend>, TunnelError>;
@@ -556,18 +598,12 @@ declared kind could not drift out of sync with what the frontend actually
 yields. `FrontendAccept` carries no `FlowKey` either — stream flows use `peer`,
 and datagram flows carry their key per envelope in `Datagram.flow`.
 
-`frontend::bind` consults a `FrontendRegistry` keyed by `L4Protocol`. Only
-`Tcp` is registered; a `Udp` spec returns `TunnelError::UnsupportedChannel`
-before any socket is created. `run_forward_mapping` builds the spec with
-`MappingSpec::tcp`; `canonical_mappings()` only supplies the `listen` and
-`target` strings, with no protocol field in `PortMappingConfig`.
-
-**Adding UDP port mapping later** requires a `UdpFrontend` registered in
-`FrontendRegistry`, a datagram-capable `TransportDriver` that yields
-`IoChannel::Datagram`, and a `StreamDatagramPump` / `DatagramDatagramPump`
-registered in `PumpRegistry`. No file under `core/` changes. UDP port mapping
-itself is **not implemented** in this release; only these extension points
-exist.
+`frontend::bind` consults `FrontendRegistry` keyed by `L4Protocol`, with both
+`TcpFrontendFactory` (`L4Protocol::Tcp`) and `UdpFrontendFactory` (`L4Protocol::Udp`)
+registered. Both `run_forward_mapping` and `ServerRunner::handle_reverse_control`
+construct `MappingSpec::new(protocol, listen, target)`. Adding complete UDP
+support validated the three-layer architecture directly: `core/serve.rs` `serve()`
+required zero modifications.
 
 ---
 
@@ -593,26 +629,39 @@ Forward target resolution order:
 2. `metadata.target` unless it is the pool dummy host `pool.idle`.
 3. `server.default_target`.
 
-If none is available the stream is closed with a log message. Dialing uses
-`platform::connect_target`. Both sides are wrapped as `IoChannel` and handed to
-`core::serve(req, ctx)`, which dispatches `StreamStreamPump`. Stream-only
-branches (control framing, session fulfillment, idle pools) call
+If none is available the stream is closed with a log message. Effective L4
+protocol (`effective_proto`) comes from `ACTIVATE_STREAM_UDP` (`Udp`) vs
+`ACTIVATE_STREAM_MAGIC` (`Tcp`) on pooled streams, or `metadata.protocol` on
+unpooled streams. Dialing uses
+`platform::connect_target_channel(&target, effective_proto)` (TCP/UDS stream or
+`ConnectedUdpSocket`). Both sides are handed to `core::serve(req, ctx)` with
+`idle_timeout` (`server.idle_timeout` for TCP, `server.udp_idle_timeout` for
+UDP), which dispatches `StreamStreamPump` or `DatagramStreamPump` / `StreamDatagramPump`.
+Stream-only branches (control framing, session fulfillment, idle pools) call
 `channel.into_stream()` at their own boundary.
 
 ### 6.1 Activation packet
 
 ```
-0xA5 | length: u16 big-endian | UTF-8 target string (Forward mode only)
+magic (1 byte) | length: u16 big-endian | UTF-8 target string (Forward mode only)
 ```
 
-- In **Forward mode**: Produced by `ReplenishingStreamPool::encode_activation` on
-  the client, written before any application data. The server reads the magic
-  byte, then the length and payload with a 10-second timeout, rejects lengths
-  `>= 512`, parses the string with `parse_target_addr`, and only then dials the
-  target. An invalid magic byte or a closed idle stream terminates that connection.
-- In **Reverse mode**: The server sends a single `0xA5` byte directly down the
-  popped idle reverse stream to trigger activation on the client. Target address
-  is already statically configured on the client.
+Magic byte values:
+- `0xA5` (`ACTIVATE_STREAM_MAGIC`): TCP forward/reverse stream activation.
+- `0xA6` (`ACTIVATE_STREAM_PROMOTE`): emergency promotion of an idle reverse pool
+  stream into a replacement `SignalingChannel`.
+- `0xA7` (`ACTIVATE_STREAM_UDP`): UDP forward/reverse stream activation.
+
+- In **Forward mode**: Produced by `ReplenishingStreamPool::encode_activation_with_proto`
+  on the client, written before any application data. The server reads the magic
+  byte (`0xA5` or `0xA7`), then the length and payload with a 10-second timeout,
+  rejects lengths `>= 512`, parses the string with `parse_target_addr`, and only
+  then dials the target (TCP/UDS or `ConnectedUdpSocket`). An invalid magic byte
+  or a closed idle stream terminates that connection.
+- In **Reverse mode**: The server sends a single `0xA5` (TCP) or `0xA7` (UDP)
+  byte directly down the popped idle reverse stream to trigger activation on the
+  client (or `0xA6` to promote an idle stream to control signaling). Target
+  address and protocol are already statically configured on the client.
 
 ### 6.2 Reverse control channel, SignalingChannel & Inbound Pool
 
@@ -625,17 +674,18 @@ interacts with the channel purely via a decoupled `SignalingHandle` (bounded
 command transmission) and `SignalingReceiver` (yielding application-level control
 events: `RegisterReverse`, `RegisterAck`, `NewConnection`).
 
-1. `handle_reverse_control` receives `RegisterReverse { listen_addr, target_addr, pool_size }`
-   from `SignalingReceiver`, binds the requested listener through
-   `frontend::bind(&MappingSpec::tcp(...))`, registers an `inbound_pool` with
+1. `handle_reverse_control` receives `RegisterReverse { listen_addr, target_addr, pool_size, protocol }`
+   from `SignalingReceiver`, binds the requested TCP/UDS or UDP listener through
+   `frontend::bind(&MappingSpec::new(protocol, &listen_addr, &target_addr))`,
+   registers an `inbound_pool` keyed by `(protocol, listen_addr)` with
    `SessionManager` **before** replying `RegisterAck` via `SignalingHandle` (the
    client starts pre-warming immediately on the ack), and enters the accept loop.
 2. `pool_size` is the effective, already-clamped worker count, so the server's
-   soft cap is derived from the same number the client uses; the field is
-   `#[serde(default)]` for interoperability with older peers. Registration of a
-   new generation drains the previous pool, closing its stale idle streams.
-   Teardown removes the pool only if it is still the same `Arc`, so an overlapping
-   reconnect cannot delete the new generation.
+   soft cap is derived from the same number the client uses; both `pool_size`
+   and `protocol` carry `#[serde(default)]` for interoperability with older
+   peers. Registration of a new generation drains the previous pool, closing its
+   stale idle streams. Teardown removes the pool only if it is still the same
+   `Arc`, so an overlapping reconnect cannot delete the new generation.
 3. In the event loop, `SignalingReceiver::recv()` is prioritized above
    `frontend.accept()` in `biased; select!`: this guarantees that control events
    and disconnect alerts are handled promptly without starvation during visitor floods.
@@ -643,15 +693,17 @@ events: `RegisterReverse`, `RegisterAck`, `NewConnection`).
    autonomously within the background `SignalingChannel` actor, completely
    insulating the visitor accept loop from keepalive overhead.
 
-For each inbound connection on the reverse listener:
+For each inbound connection or new UDP client flow on the reverse listener:
 
 1. **Fast path (0-RTT Pool)**: `pop_live(idle_timeout)` takes the newest idle
    stream, drops entries older than the effective idle window, and verifies the
    rest with `poll_check_alive`. To eliminate WAN RTT latency from the accept
-   loop, stream activation (`write_all(&[ACTIVATE_STREAM_MAGIC])` and `flush()`)
-   is offloaded directly into the spawned relay task in `local_tracker`. The
-   accept loop returns in 0 ms, allowing hundreds of visitors to be paired in
-   parallel without blocking subsequent accepts.
+   loop, stream activation (`write_all(&[activation_magic])` — `0xA5` for TCP
+   or `0xA7` for UDP — and `flush()`) is offloaded directly into the spawned
+   relay task in `local_tracker`. The accept loop returns in 0 ms, allowing
+   hundreds of visitors or UDP NAT flows to be paired in parallel without
+   blocking subsequent accepts. `PumpCtx` passes `idle_timeout` for TCP or
+   `udp_idle_timeout` for UDP.
 2. **Fallback path (On-demand Signaling)**: If no live stream is available
    (empty pool, stale entries, or `pool_size` not set), the server allocates a
    session id (`REVERSE_SESSION_COUNTER`), registers a oneshot receiver in
@@ -713,31 +765,39 @@ and spawns one task per mapping.
 
 ### 7.1 Forward mapping
 
-`run_forward_mapping` builds a `MappingSpec` (always `L4Protocol::Tcp`) and
-calls `frontend::bind`. For each `FrontendAccept` it either acquires a stream
-from the shared pool or calls `TransportConnector::connect(&target, None)` on a
-connector shared by the mapping. If a pooled stream was acquired, the activation
-packet is written and flushed first. Both channels are then passed to
-`core::serve`. An `ActiveStreamGuard` calls `pool.on_stream_closed()` on drop.
+`run_forward_mapping` builds a `MappingSpec::new(protocol, &listen, &target_str)`
+and calls `frontend::bind`. For each `FrontendAccept` (TCP connection or per-peer
+`UdpFlowChannel`) it either acquires a stream from the shared pool or calls
+`TransportConnector::connect_with_protocol(&target, None, protocol)` on a
+connector shared by the mapping. If a pooled stream was acquired,
+`ReplenishingStreamPool::encode_activation_with_proto(Some(&target), protocol)`
+writes `0xA5` (TCP) or `0xA7` (UDP) + length + target and flushes first. Both
+channels are then passed to `core::serve` with `idle_timeout` (`endpoint_ctx.idle_timeout()`
+for TCP, or per-mapping `udp_idle_timeout` / `endpoint_ctx.udp_idle_timeout()` for
+UDP). An `ActiveStreamGuard` calls `pool.on_stream_closed()` on drop.
 
 ### 7.2 Reverse mapping
 
 `run_reverse_mapping` opens the control channel with dummy target
-`control:0`, sends `RegisterReverse`, awaits `RegisterAck`, and then loops on
-control messages.
+`control:0`, sends `RegisterReverse { listen_addr, target_addr, pool_size, protocol }`,
+awaits `RegisterAck`, and then loops on control messages.
 
 When `pool_size` is configured, `clamp_reverse_pool_size` caps it at
 `POOL_MAX_CAPACITY` = 64 and one worker per slot maintains a pre-warmed idle
-stream connected to the server (`mode = Reverse`, `pool_idle = true`,
-`target = listen_addr`). The worker waits cancellably for the `0xA5` activation
-byte and reaps its own relay tasks while waiting. It has **no independent
+stream connected to the server via `connect_pooled_with_protocol(&listen_target, protocol)`
+(`mode = Reverse`, `pool_idle = true`, `target = listen_addr`, `protocol`). The
+worker waits cancellably for an activation byte (`0xA5` for TCP, `0xA7` for UDP,
+or `0xA6` to promote the idle stream into a signaling channel) and reaps its
+own relay tasks while waiting. It has **no independent
 recycle timer**: the server is the sole owner of an idle stream's lifetime, so
 a worker can never close a connection the server has already popped and
 committed to a visitor. Expiry, overflow eviction, re-registration and listener
 teardown all close idle streams from the server side; the worker sees EOF and
-re-dials. Upon activation it dials the local `mappings.target`, hands `core::serve`
-to its own `TaskTracker` (never detached), and immediately dials a replacement
-— one dial RTT, with no server-side "pool low" message. Pre-warm dials are
+re-dials. Upon activation it opens the local channel via
+`platform::connect_target_channel_str(&target_clone, protocol)` (TCP/UDS or
+`ConnectedUdpSocket`), hands `core::serve` (with `relay_idle_timeout`) to its own
+`TaskTracker` (never detached), and immediately dials a replacement — one dial
+RTT, with no server-side "pool low" message. Pre-warm dials are
 throttled to at most `POOL_MAX_CONCURRENT_CONNECTS` = 16 concurrent handshakes
 via a shared semaphore, protecting low-bandwidth links from connection storms.
 Dial failures back off exponentially from 200 ms up to 10 s (`POOL_BACKOFF_MAX`),
@@ -748,10 +808,11 @@ Because each consumed slot is replenished by its own worker, an extra server
 signaling round trip would be strictly slower; the control channel is reserved
 for visitors that actually find the pool empty.
 
-On `NewConnection` (the signaling fallback path), it continues to dial the local
-`mappings.target`, opens a `reverse-data` stream with the session id, and calls
-`core::serve`. Reconnect backoff starts at 500 ms, doubles up to 30 s, and
-resets after 30 s of stable operation.
+On `NewConnection` (the signaling fallback path), it opens the local target
+channel via `connect_target_channel_str(&target_clone, protocol)`, opens a
+`reverse-data` stream via `connect_with_protocol(&dummy_target, Some(&session_id), protocol)`,
+and calls `core::serve`. Reconnect backoff starts at 500 ms, doubles up to 30 s,
+and resets after 30 s of stable operation.
 
 ### 7.3 Retry supervision
 
@@ -805,7 +866,7 @@ a simple standalone implementation; the runtime data path uses
 
 ---
 
-## 9. Stream/Stream Pump
+## 9. Stream and Datagram Pumps
 
 `io::pump::StreamStreamPump` implements `Pump` for `(Stream, Stream)`. Its
 `relay_with_heartbeat(a, b, token, heartbeat_interval, idle_timeout)` maintains
@@ -829,13 +890,46 @@ before the loop, not on every poll. On cancellation it allows a bounded 500 ms
 drain (`DEFAULT_RELAY_DRAIN_TIMEOUT`) for in-flight tails. The return value is
 `(bytes_a_to_b, bytes_b_to_a)`.
 
-`Pump::run` calls `IoChannel::into_stream()` on both sides once, then runs this
-state machine. No other pump is registered in this release.
+`StreamStreamPump::run` calls `IoChannel::into_stream()` on both sides once,
+then runs this state machine.
 
-Design constraint: this hot path is intentionally a hand-written `poll_fn`
-state machine. Replacing it with `tokio::select!` is not permitted because of
+### 9.1 Datagram Pumps
+
+`PumpRegistry` also seeds three datagram-capable pumps in `io/pump.rs`:
+
+- `DatagramStreamPump` for `(Datagram, Stream)` (used by frontends like `UdpFrontend`
+  and reverse server UDP listeners over WS/H3/QUIC streams).
+- `StreamDatagramPump` for `(Stream, Datagram)` (used by the server forward side
+  and reverse client side pairing a relay `TunnelStream` with a `ConnectedUdpSocket`).
+- `DatagramDatagramPump` for `(Datagram, Datagram)` (zero-framing batch relay
+  for pure datagram transports).
+
+Over byte streams, datagrams use explicit packet-boundary framing:
+
+```
+payload_len: u16 big-endian | payload bytes (0..=65507 bytes)
+```
+
+This preserves exact UDP message boundaries across arbitrary TCP/WebSocket/QUIC
+chunking splits, including valid 0-byte empty datagrams. `DatagramStreamPump::relay_datagram_stream`
+runs inside a single `poll_fn` loop using reusable `BytesMut` scratch buffers,
+batched datagram polling (`DATAGRAM_BATCH_SIZE = 16`, `MAX_PENDING_DATAGRAMS = 64`),
+and `StreamCaps` (`owned_write` and `half_close`) queried once up front.
+
+UDP session lifetime is governed by `last_dgram_activity.elapsed() >= ctx.idle_timeout`
+(populated from `udp_idle_timeout`): when no datagram flows in either direction
+before the deadline, the pump returns `Ok((dgram_to_stream, stream_to_dgram))` and
+drops the stream cleanly (propagating TCP/WS/QUIC FIN so the remote peer tears
+down its paired `ConnectedUdpSocket` / `UdpFlowChannel` immediately). Meanwhile,
+if `heartbeat_interval` fires while a UDP flow is quietly open, `poll_send_ping` /
+`poll_check_alive` keep the underlying relay transport healthy with
+`stream.last_activity_ms()` clamped at `pump_start_ms` so long-idle pooled
+streams do not expire immediately upon activation.
+
+Design constraint: these hot paths are intentionally hand-written `poll_fn`
+state machines. Replacing them with `tokio::select!` is not permitted because of
 the measured performance impact. Fairness/hand-written priority behavior in
-this loop and in the pool reactor is deliberately retained.
+these loops and in the pool reactor is deliberately retained.
 
 ---
 
@@ -849,12 +943,14 @@ this loop and in the pool reactor is deliberately retained.
    is delivered by `fulfill(session_id, stream)`. `remove` clears timed-out
    entries.
 2. **Reverse Inbound Pools**: A `DashMap<String, Arc<ReverseInboundPool>>` keyed
-   by the canonical `TargetAddr` string (host **and** port or UDS path, so two
-   listeners sharing a port on different local addresses never collide).
+   by `canonical_reverse_key(protocol, addr)` -> `"{protocol}:{normalized}"`
+   (normalized `TargetAddr` host **and** port or UDS path prefixed by `tcp:` or
+   `udp:`, so listeners sharing a port on different addresses or L4 protocols
+   never collide).
    Pre-warmed reverse streams (`mode = Reverse`, `pool_idle = true`,
-   `target = listen_addr`) are enqueued via `push_idle_stream`; a known target
-   that matches no pool is dropped rather than guessed into another listener's
-   pool. Each queue is LIFO with a soft cap of
+   `target = listen_addr`, `protocol`) are enqueued via `push_idle_stream`; a known
+   target that matches no pool is dropped rather than guessed into another
+   listener's pool. Each queue is LIFO with a soft cap of
    `reverse_pool_soft_cap(pool_size) = 2 x` the negotiated worker count:
    overflow evicts the oldest entry, tolerating one overlapping reconnect
    generation while preventing unbounded growth. Entries carry their enqueue
@@ -870,9 +966,10 @@ this loop and in the pool reactor is deliberately retained.
    is identity-checked with `remove_if`.
 
 Errors are `SessionNotFound`, `SessionClosed`, and `SessionPairTimeout`. This
-whole section is stream-scoped: it is the reverse control plane, not the
-byte-moving core. Datagram flows do not use `SessionManager` or
-`ReverseInboundPool`; they are handled entirely by their registered `Pump`.
+whole section is stream-scoped at the pool/control boundary while remaining
+protocol-agnostic via `(protocol, target)` keys: once a session is paired or
+popped for UDP, `IoChannel::Datagram` and `IoChannel::Stream` are handed to
+`core::serve` and driven by `DatagramStreamPump`.
 
 ---
 
@@ -902,11 +999,14 @@ effective configuration values.
 | Constant | Value |
 | :--- | :--- |
 | `RELAY_BUFFER_SIZE` | 65536 |
+| `MAX_UDP_DATAGRAM_SIZE` | 65507 bytes |
+| `UDP_SESSION_CHANNEL_SIZE` | 256 per peer NAT flow |
 | `TOKEN_MAX_LEN` | 256 bytes |
 | `DEFAULT_CONNECT_TIMEOUT` | 10 s |
 | `DEFAULT_HANDSHAKE_TIMEOUT` | 15 s |
 | `DEFAULT_HEARTBEAT_INTERVAL` | 15 s |
 | `DEFAULT_IDLE_TIMEOUT` | 30 s |
+| `DEFAULT_UDP_IDLE_TIMEOUT` | 30 s |
 | `DEFAULT_RETRY_DELAY` | 3 s |
 | `DEFAULT_SESSION_PAIR_TIMEOUT` | 15 s |
 | `DEFAULT_ACTIVATION_READ_TIMEOUT` | 10 s |
@@ -919,7 +1019,8 @@ effective configuration values.
 | `POOL_BACKOFF_BASE` / `POOL_BACKOFF_MAX` / `ACTIVE_WAITERS_MAX` | 200 ms / 10 s / 1 s |
 | `DEFAULT_REVERSE_BACKOFF_INITIAL` / `MAX` / reset | 500 ms / 30 s / 30 s |
 | `MAX_ACTIVATION_TARGET_LEN` | 512 bytes |
-| `ACTIVATE_STREAM_MAGIC` | `0xA5` |
+| `ACTIVATE_STREAM_MAGIC` / `PROMOTE` / `UDP` | `0xA5` / `0xA6` / `0xA7` |
+| `HEADER_TUNNEL_PROTO` | `x-tunnel-proto` (`tcp` / `udp`) |
 | `ALPN_H3` / `ALPN_QUIC` | `h3` / `culvert-quic` |
 | QUIC windows | stream 4 MiB, connection 128 MiB, send 128 MiB |
 | QUIC keep-alive / max idle | 5 s / 30 s |
@@ -935,16 +1036,12 @@ effective configuration values.
 | `FailoverConfig` | `config/model.rs` | Rejected by `ConfigLoader::validate`. |
 | `mux/` (frame, session, stream) | `crates/culvert/src/mux/` | Standalone module with its own tests; no data-path references to `MuxSession`. |
 | `core/failover.rs` | `crates/culvert/src/core/` | Not referenced by config or runtime. |
-| `L4Protocol::Udp` mapping | `io/addr.rs` | Vocabulary only. No config field, no `UdpFrontend`, no UDP socket. |
-| `IoChannel::Datagram` | `io/channel.rs` | Variant and `DatagramIo` trait only. No driver constructs it. |
-| Datagram pumps | `io/pump.rs` | `(Stream, Datagram)` / `(Datagram, Datagram)` are unregistered; `core::serve` returns `UnsupportedChannel`. |
+| Native datagram relay drivers (`TransportDriver` yielding `IoChannel::Datagram`) | `transport/` | `DatagramDatagramPump` is registered, while current WS/H3/QUIC drivers deliver UDP over length-framed streams; future P2P/QUIC-datagram drivers plug in without core changes. |
 
-Consequently there is no UDP port mapping, no seamless transport migration, no
-primary/standby endpoint switching, no stream-offset replay buffer, no
-P2P/STUN/ICE path, and no automatic HTTP/3-to-WSS fallback. Each tunnel uses
-exactly the scheme in its endpoint URL. The three items above are **extension
-points**, not partial implementations: the structural split is complete and
-UDP port mapping is deliberately deferred so the split can be validated first.
+Consequently there is no cross-endpoint primary/standby failover, no seamless
+transport migration with stream-offset replay buffer, no P2P/STUN/ICE path,
+and no automatic HTTP/3-to-WSS fallback. Each tunnel uses exactly the scheme in
+its endpoint URL.
 
 ---
 
@@ -966,9 +1063,10 @@ pub async fn run(config: AppConfig, cancel_token: CancellationToken)
 ```
 
 All modules are public. `io/` exports the neutral vocabulary (`TargetAddr`,
-`L4Protocol`, `MappingSpec`, `IoChannel`, `DatagramIo`, `StreamCaps`,
-`TunnelError`, `Pump`, `PumpRequest`, `PumpCtx`, `pump_registry`,
-`StreamStreamPump`); `frontend/` exports `Frontend`, `FrontendAccept`, and
+`PeerAddr`, `L4Protocol`, `MappingSpec`, `IoChannel`, `Datagram`, `DatagramIo`,
+`StreamCaps`, `TunnelError`, `Pump`, `PumpRequest`, `PumpCtx`, `pump_registry`,
+`StreamStreamPump`, `DatagramStreamPump`, `StreamDatagramPump`,
+`DatagramDatagramPump`); `frontend/` exports `Frontend`, `FrontendAccept`, and
 `bind`; `backend/` exports the `Transport*` traits and `TransportRegistry`;
 `core::serve` is the pump-dispatch entry point. `ConfigLoader`,
 `ReplenishingStreamPool`, and the protocol types are also usable directly.
@@ -980,8 +1078,11 @@ awaiting.
 ## 15. Verification
 
 - `cargo test --workspace` runs unit tests in the config model/loader,
-  control protocol, auth, session manager, task tracker, daemon watchdog, and
-  the end-to-end tests in `crates/culvert/tests/`.
+  control protocol, auth, session manager, task tracker, daemon watchdog,
+  `frontend/udp`, `io::pump`, and the end-to-end tests in `crates/culvert/tests/`
+  (including `test_udp_tunnel.rs` for forward/reverse UDP over WS, HTTP/3, and
+  raw QUIC, NAT demultiplexing, same-port TCP+UDP coexistence, 0-RTT pool &
+  signaling fallback, and `udp_idle_timeout` expiration/recreation).
 - `config-example.yaml` is asserted to parse cleanly by
   `config::loader::tests::test_load_config_example_file`.
 - `culvert --check -c config-example.yaml` exercises the same validation path

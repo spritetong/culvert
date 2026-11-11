@@ -58,8 +58,10 @@ pub async fn run_tunnel_cluster(
         let mapping_tag = format!("{}-map{}", config.tag, idx + 1);
         let PortMappingConfig {
             mode,
+            protocol,
             listen,
             target,
+            udp_idle_timeout,
         } = mapping;
 
         let registry = Arc::clone(&transport_registry);
@@ -72,8 +74,10 @@ pub async fn run_tunnel_cluster(
                 TunnelMode::Forward => {
                     run_forward_mapping(
                         mapping_tag,
+                        protocol,
                         listen,
                         target,
+                        udp_idle_timeout,
                         token,
                         endpoint,
                         registry,
@@ -85,8 +89,10 @@ pub async fn run_tunnel_cluster(
                 TunnelMode::Reverse => {
                     run_reverse_mapping(
                         mapping_tag,
+                        protocol,
                         listen,
                         target,
+                        udp_idle_timeout,
                         token,
                         endpoint,
                         registry,

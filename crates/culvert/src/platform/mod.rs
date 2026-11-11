@@ -15,14 +15,19 @@ mod unix;
 #[cfg(not(windows))]
 pub use unix::*;
 
+use bytes::Bytes;
 use reusable_future::ReusableFutureRef;
+use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
+use std::task::{Context, Poll};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use crate::common::net::SocketTuner;
 use crate::core::error::TunnelError;
 use crate::core::stream::TunnelStream;
-use crate::io::addr::TargetAddr;
+use crate::io::addr::{L4Protocol, TargetAddr};
+use crate::io::channel::{Datagram, DatagramIo, FlowKey, IoChannel};
 
 pub use crate::io::addr::{PeerAddr, is_uds_path, normalize_uds_path, parse_target_addr};
 
@@ -108,7 +113,7 @@ impl GenericListener {
     }
 }
 
-/// Connects to a destination TargetAddr (IP, Domain, or UDS Path).
+/// Connects to a destination TargetAddr (IP, Domain, or UDS Path) using TCP/UDS stream.
 pub async fn connect_target(target: &TargetAddr) -> Result<Box<dyn TunnelStream>, TunnelError> {
     match target {
         TargetAddr::Ip(sa) => {
@@ -134,6 +139,155 @@ pub async fn connect_target(target: &TargetAddr) -> Result<Box<dyn TunnelStream>
 pub async fn connect_target_str(target_str: &str) -> Result<Box<dyn TunnelStream>, TunnelError> {
     let target = parse_target_addr(target_str)?;
     connect_target(&target).await
+}
+
+/// Connected outbound UDP socket implementing `DatagramIo` for relaying to a specific backend target.
+pub struct ConnectedUdpSocket {
+    socket: UdpSocket,
+    peer_addr: SocketAddr,
+    recv_buf: Vec<u8>,
+}
+
+impl ConnectedUdpSocket {
+    /// Resolves `target` if necessary, binds an ephemeral local UDP socket of matching address family,
+    /// and connects it to the destination peer.
+    pub async fn connect(target: &TargetAddr) -> Result<Self, TunnelError> {
+        let peer_addr = match target {
+            TargetAddr::Ip(sa) => *sa,
+            TargetAddr::Domain(host, port) => {
+                let mut addrs = tokio::net::lookup_host((host.as_str(), *port))
+                    .await
+                    .map_err(TunnelError::Io)?;
+                addrs
+                    .next()
+                    .ok_or_else(|| TunnelError::DnsNoAddresses(host.clone(), "any".to_string()))?
+            }
+            TargetAddr::Path(p) => {
+                return Err(TunnelError::Config(format!(
+                    "UDP target cannot be a Unix domain socket path '{}'",
+                    p.display()
+                )));
+            }
+        };
+
+        let bind_addr: SocketAddr = if peer_addr.is_ipv4() {
+            "0.0.0.0:0"
+                .parse()
+                .map_err(|e| TunnelError::Internal(format!("Invalid IPv4 bind addr: {}", e)))?
+        } else {
+            "[::]:0"
+                .parse()
+                .map_err(|e| TunnelError::Internal(format!("Invalid IPv6 bind addr: {}", e)))?
+        };
+
+        let socket = UdpSocket::bind(bind_addr).await.map_err(TunnelError::Io)?;
+        socket.connect(peer_addr).await.map_err(TunnelError::Io)?;
+
+        Ok(Self {
+            socket,
+            peer_addr,
+            recv_buf: vec![0u8; 65536],
+        })
+    }
+}
+
+impl DatagramIo for ConnectedUdpSocket {
+    fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+        batch: &mut [Datagram],
+    ) -> Poll<io::Result<usize>> {
+        if batch.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        let mut buf = tokio::io::ReadBuf::new(&mut self.recv_buf);
+        match self.socket.poll_recv(cx, &mut buf) {
+            Poll::Ready(Ok(())) => {
+                let n = buf.filled().len();
+                batch[0] = Datagram {
+                    flow: FlowKey {
+                        peer: PeerAddr::Socket(self.peer_addr),
+                        target: None,
+                        protocol: L4Protocol::Udp,
+                    },
+                    payload: Bytes::copy_from_slice(&self.recv_buf[..n]),
+                };
+
+                let mut count = 1;
+                while count < batch.len() {
+                    match self.socket.try_recv(&mut self.recv_buf) {
+                        Ok(extra_n) => {
+                            batch[count] = Datagram {
+                                flow: FlowKey {
+                                    peer: PeerAddr::Socket(self.peer_addr),
+                                    target: None,
+                                    protocol: L4Protocol::Udp,
+                                },
+                                payload: Bytes::copy_from_slice(&self.recv_buf[..extra_n]),
+                            };
+                            count += 1;
+                        }
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(_) => break,
+                    }
+                }
+                Poll::Ready(Ok(count))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_send(&mut self, cx: &mut Context<'_>, batch: &[Datagram]) -> Poll<io::Result<usize>> {
+        let mut sent = 0;
+        for dgram in batch {
+            match self.socket.poll_send(cx, &dgram.payload) {
+                Poll::Ready(Ok(_)) => {
+                    sent += 1;
+                }
+                Poll::Ready(Err(e)) => {
+                    if sent > 0 {
+                        return Poll::Ready(Ok(sent));
+                    }
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => {
+                    if sent > 0 {
+                        return Poll::Ready(Ok(sent));
+                    }
+                    return Poll::Pending;
+                }
+            }
+        }
+        Poll::Ready(Ok(sent))
+    }
+}
+
+/// Connects to a destination `TargetAddr` returning either a stream or datagram `IoChannel`
+/// based on the specified L4 protocol.
+pub async fn connect_target_channel(
+    target: &TargetAddr,
+    protocol: L4Protocol,
+) -> Result<IoChannel, TunnelError> {
+    match protocol {
+        L4Protocol::Tcp => connect_target(target)
+            .await
+            .map(IoChannel::from_boxed_stream),
+        L4Protocol::Udp => {
+            let sock = ConnectedUdpSocket::connect(target).await?;
+            Ok(IoChannel::from_datagram(sock))
+        }
+    }
+}
+
+/// Connects to a target address string returning an `IoChannel` matching `protocol`.
+pub async fn connect_target_channel_str(
+    target_str: &str,
+    protocol: L4Protocol,
+) -> Result<IoChannel, TunnelError> {
+    let target = parse_target_addr(target_str)?;
+    connect_target_channel(&target, protocol).await
 }
 
 #[cfg(test)]

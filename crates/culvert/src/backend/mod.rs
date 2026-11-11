@@ -8,7 +8,7 @@
 
 use crate::config::model::{TlsConfig, TunnelMode};
 use crate::dialer::endpoint::EndpointContext;
-use crate::io::addr::TargetAddr;
+use crate::io::addr::{L4Protocol, TargetAddr};
 use crate::io::channel::IoChannel;
 use crate::io::error::TunnelError;
 use crate::io::stream::BoxFuture;
@@ -26,6 +26,8 @@ pub struct StreamMetadata {
     pub target: Option<TargetAddr>,
     #[serde(default)]
     pub pool_idle: bool,
+    #[serde(default)]
+    pub protocol: L4Protocol,
 }
 
 /// Result type produced when accepting a channel from a `TransportListener`.
@@ -48,6 +50,27 @@ pub trait TransportConnector: Send + Sync {
         &'a self,
         target: &'a TargetAddr,
     ) -> BoxFuture<'a, Result<IoChannel, TunnelError>>;
+
+    /// Opens a new channel through the underlying transport carrying the explicit L4 protocol hint.
+    fn connect_with_protocol<'a>(
+        &'a self,
+        target: &'a TargetAddr,
+        session_id: Option<&'a str>,
+        protocol: L4Protocol,
+    ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
+        let _ = protocol;
+        self.connect(target, session_id)
+    }
+
+    /// Opens a pre-warmed pooled stream tagged with the explicit L4 protocol hint.
+    fn connect_pooled_with_protocol<'a>(
+        &'a self,
+        target: &'a TargetAddr,
+        protocol: L4Protocol,
+    ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
+        let _ = protocol;
+        self.connect_pooled(target)
+    }
 
     /// Hints to the connector that underlying streams have failed or become dead,
     /// allowing multiplexed transports (such as HTTP/3) to invalidate broken cached sessions.

@@ -24,11 +24,12 @@ use crate::consts::{
     DEFAULT_QUIC_MAX_IDLE_TIMEOUT, DEFAULT_QUIC_RECEIVE_WINDOW, DEFAULT_QUIC_SEND_WINDOW,
     DEFAULT_QUIC_STREAM_RECEIVE_WINDOW, HEADER_SESSION_ID, HEADER_TARGET_HOST, HEADER_TARGET_PATH,
     HEADER_TARGET_PORT, HEADER_TUNNEL_AUTH, HEADER_TUNNEL_MODE, HEADER_TUNNEL_POOL,
-    HEADER_TUNNEL_TARGET, RAW_QUIC_MAX_AUTH_LEN, RAW_QUIC_MAX_META_LEN, TUNNEL_MODE_REVERSE,
-    TUNNEL_MODE_REVERSE_CTRL, TUNNEL_MODE_REVERSE_DATA, TUNNEL_POOL_IDLE,
+    HEADER_TUNNEL_PROTO, HEADER_TUNNEL_TARGET, RAW_QUIC_MAX_AUTH_LEN, RAW_QUIC_MAX_META_LEN,
+    TUNNEL_MODE_REVERSE, TUNNEL_MODE_REVERSE_CTRL, TUNNEL_MODE_REVERSE_DATA, TUNNEL_POOL_IDLE,
 };
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, TunnelStream};
+use crate::io::addr::L4Protocol;
 use crate::io::channel::IoChannel;
 use crate::transport::h3::stream::{H3TunnelStream, QuinnTunnelStream};
 use crate::transport::{
@@ -455,6 +456,26 @@ impl H3Listener {
                                     .map(|v| v == TUNNEL_POOL_IDLE)
                                     .unwrap_or(false);
 
+                                let protocol = match req
+                                    .headers()
+                                    .get(HEADER_TUNNEL_PROTO)
+                                    .and_then(|v| v.to_str().ok())
+                                {
+                                    Some(s) => match s.parse::<L4Protocol>() {
+                                        Ok(p) => p,
+                                        Err(_) => {
+                                            if let Ok(resp) = Response::builder()
+                                                .status(StatusCode::BAD_REQUEST)
+                                                .body(())
+                                            {
+                                                let _ = stream.send_response(resp).await;
+                                            }
+                                            return;
+                                        }
+                                    },
+                                    None => L4Protocol::Tcp,
+                                };
+
                                 let resp = Response::builder()
                                     .status(StatusCode::OK)
                                     .body(())
@@ -470,6 +491,7 @@ impl H3Listener {
                                     session_id,
                                     target,
                                     pool_idle,
+                                    protocol,
                                 };
                                 let tunnel_stream = Box::new(
                                     H3TunnelStream::from_server(stream)

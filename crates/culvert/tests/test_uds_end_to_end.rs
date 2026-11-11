@@ -72,6 +72,7 @@ async fn test_e2e_server_uds_url_and_mappings() {
                 mode: TunnelMode::Forward,
                 listen: forward_sock_path.clone(),
                 target: target_sock_path.clone(),
+                ..Default::default()
             }],
         }],
     };
@@ -163,6 +164,7 @@ async fn test_e2e_reverse_mapping_uds() {
                 mode: TunnelMode::Reverse,
                 listen: rev_external_str.clone(),
                 target: rev_target_str.clone(),
+                ..Default::default()
             }],
         }],
     };
@@ -266,6 +268,7 @@ async fn test_e2e_server_ws_unix_with_query_path() {
                 mode: TunnelMode::Forward,
                 listen: fwd_listen_str.clone(),
                 target: target_sock_str.clone(),
+                ..Default::default()
             }],
         }],
     };

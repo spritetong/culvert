@@ -89,11 +89,13 @@ async fn test_multi_mapping_shared_pool_and_path_matching_e2e() {
                 mode: TunnelMode::Forward,
                 listen: format!("127.0.0.1:{}", map1_listen_port),
                 target: format!("127.0.0.1:{}", echo_target1_port),
+                ..Default::default()
             },
             PortMappingConfig {
                 mode: TunnelMode::Forward,
                 listen: format!("127.0.0.1:{}", map2_listen_port),
                 target: format!("127.0.0.1:{}", echo_target2_port),
+                ..Default::default()
             },
         ],
     });
@@ -177,6 +179,7 @@ async fn test_path_mismatch_rejection() {
             mode: TunnelMode::Forward,
             listen: format!("127.0.0.1:{}", client_listen_port),
             target: format!("127.0.0.1:{}", echo_port),
+            ..Default::default()
         }],
     });
 
@@ -245,11 +248,13 @@ async fn test_cluster_mixed_forward_and_reverse_with_pool_e2e() {
                 mode: TunnelMode::Forward,
                 listen: format!("127.0.0.1:{}", fwd_listen_port),
                 target: format!("127.0.0.1:{}", echo_fwd_port),
+                ..Default::default()
             },
             PortMappingConfig {
                 mode: TunnelMode::Reverse,
                 listen: format!("127.0.0.1:{}", rev_listen_port),
                 target: format!("127.0.0.1:{}", echo_rev_port),
+                ..Default::default()
             },
         ],
     });

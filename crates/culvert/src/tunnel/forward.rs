@@ -6,6 +6,7 @@
 //! All comments and docstrings must be in English.
 
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -16,7 +17,7 @@ use crate::core::error::TunnelError;
 use crate::core::serve::serve;
 use crate::dialer::endpoint::EndpointContext;
 use crate::frontend::{self, FrontendOutput};
-use crate::io::addr::{MappingSpec, parse_target_addr};
+use crate::io::addr::{L4Protocol, MappingSpec, parse_target_addr};
 use crate::io::channel::IoChannel;
 use crate::io::pump::{PumpCtx, PumpRequest};
 use crate::pool::ReplenishingStreamPool;
@@ -37,8 +38,10 @@ impl Drop for ActiveStreamGuard {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_forward_mapping(
     tag: String,
+    protocol: L4Protocol,
     listen: String,
     target_str: String,
+    udp_idle_timeout: Option<Duration>,
     token: Option<String>,
     endpoint_ctx: EndpointContext,
     transport_registry: Arc<TransportRegistry>,
@@ -47,12 +50,13 @@ pub async fn run_forward_mapping(
 ) -> Result<(), TunnelError> {
     info!(
         tag = %tag,
+        protocol = %protocol,
         listen = %listen,
         target = %target_str,
         "Forward tunnel listener started"
     );
 
-    let spec = MappingSpec::tcp(&listen, &target_str);
+    let spec = MappingSpec::new(protocol, &listen, &target_str);
     let mut frontend = frontend::bind(&spec).await?;
     let mut conn_tracker = TaskTracker::<()>::new(cancel_token.clone());
     let target = parse_target_addr(&target_str)?;
@@ -73,7 +77,10 @@ pub async fn run_forward_mapping(
     };
 
     let hb_interval = endpoint_ctx.heartbeat_interval();
-    let idle_timeout = endpoint_ctx.idle_timeout();
+    let idle_timeout = match protocol {
+        L4Protocol::Tcp => endpoint_ctx.idle_timeout(),
+        L4Protocol::Udp => udp_idle_timeout.unwrap_or_else(|| endpoint_ctx.udp_idle_timeout()),
+    };
     let mut accept_slot: ReusableFutureRef<'static, FrontendOutput> = ReusableFutureRef::default();
 
     loop {
@@ -107,7 +114,7 @@ pub async fn run_forward_mapping(
                                         .await
                                         .map(IoChannel::from_boxed_stream)
                                 } else if let Some(ref c) = connector_clone {
-                                    c.connect(&target, None).await
+                                    c.connect_with_protocol(&target, None, protocol).await
                                 } else {
                                     Err(TunnelError::Internal("Connector unavailable".into()))
                                 }
@@ -122,7 +129,7 @@ pub async fn run_forward_mapping(
                                     let _stream_guard = ActiveStreamGuard(pool_for_close.clone());
 
                                     if pool_clone.is_some() {
-                                        let activation_pkt = ReplenishingStreamPool::encode_activation(Some(&target));
+                                        let activation_pkt = ReplenishingStreamPool::encode_activation_with_proto(Some(&target), protocol);
                                         let Some(write_act_res) = async {
                                             remote_channel.write_all(&activation_pkt).await?;
                                             remote_channel.flush().await?;
@@ -189,6 +196,8 @@ pub async fn run_forward_tunnel(
     })?;
     let listen = mapping.listen.clone();
     let target = mapping.target.clone();
+    let protocol = mapping.protocol;
+    let udp_idle_timeout = mapping.udp_idle_timeout;
 
     let pool = if let Some(size) = config.pool_size.filter(|&s| s > 0) {
         let connector: Arc<dyn TransportConnector> =
@@ -210,8 +219,10 @@ pub async fn run_forward_tunnel(
 
     run_forward_mapping(
         config.tag,
+        protocol,
         listen,
         target,
+        udp_idle_timeout,
         config.token,
         endpoint_ctx,
         transport_registry,

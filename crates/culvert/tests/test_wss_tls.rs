@@ -312,6 +312,7 @@ async fn test_wss_forward_tunnel_with_custom_ca_and_sni() {
             mode: TunnelMode::Forward,
             listen: format!("127.0.0.1:{}", client_listen_port),
             target: format!("127.0.0.1:{}", echo_port),
+            ..Default::default()
         }],
         retry: None,
         http_headers: None,
@@ -430,6 +431,7 @@ async fn test_wss_forward_tunnel_insecure_mode() {
             mode: TunnelMode::Forward,
             listen: format!("127.0.0.1:{}", client_listen_port),
             target: format!("127.0.0.1:{}", echo_port),
+            ..Default::default()
         }],
         retry: None,
         http_headers: None,
@@ -546,6 +548,7 @@ async fn test_wss_mtls_mutual_authentication() {
             mode: TunnelMode::Forward,
             listen: format!("127.0.0.1:{}", client_listen_port),
             target: format!("127.0.0.1:{}", echo_port),
+            ..Default::default()
         }],
         retry: None,
         http_headers: None,
@@ -667,6 +670,7 @@ async fn test_wss_reverse_tunnel_e2e() {
             mode: TunnelMode::Reverse,
             listen: format!("127.0.0.1:{}", reverse_listen_port),
             target: format!("127.0.0.1:{}", local_echo_port),
+            ..Default::default()
         }],
         retry: None,
         http_headers: None,

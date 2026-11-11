@@ -102,6 +102,7 @@ async fn test_high_volume_duplex_stream_integrity() {
             mode: TunnelMode::Forward,
             listen: client_listen.clone(),
             target: format!("127.0.0.1:{}", echo_port),
+            ..Default::default()
         }],
         retry: None,
         http_headers: None,
@@ -247,6 +248,7 @@ async fn test_stream_half_close_and_draining() {
             mode: TunnelMode::Forward,
             listen: client_listen.clone(),
             target: format!("127.0.0.1:{}", backend_service_port),
+            ..Default::default()
         }],
         retry: None,
         http_headers: None,
@@ -342,6 +344,7 @@ async fn test_pool_prewarm_and_reuse() {
             mode: TunnelMode::Forward,
             listen: client_listen.clone(),
             target: format!("127.0.0.1:{}", echo_port),
+            ..Default::default()
         }],
         retry: None,
         http_headers: None,
@@ -439,6 +442,7 @@ async fn test_pool_resilience_after_disconnect_and_high_churn() {
             mode: TunnelMode::Forward,
             listen: client_listen.clone(),
             target: format!("127.0.0.1:{}", echo_port),
+            ..Default::default()
         }],
         retry: None,
         http_headers: None,

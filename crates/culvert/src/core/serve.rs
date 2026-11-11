@@ -104,13 +104,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_serve_rejects_unregistered_channel_pair() {
-        let (_, a) = duplex(64);
-        let datagram = IoChannel::Datagram(Box::new(NoDatagrams));
-        let err = serve(PumpRequest::new(IoChannel::from_stream(a), datagram), ctx())
-            .await
-            .unwrap_err();
-        assert!(matches!(err, TunnelError::UnsupportedChannel(_)));
+    async fn test_serve_recognizes_registered_channel_pairs() {
+        assert!(
+            pump_registry()
+                .lookup((ChannelKind::Stream, ChannelKind::Stream))
+                .is_some()
+        );
+        assert!(
+            pump_registry()
+                .lookup((ChannelKind::Datagram, ChannelKind::Stream))
+                .is_some()
+        );
+        assert!(
+            pump_registry()
+                .lookup((ChannelKind::Stream, ChannelKind::Datagram))
+                .is_some()
+        );
+        assert!(
+            pump_registry()
+                .lookup((ChannelKind::Datagram, ChannelKind::Datagram))
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -137,11 +151,6 @@ mod tests {
         assert!(
             registry
                 .lookup((ChannelKind::Stream, ChannelKind::Datagram))
-                .is_some()
-        );
-        assert!(
-            pump_registry()
-                .lookup((ChannelKind::Stream, ChannelKind::Stream))
                 .is_some()
         );
     }

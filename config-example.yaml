@@ -38,6 +38,7 @@ dialer:
   tcp_nodelay: true
   heartbeat_interval: "15s"  # Optional: probe interval when quiet; any RX or real TX suppresses probes (default: 15s)
   idle_timeout: "30s"        # Optional: deadline with no RX and no TX activity; probe PINGs do not count (default: 30s)
+  udp_idle_timeout: "30s"    # Optional: idle expiration timeout for UDP NAT flows (default: 30s)
 
 # Global default TLS settings
 tls:
@@ -58,6 +59,7 @@ server:
   default_target: "127.0.0.1:5201"  # Optional: fallback target
   # heartbeat_interval: "15s"       # Optional: transport heartbeat interval (default: 15s)
   # idle_timeout: "30s"             # Optional: reverse control & transport idle timeout (default: 30s)
+  # udp_idle_timeout: "30s"         # Optional: server-side idle timeout for UDP NAT flows (default: 30s)
   # TLS certificate & private key (Optional: wss/h3/quic auto-generate self-signed cert if omitted)
   # certificate: "/path/to/server.crt"
   # key: "/path/to/server.key"
@@ -73,23 +75,36 @@ tunnels:
       delay: "3s"
       max_retries: 10
     mappings:
-      # Forward mapping: local 15201 -> remote 5201 (iperf3)
+      # Forward TCP mapping (protocol defaults to "tcp"): local 15201 -> remote 5201 (iperf3)
       - mode: "forward"
+        protocol: "tcp"             # Optional: "tcp" (default) or "udp"
         listen: "127.0.0.1:15201"
         target: "127.0.0.1:5201"
-      # Forward mapping: local 13306 -> remote 3306 (MySQL)
+      # Forward TCP mapping: local 13306 -> remote 3306 (MySQL)
       - mode: "forward"
         listen: "127.0.0.1:13306"
         target: "10.0.0.5:3306"
-      # Forward mapping to Unix domain socket: local 18000 -> remote unix socket
-      # Mappings support 3 formats: ip:port, hostname:port, unix://path
+      # Forward TCP mapping to Unix domain socket: local 18000 -> remote unix socket
+      # TCP mappings support 3 formats: ip:port, hostname:port, unix://path (UDP rejects unix://)
       - mode: "forward"
         listen: "127.0.0.1:18000"
         target: "unix:///var/run/docker.sock"
-      # Reverse mapping: remote 2222 -> local 22 (SSH)
+      # Forward UDP mapping: local 15353/udp -> remote 1.1.1.1:53/udp (TCP and UDP may share a port)
+      - mode: "forward"
+        protocol: "udp"
+        listen: "127.0.0.1:15353"
+        target: "1.1.1.1:53"
+        udp_idle_timeout: "15s"     # Optional: per-mapping override for UDP NAT session expiry
+      # Reverse TCP mapping: remote 2222 -> local 22 (SSH)
       - mode: "reverse"
         listen: "0.0.0.0:2222"
         target: "127.0.0.1:22"
+      # Reverse UDP mapping: remote 51820/udp -> local 51820/udp (WireGuard)
+      - mode: "reverse"
+        protocol: "udp"
+        listen: "0.0.0.0:51820"
+        target: "127.0.0.1:51820"
+        udp_idle_timeout: "60s"
 
   # Tunnel 2: Multi-port tunnel with HTTP/3 & custom HTTP headers
   - tag: "cloud-h3-forward"

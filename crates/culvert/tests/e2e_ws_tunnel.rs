@@ -109,6 +109,7 @@ async fn test_forward_tunnel_ws_e2e() {
             mode: TunnelMode::Forward,
             listen: client_listen.clone(),
             target: format!("127.0.0.1:{}", echo_port),
+            ..Default::default()
         }],
         retry: None,
         http_headers: None,
@@ -206,6 +207,7 @@ async fn test_reverse_tunnel_ws_e2e() {
             mode: TunnelMode::Reverse,
             listen: reverse_listen.clone(),
             target: format!("127.0.0.1:{}", local_echo_port),
+            ..Default::default()
         }],
         retry: None,
         http_headers: None,
@@ -302,6 +304,7 @@ async fn test_reverse_tunnel_with_inbound_pool_e2e() {
             mode: TunnelMode::Reverse,
             listen: reverse_listen.clone(),
             target: format!("127.0.0.1:{}", local_echo_port),
+            ..Default::default()
         }],
         retry: None,
         http_headers: None,
@@ -407,6 +410,7 @@ async fn test_reverse_pool_burst_falls_back_to_signaling_e2e() {
             mode: TunnelMode::Reverse,
             listen: reverse_listen.clone(),
             target: format!("127.0.0.1:{}", local_echo_port),
+            ..Default::default()
         }],
         retry: None,
         http_headers: None,
@@ -491,6 +495,7 @@ async fn test_supervisor_multi_tunnel_concurrency_e2e() {
             mode: TunnelMode::Forward,
             listen: format!("127.0.0.1:{}", fwd_listen_port),
             target: format!("127.0.0.1:{}", echo_fwd_port),
+            ..Default::default()
         }],
         retry: None,
         http_headers: None,
@@ -507,6 +512,7 @@ async fn test_supervisor_multi_tunnel_concurrency_e2e() {
             mode: TunnelMode::Reverse,
             listen: format!("127.0.0.1:{}", rev_listen_port),
             target: format!("127.0.0.1:{}", echo_rev_port),
+            ..Default::default()
         }],
         retry: None,
         http_headers: None,

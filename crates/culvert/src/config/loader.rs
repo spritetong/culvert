@@ -103,6 +103,13 @@ impl ConfigLoader {
                     "dialer.idle_timeout must be greater than 0".to_string(),
                 ));
             }
+            if let Some(ut) = d.udp_idle_timeout
+                && ut.is_zero()
+            {
+                return Err(TunnelError::Config(
+                    "dialer.udp_idle_timeout must be greater than 0".to_string(),
+                ));
+            }
             if let Some(ref iface) = d.bind_interface {
                 crate::platform::validate_bind_interface(iface)?;
             }
@@ -143,6 +150,13 @@ impl ConfigLoader {
             {
                 return Err(TunnelError::Config(
                     "server.idle_timeout must be greater than 0".to_string(),
+                ));
+            }
+            if let Some(ut) = server.udp_idle_timeout
+                && ut.is_zero()
+            {
+                return Err(TunnelError::Config(
+                    "server.udp_idle_timeout must be greater than 0".to_string(),
                 ));
             }
             if let Some(ref dt) = server.default_target {
@@ -302,12 +316,31 @@ impl ConfigLoader {
                     ))
                 })?;
 
-                if mapping.mode == crate::config::model::TunnelMode::Forward
-                    && !seen_forward_binds.insert(mapping.listen.clone())
+                if mapping.protocol == crate::io::addr::L4Protocol::Udp
+                    && (crate::io::addr::is_uds_path(&mapping.listen)
+                        || crate::io::addr::is_uds_path(&mapping.target))
                 {
                     return Err(TunnelError::Config(format!(
-                        "Duplicate forward mapping listen address '{}' in tunnel '{}'. Multiple forward tunnels cannot bind the same local address.",
-                        mapping.listen, tunnel.tag
+                        "tunnel '{}': UDP mapping ('{}' -> '{}') cannot use 'unix://' domain socket addresses",
+                        tunnel.tag, mapping.listen, mapping.target
+                    )));
+                }
+
+                if let Some(ut) = mapping.udp_idle_timeout
+                    && ut.is_zero()
+                {
+                    return Err(TunnelError::Config(format!(
+                        "tunnel '{}': mapping.udp_idle_timeout must be greater than 0",
+                        tunnel.tag
+                    )));
+                }
+
+                if mapping.mode == crate::config::model::TunnelMode::Forward
+                    && !seen_forward_binds.insert((mapping.protocol, mapping.listen.clone()))
+                {
+                    return Err(TunnelError::Config(format!(
+                        "Duplicate forward {} mapping listen address '{}' in tunnel '{}'. Multiple forward tunnels cannot bind the same local {} address.",
+                        mapping.protocol, mapping.listen, tunnel.tag, mapping.protocol
                     )));
                 }
             }
@@ -388,6 +421,14 @@ impl ConfigLoader {
                     {
                         return Err(TunnelError::Config(format!(
                             "tunnel '{}': dialer.idle_timeout must be greater than 0",
+                            tunnel.tag
+                        )));
+                    }
+                    if let Some(ut) = dl.udp_idle_timeout
+                        && ut.is_zero()
+                    {
+                        return Err(TunnelError::Config(format!(
+                            "tunnel '{}': dialer.udp_idle_timeout must be greater than 0",
                             tunnel.tag
                         )));
                     }
@@ -987,7 +1028,7 @@ tunnels:
         assert!(
             res2.unwrap_err()
                 .to_string()
-                .contains("Duplicate forward mapping listen address")
+                .contains("Duplicate forward tcp mapping listen address")
         );
     }
 
@@ -1214,5 +1255,127 @@ tunnels:
         let cfg = res.unwrap();
         let tunnel = &cfg.tunnels[0];
         assert_eq!(tunnel.mappings.len(), 3);
+    }
+
+    #[test]
+    fn test_accept_udp_mapping_and_same_port_tcp_udp() {
+        let yaml = r#"
+dialer:
+  heartbeat_interval: "15s"
+  udp_idle_timeout: "5s"
+server:
+  listen: ["ws://127.0.0.1:8080"]
+  udp_idle_timeout: "20s"
+tunnels:
+  - tag: "dns-dual-stack"
+    endpoint:
+      url: "ws://127.0.0.1:8080/tunnel"
+      dialer:
+        udp_idle_timeout: "3s"
+    mappings:
+      - mode: "forward"
+        protocol: "tcp"
+        listen: "127.0.0.1:5353"
+        target: "8.8.8.8:53"
+      - mode: "forward"
+        protocol: "udp"
+        listen: "127.0.0.1:5353"
+        target: "8.8.8.8:53"
+        udp_idle_timeout: "2s"
+      - mode: "reverse"
+        protocol: "udp"
+        listen: "0.0.0.0:15353"
+        target: "127.0.0.1:53"
+"#;
+        let cfg = ConfigLoader::from_yaml_str(yaml).unwrap();
+        assert_eq!(
+            cfg.dialer.as_ref().unwrap().udp_idle_timeout,
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            cfg.server.as_ref().unwrap().udp_idle_timeout,
+            Some(Duration::from_secs(20))
+        );
+        let m = &cfg.tunnels[0].mappings;
+        assert_eq!(m[0].protocol, crate::io::addr::L4Protocol::Tcp);
+        assert_eq!(m[1].protocol, crate::io::addr::L4Protocol::Udp);
+        assert_eq!(m[1].udp_idle_timeout, Some(Duration::from_secs(2)));
+        assert_eq!(m[2].protocol, crate::io::addr::L4Protocol::Udp);
+        assert_eq!(m[2].udp_idle_timeout, None);
+    }
+
+    #[test]
+    fn test_reject_udp_uds_duplicate_and_zero_timeouts() {
+        // Reject UDP + UDS listen
+        let yaml_udp_uds = r#"
+tunnels:
+  - tag: "bad-udp-uds"
+    endpoint: "ws://127.0.0.1:8080/tunnel"
+    mappings:
+      - mode: "forward"
+        protocol: "udp"
+        listen: "unix:///tmp/not_allowed.sock"
+        target: "127.0.0.1:5353"
+"#;
+        assert!(ConfigLoader::from_yaml_str(yaml_udp_uds).is_err());
+
+        // Reject UDP + UDS target
+        let yaml_udp_uds_tgt = r#"
+tunnels:
+  - tag: "bad-udp-uds-target"
+    endpoint: "ws://127.0.0.1:8080/tunnel"
+    mappings:
+      - mode: "forward"
+        protocol: "udp"
+        listen: "127.0.0.1:5353"
+        target: "unix:///tmp/not_allowed.sock"
+"#;
+        assert!(ConfigLoader::from_yaml_str(yaml_udp_uds_tgt).is_err());
+
+        // Reject duplicate UDP forward listen address
+        let yaml_dup_udp = r#"
+tunnels:
+  - tag: "dup-udp"
+    endpoint: "ws://127.0.0.1:8080/tunnel"
+    mappings:
+      - mode: "forward"
+        protocol: "udp"
+        listen: "127.0.0.1:5354"
+        target: "127.0.0.1:53"
+      - mode: "forward"
+        protocol: "udp"
+        listen: "127.0.0.1:5354"
+        target: "127.0.0.1:54"
+"#;
+        assert!(ConfigLoader::from_yaml_str(yaml_dup_udp).is_err());
+
+        // Reject 0s udp_idle_timeout across all scopes
+        let yaml_zero_dialer = r#"
+dialer:
+  udp_idle_timeout: "0s"
+server:
+  listen: ["ws://127.0.0.1:8080"]
+"#;
+        assert!(ConfigLoader::from_yaml_str(yaml_zero_dialer).is_err());
+
+        let yaml_zero_server = r#"
+server:
+  listen: ["ws://127.0.0.1:8080"]
+  udp_idle_timeout: "0s"
+"#;
+        assert!(ConfigLoader::from_yaml_str(yaml_zero_server).is_err());
+
+        let yaml_zero_mapping = r#"
+tunnels:
+  - tag: "zero-map"
+    endpoint: "ws://127.0.0.1:8080/tunnel"
+    mappings:
+      - mode: "forward"
+        protocol: "udp"
+        listen: "127.0.0.1:5355"
+        target: "127.0.0.1:53"
+        udp_idle_timeout: "0s"
+"#;
+        assert!(ConfigLoader::from_yaml_str(yaml_zero_mapping).is_err());
     }
 }

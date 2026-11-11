@@ -15,6 +15,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use crate::core::error::TunnelError;
+use crate::io::addr::L4Protocol;
 
 /// Signaling protocol message exchanged over the reverse tunnel control channel.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -23,13 +24,15 @@ pub enum ControlMessage {
     ///
     /// `pool_size` is the *effective, clamped* worker count the client will
     /// pre-warm. The server derives its inbound-queue soft cap from it, so both
-    /// ends size the same pool. `None` means pooling is disabled. The field is
-    /// defaulted so older peers that omit it still interoperate.
+    /// ends size the same pool. `None` means pooling is disabled. Both `pool_size`
+    /// and `protocol` are defaulted so older peers that omit them still interoperate.
     RegisterReverse {
         listen_addr: String,
         target_addr: String,
         #[serde(default)]
         pool_size: Option<usize>,
+        #[serde(default)]
+        protocol: L4Protocol,
     },
     /// Server acknowledges the port binding request.
     RegisterAck {
@@ -146,12 +149,24 @@ mod tests {
             listen_addr: "0.0.0.0:2222".to_string(),
             target_addr: "127.0.0.1:22".to_string(),
             pool_size: Some(4),
+            protocol: L4Protocol::Tcp,
         };
 
         ctrl_a.send(msg.clone()).await.unwrap();
 
         let received = ctrl_b.next().await.unwrap().unwrap();
         assert_eq!(received, msg);
+
+        let udp_msg = ControlMessage::RegisterReverse {
+            listen_addr: "0.0.0.0:5353".to_string(),
+            target_addr: "127.0.0.1:53".to_string(),
+            pool_size: Some(2),
+            protocol: L4Protocol::Udp,
+        };
+
+        ctrl_a.send(udp_msg.clone()).await.unwrap();
+        let received_udp = ctrl_b.next().await.unwrap().unwrap();
+        assert_eq!(received_udp, udp_msg);
 
         let ack = ControlMessage::RegisterAck {
             listen_addr: "0.0.0.0:2222".to_string(),
@@ -164,7 +179,7 @@ mod tests {
         assert_eq!(received_ack, ack);
     }
 
-    /// Wire shape emitted by peers predating the negotiated `pool_size` field.
+    /// Wire shape emitted by peers predating the negotiated `pool_size` and `protocol` fields.
     #[derive(Serialize)]
     enum LegacyControlMessage {
         RegisterReverse {
@@ -188,6 +203,7 @@ mod tests {
                 listen_addr: "0.0.0.0:2222".to_string(),
                 target_addr: "127.0.0.1:22".to_string(),
                 pool_size: None,
+                protocol: L4Protocol::Tcp,
             }
         );
     }

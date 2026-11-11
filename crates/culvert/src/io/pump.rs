@@ -6,17 +6,18 @@
 //! and never moves bytes itself.
 //! All comments and docstrings must be in English.
 
-use crate::io::channel::{ChannelKind, IoChannel};
+use crate::io::channel::{ChannelKind, Datagram, DatagramIo, IoChannel};
 use crate::io::error::TunnelError;
 use crate::io::stream::{
     BoxFuture, HeartbeatStatus, StreamCaps, TunnelStream, activity_now_ms, heartbeat_timing,
 };
-use std::collections::HashMap;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use std::collections::{HashMap, VecDeque};
 use std::future::poll_fn;
 use std::pin::{Pin, pin};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::ReadBuf;
 use tokio_util::sync::CancellationToken;
 
@@ -88,7 +89,8 @@ impl Default for PumpRegistry {
     }
 }
 
-/// Returns the process-wide registry, seeded with the stream/stream pump.
+/// Returns the process-wide registry, seeded with stream/stream, datagram/stream,
+/// stream/datagram, and datagram/datagram pumps.
 pub fn pump_registry() -> &'static PumpRegistry {
     static REGISTRY: OnceLock<PumpRegistry> = OnceLock::new();
     REGISTRY.get_or_init(|| {
@@ -96,6 +98,18 @@ pub fn pump_registry() -> &'static PumpRegistry {
         registry.register(
             (ChannelKind::Stream, ChannelKind::Stream),
             Arc::new(StreamStreamPump),
+        );
+        registry.register(
+            (ChannelKind::Datagram, ChannelKind::Stream),
+            Arc::new(DatagramStreamPump),
+        );
+        registry.register(
+            (ChannelKind::Stream, ChannelKind::Datagram),
+            Arc::new(StreamDatagramPump),
+        );
+        registry.register(
+            (ChannelKind::Datagram, ChannelKind::Datagram),
+            Arc::new(DatagramDatagramPump),
         );
         registry
     })
@@ -444,6 +458,451 @@ impl StreamStreamPump {
     }
 }
 
+const DATAGRAM_BATCH_SIZE: usize = 16;
+const MAX_PENDING_DATAGRAMS: usize = 64;
+
+/// The `(Datagram, Stream)` pump framing datagrams over a length-prefixed byte stream.
+///
+/// Each datagram is encoded on the wire as `[u16 payload_len (big-endian) | payload bytes]`.
+pub struct DatagramStreamPump;
+
+impl Pump for DatagramStreamPump {
+    fn run<'a>(
+        &'a self,
+        req: PumpRequest,
+        ctx: PumpCtx,
+    ) -> BoxFuture<'a, Result<(u64, u64), TunnelError>> {
+        Box::pin(async move {
+            let dgram = req.frontend.into_datagram()?;
+            let stream = req.backend.into_stream()?;
+            Self::relay_datagram_stream(
+                dgram,
+                stream,
+                ctx.cancel,
+                ctx.heartbeat_interval,
+                ctx.idle_timeout,
+            )
+            .await
+        })
+    }
+}
+
+/// The `(Stream, Datagram)` pump delegating to `DatagramStreamPump`.
+pub struct StreamDatagramPump;
+
+impl Pump for StreamDatagramPump {
+    fn run<'a>(
+        &'a self,
+        req: PumpRequest,
+        ctx: PumpCtx,
+    ) -> BoxFuture<'a, Result<(u64, u64), TunnelError>> {
+        Box::pin(async move {
+            let stream = req.frontend.into_stream()?;
+            let dgram = req.backend.into_datagram()?;
+            let (d2s, s2d) = DatagramStreamPump::relay_datagram_stream(
+                dgram,
+                stream,
+                ctx.cancel,
+                ctx.heartbeat_interval,
+                ctx.idle_timeout,
+            )
+            .await?;
+            Ok((s2d, d2s))
+        })
+    }
+}
+
+/// The `(Datagram, Datagram)` pump forwarding batched datagrams between two datagram channels.
+pub struct DatagramDatagramPump;
+
+impl Pump for DatagramDatagramPump {
+    fn run<'a>(
+        &'a self,
+        req: PumpRequest,
+        ctx: PumpCtx,
+    ) -> BoxFuture<'a, Result<(u64, u64), TunnelError>> {
+        Box::pin(async move {
+            let mut a = req.frontend.into_datagram()?;
+            let mut b = req.backend.into_datagram()?;
+            let mut batch_a = vec![Datagram::default(); DATAGRAM_BATCH_SIZE];
+            let mut batch_b = vec![Datagram::default(); DATAGRAM_BATCH_SIZE];
+            let mut queue_a_to_b: VecDeque<Datagram> = VecDeque::with_capacity(DATAGRAM_BATCH_SIZE);
+            let mut queue_b_to_a: VecDeque<Datagram> = VecDeque::with_capacity(DATAGRAM_BATCH_SIZE);
+            let mut bytes_a_to_b = 0u64;
+            let mut bytes_b_to_a = 0u64;
+            let mut a_done = false;
+            let mut b_done = false;
+
+            let tick_interval = ctx
+                .heartbeat_interval
+                .min(ctx.idle_timeout / 2)
+                .max(Duration::from_millis(50));
+            let mut last_activity = Instant::now();
+            let mut cancel_fut = pin!(ctx.cancel.cancelled_owned());
+            let mut drain_sleep: Option<Pin<Box<tokio::time::Sleep>>> = None;
+            let mut idle_timer = Box::pin(tokio::time::sleep(tick_interval));
+
+            poll_fn(|cx| {
+                let is_cancelled = cancel_fut.as_mut().poll(cx).is_ready();
+                if is_cancelled {
+                    if drain_sleep.is_none() {
+                        drain_sleep =
+                            Some(Box::pin(tokio::time::sleep(DEFAULT_RELAY_DRAIN_TIMEOUT)));
+                    }
+                    if let Some(sleep_fut) = drain_sleep.as_mut()
+                        && sleep_fut.as_mut().poll(cx).is_ready()
+                    {
+                        return Poll::Ready(Ok((bytes_a_to_b, bytes_b_to_a)));
+                    }
+                }
+
+                if idle_timer.as_mut().poll(cx).is_ready() {
+                    if last_activity.elapsed() >= ctx.idle_timeout {
+                        return Poll::Ready(Ok((bytes_a_to_b, bytes_b_to_a)));
+                    }
+                    idle_timer
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + tick_interval);
+                }
+
+                let mut progress = false;
+
+                // Flush queues
+                if !queue_a_to_b.is_empty() {
+                    match b.poll_send(cx, queue_a_to_b.make_contiguous()) {
+                        Poll::Ready(Ok(n)) if n > 0 => {
+                            queue_a_to_b.drain(..n);
+                            last_activity = Instant::now();
+                            progress = true;
+                        }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(TunnelError::Io(e))),
+                        _ => {}
+                    }
+                }
+                if !queue_b_to_a.is_empty() {
+                    match a.poll_send(cx, queue_b_to_a.make_contiguous()) {
+                        Poll::Ready(Ok(n)) if n > 0 => {
+                            queue_b_to_a.drain(..n);
+                            last_activity = Instant::now();
+                            progress = true;
+                        }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(TunnelError::Io(e))),
+                        _ => {}
+                    }
+                }
+
+                // Receive from A
+                if !a_done && !is_cancelled && queue_a_to_b.len() < MAX_PENDING_DATAGRAMS {
+                    match a.poll_recv(cx, &mut batch_a) {
+                        Poll::Ready(Ok(0)) => {
+                            a_done = true;
+                            progress = true;
+                        }
+                        Poll::Ready(Ok(n)) => {
+                            for d in batch_a.iter().take(n) {
+                                bytes_a_to_b += d.payload.len() as u64;
+                                queue_a_to_b.push_back(d.clone());
+                            }
+                            last_activity = Instant::now();
+                            progress = true;
+                        }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(TunnelError::Io(e))),
+                        Poll::Pending => {}
+                    }
+                }
+
+                // Receive from B
+                if !b_done && !is_cancelled && queue_b_to_a.len() < MAX_PENDING_DATAGRAMS {
+                    match b.poll_recv(cx, &mut batch_b) {
+                        Poll::Ready(Ok(0)) => {
+                            b_done = true;
+                            progress = true;
+                        }
+                        Poll::Ready(Ok(n)) => {
+                            for d in batch_b.iter().take(n) {
+                                bytes_b_to_a += d.payload.len() as u64;
+                                queue_b_to_a.push_back(d.clone());
+                            }
+                            last_activity = Instant::now();
+                            progress = true;
+                        }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(TunnelError::Io(e))),
+                        Poll::Pending => {}
+                    }
+                }
+
+                if ((a_done && queue_a_to_b.is_empty()) || (b_done && queue_b_to_a.is_empty()))
+                    || (is_cancelled && queue_a_to_b.is_empty() && queue_b_to_a.is_empty())
+                {
+                    return Poll::Ready(Ok((bytes_a_to_b, bytes_b_to_a)));
+                }
+
+                if progress {
+                    cx.waker().wake_by_ref();
+                }
+                Poll::Pending
+            })
+            .await
+        })
+    }
+}
+
+impl DatagramStreamPump {
+    /// Relays length-framed datagrams bidirectionally between a `DatagramIo` channel and a `TunnelStream`.
+    pub async fn relay_datagram_stream(
+        mut dgram: Box<dyn DatagramIo>,
+        mut stream: Box<dyn TunnelStream>,
+        cancel_token: CancellationToken,
+        heartbeat_interval: Duration,
+        idle_timeout: Duration,
+    ) -> Result<(u64, u64), TunnelError> {
+        let caps = stream.caps();
+        let mut recv_batch = vec![Datagram::default(); DATAGRAM_BATCH_SIZE];
+        let mut tx_scratch = BytesMut::with_capacity(RELAY_BUFFER_SIZE);
+        let mut in_flight_chunk: Option<Bytes> = None;
+        let mut chunk_pos: usize = 0;
+        let mut need_flush = false;
+        let mut dgram_read_done = false;
+        let mut stream_write_shutdown = false;
+
+        let mut rx_buf = BytesMut::with_capacity(RELAY_BUFFER_SIZE);
+        let mut read_scratch = vec![0u8; RELAY_BUFFER_SIZE];
+        let mut pending_dgrams: VecDeque<Datagram> = VecDeque::with_capacity(DATAGRAM_BATCH_SIZE);
+        let mut stream_read_done = false;
+
+        let mut dgram_to_stream_bytes: u64 = 0;
+        let mut stream_to_dgram_bytes: u64 = 0;
+
+        let tick_interval = heartbeat_interval
+            .min(idle_timeout / 2)
+            .max(Duration::from_millis(50));
+        let pump_start_ms = activity_now_ms();
+        let mut last_dgram_activity = Instant::now();
+
+        let mut cancel_fut = pin!(cancel_token.cancelled_owned());
+        let mut drain_sleep: Option<Pin<Box<tokio::time::Sleep>>> = None;
+        let mut heartbeat_timer = Box::pin(tokio::time::sleep(tick_interval));
+
+        poll_fn(|cx| {
+            let is_cancelled = cancel_fut.as_mut().poll(cx).is_ready();
+            if is_cancelled {
+                if drain_sleep.is_none() {
+                    drain_sleep = Some(Box::pin(tokio::time::sleep(DEFAULT_RELAY_DRAIN_TIMEOUT)));
+                }
+                if let Some(sleep_fut) = drain_sleep.as_mut()
+                    && sleep_fut.as_mut().poll(cx).is_ready()
+                {
+                    return Poll::Ready(Ok((dgram_to_stream_bytes, stream_to_dgram_bytes)));
+                }
+            }
+
+            if heartbeat_timer.as_mut().poll(cx).is_ready() {
+                heartbeat_timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + tick_interval);
+
+                if last_dgram_activity.elapsed() >= idle_timeout {
+                    return Poll::Ready(Ok((dgram_to_stream_bytes, stream_to_dgram_bytes)));
+                }
+
+                let now_ms = activity_now_ms();
+                let effective_activity = stream.last_activity_ms().map(|ts| ts.max(pump_start_ms));
+                let (probe, expired) = heartbeat_timing(
+                    effective_activity,
+                    now_ms,
+                    heartbeat_interval,
+                    idle_timeout.saturating_add(tick_interval),
+                );
+                if expired {
+                    return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Datagram relay tunnel stream idle timeout",
+                    ))));
+                }
+                if probe && let Poll::Ready(Err(e)) = stream.poll_send_ping(cx) {
+                    return Poll::Ready(Err(TunnelError::Io(e)));
+                }
+                if let Poll::Ready(HeartbeatStatus::Dead) = stream.poll_check_alive(cx) {
+                    return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Datagram relay tunnel stream unresponsive to heartbeats",
+                    ))));
+                }
+            }
+
+            let mut progress = false;
+
+            // --- Direction 1: Datagram -> Stream (write encoded frames) ---
+            while let Some(ref chunk) = in_flight_chunk {
+                let write_res = if caps.owned_write {
+                    let to_write = if chunk_pos == 0 {
+                        chunk.clone()
+                    } else {
+                        chunk.slice(chunk_pos..)
+                    };
+                    stream.poll_write_owned(cx, to_write)
+                } else {
+                    Pin::new(&mut *stream).poll_write(cx, &chunk[chunk_pos..])
+                };
+
+                match write_res {
+                    Poll::Ready(Ok(0)) => {
+                        return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "stream writer returned zero bytes",
+                        ))));
+                    }
+                    Poll::Ready(Ok(n)) => {
+                        chunk_pos += n;
+                        progress = true;
+                        if chunk_pos >= chunk.len() {
+                            in_flight_chunk = None;
+                            chunk_pos = 0;
+                            need_flush = true;
+                        }
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(TunnelError::Io(e))),
+                    Poll::Pending => break,
+                }
+            }
+
+            if !dgram_read_done && !is_cancelled && in_flight_chunk.is_none() {
+                match dgram.poll_recv(cx, &mut recv_batch) {
+                    Poll::Ready(Ok(0)) => {
+                        dgram_read_done = true;
+                        progress = true;
+                    }
+                    Poll::Ready(Ok(n)) => {
+                        tx_scratch.clear();
+                        for d in recv_batch.iter().take(n) {
+                            let plen = d.payload.len();
+                            if plen > u16::MAX as usize {
+                                return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    "UDP datagram exceeds maximum u16 frame length",
+                                ))));
+                            }
+                            tx_scratch.put_u16(plen as u16);
+                            tx_scratch.extend_from_slice(&d.payload);
+                            dgram_to_stream_bytes += plen as u64;
+                        }
+                        if !tx_scratch.is_empty() {
+                            in_flight_chunk = Some(tx_scratch.split().freeze());
+                            chunk_pos = 0;
+                            last_dgram_activity = Instant::now();
+                            progress = true;
+                        }
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(TunnelError::Io(e))),
+                    Poll::Pending => {}
+                }
+            }
+
+            if need_flush && in_flight_chunk.is_none() {
+                match Pin::new(&mut *stream).poll_flush(cx) {
+                    Poll::Ready(Ok(())) => {
+                        need_flush = false;
+                        progress = true;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(TunnelError::Io(e))),
+                    Poll::Pending => {}
+                }
+            }
+
+            if is_cancelled {
+                dgram_read_done = true;
+            }
+
+            if dgram_read_done && in_flight_chunk.is_none() && !stream_write_shutdown {
+                match Pin::new(&mut *stream).poll_flush(cx) {
+                    Poll::Ready(Ok(())) => {
+                        need_flush = false;
+                    }
+                    Poll::Ready(Err(e)) => {
+                        tracing::debug!("Datagram pump stream flush error on shutdown: {}", e);
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+                if caps.half_close {
+                    match Pin::new(&mut *stream).poll_shutdown(cx) {
+                        Poll::Ready(Ok(())) | Poll::Ready(Err(_)) => {
+                            stream_write_shutdown = true;
+                            progress = true;
+                        }
+                        Poll::Pending => {}
+                    }
+                } else {
+                    stream_write_shutdown = true;
+                    progress = true;
+                }
+            }
+
+            // --- Direction 2: Stream -> Datagram (read & decode frames) ---
+            if !stream_read_done && !is_cancelled && pending_dgrams.len() < MAX_PENDING_DATAGRAMS {
+                let mut read_buf = ReadBuf::new(&mut read_scratch);
+                match Pin::new(&mut *stream).poll_read(cx, &mut read_buf) {
+                    Poll::Ready(Ok(())) => {
+                        let filled = read_buf.filled();
+                        if filled.is_empty() {
+                            stream_read_done = true;
+                        } else {
+                            rx_buf.extend_from_slice(filled);
+                            while rx_buf.len() >= 2 {
+                                let frame_len = u16::from_be_bytes([rx_buf[0], rx_buf[1]]) as usize;
+                                if rx_buf.len() >= 2 + frame_len {
+                                    rx_buf.advance(2);
+                                    let payload = rx_buf.split_to(frame_len).freeze();
+                                    stream_to_dgram_bytes += frame_len as u64;
+                                    pending_dgrams.push_back(Datagram {
+                                        flow: Default::default(),
+                                        payload,
+                                    });
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        progress = true;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(TunnelError::Io(e))),
+                    Poll::Pending => {}
+                }
+            }
+
+            while !pending_dgrams.is_empty() {
+                match dgram.poll_send(cx, pending_dgrams.make_contiguous()) {
+                    Poll::Ready(Ok(0)) => {
+                        return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "datagram sender returned zero sent",
+                        ))));
+                    }
+                    Poll::Ready(Ok(sent)) => {
+                        pending_dgrams.drain(..sent);
+                        last_dgram_activity = Instant::now();
+                        progress = true;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(TunnelError::Io(e))),
+                    Poll::Pending => break,
+                }
+            }
+
+            if (stream_read_done && pending_dgrams.is_empty())
+                || (dgram_read_done && stream_write_shutdown && pending_dgrams.is_empty())
+            {
+                return Poll::Ready(Ok((dgram_to_stream_bytes, stream_to_dgram_bytes)));
+            }
+
+            if progress {
+                cx.waker().wake_by_ref();
+            }
+
+            Poll::Pending
+        })
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -779,5 +1238,160 @@ mod tests {
             0,
             "TX/RX activity must suppress keepalive probes"
         );
+    }
+
+    struct ChannelDatagramIo {
+        rx: tokio::sync::mpsc::UnboundedReceiver<Datagram>,
+        tx: tokio::sync::mpsc::UnboundedSender<Datagram>,
+    }
+
+    impl DatagramIo for ChannelDatagramIo {
+        fn poll_recv(
+            &mut self,
+            cx: &mut Context<'_>,
+            batch: &mut [Datagram],
+        ) -> Poll<io::Result<usize>> {
+            if batch.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+            match self.rx.poll_recv(cx) {
+                Poll::Ready(Some(d)) => {
+                    batch[0] = d;
+                    let mut count = 1;
+                    while count < batch.len() {
+                        match self.rx.try_recv() {
+                            Ok(d) => {
+                                batch[count] = d;
+                                count += 1;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    Poll::Ready(Ok(count))
+                }
+                Poll::Ready(None) => Poll::Ready(Ok(0)),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+
+        fn poll_send(
+            &mut self,
+            _cx: &mut Context<'_>,
+            batch: &[Datagram],
+        ) -> Poll<io::Result<usize>> {
+            for d in batch {
+                if self.tx.send(d.clone()).is_err() {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "datagram receiver closed",
+                    )));
+                }
+            }
+            Poll::Ready(Ok(batch.len()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_datagram_stream_pump_framing_and_empty_packet() {
+        let (to_dgram_tx, from_pump_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (to_pump_tx, to_dgram_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let (stream_a, mut stream_b) = duplex(65536);
+
+        let dgram_io = ChannelDatagramIo {
+            rx: to_dgram_rx,
+            tx: to_dgram_tx,
+        };
+
+        let cancel = CancellationToken::new();
+        let pump_handle = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                DatagramStreamPump::relay_datagram_stream(
+                    Box::new(dgram_io),
+                    Box::new(stream_a),
+                    cancel,
+                    Duration::from_secs(5),
+                    Duration::from_secs(10),
+                )
+                .await
+            }
+        });
+
+        // 1. Send packet + empty packet from datagram side to stream side
+        to_pump_tx
+            .send(Datagram {
+                flow: Default::default(),
+                payload: Bytes::from_static(b"hello udp"),
+            })
+            .unwrap();
+        to_pump_tx
+            .send(Datagram {
+                flow: Default::default(),
+                payload: Bytes::new(),
+            })
+            .unwrap();
+
+        let mut hdr = [0u8; 2];
+        stream_b.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(u16::from_be_bytes(hdr), 9);
+        let mut body = vec![0u8; 9];
+        stream_b.read_exact(&mut body).await.unwrap();
+        assert_eq!(&body, b"hello udp");
+
+        stream_b.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(u16::from_be_bytes(hdr), 0);
+
+        // 2. Write a fragmented frame from stream_b back to datagram side
+        let reply = b"reply-from-stream";
+        let frame_len = (reply.len() as u16).to_be_bytes();
+        stream_b.write_all(&frame_len[..1]).await.unwrap();
+        stream_b.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        stream_b.write_all(&frame_len[1..]).await.unwrap();
+        stream_b.write_all(&reply[..5]).await.unwrap();
+        stream_b.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        stream_b.write_all(&reply[5..]).await.unwrap();
+        stream_b.flush().await.unwrap();
+
+        let mut from_pump_rx = from_pump_rx;
+        let recvd = from_pump_rx.recv().await.unwrap();
+        assert_eq!(recvd.payload.as_ref(), reply);
+
+        drop(to_pump_tx);
+        let (d2s, s2d) = pump_handle.await.unwrap().unwrap();
+        assert_eq!(d2s, 9);
+        assert_eq!(s2d, 17);
+    }
+
+    #[tokio::test]
+    async fn test_datagram_stream_pump_idle_timeout() {
+        let (_to_dgram_tx, _from_pump_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_to_pump_tx, to_dgram_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stream_a, _stream_b) = duplex(4096);
+
+        let dgram_io = ChannelDatagramIo {
+            rx: to_dgram_rx,
+            tx: _to_dgram_tx,
+        };
+
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            DatagramStreamPump::relay_datagram_stream(
+                Box::new(dgram_io),
+                Box::new(stream_a),
+                CancellationToken::new(),
+                Duration::from_secs(15),
+                Duration::from_millis(120),
+            ),
+        )
+        .await;
+
+        assert!(
+            res.is_ok(),
+            "Pump must terminate promptly on UDP idle timeout"
+        );
+        assert!(res.unwrap().is_ok(), "UDP idle expiration is clean Ok exit");
     }
 }

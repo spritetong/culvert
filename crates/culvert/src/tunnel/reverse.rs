@@ -15,14 +15,16 @@ use tracing::{debug, error, info, warn};
 use crate::common::{CancelFutureExt, CancellationTokenExt, TaskTracker};
 use crate::config::model::{TunnelConfig, TunnelMode};
 use crate::consts::{
-    ACTIVATE_STREAM_MAGIC, DEFAULT_REVERSE_BACKOFF_INITIAL, DEFAULT_REVERSE_BACKOFF_MAX,
-    POOL_BACKOFF_ACTIVE_WAITERS_MAX, POOL_BACKOFF_BASE, POOL_MAX_CONCURRENT_CONNECTS,
-    REVERSE_BACKOFF_RESET_THRESHOLD, REVERSE_CONTROL_TARGET_HOST, clamp_reverse_pool_size,
+    ACTIVATE_STREAM_MAGIC, ACTIVATE_STREAM_UDP, DEFAULT_REVERSE_BACKOFF_INITIAL,
+    DEFAULT_REVERSE_BACKOFF_MAX, POOL_BACKOFF_ACTIVE_WAITERS_MAX, POOL_BACKOFF_BASE,
+    POOL_MAX_CONCURRENT_CONNECTS, REVERSE_BACKOFF_RESET_THRESHOLD, REVERSE_CONTROL_TARGET_HOST,
+    clamp_reverse_pool_size,
 };
 use crate::control::{ControlMessage, SignalingChannel, SignalingConfig, SignalingRouter};
 use crate::core::error::TunnelError;
 use crate::core::serve::serve;
 use crate::dialer::endpoint::EndpointContext;
+use crate::io::addr::L4Protocol;
 use crate::io::pump::{PumpCtx, PumpRequest};
 use crate::transport::{TargetAddr, TransportConnector, TransportRegistry};
 
@@ -30,8 +32,10 @@ use crate::transport::{TargetAddr, TransportConnector, TransportRegistry};
 #[allow(clippy::too_many_arguments)]
 pub async fn run_reverse_mapping(
     tag: String,
+    protocol: L4Protocol,
     listen: String,
     target_addr: String,
+    udp_idle_timeout: Option<Duration>,
     token: Option<String>,
     endpoint_ctx: EndpointContext,
     transport_registry: Arc<TransportRegistry>,
@@ -40,6 +44,7 @@ pub async fn run_reverse_mapping(
 ) -> Result<(), TunnelError> {
     info!(
         tag = %tag,
+        protocol = %protocol,
         listen = %listen,
         target = %target_addr,
         "Reverse tunnel worker started"
@@ -48,6 +53,14 @@ pub async fn run_reverse_mapping(
     let dummy_target = TargetAddr::Domain(REVERSE_CONTROL_TARGET_HOST.to_string(), 0);
     let hb_interval = endpoint_ctx.heartbeat_interval();
     let idle_timeout = endpoint_ctx.idle_timeout();
+    let relay_idle_timeout = match protocol {
+        L4Protocol::Tcp => idle_timeout,
+        L4Protocol::Udp => udp_idle_timeout.unwrap_or_else(|| endpoint_ctx.udp_idle_timeout()),
+    };
+    let expected_activation_magic = match protocol {
+        L4Protocol::Tcp => ACTIVATE_STREAM_MAGIC,
+        L4Protocol::Udp => ACTIVATE_STREAM_UDP,
+    };
     // Clamp once and advertise the effective worker count: the server derives
     // its soft cap from exactly this value instead of an independent constant.
     let pool_workers = clamp_reverse_pool_size(pool_size);
@@ -114,6 +127,7 @@ pub async fn run_reverse_mapping(
             listen_addr: listen.clone(),
             target_addr: target_addr.clone(),
             pool_size: pool_workers,
+            protocol,
         };
 
         let send_result = router.send(reg_msg).await;
@@ -203,7 +217,7 @@ pub async fn run_reverse_mapping(
                 let event_sink_worker = event_sink.clone();
                 let sig_cfg = sig_config;
                 let hb = hb_interval;
-                let idle = idle_timeout;
+                let idle = relay_idle_timeout;
 
                 pool_tracker.spawn_with_cancel(move |token| async move {
                     // Every relay this worker starts is owned and awaited; no task
@@ -221,7 +235,7 @@ pub async fn run_reverse_mapping(
                         };
 
                         let conn_res_opt = connector
-                            .connect_pooled(&listen_target)
+                            .connect_pooled_with_protocol(&listen_target, protocol)
                             .cancel_with(&token)
                             .await;
                         drop(_permit);
@@ -294,20 +308,21 @@ pub async fn run_reverse_mapping(
                                 router_worker.attach(new_handle);
                                 continue;
                             }
-                        } else if activation_kind != ACTIVATE_STREAM_MAGIC {
+                        } else if activation_kind != expected_activation_magic {
                             if !token.sleep_or_cancel(Duration::from_millis(100)).await {
                                 break;
                             }
                             continue;
                         }
 
-                        let Some(local_res) = crate::platform::connect_target_str(&target_clone)
-                            .cancel_with(&token)
-                            .await
+                        let Some(local_res) =
+                            crate::platform::connect_target_channel_str(&target_clone, protocol)
+                                .cancel_with(&token)
+                                .await
                         else {
                             break;
                         };
-                        let local_stream = match local_res {
+                        let local_channel = match local_res {
                             Ok(s) => s,
                             Err(e) => {
                                 error!(
@@ -323,7 +338,7 @@ pub async fn run_reverse_mapping(
 
                         relays.spawn_with_cancel(move |relay_token| async move {
                             let _ = serve(
-                                PumpRequest::new(local_stream, stream),
+                                PumpRequest::new(local_channel, stream),
                                 PumpCtx {
                                     cancel: relay_token,
                                     heartbeat_interval: hb,
@@ -366,16 +381,18 @@ pub async fn run_reverse_mapping(
                             let session_id_clone = session_id.clone();
                             let dummy_target = dummy_target.clone();
                             let tag_clone = tag.clone();
+                            let relay_idle = relay_idle_timeout;
 
                             conn_tracker.spawn_with_cancel(move |token| async move {
                                 // 1. Dial local target service
-                                let Some(local_res) = crate::platform::connect_target_str(&target_clone)
-                                    .cancel_with(&token)
-                                    .await
+                                let Some(local_res) =
+                                    crate::platform::connect_target_channel_str(&target_clone, protocol)
+                                        .cancel_with(&token)
+                                        .await
                                 else {
                                     return;
                                 };
-                                let local_stream = match local_res {
+                                let local_channel = match local_res {
                                     Ok(s) => s,
                                     Err(e) => {
                                         if !token.is_cancelled() {
@@ -387,7 +404,7 @@ pub async fn run_reverse_mapping(
 
                                 // 2. Open reverse data stream to server matching session_id
                                 let Some(remote_res) = connector
-                                    .connect(&dummy_target, Some(&session_id_clone))
+                                    .connect_with_protocol(&dummy_target, Some(&session_id_clone), protocol)
                                     .cancel_with(&token)
                                     .await
                                 else {
@@ -405,11 +422,11 @@ pub async fn run_reverse_mapping(
 
                                 // 3. Relay bidirectionally
                                 let _ = serve(
-                                    PumpRequest::new(local_stream, data_stream),
+                                    PumpRequest::new(local_channel, data_stream),
                                     PumpCtx {
                                         cancel: token,
                                         heartbeat_interval: hb_interval,
-                                        idle_timeout,
+                                        idle_timeout: relay_idle,
                                     },
                                 ).await;
                             });
@@ -460,8 +477,10 @@ pub async fn run_reverse_tunnel(
     let target = mapping.target.clone();
     run_reverse_mapping(
         config.tag,
+        mapping.protocol,
         listen,
         target,
+        mapping.udp_idle_timeout,
         config.token,
         endpoint_ctx,
         transport_registry,
@@ -558,8 +577,10 @@ mod tests {
         let handle = tokio::spawn(async move {
             run_reverse_mapping(
                 "test_silent".to_string(),
+                L4Protocol::Tcp,
                 "127.0.0.1:9090".to_string(),
                 "127.0.0.1:9091".to_string(),
+                None,
                 None,
                 ep_ctx,
                 reg,
@@ -696,8 +717,10 @@ mod tests {
         let handle = tokio::spawn(async move {
             run_reverse_mapping(
                 "test_throttle".to_string(),
+                L4Protocol::Tcp,
                 "127.0.0.1:9090".to_string(),
                 "127.0.0.1:9091".to_string(),
+                None,
                 None,
                 ep_ctx,
                 reg,
@@ -811,8 +834,10 @@ mod tests {
         let handle = tokio::spawn(async move {
             run_reverse_mapping(
                 "test_stalled_register".to_string(),
+                L4Protocol::Tcp,
                 "127.0.0.1:9090".to_string(),
                 "127.0.0.1:9091".to_string(),
+                None,
                 None,
                 ep_ctx,
                 reg,

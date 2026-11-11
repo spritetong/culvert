@@ -22,13 +22,15 @@ use crate::consts::{
     DEFAULT_QUIC_MAX_CONCURRENT_UNI_STREAMS, DEFAULT_QUIC_MAX_IDLE_TIMEOUT,
     DEFAULT_QUIC_RECEIVE_WINDOW, DEFAULT_QUIC_SEND_WINDOW, DEFAULT_QUIC_STREAM_RECEIVE_WINDOW,
     DEFAULT_TUNNEL_PATH, H3_FAILURE_SUPPRESSION_COOLDOWN, HEADER_SESSION_ID, HEADER_TUNNEL_AUTH,
-    HEADER_TUNNEL_MODE, HEADER_TUNNEL_POOL, HEADER_TUNNEL_TARGET, SCHEME_QUIC, TUNNEL_MODE_FORWARD,
-    TUNNEL_MODE_REVERSE_CTRL, TUNNEL_MODE_REVERSE_DATA, TUNNEL_POOL_IDLE,
+    HEADER_TUNNEL_MODE, HEADER_TUNNEL_POOL, HEADER_TUNNEL_PROTO, HEADER_TUNNEL_TARGET, SCHEME_QUIC,
+    TUNNEL_MODE_FORWARD, TUNNEL_MODE_REVERSE_CTRL, TUNNEL_MODE_REVERSE_DATA, TUNNEL_POOL_IDLE,
+    TUNNEL_PROTO_UDP,
 };
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, TunnelStream};
 use crate::dialer::endpoint::EndpointContext;
 use crate::dialer::tls::TlsConfigBuilder;
+use crate::io::addr::L4Protocol;
 use crate::io::channel::IoChannel;
 use crate::transport::h3::stream::{H3TunnelStream, QuinnTunnelStream};
 use crate::transport::{TargetAddr, TransportConnector};
@@ -378,6 +380,7 @@ impl H3Connector {
         target: &TargetAddr,
         session_id: Option<&str>,
         pool_idle: bool,
+        protocol: L4Protocol,
     ) -> Result<Box<dyn TunnelStream>, TunnelError> {
         let session = self.get_or_establish_h3_session().await?;
         let mut send_request = session.sender.clone();
@@ -443,6 +446,10 @@ impl H3Connector {
 
         if pool_idle {
             req_builder = req_builder.header(HEADER_TUNNEL_POOL, TUNNEL_POOL_IDLE);
+        }
+
+        if protocol == L4Protocol::Udp {
+            req_builder = req_builder.header(HEADER_TUNNEL_PROTO, TUNNEL_PROTO_UDP);
         }
 
         req_builder = req_builder.header(HEADER_TUNNEL_TARGET, target.to_string());
@@ -521,6 +528,7 @@ impl H3Connector {
         target: &TargetAddr,
         session_id: Option<&str>,
         pool_idle: bool,
+        protocol: L4Protocol,
     ) -> Result<Box<dyn TunnelStream>, TunnelError> {
         let session = self.get_or_connect_quic_raw().await?;
         let conn = session.conn.clone();
@@ -548,6 +556,7 @@ impl H3Connector {
             session_id: session_id.map(|s| s.to_string()),
             target: Some(target.clone()),
             pool_idle,
+            protocol,
         };
 
         let handshake_bytes = rmp_serde::to_vec_named(&handshake_meta)
@@ -592,25 +601,43 @@ impl TransportConnector for H3Connector {
         target: &'a TargetAddr,
         session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
-        Box::pin(async move {
-            let stream = if self.endpoint.endpoint.scheme == "quic" {
-                self.connect_quic_raw(target, session_id, false).await?
-            } else {
-                self.connect_h3(target, session_id, false).await?
-            };
-            Ok(IoChannel::from_boxed_stream(stream))
-        })
+        self.connect_with_protocol(target, session_id, L4Protocol::Tcp)
     }
 
     fn connect_pooled<'a>(
         &'a self,
         target: &'a TargetAddr,
     ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
+        self.connect_pooled_with_protocol(target, L4Protocol::Tcp)
+    }
+
+    fn connect_with_protocol<'a>(
+        &'a self,
+        target: &'a TargetAddr,
+        session_id: Option<&'a str>,
+        protocol: L4Protocol,
+    ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
         Box::pin(async move {
             let stream = if self.endpoint.endpoint.scheme == "quic" {
-                self.connect_quic_raw(target, None, true).await?
+                self.connect_quic_raw(target, session_id, false, protocol)
+                    .await?
             } else {
-                self.connect_h3(target, None, true).await?
+                self.connect_h3(target, session_id, false, protocol).await?
+            };
+            Ok(IoChannel::from_boxed_stream(stream))
+        })
+    }
+
+    fn connect_pooled_with_protocol<'a>(
+        &'a self,
+        target: &'a TargetAddr,
+        protocol: L4Protocol,
+    ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
+        Box::pin(async move {
+            let stream = if self.endpoint.endpoint.scheme == "quic" {
+                self.connect_quic_raw(target, None, true, protocol).await?
+            } else {
+                self.connect_h3(target, None, true, protocol).await?
             };
             Ok(IoChannel::from_boxed_stream(stream))
         })

@@ -11,14 +11,44 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 /// Transport-layer protocol of a port mapping.
-///
-/// `Udp` is vocabulary only in this release: no configuration field, frontend,
-/// or datagram driver constructs it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum L4Protocol {
     #[default]
     Tcp,
     Udp,
+}
+
+impl L4Protocol {
+    /// Returns the lowercase canonical string representation (`"tcp"` or `"udp"`).
+    #[inline]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Tcp => crate::consts::TUNNEL_PROTO_TCP,
+            Self::Udp => crate::consts::TUNNEL_PROTO_UDP,
+        }
+    }
+}
+
+impl std::fmt::Display for L4Protocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for L4Protocol {
+    type Err = TunnelError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "tcp" => Ok(Self::Tcp),
+            "udp" => Ok(Self::Udp),
+            other => Err(TunnelError::Config(format!(
+                "Unsupported L4 protocol '{}'. Expected 'tcp' or 'udp'.",
+                other
+            ))),
+        }
+    }
 }
 
 /// Neutral description of one port mapping handed to `frontend::bind`.
@@ -30,13 +60,23 @@ pub struct MappingSpec {
 }
 
 impl MappingSpec {
-    /// Builds the only mapping kind supported today.
-    pub fn tcp(listen: impl Into<String>, target: impl Into<String>) -> Self {
+    /// Builds a mapping spec for any L4 protocol.
+    pub fn new(protocol: L4Protocol, listen: impl Into<String>, target: impl Into<String>) -> Self {
         Self {
-            protocol: L4Protocol::Tcp,
+            protocol,
             listen: listen.into(),
             target: target.into(),
         }
+    }
+
+    /// Builds a TCP mapping spec.
+    pub fn tcp(listen: impl Into<String>, target: impl Into<String>) -> Self {
+        Self::new(L4Protocol::Tcp, listen, target)
+    }
+
+    /// Builds a UDP mapping spec.
+    pub fn udp(listen: impl Into<String>, target: impl Into<String>) -> Self {
+        Self::new(L4Protocol::Udp, listen, target)
     }
 }
 

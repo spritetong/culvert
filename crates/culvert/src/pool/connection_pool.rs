@@ -18,15 +18,16 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::consts::{
-    ACTIVATE_STREAM_MAGIC, POOL_ACQUIRE_TIMEOUT, POOL_BACKOFF_ACTIVE_WAITERS_MAX,
-    POOL_BACKOFF_BASE, POOL_BACKOFF_MAX, POOL_COMMAND_QUEUE_SIZE, POOL_DUMMY_HOST,
-    POOL_HEARTBEAT_INTERVAL, POOL_HEARTBEAT_TICK_INTERVAL, POOL_HEARTBEAT_TIMEOUT,
+    ACTIVATE_STREAM_MAGIC, ACTIVATE_STREAM_UDP, POOL_ACQUIRE_TIMEOUT,
+    POOL_BACKOFF_ACTIVE_WAITERS_MAX, POOL_BACKOFF_BASE, POOL_BACKOFF_MAX, POOL_COMMAND_QUEUE_SIZE,
+    POOL_DUMMY_HOST, POOL_HEARTBEAT_INTERVAL, POOL_HEARTBEAT_TICK_INTERVAL, POOL_HEARTBEAT_TIMEOUT,
     POOL_MAX_CAPACITY, POOL_MAX_CONCURRENT_CONNECTS,
 };
 use crate::core::error::TunnelError;
 use crate::core::stream::{
     BoxFuture, HeartbeatStatus, TunnelStream, activity_now_ms, heartbeat_timing,
 };
+use crate::io::addr::L4Protocol;
 use crate::transport::{TargetAddr, TransportConnector};
 
 /// Statistics for monitoring connection pool performance.
@@ -652,10 +653,22 @@ impl ReplenishingStreamPool {
         }
     }
 
-    /// Encodes target activation packet: [ACTIVATE_STREAM_MAGIC, len: u16, target_str]
+    /// Encodes target activation packet for TCP: `[ACTIVATE_STREAM_MAGIC, len: u16, target_str]`.
     pub fn encode_activation(target: Option<&TargetAddr>) -> Vec<u8> {
+        Self::encode_activation_with_proto(target, L4Protocol::Tcp)
+    }
+
+    /// Encodes target activation packet with explicit L4 protocol: `[magic, len: u16, target_str]`.
+    pub fn encode_activation_with_proto(
+        target: Option<&TargetAddr>,
+        protocol: L4Protocol,
+    ) -> Vec<u8> {
         let mut pkt = Vec::new();
-        pkt.push(ACTIVATE_STREAM_MAGIC);
+        let magic = match protocol {
+            L4Protocol::Tcp => ACTIVATE_STREAM_MAGIC,
+            L4Protocol::Udp => ACTIVATE_STREAM_UDP,
+        };
+        pkt.push(magic);
         if let Some(t) = target {
             let s = t.to_string();
             let b = s.as_bytes();

@@ -17,26 +17,29 @@
 
 ## 1. Purpose and Scope
 
-culvert is a bidirectional TCP port-forwarding tool. A single process reads one
+culvert is a bidirectional TCP and UDP port-forwarding tool. A single process reads one
 declarative YAML file and can act as an ingress server, as one or more tunnel
 clients, or as both at the same time. A tunnel client connects to an ingress
 server over WebSocket, HTTP/3, or raw QUIC; the ingress server then connects to
 the requested target address, or the client registers a listener on the server
-and serves incoming connections back through the tunnel.
+and serves incoming connections or datagram flows back through the tunnel.
 
-The data carried over a tunnel is an opaque byte stream. culvert does not
-interpret the application protocol, does not proxy UDP datagrams, and does not
-implement SOCKS5 or HTTP proxy semantics. Targets may be TCP addresses
-(`ip:port`, `hostname:port`) or Unix domain sockets (`unix://path`).
+The data carried over a tunnel is an opaque byte stream (for TCP/UDS) or
+length-framed datagrams (`[u16 payload_len (big-endian) | payload]`, for UDP).
+culvert does not interpret the application protocol and does not implement
+SOCKS5, DNS-specific proxying, or HTTP proxy semantics. TCP mappings support
+IP/hostname targets (`ip:port`, `hostname:port`) and Unix domain sockets
+(`unix://path`); UDP mappings support IP/hostname addresses (`ip:port`,
+`hostname:port`) with per-peer NAT flow demultiplexing and idle expiration.
 
 The runtime is split into three independent parts — frontend (port mapping
 service), core (tunnel session lifecycle), and backend (uniform I/O over relay
 channels) — sharing a neutral `io` vocabulary. Core dispatches I/O through a
-`PumpRegistry` keyed by channel kind and never moves bytes itself. The
-architecture intentionally leaves `L4Protocol::Udp`, `IoChannel::Datagram`, and
-datagram pumps as **unregistered extension points**; UDP port mapping is not
-implemented in this release and is deferred until the structural split is
-validated. See [DESIGN.md](DESIGN.md#57-three-layer-boundaries-and-the-pump-registry).
+`PumpRegistry` keyed by channel kind and never moves bytes itself. Both TCP
+(`TcpFrontend` + `StreamStreamPump`) and UDP (`UdpFrontend` + `ConnectedUdpSocket`
++ `DatagramStreamPump` / `StreamDatagramPump` / `DatagramDatagramPump`) are wired
+through those registries without changing `core::serve`. See
+[DESIGN.md](DESIGN.md#57-three-layer-boundaries-and-the-pump-registry).
 
 ### 1.1 Why this product exists
 
@@ -55,7 +58,7 @@ validated. See [DESIGN.md](DESIGN.md#57-three-layer-boundaries-and-the-pump-regi
 
 ### 1.2 Comparable functionality
 
-Tools such as `wstunnel`, `frp`, `Xray`, and `Hysteria` also provide TCP port
+Tools such as `wstunnel`, `frp`, `Xray`, and `Hysteria` also provide TCP and UDP port
 forwarding over WebSocket or QUIC-based transports. This document records only
 what culvert implements; it does not evaluate or rank other tools.
 
@@ -71,14 +74,15 @@ behavior is configurable, the configuration key is given.
 
 | ID | Use case | Flow |
 | :--- | :--- | :--- |
-| UC-1 | Publish a local service on a remote host (reverse mapping) | Client behind NAT connects to the ingress endpoint, sends `RegisterReverse`, the server binds the requested address, and each inbound connection is relayed back to the client's local target. |
-| UC-2 | Reach a private service from a local port (forward mapping) | Client binds `mappings.listen` locally; each local connection opens a tunnel stream to the ingress endpoint; the server dials `mappings.target` and relays bytes in both directions. |
-| UC-3 | Carry several ports over one endpoint (cluster) | One `tunnels` entry declares several `mappings`. Forward mappings share the outbound pool, and reverse mappings share the inbound pool when `pool_size` is set; in-band 0-RTT activation is used when idle streams exist, falling back to signaling when the pool is empty. |
-| UC-4 | Reach a Unix domain socket through a tunnel | `mappings.target` or `mappings.listen` uses `unix://path`; the ingress side or client side binds/connects the socket directly. |
-| UC-5 | Deploy behind a reverse proxy | `server.listen` uses `ws+unix://...` or `ws://127.0.0.1:...`; the proxy handles public TLS and forwards the configured HTTP path to culvert. |
+| UC-1 | Publish a local service on a remote host (reverse mapping) | Client behind NAT connects to the ingress endpoint, sends `RegisterReverse`, the server binds the requested TCP/UDS or UDP address, and each inbound connection or UDP NAT flow is relayed back to the client's local target. |
+| UC-2 | Reach a private service from a local port (forward mapping) | Client binds `mappings.listen` locally (TCP or UDP); each local connection or UDP client flow opens a tunnel stream to the ingress endpoint; the server opens the corresponding TCP/UDS connection or `ConnectedUdpSocket` to `mappings.target` and relays in both directions. |
+| UC-3 | Carry several ports over one endpoint (cluster) | One `tunnels` entry declares several `mappings` (TCP and/or UDP, even sharing the same port). Forward mappings share the outbound pool, and reverse mappings maintain per-`(protocol, listen)` inbound pools when `pool_size` is set; in-band 0-RTT activation (`0xA5` TCP / `0xA7` UDP) is used when idle streams exist, falling back to signaling when the pool is empty. |
+| UC-4 | Reach a Unix domain socket through a tunnel | TCP `mappings.target` or `mappings.listen` uses `unix://path`; the ingress side or client side binds/connects the socket directly. |
+| UC-5 | Deploy behind a reverse proxy | `server.listen` uses `ws+unix://...` or `ws://127.0.0.1:...`; the proxy handles public TLS and forwards the configured HTTP path to culvert (capable of carrying both TCP and UDP mappings). |
 | UC-6 | Deploy without a reverse proxy | `server.listen` uses a TLS scheme (`wss`, `h3`, `https`, `quic`, `wss+unix`). culvert terminates TLS using the configured certificate and key, or an ephemeral self-signed certificate when neither is provided. |
 | UC-7 | Apply per-endpoint network policy | `tunnels[].endpoint` can be an object with its own `dns`, `dialer`, and `tls` blocks, overriding the global defaults for that endpoint only. |
 | UC-8 | Validate a deployment file before starting | `culvert --check -c <file>` parses and validates the configuration without starting listeners or tunnels. |
+| UC-9 | Forward or expose UDP services | Setting `protocol: "udp"` demultiplexes inbound UDP datagrams per peer `SocketAddr` into `IoChannel::Datagram` flows, frames packets with `[u16 len \| payload]` over pooled or on-demand relay streams, and expires idle NAT flows after `udp_idle_timeout`. |
 
 ---
 
@@ -108,10 +112,10 @@ behavior is configurable, the configuration key is given.
 
 ### 3.3 Mapping modes
 
-| Mode | Listener location | Target location | Pool |
-| :--- | :--- | :--- | :--- |
-| `forward` (default) | Client host | Dialed by the ingress server | Shared outbound pool when `pool_size > 0` |
-| `reverse` | Ingress server (registered over a control channel) | Dialed by the client host | Shared inbound pool when `pool_size > 0` (0-RTT with signaling fallback) |
+| Mode | Listener location | Target location | Protocols | Pool |
+| :--- | :--- | :--- | :--- | :--- |
+| `forward` (default) | Client host | Dialed by the ingress server | `tcp` (default; IP/host/UDS), `udp` (IP/host) | Shared outbound pool when `pool_size > 0` (`0xA5` TCP / `0xA7` UDP) |
+| `reverse` | Ingress server (registered over a control channel) | Dialed by the client host | `tcp` (default; IP/host/UDS), `udp` (IP/host) | Per-`(protocol, listen)` inbound pool when `pool_size > 0` (`0xA5`/`0xA7` 0-RTT with signaling fallback) |
 
 ---
 
@@ -172,17 +176,24 @@ behavior is configurable, the configuration key is given.
   default.
 - **FR-3.4** A `tls` block on a non-TLS endpoint scheme is rejected.
 - **FR-3.5** Every tunnel requires a unique non-empty `tag` and a non-empty
-  `mappings` list. Each mapping's `listen` and `target` must parse as
-  `ip:port`, `hostname:port`, `[ipv6]:port`, or `unix://path`; the port must be
-  present and non-zero for TCP forms.
-- **FR-3.6** Duplicate `listen` addresses across forward mappings are
-  rejected. Reverse listen addresses are not subject to this check.
+  `mappings` list. Each mapping accepts an optional `protocol` (`tcp` by
+  default, or `udp`) and an optional `udp_idle_timeout`. `listen` and `target`
+  must parse as `ip:port`, `hostname:port`, `[ipv6]:port`, or (for TCP mappings
+  only) `unix://path`; the port must be present and non-zero for non-UDS forms.
+  UDP mappings must not specify `unix://` domain socket addresses for `listen`
+  or `target` (though UDP mappings may tunnel over `ws+unix://` / `wss+unix://`
+  transport endpoints).
+- **FR-3.6** Duplicate `(protocol, listen)` pairs across forward mappings are
+  rejected; a TCP mapping and a UDP mapping may bind the same local port.
+  Reverse listen addresses are not subject to this duplicate check.
 - **FR-3.7** Load-time validation covers log level and output, worker thread
   count, token length, pool size, retry bounds, TLS version range
   (`1.2`/`1.3`, min not above max), PEM certificate/key/CA files, DNS
   resolver definitions, and `EndpointContext` construction. Effective
   `idle_timeout` must be greater than effective `heartbeat_interval` after
-  defaults are merged.
+  defaults are merged. Any configured `udp_idle_timeout` (under `dialer`,
+  `server`, `endpoint.dialer`, or `mappings[]`) must be greater than `0`
+  (defaulting to `30s`, `DEFAULT_UDP_IDLE_TIMEOUT`).
 - **FR-3.8** `culvert --check` performs this static validation only; it does
   not bind addresses or start the runtime.
 - **FR-3.9** `tunnels[].multiplex` and `tunnels[].failover` are present in the
@@ -191,20 +202,25 @@ behavior is configurable, the configuration key is given.
 
 ### FR-4 Forward mappings and the stream pool
 
-- **FR-4.1** A forward mapping binds `mappings.listen` on the client host and
-  relays each accepted connection to `mappings.target` through the ingress
+- **FR-4.1** A forward mapping binds `mappings.listen` on the client host
+  (`TcpFrontend` for `tcp`, `UdpFrontend` for `udp`) and relays each accepted
+  connection or per-peer UDP NAT flow to `mappings.target` through the ingress
   endpoint.
 - **FR-4.2** When `pool_size` is set to a positive value, all forward mappings
   of that tunnel share one `ReplenishingStreamPool`. Without `pool_size`, each
-  accepted connection opens a new transport stream through a connector shared
-  by that mapping.
-- **FR-4.3** Pooled streams are pre-warmed without a fixed backend target.
-  The server keeps them idle and does not dial any target service until the
-  client sends an activation packet.
-- **FR-4.4** Activation packet: one magic byte `0xA5`, a two-byte big-endian
-  target length, then the UTF-8 target string. The server reads it with a
-  10-second timeout and rejects payloads of 512 bytes or more. An invalid
-  magic byte closes the stream.
+  accepted connection or UDP flow opens a new transport stream through a
+  connector shared by that mapping, tagging the request with `protocol`
+  (`x-tunnel-proto: tcp | udp` on HTTP/WS, or `StreamMetadata.protocol` on raw QUIC).
+- **FR-4.3** Pooled forward streams are pre-warmed without a fixed backend
+  target or L4 protocol. The server keeps them idle and does not dial any
+  target service or allocate a `ConnectedUdpSocket` until the client sends an
+  activation packet.
+- **FR-4.4** Activation packet: one magic byte (`0xA5` `ACTIVATE_STREAM_MAGIC`
+  for TCP, `0xA7` `ACTIVATE_STREAM_UDP` for UDP; `0xA6` `ACTIVATE_STREAM_PROMOTE`
+  is reserved for reverse control promotion), a two-byte big-endian target
+  length, then the UTF-8 target string. The server reads it with a 10-second
+  timeout and rejects payloads of 512 bytes or more. An invalid magic byte
+  closes the stream.
 - **FR-4.5** The pool is an actor with idle streams, pending acquire requests,
   concurrent dial limits, heartbeat sweeps, dead-stream eviction, and backoff
   replenishment. Acquire requests wait at most 15 seconds. The pool caps idle
@@ -224,36 +240,43 @@ behavior is configurable, the configuration key is given.
 ### FR-5 Reverse mappings, 0-RTT inbound pool, and control protocol
 
 - **FR-5.1** The client opens a control stream in `reverse-ctrl` mode and
-  sends `RegisterReverse { listen_addr, target_addr, pool_size }`, where
-  `pool_size` is the effective clamped worker count (defaulted on the wire so
+  sends `RegisterReverse { listen_addr, target_addr, pool_size, protocol }`,
+  where `pool_size` is the effective clamped worker count and `protocol` is
+  `L4Protocol::Tcp` or `L4Protocol::Udp` (both `#[serde(default)]` on the wire so
   older peers interoperate). The server derives the inbound-queue soft cap from
-  it, binds the requested listener, and replies with `RegisterAck {
-  listen_addr, success, error_msg }`.
+  `pool_size`, binds the requested TCP/UDS or UDP frontend, and replies with
+  `RegisterAck { listen_addr, success, error_msg }`.
 - **FR-5.2** Control messages are encoded with MessagePack
   (`to_vec_named`) over a length-delimited frame. Variants are
   `RegisterReverse`, `RegisterAck`, `NewConnection`, `Ping`, `Pong`.
 - **FR-5.3** When `pool_size` is configured on a tunnel with reverse mappings,
   the client pre-warms idle reverse streams to the server (`mode = reverse`,
-  `pool_idle = true`, `target = listen_addr`). The server maintains an inbound
-  stream pool for that reverse listener.
-- **FR-5.4** Fast path (0-RTT): For each inbound connection on the reverse
-  listener, if an idle stream is available in the inbound pool, the server pops
-  it, writes the single-byte activation signal `0xA5`, and immediately relays
-  with the inbound connection without control signaling. The client reads `0xA5`,
-  dials local `mappings.target`, starts relaying, and replenishes the inbound
-  pool in the background.
+  `pool_idle = true`, `target = listen_addr`, `protocol = mapping.protocol`).
+  The server maintains an inbound stream pool per `(protocol, listen_addr)`
+  key (`{protocol}:{normalized}`) so TCP and UDP reverse pools on the same
+  port remain isolated.
+- **FR-5.4** Fast path (0-RTT): For each inbound connection or new UDP peer
+  flow on the reverse listener, if an idle stream is available in the inbound
+  pool, the server pops it, writes the single-byte activation signal (`0xA5` for
+  TCP, `0xA7` for UDP), and immediately relays with the inbound channel without
+  control signaling. The client reads `0xA5` / `0xA7` (or `0xA6` to promote the
+  stream into a replacement signaling channel), dials local `mappings.target`
+  (TCP/UDS or `ConnectedUdpSocket`), starts relaying, and replenishes the
+  inbound pool in the background.
 - **FR-5.5** Fallback path (on-demand signaling): If no idle stream is
   available (e.g. pool exhausted under burst or `pool_size` not set), the server
   allocates a session id, registers a pending session, and sends
   `NewConnection { session_id, client_addr }` over the control channel. The
-  client dials its local `mappings.target`, opens a `reverse-data` stream
-  carrying `x-session-id`, and the server pairs it with the waiting inbound
-  connection through `SessionManager`. Pairing has a 15-second timeout
-  (`DEFAULT_SESSION_PAIR_TIMEOUT`).
+  client opens the local target channel matching its `protocol` (`Tcp` or
+  `Udp`), opens a `reverse-data` stream carrying `x-session-id` and `x-tunnel-proto`,
+  and the server pairs it with the waiting inbound channel through
+  `SessionManager`. Pairing has a 15-second timeout (`DEFAULT_SESSION_PAIR_TIMEOUT`).
 - **FR-5.6** Both sides are handed to `core::serve` as `IoChannel`s. The
-  control channel stays open with activity-gated `Ping`/`Pong` and an idle
-  timeout; any inbound frame refreshes the activity deadline, while outbound
-  probes alone do not.
+  control channel stays open inside a `SignalingChannel` actor with
+  activity-gated `Ping`/`Pong` and an idle timeout, backed by a `SignalingRouter`
+  capable of dual-channel emergency promotion (`0xA6`) and sliding-window
+  `session_id` deduplication (`CommandDeduplicator`); any inbound frame
+  refreshes the activity deadline, while outbound probes alone do not.
 - **FR-5.7** Control-channel reconnection uses an exponential backoff from
   500 ms up to 30 s, reset after 30 s of stable operation.
 - **FR-5.8** Inbound pool bounds and single-owner lifetime: the client caps
@@ -277,7 +300,7 @@ behavior is configurable, the configuration key is given.
   signaling instead of stalling visitors. Relay tasks are owned and awaited by
   their worker; none are detached.
 
-### FR-6 Stream/stream pump
+### FR-6 Stream and datagram pumps
 
 - **FR-6.1** `core::serve` selects a `Pump` by channel-kind pair. The registered
   `(Stream, Stream)` pump, `StreamStreamPump::relay_with_heartbeat`, drives both
@@ -294,6 +317,21 @@ behavior is configurable, the configuration key is given.
   truncates the remaining response tail.
 - **FR-6.4** On cancellation, the relay drains in-flight data for at most
   500 ms before terminating.
+- **FR-6.5** UDP relay pairs are handled by the registered `(Datagram, Stream)`
+  (`DatagramStreamPump`) and `(Stream, Datagram)` (`StreamDatagramPump`) pumps,
+  as well as `(Datagram, Datagram)` (`DatagramDatagramPump`). Over byte streams,
+  each datagram is encoded in-band as `[u16 payload_len (big-endian) | payload]`,
+  preserving exact packet boundaries and 0-byte datagrams up to
+  `MAX_UDP_DATAGRAM_SIZE` (65,507 bytes), with batched send/recv (`DATAGRAM_BATCH_SIZE = 16`).
+- **FR-6.6** Datagram/stream relay timers track `last_dgram_activity` using the
+  configured `udp_idle_timeout` (default 30 s, independent of `idle_timeout`):
+  when no datagram is received or sent within `udp_idle_timeout`, the pump exits
+  cleanly (`Ok`), closing the relay stream (propagating FIN to tear down the
+  remote paired `UdpFlowChannel` / `ConnectedUdpSocket`). Subsequent datagrams
+  from the same client port transparently open a fresh tunnel session. While
+  active, transport keepalive probes still fire at `heartbeat_interval` and
+  clamp pre-activation stream activity to `pump_start_ms` so long-idle pooled
+  streams are never killed immediately on promotion.
 
 ### FR-7 Supervision, retry, and shutdown
 
@@ -321,7 +359,8 @@ behavior is configurable, the configuration key is given.
   bounded in-memory cache is used (default capacity 1024 entries, TTL 300 s).
 - **FR-8.2** Dialer options: `connect_timeout` (default 10 s),
   `tcp_nodelay` (default true), `bind_interface`, `heartbeat_interval`
-  (default 15 s), `idle_timeout` (default 30 s). `bind_interface` relies on
+  (default 15 s), `idle_timeout` (default 30 s), `udp_idle_timeout` (default 30 s,
+  also configurable on `server` and per mapping). `bind_interface` relies on
   `SO_BINDTODEVICE` and is rejected on platforms without it.
 - **FR-8.3** TLS client options: `server_name`, `insecure`, `alpn`,
   `ca_certificate`, `client_certificate`, `client_key`, `certificate`, `key`,
@@ -341,25 +380,30 @@ behavior is configurable, the configuration key is given.
 - **FR-9.1** `core::serve` depends only on the neutral `io` vocabulary; it never
   names a `Frontend` or `Transport*` trait. The runtime layers build a
   `PumpRequest` from those traits. Adding a new frontend capability must not
-  require a change to core business logic.
+  require a change to core business logic (adding UDP left `core::serve`
+  completely unchanged).
 - **FR-9.2** Both frontend and backend yield `IoChannel = Stream | Datagram`.
   `core::serve` selects a `Pump` from `PumpRegistry` by
   `(frontend.kind(), backend.kind())` and contains no match on channel variants
   and no byte-copying code.
-- **FR-9.3** `frontend::bind` dispatches on `MappingSpec.protocol` through a
-  registry. Only `L4Protocol::Tcp` is registered; a UDP spec fails before any
-  socket is created.
+- **FR-9.3** `frontend::bind` dispatches on `MappingSpec.protocol` through
+  `FrontendRegistry`, with both `L4Protocol::Tcp` (`TcpFrontendFactory`) and
+  `L4Protocol::Udp` (`UdpFrontendFactory`) registered. `PumpRegistry` seeds all
+  four combinations: `(Stream, Stream)`, `(Datagram, Stream)`, `(Stream, Datagram)`,
+  and `(Datagram, Datagram)`.
 - **FR-9.4** A `TunnelStream` implementation advertises its write/half-close
   capabilities through `StreamCaps` (`owned_write`, `half_close`); `IoChannel`
   forwards the query. The pump reads them once per direction so an owned `Bytes`
   write path cannot be left unselected.
 - **FR-9.5** The reverse control plane (`control/`, `session/`, `pool/`) is
-  stream-scoped. A datagram frontend bypasses it and is handled entirely by its
-  registered pump.
-- **FR-9.6** UDP port mapping is **not implemented**. `L4Protocol::Udp`,
-  `IoChannel::Datagram`, `DatagramIo`, and the unregistered datagram pump pairs
-  are extension points only; no config field, UDP socket, or datagram driver
-  exists.
+  stream-scoped for control framing and pre-warming while forwarding `L4Protocol`
+  hints (`RegisterReverse.protocol`, `x-tunnel-proto`, `ACTIVATE_STREAM_UDP`);
+  datagram payload transport is handled solely by the registered pumps.
+- **FR-9.6** UDP port mapping demultiplexes incoming datagrams on one bound
+  `UdpSocket` per client `SocketAddr` into `UdpFlowChannel` (`IoChannel::Datagram`)
+  and connects outbound targets with `ConnectedUdpSocket`. When a session drops on
+  `UdpFlowChannel`, its NAT entry is atomically removed from the listener map so
+  subsequent packets from the same source address open a fresh flow cleanly.
 
 ---
 
@@ -367,12 +411,12 @@ behavior is configurable, the configuration key is given.
 
 | ID | Constraint | Implementation basis |
 | :--- | :--- | :--- |
-| NFR-1 | Byte streams are relayed without interpreting application protocols. | `StreamStreamPump` moves `Bytes` between two `TunnelStream` trait objects obtained from `IoChannel`. |
+| NFR-1 | Streams and datagrams are relayed without interpreting application protocols. | `StreamStreamPump` moves `Bytes` between two `TunnelStream`s; `DatagramStreamPump` / `StreamDatagramPump` / `DatagramDatagramPump` transfer opaque datagram payloads with `[u16 len \| payload]` framing. |
 | NFR-2 | Every asynchronous task is owned and awaitable; shutdown cancels then awaits. | `TaskTracker`, `CancelFutureExt`, explicit `shutdown()` on listeners; no `detach_all()` on the normal path. |
-| NFR-3 | Every await is cancellation-aware or bounded by a timeout. | Handshake, activation read, session pairing, relay drain, and pool acquire all have explicit bounds in `consts.rs`. |
+| NFR-3 | Every await is cancellation-aware or bounded by a timeout. | Handshake, activation read, session pairing, relay drain, UDP NAT expiry, and pool acquire all have explicit bounds in `consts.rs`. |
 | NFR-4 | Configuration errors are surfaced before the daemon starts. | `ConfigLoader::validate` runs on every startup and on `--check`. |
 | NFR-5 | Unix domain sockets are available through a single platform abstraction. | `frontend::tcp::TcpFrontend` wraps `platform::GenericListener` / `PlatformUdsListener`, with a dedicated accept thread on Windows. |
-| NFR-6 | The relay hot path uses a single `poll_fn` state machine rather than a per-direction task. | `io/pump.rs`. This is a deliberate performance constraint; it must not be replaced with `tokio::select!` in the hot path. |
+| NFR-6 | The relay hot path uses a single `poll_fn` state machine rather than a per-direction task. | `io/pump.rs` (`StreamStreamPump`, `DatagramStreamPump`, `DatagramDatagramPump`). This is a deliberate performance constraint; it must not be replaced with `tokio::select!` in the hot path. |
 | NFR-7 | Documentation states implemented behavior only. | Unwired options are rejected by the loader and listed in Section 6. |
 | NFR-8 | Frontend, core, and backend are independently replaceable. | `io/`, `frontend/`, `backend/`, `core::serve`, `PumpRegistry`; see FR-9. |
 | NFR-9 | I/O capability is queried, not guessed. | `StreamCaps` / `poll_write_owned` replace the former dead `consumes_owned_write()` + `poll_write_bytes()` pair; `caps()` is read once per direction. |
@@ -392,11 +436,11 @@ configuration data model; none are part of the runtime data path.
 | :--- | :--- |
 | `tunnels[].multiplex` / `tunnels[].failover` | Present in the model, explicitly rejected by `ConfigLoader::validate`. |
 | `mux` module and `core/failover.rs` | Modules exist but are not wired into the config or data path. |
-| Seamless failover / stream migration / ring-buffer replay | Not implemented. |
+| Seamless failover / stream migration / ring-buffer replay / cross-endpoint switching | Not implemented (`SignalingRouter` handles reverse control-channel emergency promotion via `0xA6` within one endpoint). |
 | Automatic HTTP/3-to-WSS fallback | Not implemented. Each tunnel uses exactly the scheme in its endpoint URL. |
-| P2P, STUN/ICE, NAT hole punching, dual-channel hot standby | Not implemented. |
+| P2P, STUN/ICE, NAT hole punching | Not implemented. |
 | TOML configuration files | Not implemented. Configuration is YAML only. |
-| UDP port mapping, UDP tunneling, DNS proxying for tunneled clients, SOCKS5, HTTP proxy | Not implemented. `L4Protocol::Udp`, `IoChannel::Datagram`, `DatagramIo`, and datagram pump slots are unregistered extension points; adding UDP later needs no core change (FR-9). |
+| DNS-specific resolver proxying for tunneled clients, SOCKS5, HTTP proxy | Not implemented (raw DNS UDP traffic can be forwarded via `protocol: "udp"`). |
 | ACME certificate issuance and renewal | Not implemented. Certificates come from files, an ephemeral self-signed fallback, or an external reverse proxy. |
 | Protocol-level `CMD_TUNNEL_RESET` / `CMD_RESET_ACK` draining and returning streams to the idle pool | Not implemented. Pooled streams are one-shot. |
 | WebSocket SIMD masking claims, hardware acceleration claims | No such implementation is exposed by the product. |
@@ -408,13 +452,16 @@ configuration data model; none are part of the runtime data path.
 The checked-in [`config-example.yaml`](../config-example.yaml) is the canonical
 example and is asserted to parse cleanly by the loader tests. It defines a
 server with five heterogeneous listeners, a multi-mapping tunnel sharing a
-pool, and a second HTTP/3 tunnel. The complete parameter reference is in
+pool (carrying forward/reverse TCP, UDS, and UDP mappings), and a second HTTP/3 tunnel.
+The complete parameter reference is in
 [README.md](../README.md#configuration-reference).
 
 ```yaml
 log:
   level: "info"
   output: "stdout"
+dialer:
+  udp_idle_timeout: "30s"
 tls:
   insecure: false
 server:
@@ -437,9 +484,18 @@ tunnels:
       - mode: "forward"
         listen: "127.0.0.1:13306"
         target: "10.0.0.5:3306"
+      - mode: "forward"
+        protocol: "udp"
+        listen: "127.0.0.1:15353"
+        target: "1.1.1.1:53"
+        udp_idle_timeout: "15s"
       - mode: "reverse"
         listen: "0.0.0.0:2222"
         target: "127.0.0.1:22"
+      - mode: "reverse"
+        protocol: "udp"
+        listen: "0.0.0.0:51820"
+        target: "127.0.0.1:51820"
 ```
 
 ---
@@ -457,7 +513,8 @@ tunnels:
 | AC-7 | Shutdown cancels and awaits all owned tasks; the watchdog is joined on clean exit. | `daemon.rs` tests, `common/task.rs` tests. |
 | AC-8 | DNS and configuration options parse as documented. | `test_config_and_dns.rs`. |
 | AC-9 | Custom HTTP headers and Host override are applied to outgoing handshakes and validated fail-fast. | `test_http_headers.rs`, `test_config_and_dns.rs`. |
-| AC-10 | Frontend, core, and backend are independently replaceable; `core::serve` dispatches by channel kind, and an unregistered channel pair fails with `UnsupportedChannel`. | `io::pump` / `core::serve` unit tests; a UDP `MappingSpec` is rejected by `frontend::bind`. |
+| AC-10 | Frontend, core, and backend are independently replaceable; `core::serve` dispatches by channel kind across registered stream and datagram pairs, and an unregistered channel pair fails with `UnsupportedChannel`. | `io::pump`, `frontend`, and `core::serve` unit tests (`test_serve_recognizes_registered_channel_pairs`, `test_registry_extensibility`). |
+| AC-11 | Forward and reverse UDP port mapping (0-byte and multi-KB datagrams, multi-client NAT demux, 0-RTT `0xA7` pool & `NewConnection` fallback, same-port TCP+UDP coexistence, and `udp_idle_timeout` flow expiration/recreation) works end to end across WS, HTTP/3, and raw QUIC. | `crates/culvert/tests/test_udp_tunnel.rs`, `config::loader` & `session::manager` UDP unit tests. |
 
 Run the suite with `cargo test --workspace`.
 
@@ -471,20 +528,21 @@ content is merged as follows.
 **Retained, restated against the implementation:** reverse-proxy deployment
 with an ingress on a Unix domain socket or loopback; no ACME certificate
 management inside culvert; optional pre-shared token authentication; absence of
-UDP tunneling, DNS proxying, and SOCKS5/HTTP proxy semantics; one configuration
+DNS-specific proxying logic and SOCKS5/HTTP proxy semantics; one configuration
 file combining server ingress and client tunnels; forward and reverse port
-forwarding; per-endpoint DNS/TLS/dialer settings; pre-warmed streams whose
-backend target is dialed only on activation; path-based request matching.
+forwarding (TCP/UDS and UDP, with UDP port mapping built on the three-layer
+`Frontend`/`PumpRegistry` split); per-endpoint DNS/TLS/dialer settings; pre-warmed
+streams whose backend target is dialed only on activation; path-based request
+matching.
 
-**Retired (not implemented):** P2P readiness, STUN/ICE candidates, dual-channel
-hot standby, primary/standby failover, seamless migration with ring-buffer
-replay, `CMD_TUNNEL_RESET` / `CMD_RESET_ACK` draining and pool reuse,
-HTTP/3 `POST /tunnel` extended CONNECT framing (the implementation uses
-`CONNECT` for `h3`/`https` and a MessagePack metadata handshake for `quic`),
-`server.toml` / `client.toml` TOML configuration, automatic QUIC-to-WSS
-fallback, Caddyfile and sysctl tuning recipes, throughput/latency/memory
-targets, SIMD masking claims, milestone plans, and subjective evaluations of
-other tools.
+**Retired (not implemented):** P2P readiness, STUN/ICE candidates, cross-endpoint
+primary/standby failover, seamless migration with ring-buffer replay,
+`CMD_TUNNEL_RESET` / `CMD_RESET_ACK` draining and pool reuse, HTTP/3 `POST /tunnel`
+extended CONNECT framing (the implementation uses `CONNECT` for `h3`/`https` and
+a MessagePack metadata handshake for `quic`), `server.toml` / `client.toml` TOML
+configuration, automatic QUIC-to-WSS fallback, Caddyfile and sysctl tuning
+recipes, throughput/latency/memory targets, SIMD masking claims, milestone plans,
+and subjective evaluations of other tools.
 
 The design details of what replaced that draft are in
 [DESIGN.md](DESIGN.md); usage and the full parameter reference are in

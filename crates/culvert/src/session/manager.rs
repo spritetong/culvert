@@ -17,21 +17,23 @@ use tokio::time::Instant;
 
 use crate::core::error::TunnelError;
 use crate::core::stream::{HeartbeatStatus, TunnelStream};
+use crate::io::addr::L4Protocol;
 use crate::transport::TargetAddr;
 
 /// Derives a canonical key for matching reverse listener inbound pools.
 ///
 /// The client puts its `listen` address into the pre-warm target header while
-/// the server registers the pool under the `listen_addr` from
+/// the server registers the pool under `(protocol, listen_addr)` from
 /// `RegisterReverse`. Normalizing both through `TargetAddr` keeps IPv4/IPv6/UDS
-/// spellings aligned. The host is preserved: two listeners that share a port
-/// on different local addresses must never share one pool.
-pub fn canonical_reverse_key(addr: &str) -> String {
+/// spellings aligned, and prefixing by protocol lets TCP and UDP reverse
+/// listeners coexist on the same port without cross-talk.
+pub fn canonical_reverse_key(protocol: L4Protocol, addr: &str) -> String {
     let s = addr.trim();
-    match crate::io::addr::parse_target_addr(s) {
+    let normalized = match crate::io::addr::parse_target_addr(s) {
         Ok(target) => target.to_string(),
         Err(_) => s.to_string(),
-    }
+    };
+    format!("{}:{}", protocol, normalized)
 }
 
 /// One queued idle stream together with the time it arrived at the server.
@@ -193,13 +195,18 @@ impl SessionManager {
         self.pending_sessions.is_empty()
     }
 
-    /// Registers an inbound pool for a reverse listener address.
+    /// Registers an inbound pool for a `(protocol, listen_addr)` reverse listener.
     ///
     /// A reconnect replaces the pool and closes everything queued by the old
     /// control-channel generation, so late-arriving stale streams cannot be
     /// inherited and consumed LIFO ahead of the new generation.
-    pub fn register_pool(&self, listen_addr: &str, capacity: usize) -> Arc<ReverseInboundPool> {
-        let key = canonical_reverse_key(listen_addr);
+    pub fn register_pool(
+        &self,
+        protocol: L4Protocol,
+        listen_addr: &str,
+        capacity: usize,
+    ) -> Arc<ReverseInboundPool> {
+        let key = canonical_reverse_key(protocol, listen_addr);
         let pool = Arc::new(ReverseInboundPool::new(capacity));
         if let Some(previous) = self.reverse_pools.insert(key, Arc::clone(&pool)) {
             previous.drain();
@@ -211,8 +218,13 @@ impl SessionManager {
     ///
     /// A reconnecting control channel can overlap with the old one; without the
     /// identity check the old listener's teardown would delete the new pool.
-    pub fn unregister_pool(&self, listen_addr: &str, pool: &Arc<ReverseInboundPool>) {
-        let key = canonical_reverse_key(listen_addr);
+    pub fn unregister_pool(
+        &self,
+        protocol: L4Protocol,
+        listen_addr: &str,
+        pool: &Arc<ReverseInboundPool>,
+    ) {
+        let key = canonical_reverse_key(protocol, listen_addr);
         self.reverse_pools
             .remove_if(&key, |_, current| Arc::ptr_eq(current, pool));
     }
@@ -220,11 +232,12 @@ impl SessionManager {
     /// Pushes a pre-warmed idle reverse stream into the matching listener's pool.
     pub fn push_idle_stream(
         &self,
+        protocol: L4Protocol,
         target_opt: Option<&TargetAddr>,
         stream: Box<dyn TunnelStream>,
     ) -> bool {
         if let Some(target) = target_opt {
-            let key = canonical_reverse_key(&target.to_string());
+            let key = canonical_reverse_key(protocol, &target.to_string());
             return match self.reverse_pools.get(&key) {
                 Some(entry) => entry.value().push(stream),
                 // Never guess: routing a stream meant for another listener would
@@ -232,11 +245,17 @@ impl SessionManager {
                 None => false,
             };
         }
-        // Target-less transports are ambiguous; only a single active pool is safe.
-        if self.reverse_pools.len() == 1
-            && let Some(entry) = self.reverse_pools.iter().next()
+        // Target-less transports are ambiguous; only a single active pool for
+        // the given protocol is safe.
+        let prefix = format!("{}:", protocol);
+        let mut matches = self
+            .reverse_pools
+            .iter()
+            .filter(|entry| entry.key().starts_with(&prefix));
+        if let Some(first) = matches.next()
+            && matches.next().is_none()
         {
-            return entry.value().push(stream);
+            return first.value().push(stream);
         }
         false
     }
@@ -308,17 +327,17 @@ mod tests {
         let manager = SessionManager::new();
         assert_eq!(manager.pool_count(), 0);
 
-        let pool = manager.register_pool("0.0.0.0:8080", 8);
+        let pool = manager.register_pool(L4Protocol::Tcp, "0.0.0.0:8080", 8);
         assert_eq!(manager.pool_count(), 1);
 
         let (client, _server) = duplex(1024);
         let target = TargetAddr::Domain("0.0.0.0".into(), 8080);
-        assert!(manager.push_idle_stream(Some(&target), Box::new(client)));
+        assert!(manager.push_idle_stream(L4Protocol::Tcp, Some(&target), Box::new(client)));
         assert_eq!(pool.len(), 1);
         assert!(pool.pop_live(Duration::from_secs(60)).await.is_some());
         assert!(pool.is_empty());
 
-        manager.unregister_pool("0.0.0.0:8080", &pool);
+        manager.unregister_pool(L4Protocol::Tcp, "0.0.0.0:8080", &pool);
         assert_eq!(manager.pool_count(), 0);
     }
 
@@ -375,12 +394,12 @@ mod tests {
     #[tokio::test]
     async fn test_register_pool_drains_previous_generation() {
         let manager = SessionManager::new();
-        let old_pool = manager.register_pool("127.0.0.1:8080", 8);
+        let old_pool = manager.register_pool(L4Protocol::Tcp, "127.0.0.1:8080", 8);
         let (client, _peer) = duplex(64);
         assert!(old_pool.push(Box::new(client)));
         assert_eq!(old_pool.len(), 1);
 
-        let new_pool = manager.register_pool("127.0.0.1:8080", 8);
+        let new_pool = manager.register_pool(L4Protocol::Tcp, "127.0.0.1:8080", 8);
         assert!(
             old_pool.is_empty(),
             "a reconnect must close the stale generation's idle streams"
@@ -392,17 +411,17 @@ mod tests {
     #[tokio::test]
     async fn test_push_does_not_route_to_wrong_listener() {
         let manager = SessionManager::new();
-        let pool_a = manager.register_pool("127.0.0.1:8080", 8);
+        let pool_a = manager.register_pool(L4Protocol::Tcp, "127.0.0.1:8080", 8);
         let (client, _server) = duplex(64);
         let wrong = TargetAddr::Domain("127.0.0.1".into(), 9090);
         assert!(
-            !manager.push_idle_stream(Some(&wrong), Box::new(client)),
+            !manager.push_idle_stream(L4Protocol::Tcp, Some(&wrong), Box::new(client)),
             "a single registered pool must not capture another listener's streams"
         );
         assert!(pool_a.is_empty());
 
         // Two listeners on the same port but different hosts stay distinct.
-        let pool_b = manager.register_pool("127.0.0.2:8080", 8);
+        let pool_b = manager.register_pool(L4Protocol::Tcp, "127.0.0.2:8080", 8);
         assert_eq!(manager.pool_count(), 2);
         assert!(!Arc::ptr_eq(&pool_a, &pool_b));
     }
@@ -410,9 +429,9 @@ mod tests {
     #[tokio::test]
     async fn test_unregister_pool_is_identity_aware() {
         let manager = SessionManager::new();
-        let old_pool = manager.register_pool("127.0.0.1:8080", 8);
-        let new_pool = manager.register_pool("127.0.0.1:8080", 8);
-        manager.unregister_pool("127.0.0.1:8080", &old_pool);
+        let old_pool = manager.register_pool(L4Protocol::Tcp, "127.0.0.1:8080", 8);
+        let new_pool = manager.register_pool(L4Protocol::Tcp, "127.0.0.1:8080", 8);
+        manager.unregister_pool(L4Protocol::Tcp, "127.0.0.1:8080", &old_pool);
         assert_eq!(
             manager.pool_count(),
             1,
@@ -420,8 +439,28 @@ mod tests {
         );
         let (client, _server) = duplex(64);
         let target = TargetAddr::Domain("127.0.0.1".into(), 8080);
-        assert!(manager.push_idle_stream(Some(&target), Box::new(client)));
+        assert!(manager.push_idle_stream(L4Protocol::Tcp, Some(&target), Box::new(client)));
         assert_eq!(new_pool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_and_udp_pools_coexist_on_same_port() {
+        let manager = SessionManager::new();
+        let tcp_pool = manager.register_pool(L4Protocol::Tcp, "0.0.0.0:5353", 4);
+        let udp_pool = manager.register_pool(L4Protocol::Udp, "0.0.0.0:5353", 4);
+        assert_eq!(manager.pool_count(), 2);
+
+        let target = TargetAddr::Domain("0.0.0.0".into(), 5353);
+        let (c_tcp, _) = duplex(64);
+        let (c_udp, _) = duplex(64);
+        assert!(manager.push_idle_stream(L4Protocol::Tcp, Some(&target), Box::new(c_tcp)));
+        assert!(manager.push_idle_stream(L4Protocol::Udp, Some(&target), Box::new(c_udp)));
+        assert_eq!(tcp_pool.len(), 1);
+        assert_eq!(udp_pool.len(), 1);
+
+        manager.unregister_pool(L4Protocol::Tcp, "0.0.0.0:5353", &tcp_pool);
+        assert_eq!(manager.pool_count(), 1);
+        assert_eq!(udp_pool.len(), 1);
     }
 
     #[tokio::test]
@@ -445,18 +484,36 @@ mod tests {
 
     #[test]
     fn test_canonical_reverse_key() {
-        assert_eq!(canonical_reverse_key("0.0.0.0:9090"), "0.0.0.0:9090");
-        assert_eq!(canonical_reverse_key("127.0.0.1:9090"), "127.0.0.1:9090");
-        assert_ne!(
-            canonical_reverse_key("127.0.0.1:9090"),
-            canonical_reverse_key("127.0.0.2:9090")
+        assert_eq!(
+            canonical_reverse_key(L4Protocol::Tcp, "0.0.0.0:9090"),
+            "tcp:0.0.0.0:9090"
         );
-        assert_eq!(canonical_reverse_key("[::1]:9090"), "[::1]:9090");
+        assert_eq!(
+            canonical_reverse_key(L4Protocol::Udp, "0.0.0.0:9090"),
+            "udp:0.0.0.0:9090"
+        );
+        assert_ne!(
+            canonical_reverse_key(L4Protocol::Tcp, "127.0.0.1:9090"),
+            canonical_reverse_key(L4Protocol::Udp, "127.0.0.1:9090")
+        );
+        assert_eq!(
+            canonical_reverse_key(L4Protocol::Tcp, "127.0.0.1:9090"),
+            "tcp:127.0.0.1:9090"
+        );
+        assert_ne!(
+            canonical_reverse_key(L4Protocol::Tcp, "127.0.0.1:9090"),
+            canonical_reverse_key(L4Protocol::Tcp, "127.0.0.2:9090")
+        );
+        assert_eq!(
+            canonical_reverse_key(L4Protocol::Tcp, "[::1]:9090"),
+            "tcp:[::1]:9090"
+        );
         // UDS paths are normalized by the platform, so assert stability rather
         // than a POSIX-specific literal.
-        let uds_a = canonical_reverse_key("unix:///tmp/sock");
-        let uds_b = canonical_reverse_key(&uds_a);
-        assert!(uds_a.starts_with("unix://"));
+        let uds_a = canonical_reverse_key(L4Protocol::Tcp, "unix:///tmp/sock");
+        assert!(uds_a.starts_with("tcp:unix://"));
+        let uds_path = uds_a.strip_prefix("tcp:").unwrap();
+        let uds_b = canonical_reverse_key(L4Protocol::Tcp, uds_path);
         assert_eq!(uds_a, uds_b);
     }
 }

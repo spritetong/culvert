@@ -16,7 +16,7 @@ use culvert::config::ConfigLoader;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-/// High-performance lightweight HTTP/3 & WSS bidirectional TCP tunnel system.
+/// High-performance lightweight HTTP/3 & WSS bidirectional TCP/UDP tunnel system.
 #[derive(Parser, Debug)]
 #[command(name = "culvert", version, about, long_about = None)]
 struct Cli {

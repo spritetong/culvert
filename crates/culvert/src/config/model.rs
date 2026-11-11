@@ -5,6 +5,7 @@
 //! Declarative YAML configuration data models.
 //! All comments and docstrings must be in English.
 
+use crate::io::addr::L4Protocol;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -223,6 +224,10 @@ pub struct ServerConfig {
     /// Maximum silent duration before terminating an idle client connection.
     #[serde(with = "humantime_serde_opt", default)]
     pub idle_timeout: Option<Duration>,
+
+    /// Idle session expiration timeout for relayed UDP NAT flows.
+    #[serde(with = "humantime_serde_opt", default)]
+    pub udp_idle_timeout: Option<Duration>,
 }
 
 impl ServerConfig {
@@ -240,6 +245,7 @@ impl ServerConfig {
             tls: None,
             heartbeat_interval: None,
             idle_timeout: None,
+            udp_idle_timeout: None,
         }
     }
 
@@ -446,6 +452,9 @@ pub struct DialerConfig {
 
     #[serde(with = "humantime_serde_opt", default)]
     pub idle_timeout: Option<Duration>,
+
+    #[serde(with = "humantime_serde_opt", default)]
+    pub udp_idle_timeout: Option<Duration>,
 }
 
 pub(crate) mod humantime_serde_opt {
@@ -580,21 +589,26 @@ impl TlsConfig {
 }
 
 /// Operational mode of the tunnel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TunnelMode {
+    #[default]
     Forward,
     Reverse,
 }
 
 /// Individual bidirectional port mapping definition.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PortMappingConfig {
     #[serde(default = "default_mapping_mode")]
     pub mode: TunnelMode,
+    #[serde(default)]
+    pub protocol: L4Protocol,
     pub listen: String,
     pub target: String,
+    #[serde(with = "humantime_serde_opt", default)]
+    pub udp_idle_timeout: Option<Duration>,
 }
 
 fn default_mapping_mode() -> TunnelMode {

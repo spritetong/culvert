@@ -430,6 +430,7 @@ async fn test_h3_tunnel_pool_prewarm_and_activation_end_to_end() {
                 mode: TunnelMode::Forward,
                 listen: client_listen.clone(),
                 target: format!("127.0.0.1:{}", echo_port),
+                ..Default::default()
             }],
             retry: None,
             http_headers: None,
@@ -530,6 +531,7 @@ async fn test_quic_raw_tunnel_pool_prewarm_and_activation_end_to_end() {
                 mode: TunnelMode::Forward,
                 listen: client_listen.clone(),
                 target: format!("127.0.0.1:{}", echo_port),
+                ..Default::default()
             }],
             retry: None,
             http_headers: None,
@@ -658,6 +660,7 @@ async fn test_quic_raw_forward_stress_throughput() {
                 mode: TunnelMode::Forward,
                 listen: client_listen.clone(),
                 target: format!("127.0.0.1:{}", sink_port),
+                ..Default::default()
             }],
             retry: None,
             http_headers: None,
@@ -758,6 +761,7 @@ async fn test_h3_concurrent_forward_stress() {
                 mode: TunnelMode::Forward,
                 listen: client_listen.clone(),
                 target: format!("127.0.0.1:{}", echo_port),
+                ..Default::default()
             }],
             retry: None,
             http_headers: None,

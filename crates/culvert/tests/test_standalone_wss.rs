@@ -100,6 +100,7 @@ async fn test_standalone_wss_server_self_signed_direct_termination() {
             mode: TunnelMode::Forward,
             listen: format!("127.0.0.1:{}", client_listen_port),
             target: format!("127.0.0.1:{}", echo_port),
+            ..Default::default()
         }],
     });
 

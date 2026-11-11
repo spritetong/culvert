@@ -128,6 +128,13 @@ impl EndpointContext {
             .unwrap_or(crate::consts::DEFAULT_CONNECT_TIMEOUT)
     }
 
+    /// Returns the effective UDP NAT session idle timeout (configured or protocol default).
+    pub fn udp_idle_timeout(&self) -> std::time::Duration {
+        self.dialer_config
+            .udp_idle_timeout
+            .unwrap_or(crate::consts::DEFAULT_UDP_IDLE_TIMEOUT)
+    }
+
     /// Builds an `EndpointContext` by merging per-endpoint configuration with global defaults.
     pub fn build(
         endpoint_cfg: &EndpointConfig,
@@ -196,6 +203,9 @@ impl EndpointContext {
             idle_timeout: endpoint_dialer
                 .and_then(|d| d.idle_timeout)
                 .or_else(|| global_app.dialer.as_ref().and_then(|d| d.idle_timeout)),
+            udp_idle_timeout: endpoint_dialer
+                .and_then(|d| d.udp_idle_timeout)
+                .or_else(|| global_app.dialer.as_ref().and_then(|d| d.udp_idle_timeout)),
         };
 
         let dialer: Arc<dyn Dialer> = Arc::new(DefaultDialer::new(
