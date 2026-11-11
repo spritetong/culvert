@@ -48,6 +48,7 @@ In enterprise production environments and compliant server architectures, standa
 
 - **Minimalist scope**: `culvert` focuses strictly on transparent, reliable, high-throughput TCP port forwarding (opaque byte streams). It intentionally avoids bloated SOCKS5/HTTP proxy semantics, custom encryption layers, or redundant certificate management.
 - **Composable and decoupled**: When application-level authentication, traffic auditing, or access control is required, `culvert` can be chained with established, specialized tools. Each component does one thing well, ensuring high cohesion, loose coupling, and long-term maintainability.
+- **Three independent layers**: frontend (port mapping), core (session lifecycle), and backend (uniform relay I/O over WS/WSS/H3/QUIC/UDS) share a neutral `io` vocabulary. `core::serve` selects an I/O pump by channel kind and never moves bytes itself. UDP port mapping is **not implemented**; `L4Protocol::Udp`, `IoChannel::Datagram`, and datagram pumps exist only as extension points so a future UDP frontend needs no core change. See [DESIGN.md §5.7](docs/DESIGN.md#57-three-layer-boundaries-and-the-pump-registry).
 
 ---
 

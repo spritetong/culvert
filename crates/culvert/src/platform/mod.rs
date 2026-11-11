@@ -16,63 +16,21 @@ mod unix;
 pub use unix::*;
 
 use reusable_future::ReusableFutureRef;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::common::net::SocketTuner;
 use crate::core::error::TunnelError;
 use crate::core::stream::TunnelStream;
-use crate::transport::TargetAddr;
+use crate::io::addr::TargetAddr;
 
-/// Checks if a given address string represents a Unix Domain Socket path or URL.
-/// Supports "unix://path", "ws+unix://path", and "wss+unix://path".
-pub fn is_uds_path(s: &str) -> bool {
-    let trimmed = s.trim();
-    trimmed.starts_with("unix://")
-        || trimmed.starts_with("ws+unix://")
-        || trimmed.starts_with("wss+unix://")
-}
-
-/// Normalizes a UDS path or URL string into a standard OS filesystem PathBuf.
-pub fn normalize_uds_path(s: &str) -> PathBuf {
-    let trimmed = s.trim();
-    let rest = if let Some(stripped) = trimmed.strip_prefix("unix://") {
-        stripped
-    } else if let Some(stripped) = trimmed.strip_prefix("ws+unix://") {
-        stripped
-    } else if let Some(stripped) = trimmed.strip_prefix("wss+unix://") {
-        stripped
-    } else {
-        trimmed
-    };
-
-    let path_only = if let Some(q_idx) = rest.find('?') {
-        &rest[..q_idx]
-    } else {
-        rest
-    };
-
-    // If path begins with "/C:..." on Windows or if drive letter follows leading slash,
-    // strip the leading slash so PathBuf recognizes the drive letter.
-    let normalized_str = if path_only.starts_with('/') && path_only.len() >= 3 {
-        let b = path_only.as_bytes();
-        if b[1].is_ascii_alphabetic() && b[2] == b':' {
-            &path_only[1..]
-        } else {
-            path_only
-        }
-    } else {
-        path_only
-    };
-
-    PathBuf::from(normalized_str)
-}
+pub use crate::io::addr::{is_uds_path, normalize_uds_path, parse_target_addr};
 
 /// Result type produced when accepting a stream from a `GenericListener`.
 pub type GenericAcceptOutput = Result<(Box<dyn TunnelStream>, String), TunnelError>;
 
 /// Generic listener capable of accepting incoming connections over TCP or Unix Domain Sockets.
+#[derive(Clone)]
 pub enum GenericListener {
     Tcp(Arc<TcpListener>),
     Uds(Arc<tokio::sync::Mutex<PlatformUdsListener>>),
@@ -82,7 +40,7 @@ impl GenericListener {
     /// Binds to either a TCP address or a Unix Domain Socket path.
     /// Supports: ip:port, hostname:port, and unix://path. Port must not be omitted.
     pub async fn bind(addr: &str) -> Result<Self, TunnelError> {
-        let target = crate::tunnel::forward::parse_target_addr(addr)?;
+        let target = parse_target_addr(addr)?;
         match target {
             TargetAddr::Path(path) => {
                 let listener = PlatformUdsListener::bind(&path).map_err(TunnelError::Io)?;
@@ -103,42 +61,42 @@ impl GenericListener {
         }
     }
 
-    /// Asynchronously awaits and accepts the next incoming connection stream into `slot`.
-    ///
-    /// Loop callers keep `slot` outside `tokio::select!` and poll `&mut slot` in a
-    /// branch, so an in-flight accept survives other branches winning. The future
-    /// installed here must be non-zero-sized: `is_empty()` uses its layout as the
-    /// idle signal.
-    pub fn accept(&mut self, slot: &mut ReusableFutureRef<'static, GenericAcceptOutput>) {
-        if !slot.is_empty() {
-            return;
-        }
-
-        match self {
-            GenericListener::Tcp(l) => {
-                let listener = Arc::clone(l);
-                slot.set(move || async move {
-                    let (stream, addr) = listener.accept().await.map_err(TunnelError::Io)?;
+    /// Returns an owned `'static` future for the next incoming connection.
+    /// Cloning the listener is two `Arc` clones; callers can embed this in a
+    /// reused slot without allocating a throwaway future container per accept.
+    pub fn accept_owned(&self) -> impl std::future::Future<Output = GenericAcceptOutput> + 'static {
+        let listener = self.clone();
+        async move {
+            match &listener {
+                GenericListener::Tcp(l) => {
+                    let (stream, addr) = l.accept().await.map_err(TunnelError::Io)?;
                     let _ = SocketTuner::tune_tcp_stream(&stream, true);
                     Ok((Box::new(stream) as Box<dyn TunnelStream>, addr.to_string()))
-                });
-            }
-            GenericListener::Uds(l) => {
-                let listener = Arc::clone(l);
-                slot.set(move || async move {
-                    let mut guard = listener.lock().await;
+                }
+                GenericListener::Uds(l) => {
+                    let mut guard = l.lock().await;
                     let (stream, peer_addr) = guard.accept().await.map_err(TunnelError::Io)?;
                     Ok((stream, peer_addr))
-                });
+                }
             }
         }
     }
 
+    /// Asynchronously awaits and accepts the next incoming connection stream into `slot`.
+    ///
+    /// Loop callers keep `slot` outside `tokio::select!` and poll `&mut slot` in a
+    /// branch, so an in-flight accept survives other branches winning.
+    pub fn accept(&mut self, slot: &mut ReusableFutureRef<'static, GenericAcceptOutput>) {
+        if !slot.is_empty() {
+            return;
+        }
+        let pending = self.accept_owned();
+        slot.set(move || pending);
+    }
+
     /// Convenience helper for single-shot / non-loop awaiting.
     pub async fn accept_one(&mut self) -> GenericAcceptOutput {
-        let mut slot = ReusableFutureRef::default();
-        self.accept(&mut slot);
-        slot.await
+        self.accept_owned().await
     }
 }
 
@@ -166,13 +124,14 @@ pub async fn connect_target(target: &TargetAddr) -> Result<Box<dyn TunnelStream>
 
 /// Connects to a target address or UDS path specified as a string.
 pub async fn connect_target_str(target_str: &str) -> Result<Box<dyn TunnelStream>, TunnelError> {
-    let target = crate::tunnel::forward::parse_target_addr(target_str)?;
+    let target = parse_target_addr(target_str)?;
     connect_target(&target).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]

@@ -146,7 +146,7 @@ impl ConfigLoader {
                 ));
             }
             if let Some(ref dt) = server.default_target {
-                crate::tunnel::forward::parse_target_addr(dt).map_err(|_| {
+                crate::io::addr::parse_target_addr(dt).map_err(|_| {
                     TunnelError::Config(format!(
                         "server.default_target '{}' is invalid. Expected 'host:port' or 'ip:port'",
                         dt
@@ -288,14 +288,14 @@ impl ConfigLoader {
             }
 
             for mapping in &tunnel.mappings {
-                let _ = crate::tunnel::forward::parse_target_addr(&mapping.listen).map_err(|_| {
+                let _ = crate::io::addr::parse_target_addr(&mapping.listen).map_err(|_| {
                     TunnelError::Config(format!(
                         "tunnel '{}': invalid listen address '{}' in mapping. Expected 'ip:port', 'hostname:port', or 'unix://path'",
                         tunnel.tag, mapping.listen
                     ))
                 })?;
 
-                let _ = crate::tunnel::forward::parse_target_addr(&mapping.target).map_err(|_| {
+                let _ = crate::io::addr::parse_target_addr(&mapping.target).map_err(|_| {
                     TunnelError::Config(format!(
                         "tunnel '{}': invalid target address '{}' in mapping. Expected 'ip:port', 'hostname:port', or 'unix://path'",
                         tunnel.tag, mapping.target

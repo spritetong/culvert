@@ -339,7 +339,11 @@ impl ReplenishingStreamPool {
 
                     let c = Arc::clone(&connector);
                     let t = dummy_target.clone();
-                    connecting_futures.push(Box::pin(async move { c.connect_pooled(&t).await }));
+                    // The idle pool is stream-scoped: take the byte-stream view at
+                    // the connector boundary.
+                    connecting_futures.push(Box::pin(async move {
+                        c.connect_pooled(&t).await.and_then(|ch| ch.into_stream())
+                    }));
                 }
 
                 // 2. Drive single unified event reactor
@@ -716,6 +720,7 @@ impl ReplenishingStreamPool {
 mod tests {
     use super::*;
     use crate::consts::{DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_IDLE_TIMEOUT};
+    use crate::io::channel::IoChannel;
     use std::io;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
@@ -725,15 +730,11 @@ mod tests {
     }
 
     impl TransportConnector for MockFailingConnector {
-        fn protocol_scheme(&self) -> &'static str {
-            "mock"
-        }
-
         fn connect<'a>(
             &'a self,
             _target: &'a TargetAddr,
             _session_id: Option<&'a str>,
-        ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+        ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {
                 Err(TunnelError::Io(std::io::Error::new(
@@ -746,7 +747,7 @@ mod tests {
         fn connect_pooled<'a>(
             &'a self,
             _target: &'a TargetAddr,
-        ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+        ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {
                 Err(TunnelError::Io(std::io::Error::new(
@@ -794,25 +795,21 @@ mod tests {
     struct MockSuccessfulConnector;
 
     impl TransportConnector for MockSuccessfulConnector {
-        fn protocol_scheme(&self) -> &'static str {
-            "mock"
-        }
-
         fn connect<'a>(
             &'a self,
             _target: &'a TargetAddr,
             _session_id: Option<&'a str>,
-        ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+        ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
             let (client, _server) = tokio::io::duplex(1024);
-            Box::pin(async move { Ok(Box::new(client) as Box<dyn TunnelStream>) })
+            Box::pin(async move { Ok(IoChannel::from_boxed_stream(Box::new(client))) })
         }
 
         fn connect_pooled<'a>(
             &'a self,
             _target: &'a TargetAddr,
-        ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+        ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
             let (client, _server) = tokio::io::duplex(1024);
-            Box::pin(async move { Ok(Box::new(client) as Box<dyn TunnelStream>) })
+            Box::pin(async move { Ok(IoChannel::from_boxed_stream(Box::new(client))) })
         }
     }
 
@@ -928,28 +925,24 @@ mod tests {
     }
 
     impl TransportConnector for BarrierConnector {
-        fn protocol_scheme(&self) -> &'static str {
-            "mock"
-        }
-
         fn connect<'a>(
             &'a self,
             _target: &'a TargetAddr,
             _session_id: Option<&'a str>,
-        ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+        ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
             self.connect_pooled(_target)
         }
 
         fn connect_pooled<'a>(
             &'a self,
             _target: &'a TargetAddr,
-        ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+        ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
             let barrier = Arc::clone(&self.barrier);
             Box::pin(async move {
                 // Only completes when every allowed slot is dialing concurrently.
                 barrier.wait().await;
                 let (client, _server) = tokio::io::duplex(1024);
-                Ok(Box::new(client) as Box<dyn TunnelStream>)
+                Ok(IoChannel::from_boxed_stream(Box::new(client)))
             })
         }
     }
@@ -1391,28 +1384,24 @@ mod tests {
     }
 
     impl TransportConnector for CountingInvalidationConnector {
-        fn protocol_scheme(&self) -> &'static str {
-            "mock"
-        }
-
         fn connect<'a>(
             &'a self,
             _target: &'a TargetAddr,
             _session_id: Option<&'a str>,
-        ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+        ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
             Box::pin(async {
                 let (client, _server) = tokio::io::duplex(1024);
-                Ok(Box::new(client) as Box<dyn TunnelStream>)
+                Ok(IoChannel::from_boxed_stream(Box::new(client)))
             })
         }
 
         fn connect_pooled<'a>(
             &'a self,
             _target: &'a TargetAddr,
-        ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+        ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
             Box::pin(async {
                 let (client, _server) = tokio::io::duplex(1024);
-                Ok(Box::new(client) as Box<dyn TunnelStream>)
+                Ok(IoChannel::from_boxed_stream(Box::new(client)))
             })
         }
 

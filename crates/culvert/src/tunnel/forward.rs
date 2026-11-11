@@ -13,10 +13,14 @@ use tracing::{debug, error, info, warn};
 use crate::common::{CancelFutureExt, TaskTracker};
 use crate::config::model::{TunnelConfig, TunnelMode};
 use crate::core::error::TunnelError;
-use crate::core::relay::RelayEngine;
+use crate::core::serve::serve;
 use crate::dialer::endpoint::EndpointContext;
+use crate::frontend::{self, FrontendOutput};
+use crate::io::addr::{MappingSpec, parse_target_addr};
+use crate::io::channel::IoChannel;
+use crate::io::pump::{PumpCtx, PumpRequest};
 use crate::pool::ReplenishingStreamPool;
-use crate::transport::{TargetAddr, TransportConnector, TransportRegistry};
+use crate::transport::{TransportConnector, TransportRegistry};
 use reusable_future::ReusableFutureRef;
 
 struct ActiveStreamGuard(Option<Arc<ReplenishingStreamPool>>);
@@ -27,97 +31,6 @@ impl Drop for ActiveStreamGuard {
             p.on_stream_closed();
         }
     }
-}
-
-/// Helper to validate if a string conforms to a valid hostname / domain name.
-fn is_valid_hostname(host: &str) -> bool {
-    if host.is_empty() || host.len() > 253 {
-        return false;
-    }
-    for label in host.split('.') {
-        if label.is_empty() || label.len() > 63 {
-            return false;
-        }
-        if label.starts_with('-') || label.ends_with('-') {
-            return false;
-        }
-        if !label
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
-            return false;
-        }
-    }
-    true
-}
-
-/// Helper to parse target address string supporting three formats:
-/// 1. ip:port (e.g. 127.0.0.1:8080, [::1]:8080)
-/// 2. hostname:port (e.g. localhost:8080, example.com:443)
-/// 3. unix://path (e.g. unix:///run/tunnel.sock, unix://C:/temp/tunnel.sock)
-///
-/// Port number cannot be omitted for IP and hostname addresses.
-pub fn parse_target_addr(target_str: &str) -> Result<TargetAddr, TunnelError> {
-    let target_str = target_str.trim();
-    if target_str.starts_with("unix://") {
-        let path = crate::platform::normalize_uds_path(target_str);
-        if path.as_os_str().is_empty() {
-            return Err(TunnelError::Config(format!(
-                "Invalid target UDS path: {}",
-                target_str
-            )));
-        }
-        return Ok(TargetAddr::Path(path));
-    }
-
-    // Must be ip:port or hostname:port. Port number cannot be omitted.
-    if let Some((host, port_str)) = target_str.rsplit_once(':') {
-        let is_bracketed = host.starts_with('[') && host.ends_with(']');
-        if host.contains(':') && !is_bracketed {
-            return Err(TunnelError::Config(format!(
-                "Invalid mapping address '{}'. IPv6 addresses with port must be enclosed in brackets (e.g. '[::1]:8080')",
-                target_str
-            )));
-        }
-
-        let clean_host = if is_bracketed {
-            &host[1..host.len() - 1]
-        } else {
-            host
-        };
-
-        if clean_host.is_empty() {
-            return Err(TunnelError::Config(format!(
-                "Invalid mapping address '{}': missing host",
-                target_str
-            )));
-        }
-
-        let port = port_str.parse::<u16>().map_err(|_| {
-            TunnelError::Config(format!(
-                "Invalid mapping address '{}': invalid port '{}'",
-                target_str, port_str
-            ))
-        })?;
-
-        if port == 0 {
-            return Err(TunnelError::Config(format!(
-                "Invalid mapping address '{}': port must not be 0",
-                target_str
-            )));
-        }
-
-        if let Ok(ip) = clean_host.parse::<std::net::IpAddr>() {
-            return Ok(TargetAddr::Ip(std::net::SocketAddr::new(ip, port)));
-        } else if is_valid_hostname(clean_host) {
-            return Ok(TargetAddr::Domain(clean_host.to_string(), port));
-        }
-    }
-
-    Err(TunnelError::Config(format!(
-        "Invalid mapping address '{}'. Expected 'ip:port', 'hostname:port', or 'unix://path'",
-        target_str
-    )))
 }
 
 /// Runs a single forward mapping listener and forwards inbound connections to remote peer.
@@ -139,7 +52,8 @@ pub async fn run_forward_mapping(
         "Forward tunnel listener started"
     );
 
-    let mut listener = crate::platform::GenericListener::bind(&listen).await?;
+    let spec = MappingSpec::tcp(&listen, &target_str);
+    let mut frontend = frontend::bind(&spec).await?;
     let mut conn_tracker = TaskTracker::<()>::new(cancel_token.clone());
     let target = parse_target_addr(&target_str)?;
 
@@ -160,11 +74,11 @@ pub async fn run_forward_mapping(
 
     let hb_interval = endpoint_ctx.heartbeat_interval();
     let idle_timeout = endpoint_ctx.idle_timeout();
-    let mut accept_slot = ReusableFutureRef::default();
+    let mut accept_slot: ReusableFutureRef<'static, FrontendOutput> = ReusableFutureRef::default();
 
     loop {
         if accept_slot.is_empty() {
-            listener.accept(&mut accept_slot);
+            frontend.accept(&mut accept_slot);
         }
 
         tokio::select! {
@@ -177,7 +91,8 @@ pub async fn run_forward_mapping(
             accept_res = &mut accept_slot, if !accept_slot.is_empty() => {
                 accept_slot.reset();
                 match accept_res {
-                    Ok((inbound_stream, peer_addr)) => {
+                    Ok(accepted) => {
+                        let peer_addr = accepted.peer;
                         debug!(tag = %tag, peer = %peer_addr, "Accepted inbound connection");
                         let target = target.clone();
                         let pool_clone = pool.clone();
@@ -185,12 +100,12 @@ pub async fn run_forward_mapping(
                         let pool_for_close = pool.clone();
                         let tag_for_task = tag.clone();
 
-                        // `Duration` is `Copy`; the `move` task captures its own
-                        // values without shadowing the loop-scoped originals.
                         conn_tracker.spawn_with_cancel(move |conn_token| async move {
                             let acquire_fut = async {
                                 if let Some(ref p) = pool_clone {
-                                    p.acquire(Some(&target)).await
+                                    p.acquire(Some(&target))
+                                        .await
+                                        .map(IoChannel::from_boxed_stream)
                                 } else if let Some(ref c) = connector_clone {
                                     c.connect(&target, None).await
                                 } else {
@@ -203,14 +118,14 @@ pub async fn run_forward_mapping(
                             };
 
                             match remote_res {
-                                Ok(mut remote_stream) => {
+                                Ok(mut remote_channel) => {
                                     let _stream_guard = ActiveStreamGuard(pool_for_close.clone());
 
                                     if pool_clone.is_some() {
                                         let activation_pkt = ReplenishingStreamPool::encode_activation(Some(&target));
                                         let Some(write_act_res) = async {
-                                            remote_stream.write_all(&activation_pkt).await?;
-                                            remote_stream.flush().await?;
+                                            remote_channel.write_all(&activation_pkt).await?;
+                                            remote_channel.flush().await?;
                                             Ok::<(), std::io::Error>(())
                                         }
                                         .cancel_with(&conn_token)
@@ -225,12 +140,16 @@ pub async fn run_forward_mapping(
                                         }
                                     }
 
-                                    let _ = RelayEngine::relay_with_heartbeat(
-                                        inbound_stream,
-                                        remote_stream,
-                                        conn_token,
-                                        hb_interval,
-                                        idle_timeout,
+                                    let _ = serve(
+                                        PumpRequest {
+                                            frontend: accepted.channel,
+                                            backend: remote_channel,
+                                        },
+                                        PumpCtx {
+                                            cancel: conn_token,
+                                            heartbeat_interval: hb_interval,
+                                            idle_timeout,
+                                        },
                                     ).await;
                                 }
                                 Err(e) => {
@@ -252,6 +171,7 @@ pub async fn run_forward_mapping(
     }
 
     accept_slot.reset();
+    frontend.shutdown().await;
     conn_tracker.shutdown_and_wait().await;
     Ok(())
 }

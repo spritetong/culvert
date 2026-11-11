@@ -22,7 +22,10 @@ use crate::consts::{
 };
 use crate::control::stream::{ControlMessage, FramedControlStream};
 use crate::core::error::TunnelError;
-use crate::core::relay::RelayEngine;
+use crate::core::serve::serve;
+use crate::frontend::{self, FrontendOutput};
+use crate::io::addr::MappingSpec;
+use crate::io::pump::{PumpCtx, PumpRequest};
 use crate::session::SessionManager;
 use crate::transport::{TargetAddr, TransportRegistry};
 use reusable_future::ReusableFutureRef;
@@ -225,7 +228,7 @@ impl ServerRunner {
                                                                     return;
                                                                 }
                                                                         if let Ok(t_str) = std::str::from_utf8(&target_bytes)
-                                                                            && let Ok(sa) = crate::tunnel::forward::parse_target_addr(t_str) {
+                                                                            && let Ok(sa) = crate::io::addr::parse_target_addr(t_str) {
                                                                                 dynamic_target = Some(sa);
                                                                         }
                                                                     }
@@ -248,7 +251,7 @@ impl ServerRunner {
                                                 let valid_meta_target = if is_dummy_target { None } else { metadata.target };
 
                                                 let target_opt = dynamic_target.or(valid_meta_target).or_else(|| {
-                                                    default_target.and_then(|dt| crate::tunnel::forward::parse_target_addr(&dt).ok())
+                                                    default_target.and_then(|dt| crate::io::addr::parse_target_addr(&dt).ok())
                                                 });
 
                                                 let target = match target_opt {
@@ -274,17 +277,24 @@ impl ServerRunner {
                                                     }
                                                 };
 
-                                                let _ = RelayEngine::relay_with_heartbeat(
-                                                    target_conn,
-                                                    stream,
-                                                    conn_token,
-                                                    hb_interval,
-                                                    idle_timeout,
+                                                let _ = serve(
+                                                    PumpRequest::new(target_conn, stream),
+                                                    PumpCtx {
+                                                        cancel: conn_token,
+                                                        heartbeat_interval: hb_interval,
+                                                        idle_timeout,
+                                                    },
                                                 ).await;
                                             }
 
                                             // 2. Reverse mode: Either Control channel or Data channel pairing
                                             TunnelMode::Reverse => {
+                                                // The reverse control plane is stream-scoped; it takes
+                                                // its byte-stream view at this boundary.
+                                                let Ok(stream) = stream.into_stream() else {
+                                                    warn!("Reverse control plane requires a byte-stream channel");
+                                                    return;
+                                                };
                                                 if let Some(session_id) = metadata.session_id {
                                                     // Data stream arrival: fulfill waiting session
                                                     if let Err(e) = session_mgr.fulfill(&session_id, stream) {
@@ -458,7 +468,8 @@ impl ServerRunner {
 
         debug!(addr = %listen_addr, target = %target_addr, "Binding reverse listening port on server");
 
-        let mut listener = match crate::platform::GenericListener::bind(&listen_addr).await {
+        let mut frontend = match frontend::bind(&MappingSpec::tcp(&listen_addr, &target_addr)).await
+        {
             Ok(l) => l,
             Err(e) => {
                 warn!(addr = %listen_addr, "Failed to bind reverse listener: {}", e);
@@ -506,11 +517,12 @@ impl ServerRunner {
         // A probe PING never refreshes it.
         let idle_deadline = tokio::time::sleep(idle_timeout);
         tokio::pin!(idle_deadline);
-        let mut accept_slot = ReusableFutureRef::default();
+        let mut accept_slot: ReusableFutureRef<'static, FrontendOutput> =
+            ReusableFutureRef::default();
 
         loop {
             if accept_slot.is_empty() {
-                listener.accept(&mut accept_slot);
+                frontend.accept(&mut accept_slot);
             }
 
             tokio::select! {
@@ -560,7 +572,9 @@ impl ServerRunner {
                 accept_res = &mut accept_slot, if !accept_slot.is_empty() => {
                     accept_slot.reset();
                     match accept_res {
-                        Ok((visitor_stream, visitor_addr)) => {
+                        Ok(accepted) => {
+                            let visitor_stream = accepted.channel;
+                            let visitor_addr = accepted.peer;
                             // 1. FAST PATH (0-RTT Pool): only pair streams that are
                             // fresh and still alive. A stale generation must fall
                             // through to signaling rather than blackhole the visitor.
@@ -588,15 +602,16 @@ impl ServerRunner {
                                         .cancel_with(&token)
                                         .await
                                     {
-                                        Some(Ok(Ok(()))) => {
-                                            let _ = RelayEngine::relay_with_heartbeat(
-                                                visitor_stream,
-                                                candidate,
-                                                token,
-                                                heartbeat_interval,
-                                                idle_timeout,
-                                            ).await;
-                                        }
+                                                        Some(Ok(Ok(()))) => {
+                                                            let _ = serve(
+                                                                PumpRequest::new(visitor_stream, candidate),
+                                                                PumpCtx {
+                                                                    cancel: token,
+                                                                    heartbeat_interval,
+                                                                    idle_timeout,
+                                                                },
+                                                            ).await;
+                                                        }
                                         Some(Ok(Err(e))) => {
                                             debug!("Discarding dead pooled reverse stream: {}", e);
                                         }
@@ -676,13 +691,14 @@ impl ServerRunner {
                                 match timeout(DEFAULT_SESSION_PAIR_TIMEOUT, pair_rx).await {
                                     Ok(Ok(data_stream)) => {
                                         debug!(session = %session_id_clone, "Reverse data stream paired, starting relay");
-                                        let _ = RelayEngine::relay_with_heartbeat(
-                                            visitor_stream,
-                                            data_stream,
-                                            token,
-                                            heartbeat_interval,
-                                            idle_timeout,
-                                        ).await;
+                                                        let _ = serve(
+                                                            PumpRequest::new(visitor_stream, data_stream),
+                                                            PumpCtx {
+                                                                cancel: token,
+                                                                heartbeat_interval,
+                                                                idle_timeout,
+                                                            },
+                                                        ).await;
                                     }
                                     _ => {
                                         warn!(session = %session_id_clone, "Timed out waiting for reverse data stream pairing");
@@ -708,7 +724,8 @@ impl ServerRunner {
         // This frees the port and pool key instantly so a reconnecting client
         // can re-bind the reverse listener without failing on "Address already in use",
         // even while existing visitor relay tasks are winding down gracefully.
-        drop(listener);
+        frontend.shutdown().await;
+        drop(frontend);
         session_mgr.unregister_pool(&listen_addr, &idle_pool);
 
         local_tracker.shutdown_and_wait().await;

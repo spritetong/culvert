@@ -29,6 +29,7 @@ use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, TunnelStream};
 use crate::dialer::endpoint::EndpointContext;
 use crate::dialer::tls::TlsConfigBuilder;
+use crate::io::channel::IoChannel;
 use crate::transport::h3::stream::{H3TunnelStream, QuinnTunnelStream};
 use crate::transport::{TargetAddr, TransportConnector};
 
@@ -590,37 +591,29 @@ impl TransportConnector for H3Connector {
         &'a self,
         target: &'a TargetAddr,
         session_id: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+    ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
         Box::pin(async move {
-            let scheme = self.endpoint.endpoint.scheme.as_str();
-            if scheme == "quic" {
-                self.connect_quic_raw(target, session_id, false).await
+            let stream = if self.endpoint.endpoint.scheme == "quic" {
+                self.connect_quic_raw(target, session_id, false).await?
             } else {
-                self.connect_h3(target, session_id, false).await
-            }
+                self.connect_h3(target, session_id, false).await?
+            };
+            Ok(IoChannel::from_boxed_stream(stream))
         })
     }
 
     fn connect_pooled<'a>(
         &'a self,
         target: &'a TargetAddr,
-    ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+    ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
         Box::pin(async move {
-            let scheme = self.endpoint.endpoint.scheme.as_str();
-            if scheme == "quic" {
-                self.connect_quic_raw(target, None, true).await
+            let stream = if self.endpoint.endpoint.scheme == "quic" {
+                self.connect_quic_raw(target, None, true).await?
             } else {
-                self.connect_h3(target, None, true).await
-            }
+                self.connect_h3(target, None, true).await?
+            };
+            Ok(IoChannel::from_boxed_stream(stream))
         })
-    }
-
-    fn protocol_scheme(&self) -> &'static str {
-        if self.endpoint.endpoint.scheme == "quic" {
-            "quic"
-        } else {
-            "h3"
-        }
     }
 
     fn invalidate_broken_sessions(&self) {

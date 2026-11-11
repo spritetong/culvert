@@ -19,40 +19,61 @@ data path are listed in [Section 13](#13-not-wired-into-the-runtime-data-path).
 culvert is a TCP port-forwarding daemon. A single process loads one YAML file,
 optionally starts ingress listeners (`server`), optionally starts one or more
 tunnel clients (`tunnels`), and supervises both. Traffic between a client and a
-server travels over one of three transport drivers (WebSocket, HTTP/3/QUIC,
+server travels over one of three relay drivers (WebSocket, HTTP/3/QUIC,
 WebSocket over a Unix domain socket) as an opaque bidirectional byte stream.
 
-The design is organized around four boundaries:
+The runtime is split into three independent parts. Independence means the core
+depends **only** on the neutral `io` vocabulary — `core::serve` never names a
+`Frontend` or `Transport*` trait. The runtime layers (`tunnel/`, `server/`)
+build a `PumpRequest` from those traits and hand it to core. Adding a new
+frontend capability (UDP port mapping) requires a new `Frontend` implementation
+and a new `Pump` registration, not a change to core logic.
 
-1. **Configuration boundary** — `config::model` + `config::loader`: strict
-   schema, fail-fast validation.
-2. **Transport boundary** — `transport::*` traits + `TransportRegistry`:
-   scheme dispatch with no transport-specific logic in the tunnel layer.
-3. **Session boundary** — `tunnel::*` + `pool::*` + `control::*` +
-   `session::*`: mapping lifecycles, pre-warmed streams, reverse signaling.
-4. **Lifecycle boundary** — `daemon` + `supervisor` + `common::task`: one
-   cancellation token, owned tasks, cancellation then await.
+| Part | Owns | Module |
+| :--- | :--- | :--- |
+| **Frontend** | The mapping service exposed to the outside world. Today TCP and Unix domain sockets only. | `frontend/` |
+| **Core** | Session lifecycle: pairing, activation, cancellation, retry, statistics, and `core::serve` pump dispatch. It never moves bytes itself. | `core/`, `tunnel/`, `session/`, `pool/`, `control/` |
+| **Backend** | A uniform I/O interface over relay channels: WS, WSS, H3, QUIC, UDS, and future P2P/datagram transports. | `backend/` (traits + registry), `transport/` (drivers) |
+
+`io/` is a shared vocabulary with no business logic: `TargetAddr`,
+`L4Protocol`, `IoChannel`, `TunnelStream`, `TunnelError`, `PumpCtx`, and the
+capability types. All three parts depend on `io/`; none of them depends on
+another part's implementation. `platform/` holds OS-level socket primitives
+wrapped by the TCP frontend, `config/` holds the declarative schema, and
+`daemon` + `supervisor` + `common::task` own process lifecycle (one cancellation
+token, owned tasks, cancel then await).
+
+The reverse control plane (`control/`, `session/`, `pool/`) is **stream-scoped**
+today: activation bytes, `x-session-id` pairing, and idle-stream heartbeats only
+exist for connection-oriented relays. It is orchestration, not the byte-moving
+core, and it is reached only through `IoChannel`'s stream variant. A datagram
+frontend does not pass through it; it goes straight to its own `Pump`.
 
 ```mermaid
 flowchart TB
-    CLI["culvert-cli main.rs<br/>clap + tracing + Tokio runtime"]
-    LOAD["config::ConfigLoader<br/>YAML parse + validate"]
-    DAEMON["daemon::run_daemon<br/>CancellationToken + watchdog"]
-    SUP["supervisor::TunnelSupervisor<br/>TaskTracker"]
-    SRV["server::ServerRunner<br/>per-listener accept loop"]
-    CLT["client::ClientRunner<br/>retry loop per tunnel"]
-    CLUSTER["tunnel::run_tunnel_cluster<br/>one pool + N mappings"]
-    REG["transport::TransportRegistry<br/>WS / H3 / UDS drivers"]
-    RELAY["core::RelayEngine<br/>poll_fn duplex relay"]
+    IO["io/<br/>TargetAddr · IoChannel · Pump traits"]
+    FE["frontend/<br/>Frontend · FrontendAccept · bind"]
+    CORE["core::serve<br/>session lifecycle + PumpRegistry"]
+    BE["backend/<br/>Transport* traits · TransportRegistry"]
+    DRV["transport/<br/>WS · WSS · H3 · QUIC · UDS drivers"]
+    PUMP["io::pump::StreamStreamPump<br/>poll_fn duplex relay"]
 
-    CLI --> LOAD --> DAEMON --> SUP
-    SUP --> SRV
-    SUP --> CLT --> CLUSTER
-    SRV --> REG
-    CLUSTER --> REG
-    SRV --> RELAY
-    CLUSTER --> RELAY
+    FE --> IO
+    CORE --> IO
+    BE --> IO
+    DRV --> BE
+    FE --> CORE
+    BE --> CORE
+    CORE --> PUMP
 ```
+
+`core::serve(req: PumpRequest, ctx: PumpCtx)` looks up a `Pump` by
+`(req.frontend.kind(), req.backend.kind())` in a process-wide `PumpRegistry` and
+delegates the transfer. Core contains no `match` on channel variants and no
+byte-copying code. `StreamStreamPump` is the only registered pump today; its body
+is the hand-written `poll_fn` duplex state machine. A datagram frontend would
+register a second pump without touching `serve`. See
+[Section 5.7](#57-three-layer-boundaries-and-the-pump-registry).
 
 ---
 
@@ -65,6 +86,23 @@ crates/culvert-cli/src/main.rs CLI, logging setup, Tokio runtime, --check
 crates/culvert/src/
   lib.rs                       public re-exports and run_* entry points
   consts.rs                    all constants and defaults
+  io/
+    mod.rs                     neutral vocabulary re-exports
+    addr.rs                    L4Protocol, MappingSpec, TargetAddr, parse_target_addr
+    channel.rs                 FlowKey, ChannelKind, IoChannel, DatagramIo
+    stream.rs                  TunnelStream, StreamCaps, liveness helpers
+    error.rs                   TunnelError, is_permanent, is_shutdown
+    pump.rs                    Pump, PumpRegistry, PumpCtx, StreamStreamPump
+  frontend/
+    mod.rs                     Frontend, FrontendAccept, FrontendRegistry, bind
+    tcp.rs                     TcpFrontend (TCP + Unix domain sockets)
+  backend/
+    mod.rs                     TransportConnector/Listener/Driver, StreamMetadata
+    registry.rs                TransportRegistry scheme dispatch
+  core/
+    serve.rs                   core::serve pump dispatch
+    error.rs, stream.rs        compatibility re-exports from io/
+    failover.rs                standalone module, not used by the data path
   config/{model,loader}.rs     schema, deserializers, validation
   daemon.rs                    signal handling and hard shutdown deadline
   supervisor/runner.rs         TunnelSupervisor
@@ -72,16 +110,15 @@ crates/culvert/src/
   server/runner.rs             ingress accept loop and stream dispatch
   tunnel/{cluster,forward,reverse}.rs
   pool/connection_pool.rs      ReplenishingStreamPool actor
-  core/{error,stream,relay,failover}.rs
   control/stream.rs            MessagePack control protocol
   session/manager.rs           reverse data-stream pairing
   dialer/{endpoint,dns,tls,unified}.rs
-  transport/
-    mod.rs, registry.rs        traits, metadata, driver registry
+  transport/                   backend driver implementations only
+    mod.rs                     re-exports backend traits, driver modules
     ws/{mod,connector,listener,model,stream}.rs
     h3/{mod,connector,listener,stream}.rs
     uds.rs
-  platform/{mod,unix,windows}.rs  GenericListener, UDS listener, target parsing
+  platform/{mod,unix,windows}.rs  UDS listener, target dialing, OS primitives
   common/{auth,cancel,net,task}.rs
   mux/                         standalone module, not used by the data path
 crates/culvert/tests/          end-to-end and regression tests
@@ -172,10 +209,20 @@ normalizes the socket path, parses `?path=` (prepending `/` if needed) and
 Default ports are 80 for `ws` and 443 for the TLS/QUIC schemes. A UDS endpoint
 must include a socket file path.
 
-`TargetAddr` has three variants: `Ip(SocketAddr)`, `Domain(String, u16)`,
-`Path(PathBuf)`. `parse_target_addr` accepts `unix://path`, bracketed IPv6 with
-port, `ip:port`, or a validated `hostname:port`. A port is mandatory and
-non-zero for non-UDS forms.
+`io::addr::TargetAddr` has three variants: `Ip(SocketAddr)`,
+`Domain(String, u16)`, `Path(PathBuf)`. `io::addr::parse_target_addr` accepts
+`unix://path`, bracketed IPv6 with port, `ip:port`, or a validated
+`hostname:port`. A port is mandatory and non-zero for non-UDS forms. Both live
+in the neutral vocabulary layer: config, frontend, core, and backend refer to
+the same type without any of them owning it.
+
+`io::addr::L4Protocol` is `Tcp | Udp`. `io::addr::MappingSpec { protocol,
+listen, target }` is the neutral description of one port mapping handed to
+`frontend::bind`. `run_forward_mapping` builds the spec with
+`MappingSpec::tcp` from the `listen` / `target` strings returned by
+`TunnelConfig::canonical_mappings()`. `PortMappingConfig` has no `protocol`
+field and the configuration schema has no UDP constructor. UDP port mapping is
+not implemented in this release.
 
 ### 4.3 EndpointContext merge
 
@@ -233,31 +280,33 @@ return the effective values used by runtime timers.
 
 ## 5. Transport Layer
 
-### 5.1 Traits
+### 5.1 Backend traits
+
+`backend/mod.rs` owns the relay-channel interface; `transport/` contains only
+driver implementations and re-exports these traits for existing import paths.
+`backend/registry.rs` owns `TransportRegistry`.
 
 ```rust
-// transport/mod.rs
-pub enum TargetAddr { Ip(SocketAddr), Domain(String, u16), Path(PathBuf) }
-
+// backend/mod.rs
 pub struct StreamMetadata {
     pub mode: TunnelMode,
     pub session_id: Option<String>,
     pub target: Option<TargetAddr>,
     pub pool_idle: bool,
 }
+pub type AcceptOutput = Result<(IoChannel, StreamMetadata), TunnelError>;
 
 pub trait TransportConnector: Send + Sync {
     fn connect<'a>(&'a self, target: &'a TargetAddr,
                    session_id: Option<&'a str>)
-        -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>>;
-    fn connect_pooled<'a>(&'a self, target: &'a TargetAddr) -> BoxFuture<'_, ...>;
-    fn protocol_scheme(&self) -> &'static str;
+        -> BoxFuture<'a, Result<IoChannel, TunnelError>>;
+    fn connect_pooled<'a>(&'a self, target: &'a TargetAddr)
+        -> BoxFuture<'a, Result<IoChannel, TunnelError>>;
     fn invalidate_broken_sessions(&self) {}
 }
 
 pub trait TransportListener: Send + Sync {
-    fn accept<'a>(&'a mut self)
-        -> BoxFuture<'a, Result<(Box<dyn TunnelStream>, StreamMetadata), TunnelError>>;
+    fn accept(&mut self, slot: &mut ReusableFutureRef<'static, AcceptOutput>);
     fn shutdown<'a>(&'a mut self) -> BoxFuture<'a, ()>;
 }
 
@@ -266,36 +315,72 @@ pub trait TransportDriver: Send + Sync + 'static {
     fn build_connector(&self, endpoint: &EndpointContext, auth_token: &str,
                        mode: TunnelMode) -> Result<Box<dyn TransportConnector>, TunnelError>;
     fn build_listener(&self, listen_addr: &str, auth_token: Option<&str>,
-                      path: Option<&str>, tls: Option<&TlsConfig>)
+                      path: Option<&str>, tls: Option<&TlsConfig>,
+                      cancel: CancellationToken)
                       -> Result<Box<dyn TransportListener>, TunnelError>;
-    fn build_listener_with_cancel(&self, ..., cancel: CancellationToken) -> ...;
 }
 ```
 
 `BoxFuture` is a boxed, `Send`, lifetime-bound future; the traits avoid
-`async_trait`. `TransportListener::shutdown()` is the explicit async
-termination boundary for listener-owned tasks.
+`async_trait`. `connect_pooled` is required: the old default silently omitted
+the `x-tunnel-pool: idle` marker and produced a normal data stream. There is a
+single `build_listener` carrying the root `CancellationToken`; the previous
+`build_listener` / `build_listener_with_cancel` pair and its legacy fallback are
+gone. `protocol_scheme()` was removed — it had no call sites. The single-shot
+`accept_one` helper for `TransportListener` is a free function in `backend`,
+not a trait default; `GenericListener` keeps its own concrete convenience
+method.
+`TransportListener::shutdown()` is the explicit async termination boundary for
+listener-owned tasks.
 
-### 5.2 TunnelStream
+`IoChannel` is the one I/O product both sides hand to core. It implements
+`AsyncRead`, `AsyncWrite`, and `TunnelStream` by delegating to its stream
+variant, so the stream-only control plane (pool, session manager, control
+framing) keeps its borrowed-style calls. `IoChannel::into_stream()` is the
+explicit by-value conversion used when a boxed stream is required; on a
+datagram channel it returns `TunnelError::UnsupportedChannel`. This is the only
+place the backend can grow a second I/O shape, and it is shared by `connect`
+and `accept`.
 
-`core::stream::TunnelStream` extends `AsyncRead + AsyncWrite + Send + Unpin +
-'static` with:
+### 5.2 TunnelStream and stream capabilities
 
-| Method | Purpose |
-| :--- | :--- |
-| `consumes_owned_write()` | Selects the owned-`Bytes` write path. |
-| `poll_write_bytes(cx, Bytes)` | Writes an owned chunk without copying into a borrowed buffer. |
-| `poll_send_ping(cx)` | Emits a transport-level liveness probe. |
-| `last_activity_ms()` | Timestamp for activity-gated probes. |
-| `poll_check_alive(cx)` | Returns `HeartbeatStatus` for idle-stream eviction. |
-| `supports_half_close()` | Whether the transport can shut down one write direction. |
+`io::stream::TunnelStream` extends `AsyncRead + AsyncWrite + Send + Unpin +
+'static` with liveness hooks and one capability query:
+
+```rust
+pub struct StreamCaps { pub owned_write: bool, pub half_close: bool }
+// Default: owned_write = false, half_close = true.
+pub trait TunnelStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {
+    fn caps(&self) -> StreamCaps;
+    fn poll_write_owned(&mut self, cx: &mut Context<'_>, chunk: Bytes)
+        -> Poll<io::Result<usize>>;   // default: poll_write(cx, &chunk)
+    fn poll_send_ping(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
+    fn last_activity_ms(&self) -> Option<u64>;
+    fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus>;
+}
+```
+
+`StreamStreamPump` reads `caps()` once per direction and selects the owned or
+borrowed write path; `caps().half_close` replaces the old
+`supports_half_close()` method. The previous pair
+`consumes_owned_write()` + `poll_write_bytes()` was replaced by this single
+query so that the owned path cannot be left unselected: `WsTunnelStream` had a
+zero-copy owned write implementation that the relay never called.
+`poll_write_owned` keeps a borrowed default because byte-oriented transports
+(TCP, TLS, QUIC) have nothing to retain; it is only invoked when
+`owned_write` is true.
+
+`BufferedTlsStream` (one-byte pushback) is still present: TLS drivers require
+it. `impl TunnelStream for Box<dyn TunnelStream>` was removed because no
+production path boxes a boxed stream; `IoChannel` is the only forwarding layer
+in the data path.
 
 `heartbeat_timing(last_activity_ms, now, heartbeat_interval, idle_timeout)`
 computes whether a probe is needed. Probes never refresh liveness by
 themselves; inbound frames and real outbound data do.
 
 WebSocket has no native transport-level half-close; culvert encodes half-close
-FIN as an in-band zero-length binary frame (`supports_half_close() == true`).
+FIN as an in-band zero-length binary frame (`caps().half_close == true`).
 `poll_check_alive(cx)` uses a zero-capacity `ReadBuf` to drive the underlying
 `poll_read` state machine non-destructively, ensuring that in-band FIN frames and
 in-flight data frames are never swallowed during idle liveness sweeps.
@@ -314,7 +399,8 @@ marking the stream dead.
 
 ### 5.3 Driver registry
 
-`TransportRegistry::default()` registers three drivers:
+`backend::registry::TransportRegistry::default()` (re-exported from
+`transport::registry`) registers three drivers:
 
 | Driver | Schemes | Implementation |
 | :--- | :--- | :--- |
@@ -389,11 +475,99 @@ The server caps `auth_len` at 1024 bytes and `meta_len` at 65536 bytes.
   `common::net::tune_tcp_stream` only sets `TCP_NODELAY`.
   `bind_interface` requires `SO_BINDTODEVICE` and is rejected elsewhere by
   `platform::validate_bind_interface`.
-- `platform::GenericListener` is either `Tcp(TcpListener)` or
-  `Uds(PlatformUdsListener)`. `normalize_uds_path` handles `unix://`,
-  `ws+unix://`, `wss+unix://`, query strings, and drive-letter paths. The
-  Windows UDS listener uses `uds_windows`, WSA events, and a dedicated OS
+- `platform::GenericListener` is either `Tcp(Arc<TcpListener>)` or
+  `Uds(Arc<Mutex<PlatformUdsListener>>)`. `frontend::tcp::TcpFrontend` is the
+  only wrapper that exposes it to the runtime, and it implements `Frontend`;
+  both forward and reverse port listeners go through `frontend::bind`, so no
+  runtime module binds a mapping listener directly. `normalize_uds_path` handles
+  `unix://`, `ws+unix://`, `wss+unix://`, query strings, and drive-letter paths.
+  The Windows UDS listener uses `uds_windows`, WSA events, and a dedicated OS
   accept thread whose handle is owned and joined.
+
+### 5.7 Three-layer boundaries and the Pump registry
+
+This section defines "independent". The dependency rule is one-way:
+`frontend/`, `backend/`, and `core/` each depend on `io/`; none of them imports
+another part's implementation. `io/` contains no business logic and no
+reference to a concrete driver. `transport/` drivers implement
+`TransportDriver` and never appear in `core/`.
+
+```rust
+// io/channel.rs
+pub enum ChannelKind { Stream, Datagram }
+pub enum IoChannel {
+    Stream(Box<dyn TunnelStream>),
+    Datagram(Box<dyn DatagramIo>),
+}
+pub struct FlowKey { pub peer: String, pub target: Option<TargetAddr>, pub protocol: L4Protocol }
+pub struct Datagram { pub flow: FlowKey, pub payload: Bytes }
+pub trait DatagramIo: Send + Unpin + 'static {
+    fn poll_recv(&mut self, cx: &mut Context<'_>, batch: &mut [Datagram])
+        -> Poll<io::Result<usize>>;
+    fn poll_send(&mut self, cx: &mut Context<'_>, batch: &[Datagram])
+        -> Poll<io::Result<usize>>;
+}
+
+// io/pump.rs
+pub struct PumpRequest { pub frontend: IoChannel, pub backend: IoChannel }
+pub struct PumpCtx {
+    pub cancel: CancellationToken,
+    pub heartbeat_interval: Duration,
+    pub idle_timeout: Duration,
+}
+pub trait Pump: Send + Sync + 'static {
+    fn run<'a>(&'a self, req: PumpRequest, ctx: PumpCtx)
+        -> BoxFuture<'a, Result<(u64, u64), TunnelError>>;
+}
+pub struct PumpRegistry; // register(kind_pair, pump), lookup(kind_pair)
+pub fn pump_registry() -> &'static PumpRegistry;
+
+// core/serve.rs
+pub async fn serve(req: PumpRequest, ctx: PumpCtx)
+    -> Result<(u64, u64), TunnelError>;
+```
+
+`serve` computes `(req.frontend.kind(), req.backend.kind())`, asks
+`PumpRegistry::lookup`, and returns `TunnelError::UnsupportedChannel` when no
+pump is registered. It contains no `match` on `IoChannel` variants and no
+read/write calls. `PumpRegistry` is a process-wide
+`RwLock<HashMap<(ChannelKind, ChannelKind), Arc<dyn Pump>>>` seeded at first use
+with `StreamStreamPump` for `(Stream, Stream)`; `register()` is the extension
+point. `FlowKey` identifies one datagram flow and lives on each `Datagram`.
+
+The frontend is an abstraction, not a concrete enum:
+
+```rust
+// frontend/mod.rs
+pub struct FrontendAccept {
+    pub channel: IoChannel,
+    pub peer: String,
+}
+pub trait Frontend: Send {
+    fn accept(&mut self, slot: &mut ReusableFutureRef<'static, Result<FrontendAccept, TunnelError>>);
+    fn shutdown<'a>(&'a mut self) -> BoxFuture<'a, ()>;
+}
+pub async fn bind(spec: &MappingSpec) -> Result<Box<dyn Frontend>, TunnelError>;
+```
+
+`Frontend` does not declare a channel kind: `IoChannel::kind()` on the accepted
+channel is the single authoritative key that `core::serve` dispatches on, so a
+declared kind could not drift out of sync with what the frontend actually
+yields. `FrontendAccept` carries no `FlowKey` either — stream flows use `peer`,
+and datagram flows carry their key per envelope in `Datagram.flow`.
+
+`frontend::bind` consults a `FrontendRegistry` keyed by `L4Protocol`. Only
+`Tcp` is registered; a `Udp` spec returns `TunnelError::UnsupportedChannel`
+before any socket is created. `run_forward_mapping` builds the spec with
+`MappingSpec::tcp`; `canonical_mappings()` only supplies the `listen` and
+`target` strings, with no protocol field in `PortMappingConfig`.
+
+**Adding UDP port mapping later** requires a `UdpFrontend` registered in
+`FrontendRegistry`, a datagram-capable `TransportDriver` that yields
+`IoChannel::Datagram`, and a `StreamDatagramPump` / `DatagramDatagramPump`
+registered in `PumpRegistry`. No file under `core/` changes. UDP port mapping
+itself is **not implemented** in this release; only these extension points
+exist.
 
 ---
 
@@ -403,7 +577,8 @@ The server caps `auth_len` at 1024 bytes and `meta_len` at 65536 bytes.
 listener with the effective server TLS config, heartbeat interval, and idle
 timeout, and tracks accepted connections in a nested `TaskTracker`.
 
-For each accepted `(stream, StreamMetadata)`:
+For each accepted `(channel, StreamMetadata)` — an `IoChannel` from the backend
+and its handshake metadata:
 
 | `metadata.mode` | Branch |
 | :--- | :--- |
@@ -419,8 +594,10 @@ Forward target resolution order:
 3. `server.default_target`.
 
 If none is available the stream is closed with a log message. Dialing uses
-`platform::connect_target`, and relaying uses
-`RelayEngine::relay_with_heartbeat(target_conn, stream, token, hb, idle)`.
+`platform::connect_target`. Both sides are wrapped as `IoChannel` and handed to
+`core::serve(req, ctx)`, which dispatches `StreamStreamPump`. Stream-only
+branches (control framing, session fulfillment, idle pools) call
+`channel.into_stream()` at their own boundary.
 
 ### 6.1 Activation packet
 
@@ -441,7 +618,8 @@ If none is available the stream is closed with a log message. Dialing uses
 
 `handle_reverse_control` wraps the accepted stream in `FramedControlStream`,
 reads `RegisterReverse { listen_addr, target_addr, pool_size }`, binds the
-requested listener on the server, registers an `inbound_pool` with
+requested listener through `frontend::bind(&MappingSpec::tcp(...))`, registers
+an `inbound_pool` with
 `SessionManager` **before** replying `RegisterAck` (the client starts
 pre-warming immediately on the ack), and starts accepting inbound connections.
 `pool_size` is the effective, already-clamped worker count, so the server's
@@ -473,7 +651,7 @@ For each inbound connection on the reverse listener:
    on a congested channel, the visitor session is dropped and the accept loop
    continues without tearing down the listening port. The paired data stream is
    delivered by `SessionManager::fulfill`; pairing is bounded by
-   `DEFAULT_SESSION_PAIR_TIMEOUT` (15 s). Both sides then relay.
+   `DEFAULT_SESSION_PAIR_TIMEOUT` (15 s). Both channels then go to `core::serve`.
 
 The control loop also handles `Ping`/`Pong` and reconnect with exponential
 backoff.
@@ -493,12 +671,12 @@ and spawns one task per mapping.
 
 ### 7.1 Forward mapping
 
-`run_forward_mapping` binds `mappings.listen` via `GenericListener::bind`. For
-each inbound connection it either acquires a stream from the shared pool or
-calls `TransportConnector::connect(&target, None)` on a connector shared by the
-mapping. If a pooled stream was acquired, the activation packet is written and
-flushed first. Both streams are then passed to `RelayEngine`. An
-`ActiveStreamGuard` calls `pool.on_stream_closed()` on drop.
+`run_forward_mapping` builds a `MappingSpec` (always `L4Protocol::Tcp`) and
+calls `frontend::bind`. For each `FrontendAccept` it either acquires a stream
+from the shared pool or calls `TransportConnector::connect(&target, None)` on a
+connector shared by the mapping. If a pooled stream was acquired, the activation
+packet is written and flushed first. Both channels are then passed to
+`core::serve`. An `ActiveStreamGuard` calls `pool.on_stream_closed()` on drop.
 
 ### 7.2 Reverse mapping
 
@@ -515,7 +693,7 @@ recycle timer**: the server is the sole owner of an idle stream's lifetime, so
 a worker can never close a connection the server has already popped and
 committed to a visitor. Expiry, overflow eviction, re-registration and listener
 teardown all close idle streams from the server side; the worker sees EOF and
-re-dials. Upon activation it dials the local `mappings.target`, hands the relay
+re-dials. Upon activation it dials the local `mappings.target`, hands `core::serve`
 to its own `TaskTracker` (never detached), and immediately dials a replacement
 — one dial RTT, with no server-side "pool low" message. Pre-warm dials are
 throttled to at most `POOL_MAX_CONCURRENT_CONNECTS` = 16 concurrent handshakes
@@ -529,9 +707,9 @@ signaling round trip would be strictly slower; the control channel is reserved
 for visitors that actually find the pool empty.
 
 On `NewConnection` (the signaling fallback path), it continues to dial the local
-`mappings.target`, opens a `reverse-data` stream with the session id, and
-relays. Reconnect backoff starts at 500 ms, doubles up to 30 s, and resets
-after 30 s of stable operation.
+`mappings.target`, opens a `reverse-data` stream with the session id, and calls
+`core::serve`. Reconnect backoff starts at 500 ms, doubles up to 30 s, and
+resets after 30 s of stable operation.
 
 ### 7.3 Retry supervision
 
@@ -548,7 +726,7 @@ loop:
 `retry.delay` is a fixed configured delay (default 3 s), not an exponential
 backoff. `retry.max_retries` is optional; omitting it retries indefinitely.
 `TunnelError::is_permanent()` covers `Config`, `UnsupportedScheme`,
-`AuthFailed`, and `Tls`.
+`UnsupportedChannel`, `AuthFailed`, and `Tls`.
 
 ---
 
@@ -585,11 +763,12 @@ a simple standalone implementation; the runtime data path uses
 
 ---
 
-## 9. Relay Engine
+## 9. Stream/Stream Pump
 
-`RelayEngine::relay_with_heartbeat(a, b, token, heartbeat_interval,
-idle_timeout)` maintains two `TransferState` values (64 KB buffer each, from
-`RELAY_BUFFER_SIZE`) inside one `poll_fn`:
+`io::pump::StreamStreamPump` implements `Pump` for `(Stream, Stream)`. Its
+`relay_with_heartbeat(a, b, token, heartbeat_interval, idle_timeout)` maintains
+two `TransferState` values (64 KB buffer each, from `RELAY_BUFFER_SIZE`) inside
+one `poll_fn`:
 
 ```
 TransferState {
@@ -600,12 +779,16 @@ TransferState {
 ```
 
 On each poll it checks the cancellation future, polls reads and writes for both
-directions, flushes owned `Bytes` chunks via `poll_write_bytes` when
-`consumes_owned_write()` is true, drives activity-gated `poll_send_ping`, and
+directions, flushes owned `Bytes` chunks via `poll_write_owned` when
+`caps().owned_write` is true, drives activity-gated `poll_send_ping`, and
 terminates a direction only after its buffered bytes are flushed and its write
-side is shut down (`supports_half_close`). On cancellation it allows a bounded
-500 ms drain (`DEFAULT_RELAY_DRAIN_TIMEOUT`) for in-flight tails. The return
-value is `(bytes_a_to_b, bytes_b_to_a)`.
+side is shut down (`caps().half_close`). `caps()` is read once per direction
+before the loop, not on every poll. On cancellation it allows a bounded 500 ms
+drain (`DEFAULT_RELAY_DRAIN_TIMEOUT`) for in-flight tails. The return value is
+`(bytes_a_to_b, bytes_b_to_a)`.
+
+`Pump::run` calls `IoChannel::into_stream()` on both sides once, then runs this
+state machine. No other pump is registered in this release.
 
 Design constraint: this hot path is intentionally a hand-written `poll_fn`
 state machine. Replacing it with `tokio::select!` is not permitted because of
@@ -644,17 +827,23 @@ this loop and in the pool reactor is deliberately retained.
    the port without delay so reconnecting peers never hit port conflicts. Teardown
    is identity-checked with `remove_if`.
 
-Errors are `SessionNotFound`, `SessionClosed`, and `SessionPairTimeout`.
+Errors are `SessionNotFound`, `SessionClosed`, and `SessionPairTimeout`. This
+whole section is stream-scoped: it is the reverse control plane, not the
+byte-moving core. Datagram flows do not use `SessionManager` or
+`ReverseInboundPool`; they are handled entirely by their registered `Pump`.
 
 ---
 
 ## 11. Error Model
 
-`core::error::TunnelError` includes `Io`, `UrlParse`, `Config`,
-`UnsupportedScheme`, `DnsResolutionFailed`, `DnsNoAddresses`, `Tls`,
-`TlsHandshake`, `ConnectTimeout`, `AuthFailed`, `SessionNotFound`,
-`SessionClosed`, `SessionPairTimeout`, `ControlProtocol`, `Multiplex`,
-`PoolExhausted`, `Shutdown`, `Internal`.
+`io::error::TunnelError` (re-exported as `core::error::TunnelError`) includes
+`Io`, `UrlParse`, `Config`, `UnsupportedScheme`, `UnsupportedChannel`,
+`DnsResolutionFailed`, `DnsNoAddresses`, `Tls`, `TlsHandshake`,
+`ConnectTimeout`, `AuthFailed`, `SessionNotFound`, `SessionClosed`,
+`SessionPairTimeout`, `ControlProtocol`, `Multiplex`, `PoolExhausted`,
+`Shutdown`, `Internal`. `UnsupportedChannel` reports an unregistered pump pair,
+a missing frontend protocol, or `into_stream()` on a datagram channel; it is
+permanent.
 
 `is_permanent()` and `is_shutdown()` drive the supervisor's retry and shutdown
 decisions. `common::cancel` provides `CancelFutureExt::cancel_with`,
@@ -704,11 +893,16 @@ effective configuration values.
 | `FailoverConfig` | `config/model.rs` | Rejected by `ConfigLoader::validate`. |
 | `mux/` (frame, session, stream) | `crates/culvert/src/mux/` | Standalone module with its own tests; no data-path references to `MuxSession`. |
 | `core/failover.rs` | `crates/culvert/src/core/` | Not referenced by config or runtime. |
+| `L4Protocol::Udp` mapping | `io/addr.rs` | Vocabulary only. No config field, no `UdpFrontend`, no UDP socket. |
+| `IoChannel::Datagram` | `io/channel.rs` | Variant and `DatagramIo` trait only. No driver constructs it. |
+| Datagram pumps | `io/pump.rs` | `(Stream, Datagram)` / `(Datagram, Datagram)` are unregistered; `core::serve` returns `UnsupportedChannel`. |
 
-Consequently there is no seamless transport migration, no primary/standby
-endpoint switching, no stream-offset replay buffer, no P2P/STUN/ICE path, and
-no automatic HTTP/3-to-WSS fallback. Each tunnel uses exactly the scheme in
-its endpoint URL.
+Consequently there is no UDP port mapping, no seamless transport migration, no
+primary/standby endpoint switching, no stream-offset replay buffer, no
+P2P/STUN/ICE path, and no automatic HTTP/3-to-WSS fallback. Each tunnel uses
+exactly the scheme in its endpoint URL. The three items above are **extension
+points**, not partial implementations: the structural split is complete and
+UDP port mapping is deliberately deferred so the split can be validated first.
 
 ---
 
@@ -729,10 +923,15 @@ pub async fn run(config: AppConfig, cancel_token: CancellationToken)
     -> Result<(), TunnelError>;
 ```
 
-All modules are public, so `ConfigLoader`, `TransportRegistry`,
-`ReplenishingStreamPool`, `RelayEngine`, and the protocol types can also be
-used directly. Callers own the `CancellationToken` and are responsible for
-cancelling and awaiting.
+All modules are public. `io/` exports the neutral vocabulary (`TargetAddr`,
+`L4Protocol`, `MappingSpec`, `IoChannel`, `DatagramIo`, `StreamCaps`,
+`TunnelError`, `Pump`, `PumpRequest`, `PumpCtx`, `pump_registry`,
+`StreamStreamPump`); `frontend/` exports `Frontend`, `FrontendAccept`, and
+`bind`; `backend/` exports the `Transport*` traits and `TransportRegistry`;
+`core::serve` is the pump-dispatch entry point. `ConfigLoader`,
+`ReplenishingStreamPool`, and the protocol types are also usable directly.
+Callers own the `CancellationToken` and are responsible for cancelling and
+awaiting.
 
 ---
 

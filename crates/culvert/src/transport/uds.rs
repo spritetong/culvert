@@ -25,16 +25,17 @@ use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, BufferedTlsStream, TunnelStream};
 use crate::dialer::endpoint::EndpointContext;
 use crate::dialer::tls::TlsConfigBuilder;
+use crate::io::channel::IoChannel;
 use crate::platform::{PlatformUdsListener, connect_uds, normalize_uds_path};
 use crate::transport::ws::model::WsHandshakeHeaders;
 use crate::transport::ws::stream::WsTunnelStream;
 use crate::transport::{
-    ACCEPTED_STREAM_QUEUE_SIZE, AcceptOutput, StreamMetadata, TargetAddr, TransportConnector,
-    TransportDriver, TransportListener,
+    ACCEPTED_STREAM_QUEUE_SIZE, AcceptOutput, TargetAddr, TransportConnector, TransportDriver,
+    TransportListener,
 };
 use reusable_future::ReusableFutureRef;
 
-type AcceptedResult = Result<(Box<dyn TunnelStream>, StreamMetadata), TunnelError>;
+type AcceptedResult = AcceptOutput;
 
 /// An upgrade future handed back by the HTTP service to its owning connection
 /// task. It is never spawned without an owner.
@@ -75,22 +76,6 @@ impl TransportDriver for UdsTransportDriver {
     }
 
     fn build_listener(
-        &self,
-        socket_path: &str,
-        auth_token: Option<&str>,
-        path: Option<&str>,
-        tls: Option<&crate::config::model::TlsConfig>,
-    ) -> Result<Box<dyn TransportListener>, TunnelError> {
-        self.build_listener_with_cancel(
-            socket_path,
-            auth_token,
-            path,
-            tls,
-            CancellationToken::new(),
-        )
-    }
-
-    fn build_listener_with_cancel(
         &self,
         socket_path: &str,
         auth_token: Option<&str>,
@@ -336,7 +321,9 @@ impl UdsListener {
                                             let ws_stream =
                                                 WsTunnelStream::new(ws.into_inner(), Role::Server);
                                             Ok((
-                                                Box::new(ws_stream) as Box<dyn TunnelStream>,
+                                                IoChannel::from_boxed_stream(
+                                                    Box::new(ws_stream) as Box<dyn TunnelStream>
+                                                ),
                                                 metadata,
                                             ))
                                         }
@@ -588,23 +575,23 @@ impl TransportConnector for UdsConnector {
         &'a self,
         target: &'a TargetAddr,
         session_id: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
-        Box::pin(self.connect_internal(target, session_id, false))
+    ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
+        Box::pin(async move {
+            self.connect_internal(target, session_id, false)
+                .await
+                .map(IoChannel::from_boxed_stream)
+        })
     }
 
     fn connect_pooled<'a>(
         &'a self,
         target: &'a TargetAddr,
-    ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
-        Box::pin(self.connect_internal(target, None, true))
-    }
-
-    fn protocol_scheme(&self) -> &'static str {
-        if self.endpoint.endpoint.scheme == "wss+unix" {
-            "wss+unix"
-        } else {
-            "ws+unix"
-        }
+    ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
+        Box::pin(async move {
+            self.connect_internal(target, None, true)
+                .await
+                .map(IoChannel::from_boxed_stream)
+        })
     }
 }
 
@@ -624,7 +611,7 @@ mod tests {
             UdsListener::new(&sock_str, Some("test_token"), None::<String>, None).unwrap();
 
         let srv_task = tokio::spawn(async move {
-            let (stream, meta) = listener.accept_one().await.unwrap();
+            let (stream, meta) = crate::backend::accept_one(&mut listener).await.unwrap();
             assert_eq!(meta.mode, TunnelMode::Forward);
             stream
         });
@@ -651,7 +638,7 @@ mod tests {
 
         let driver = UdsTransportDriver;
         let url = format!("ws+unix://{}?chmod=0o660", sock_str);
-        let listener = driver.build_listener(&url, None, None, None);
+        let listener = driver.build_listener(&url, None, None, None, CancellationToken::new());
         assert!(listener.is_ok());
 
         assert!(sock_path.exists());

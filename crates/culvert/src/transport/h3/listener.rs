@@ -29,6 +29,7 @@ use crate::consts::{
 };
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, TunnelStream};
+use crate::io::channel::IoChannel;
 use crate::transport::h3::stream::{H3TunnelStream, QuinnTunnelStream};
 use crate::transport::{
     ACCEPTED_STREAM_QUEUE_SIZE, AcceptOutput, StreamMetadata, TargetAddr, TransportListener,
@@ -412,7 +413,7 @@ impl H3Listener {
                                     .headers()
                                     .get(HEADER_TUNNEL_TARGET)
                                     .and_then(|v| v.to_str().ok())
-                                    .and_then(|s| crate::tunnel::forward::parse_target_addr(s).ok())
+                                    .and_then(|s| crate::io::addr::parse_target_addr(s).ok())
                                     .or_else(|| {
                                         req.headers()
                                             .get(HEADER_TARGET_PATH)
@@ -614,7 +615,7 @@ impl TransportListener for H3Listener {
                 biased;
                 _ = cancel.cancelled() => Err(TunnelError::Shutdown),
                 item = guard.recv() => match item {
-                    Some((stream, meta)) => Ok((stream, meta)),
+                    Some((stream, meta)) => Ok((IoChannel::from_boxed_stream(stream), meta)),
                     None => Err(TunnelError::Shutdown),
                 },
             }

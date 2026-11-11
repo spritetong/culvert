@@ -19,8 +19,9 @@ use tokio_util::sync::CancellationToken;
 use culvert::consts::{DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_IDLE_TIMEOUT};
 use culvert::control::stream::ControlMessage;
 use culvert::core::error::TunnelError;
-use culvert::core::relay::RelayEngine;
 use culvert::core::stream::{BoxFuture, TunnelStream};
+use culvert::io::channel::IoChannel;
+use culvert::io::pump::StreamStreamPump;
 use culvert::mux::{MuxCodec, MuxFrame, MuxSession};
 use culvert::pool::ReplenishingStreamPool;
 use culvert::transport::ws::stream::WsTunnelStream;
@@ -86,7 +87,21 @@ fn bench_mux_framing(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark RelayEngine raw throughput across stream adapters.
+/// Benchmark stream/stream pump raw throughput across stream adapters.
+fn relay(
+    a: Box<dyn TunnelStream>,
+    b: Box<dyn TunnelStream>,
+    cancel: CancellationToken,
+) -> impl std::future::Future<Output = Result<(u64, u64), TunnelError>> {
+    StreamStreamPump::relay_with_heartbeat(
+        a,
+        b,
+        cancel,
+        DEFAULT_HEARTBEAT_INTERVAL,
+        DEFAULT_IDLE_TIMEOUT,
+    )
+}
+
 fn bench_relay_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("relay_throughput");
     let rt = Runtime::new().unwrap();
@@ -110,14 +125,14 @@ fn bench_relay_throughput(c: &mut Criterion) {
                     let cancel_token = CancellationToken::new();
 
                     // Relay client_side <-> ws_client
-                    let h1 = tokio::spawn(RelayEngine::relay_with_cancel(
+                    let h1 = tokio::spawn(relay(
                         Box::new(client_side),
                         ws_client,
                         cancel_token.clone(),
                     ));
 
                     // Relay server_side <-> ws_server
-                    let h2 = tokio::spawn(RelayEngine::relay_with_cancel(
+                    let h2 = tokio::spawn(relay(
                         Box::new(server_side),
                         ws_server,
                         cancel_token.clone(),
@@ -159,13 +174,13 @@ fn bench_relay_throughput(c: &mut Criterion) {
                     let (mut app_a, client_side) = duplex(128 * 1024);
                     let (mut app_b, server_side) = duplex(128 * 1024);
 
-                    let h1 = tokio::spawn(RelayEngine::relay_with_cancel(
+                    let h1 = tokio::spawn(relay(
                         Box::new(client_side),
                         Box::new(client_stream),
                         cancel_token.clone(),
                     ));
 
-                    let h2 = tokio::spawn(RelayEngine::relay_with_cancel(
+                    let h2 = tokio::spawn(relay(
                         Box::new(server_side),
                         Box::new(server_stream),
                         cancel_token.clone(),
@@ -201,15 +216,18 @@ impl TransportConnector for DummyConnector {
         &'a self,
         _target: &'a TargetAddr,
         _session_id: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+    ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
         Box::pin(async move {
             let (a, _) = duplex(65536);
-            Ok(Box::new(a) as Box<dyn TunnelStream>)
+            Ok(IoChannel::from_boxed_stream(Box::new(a)))
         })
     }
 
-    fn protocol_scheme(&self) -> &'static str {
-        "dummy"
+    fn connect_pooled<'a>(
+        &'a self,
+        target: &'a TargetAddr,
+    ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
+        self.connect(target, None)
     }
 }
 

@@ -19,6 +19,7 @@ use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, BufferedTlsStream, TunnelStream};
 use crate::dialer::endpoint::EndpointContext;
 use crate::dialer::tls::TlsConfigBuilder;
+use crate::io::channel::IoChannel;
 use crate::transport::ws::model::WsHandshakeHeaders;
 use crate::transport::ws::stream::WsTunnelStream;
 use crate::transport::{TargetAddr, TransportConnector};
@@ -72,7 +73,7 @@ impl WsConnector {
         target: &TargetAddr,
         session_id: Option<&str>,
         pool_idle: bool,
-    ) -> Result<Box<dyn TunnelStream>, TunnelError> {
+    ) -> Result<IoChannel, TunnelError> {
         let host = &self.endpoint.endpoint.host;
         let port = self.endpoint.endpoint.port;
 
@@ -166,9 +167,11 @@ impl WsConnector {
             TunnelError::ControlProtocol(format!("WebSocket client handshake failed: {}", e))
         })?;
 
-        // 5. Wrap upgraded stream as a dynamic TunnelStream
+        // 5. Wrap upgraded stream as the common I/O channel
         let tunnel_stream = WsTunnelStream::new(ws.into_inner(), Role::Client);
-        Ok(Box::new(tunnel_stream) as Box<dyn TunnelStream>)
+        Ok(IoChannel::from_boxed_stream(
+            Box::new(tunnel_stream) as Box<dyn TunnelStream>
+        ))
     }
 }
 
@@ -177,18 +180,14 @@ impl TransportConnector for WsConnector {
         &'a self,
         target: &'a TargetAddr,
         session_id: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+    ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
         Box::pin(self.connect_internal(target, session_id, false))
     }
 
     fn connect_pooled<'a>(
         &'a self,
         target: &'a TargetAddr,
-    ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+    ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
         Box::pin(self.connect_internal(target, None, true))
-    }
-
-    fn protocol_scheme(&self) -> &'static str {
-        crate::consts::SCHEME_WSS
     }
 }

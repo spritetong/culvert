@@ -10,8 +10,10 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use culvert::backend::accept_one;
 use culvert::config::model::{AppConfig, EndpointConfig, PortMappingConfig, TlsConfig, TunnelMode};
 use culvert::core::error::TunnelError;
+use culvert::core::stream::TunnelStream;
 use culvert::dialer::endpoint::EndpointContext;
 use culvert::transport::h3::H3Connector;
 use culvert::transport::h3::listener::H3Listener;
@@ -131,7 +133,7 @@ async fn test_h3_transport_handshake_and_bidirectional_transfer() {
 
     // Spawn server accept task
     let server_task = tokio::spawn(async move {
-        let (mut stream, metadata) = listener.accept_one().await.unwrap();
+        let (mut stream, metadata) = accept_one(&mut listener).await.unwrap();
         assert_eq!(metadata.mode, TunnelMode::Forward);
         assert_eq!(metadata.session_id.as_deref(), Some("sess_h3_test_1"));
         assert_eq!(
@@ -245,7 +247,7 @@ async fn test_quic_raw_stream_bidirectional_transfer() {
     let (tx_done, rx_done) = tokio::sync::oneshot::channel::<()>();
 
     let server_task = tokio::spawn(async move {
-        let (mut stream, metadata) = listener.accept_one().await.unwrap();
+        let (mut stream, metadata) = accept_one(&mut listener).await.unwrap();
         assert_eq!(metadata.mode, TunnelMode::Forward);
         assert_eq!(metadata.session_id.as_deref(), Some("sess_quic_raw_1"));
 
@@ -317,7 +319,7 @@ async fn test_h3_stream_multiplexing_over_single_quic_connection() {
     // Spawn server accepting 3 streams
     let server_task = tokio::spawn(async move {
         for _ in 0..STREAMS {
-            let (mut stream, _) = listener.accept_one().await.unwrap();
+            let (mut stream, _) = accept_one(&mut listener).await.unwrap();
             tokio::spawn(async move {
                 let mut data = Vec::new();
                 read_to_end_timed(&mut stream, &mut data).await.unwrap();
@@ -841,7 +843,7 @@ async fn test_h3_sibling_streams_survive_sibling_abort() {
     // Server accepts multiple streams
     let server_task = tokio::spawn(async move {
         // Stream 1 handler: echo
-        let (mut stream1, _) = listener.accept_one().await.unwrap();
+        let (mut stream1, _) = accept_one(&mut listener).await.unwrap();
         let s1_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 16 * 1024];
             read_exact_timed(&mut stream1, &mut buf).await.unwrap();
@@ -851,7 +853,7 @@ async fn test_h3_sibling_streams_survive_sibling_abort() {
         });
 
         // Stream 2 handler: just accepted, then client will abruptly drop
-        let (mut stream2, _) = listener.accept_one().await.unwrap();
+        let (mut stream2, _) = accept_one(&mut listener).await.unwrap();
         let s2_handle = tokio::spawn(async move {
             let mut buf = [0u8; 1024];
             let _ = stream2.read(&mut buf).await;
@@ -918,7 +920,7 @@ async fn test_h3_stream_liveness_detects_closed_connection() {
         H3Listener::bind(&listen_addr, Some(auth_token), None, server_rustls).unwrap();
 
     let server_task = tokio::spawn(async move {
-        if let Ok((mut stream, _)) = listener.accept_one().await {
+        if let Ok((mut stream, _)) = accept_one(&mut listener).await {
             // Keep stream open until client reads or terminates
             let mut buf = [0u8; 16];
             let _ = stream.read(&mut buf).await;
@@ -981,8 +983,8 @@ async fn test_h3_connector_recovers_after_server_restart() {
     let server_1_cancel = tokio_util::sync::CancellationToken::new();
     let s1_cancel = server_1_cancel.clone();
     let server_1_task = tokio::spawn(async move {
-        // Keep the in-flight accept across loop turns: a fresh `accept_one()`
-        // future in a select branch is dropped whenever cancellation wins.
+        // Keep the in-flight accept across loop turns: a fresh accept future
+        // created in a select branch is dropped whenever cancellation wins.
         let mut accept_slot = ReusableFutureRef::default();
         loop {
             if accept_slot.is_empty() {

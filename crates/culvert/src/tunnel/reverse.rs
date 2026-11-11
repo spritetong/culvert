@@ -23,9 +23,10 @@ use crate::consts::{
 };
 use crate::control::stream::{ControlMessage, FramedControlStream};
 use crate::core::error::TunnelError;
-use crate::core::relay::RelayEngine;
+use crate::core::serve::serve;
 use crate::core::stream::{activity_now_ms, heartbeat_timing};
 use crate::dialer::endpoint::EndpointContext;
+use crate::io::pump::{PumpCtx, PumpRequest};
 use crate::transport::{TargetAddr, TransportConnector, TransportRegistry};
 
 /// Runs a single reverse mapping control loop.
@@ -199,7 +200,7 @@ pub async fn run_reverse_mapping(
         if let Some(size) = pool_workers {
             // One worker holds at most one idle stream, so an unbounded config
             // value would spawn an unbounded number of dialing tasks.
-            let listen_target = crate::tunnel::forward::parse_target_addr(&listen)
+            let listen_target = crate::io::addr::parse_target_addr(&listen)
                 .unwrap_or_else(|_| dummy_target.clone());
             debug!(
                 tag = %tag,
@@ -322,12 +323,13 @@ pub async fn run_reverse_mapping(
                         };
 
                         relays.spawn_with_cancel(move |relay_token| async move {
-                            let _ = RelayEngine::relay_with_heartbeat(
-                                local_stream,
-                                stream,
-                                relay_token,
-                                hb,
-                                idle,
+                            let _ = serve(
+                                PumpRequest::new(local_stream, stream),
+                                PumpCtx {
+                                    cancel: relay_token,
+                                    heartbeat_interval: hb,
+                                    idle_timeout: idle,
+                                },
                             )
                             .await;
                         });
@@ -444,12 +446,13 @@ pub async fn run_reverse_mapping(
                                     };
 
                                     // 3. Relay bidirectionally
-                                    let _ = RelayEngine::relay_with_heartbeat(
-                                        local_stream,
-                                        data_stream,
-                                        token,
-                                        hb_interval,
-                                        idle_timeout,
+                                    let _ = serve(
+                                        PumpRequest::new(local_stream, data_stream),
+                                        PumpCtx {
+                                            cancel: token,
+                                            heartbeat_interval: hb_interval,
+                                            idle_timeout,
+                                        },
                                     ).await;
                                 });
                             }
@@ -540,7 +543,8 @@ pub async fn run_reverse_tunnel(
 mod tests {
     use super::*;
     use crate::config::model::{AppConfig, DialerConfig, EndpointConfig};
-    use crate::core::stream::{BoxFuture, TunnelStream};
+    use crate::core::stream::BoxFuture;
+    use crate::io::channel::IoChannel;
     use crate::transport::{TargetAddr, TransportConnector, TransportDriver, TransportListener};
     use std::time::Duration;
 
@@ -551,7 +555,7 @@ mod tests {
             &'a self,
             _target: &'a TargetAddr,
             _session_id: Option<&'a str>,
-        ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+        ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
             Box::pin(async move {
                 let (client, server) = tokio::io::duplex(4096);
                 // Keep server stream alive without dropping or sending anything back
@@ -565,12 +569,15 @@ mod tests {
                         }
                     }
                 });
-                Ok(Box::new(client) as Box<dyn TunnelStream>)
+                Ok(IoChannel::from_boxed_stream(Box::new(client)))
             })
         }
 
-        fn protocol_scheme(&self) -> &'static str {
-            "ws"
+        fn connect_pooled<'a>(
+            &'a self,
+            target: &'a TargetAddr,
+        ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
+            self.connect(target, None)
         }
     }
 
@@ -596,6 +603,7 @@ mod tests {
             _auth_token: Option<&str>,
             _path: Option<&str>,
             _tls: Option<&crate::config::model::TlsConfig>,
+            _cancel: CancellationToken,
         ) -> Result<Box<dyn TransportListener>, TunnelError> {
             unimplemented!()
         }
@@ -654,7 +662,7 @@ mod tests {
             &'a self,
             _target: &'a TargetAddr,
             _session_id: Option<&'a str>,
-        ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+        ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
             let concurrent = Arc::clone(&self.concurrent);
             let max_concurrent = Arc::clone(&self.max_concurrent);
             Box::pin(async move {
@@ -684,12 +692,15 @@ mod tests {
 
                 tokio::time::sleep(Duration::from_millis(60)).await;
                 concurrent.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(Box::new(client) as Box<dyn TunnelStream>)
+                Ok(IoChannel::from_boxed_stream(Box::new(client)))
             })
         }
 
-        fn protocol_scheme(&self) -> &'static str {
-            "ws"
+        fn connect_pooled<'a>(
+            &'a self,
+            target: &'a TargetAddr,
+        ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
+            self.connect(target, None)
         }
     }
 
@@ -721,6 +732,7 @@ mod tests {
             _auth_token: Option<&str>,
             _path: Option<&str>,
             _tls: Option<&crate::config::model::TlsConfig>,
+            _cancel: CancellationToken,
         ) -> Result<Box<dyn TransportListener>, TunnelError> {
             unimplemented!()
         }
@@ -789,19 +801,22 @@ mod tests {
             &'a self,
             _target: &'a TargetAddr,
             _session_id: Option<&'a str>,
-        ) -> BoxFuture<'a, Result<Box<dyn TunnelStream>, TunnelError>> {
+        ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
             Box::pin(async move {
                 let (client, server) = tokio::io::duplex(1);
                 {
                     let mut guard = self.held.lock().unwrap();
                     guard.push(server);
                 }
-                Ok(Box::new(client) as Box<dyn TunnelStream>)
+                Ok(IoChannel::from_boxed_stream(Box::new(client)))
             })
         }
 
-        fn protocol_scheme(&self) -> &'static str {
-            "ws"
+        fn connect_pooled<'a>(
+            &'a self,
+            target: &'a TargetAddr,
+        ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
+            self.connect(target, None)
         }
     }
 
@@ -831,6 +846,7 @@ mod tests {
             _auth_token: Option<&str>,
             _path: Option<&str>,
             _tls: Option<&crate::config::model::TlsConfig>,
+            _cancel: CancellationToken,
         ) -> Result<Box<dyn TransportListener>, TunnelError> {
             unimplemented!()
         }

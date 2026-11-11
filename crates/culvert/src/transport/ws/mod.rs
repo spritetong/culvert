@@ -49,22 +49,6 @@ impl TransportDriver for WsTransportDriver {
         auth_token: Option<&str>,
         path: Option<&str>,
         tls: Option<&crate::config::model::TlsConfig>,
-    ) -> Result<Box<dyn TransportListener>, TunnelError> {
-        self.build_listener_with_cancel(
-            listen_addr,
-            auth_token,
-            path,
-            tls,
-            CancellationToken::new(),
-        )
-    }
-
-    fn build_listener_with_cancel(
-        &self,
-        listen_addr: &str,
-        auth_token: Option<&str>,
-        path: Option<&str>,
-        tls: Option<&crate::config::model::TlsConfig>,
         cancel: CancellationToken,
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
         let is_wss = listen_addr.starts_with("wss://") || listen_addr.starts_with("https://");
@@ -131,7 +115,7 @@ mod tests {
         let target = TargetAddr::Domain("127.0.0.1".to_string(), 80);
 
         let listener_handle = tokio::spawn(async move {
-            let (server_stream, meta) = listener.accept_one().await.unwrap();
+            let (server_stream, meta) = crate::backend::accept_one(&mut listener).await.unwrap();
             assert_eq!(meta.mode, TunnelMode::Forward);
             server_stream
         });

@@ -2,21 +2,104 @@
 // SPDX-License-Identifier: MPL-2.0
 // culvert is licensed under the Mozilla Public License Version 2.0.
 
-//! High-performance bidirectional byte relay engine.
+//! I/O strategy plugins. Core selects one by `(frontend.kind(), backend.kind())`
+//! and never moves bytes itself.
 //! All comments and docstrings must be in English.
 
-use std::future::{Future, poll_fn};
+use crate::io::channel::{ChannelKind, IoChannel};
+use crate::io::error::TunnelError;
+use crate::io::stream::{
+    BoxFuture, HeartbeatStatus, StreamCaps, TunnelStream, activity_now_ms, heartbeat_timing,
+};
+use std::collections::HashMap;
+use std::future::poll_fn;
 use std::pin::{Pin, pin};
-use std::task::Poll;
+use std::sync::{Arc, OnceLock, RwLock};
+use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::ReadBuf;
 use tokio_util::sync::CancellationToken;
 
-use crate::consts::{
-    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_IDLE_TIMEOUT, DEFAULT_RELAY_DRAIN_TIMEOUT,
-    RELAY_BUFFER_SIZE,
-};
-use crate::core::error::TunnelError;
-use crate::core::stream::{HeartbeatStatus, TunnelStream, activity_now_ms, heartbeat_timing};
+use crate::consts::{DEFAULT_RELAY_DRAIN_TIMEOUT, RELAY_BUFFER_SIZE};
+
+/// The two channels whose contents a `Pump` transfers.
+pub struct PumpRequest {
+    pub frontend: IoChannel,
+    pub backend: IoChannel,
+}
+
+impl PumpRequest {
+    pub fn new(frontend: impl Into<IoChannel>, backend: impl Into<IoChannel>) -> Self {
+        Self {
+            frontend: frontend.into(),
+            backend: backend.into(),
+        }
+    }
+}
+
+/// Runtime context shared by every pump.
+pub struct PumpCtx {
+    pub cancel: CancellationToken,
+    pub heartbeat_interval: Duration,
+    pub idle_timeout: Duration,
+}
+
+/// An I/O strategy for one channel-kind pair.
+pub trait Pump: Send + Sync + 'static {
+    fn run<'a>(
+        &'a self,
+        req: PumpRequest,
+        ctx: PumpCtx,
+    ) -> BoxFuture<'a, Result<(u64, u64), TunnelError>>;
+}
+
+/// Process-wide pump table. `register` is the extension point for new frontend
+/// capabilities: a datagram frontend adds its pumps here, not in `core::serve`.
+pub struct PumpRegistry {
+    pumps: RwLock<HashMap<(ChannelKind, ChannelKind), Arc<dyn Pump>>>,
+}
+
+impl PumpRegistry {
+    pub fn new() -> Self {
+        Self {
+            pumps: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub fn register(&self, pair: (ChannelKind, ChannelKind), pump: Arc<dyn Pump>) {
+        self.pumps
+            .write()
+            .expect("pump registry lock poisoned")
+            .insert(pair, pump);
+    }
+
+    pub fn lookup(&self, pair: (ChannelKind, ChannelKind)) -> Option<Arc<dyn Pump>> {
+        self.pumps
+            .read()
+            .expect("pump registry lock poisoned")
+            .get(&pair)
+            .cloned()
+    }
+}
+
+impl Default for PumpRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Returns the process-wide registry, seeded with the stream/stream pump.
+pub fn pump_registry() -> &'static PumpRegistry {
+    static REGISTRY: OnceLock<PumpRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let registry = PumpRegistry::new();
+        registry.register(
+            (ChannelKind::Stream, ChannelKind::Stream),
+            Arc::new(StreamStreamPump),
+        );
+        registry
+    })
+}
 
 /// Directional transfer state for one half of the duplex relay.
 struct TransferState {
@@ -52,38 +135,32 @@ impl TransferState {
     }
 }
 
-/// Relays bytes bidirectionally between two dynamic stream trait objects.
-///
-/// Uses an optimized buffer size (64 KB) and a `poll_fn` state machine to
-/// concurrently drive RX and TX while checking cancellation, completely avoiding
-/// the overhead and cancellation drops of `tokio::select!`.
-pub struct RelayEngine;
+/// The `(Stream, Stream)` pump. Its body is the hand-written `poll_fn` duplex
+/// state machine; replacing it with `tokio::select!` is a measured regression.
+pub struct StreamStreamPump;
 
-impl RelayEngine {
-    /// Copies data bidirectionally between stream_a and stream_b until EOF or error.
-    pub async fn relay(
-        stream_a: Box<dyn TunnelStream>,
-        stream_b: Box<dyn TunnelStream>,
-    ) -> Result<(u64, u64), TunnelError> {
-        Self::relay_with_cancel(stream_a, stream_b, CancellationToken::new()).await
+impl Pump for StreamStreamPump {
+    fn run<'a>(
+        &'a self,
+        req: PumpRequest,
+        ctx: PumpCtx,
+    ) -> BoxFuture<'a, Result<(u64, u64), TunnelError>> {
+        Box::pin(async move {
+            let frontend = req.frontend.into_stream()?;
+            let backend = req.backend.into_stream()?;
+            Self::relay_with_heartbeat(
+                frontend,
+                backend,
+                ctx.cancel,
+                ctx.heartbeat_interval,
+                ctx.idle_timeout,
+            )
+            .await
+        })
     }
+}
 
-    /// Copies data bidirectionally while monitoring a cancellation token in the same event loop.
-    pub async fn relay_with_cancel(
-        stream_a: Box<dyn TunnelStream>,
-        stream_b: Box<dyn TunnelStream>,
-        cancel_token: CancellationToken,
-    ) -> Result<(u64, u64), TunnelError> {
-        Self::relay_with_heartbeat(
-            stream_a,
-            stream_b,
-            cancel_token,
-            DEFAULT_HEARTBEAT_INTERVAL,
-            DEFAULT_IDLE_TIMEOUT,
-        )
-        .await
-    }
-
+impl StreamStreamPump {
     /// Copies data bidirectionally while driving activity-gated probes and monitoring cancellation.
     ///
     /// A PING is only emitted when neither direction has moved anything for one
@@ -93,9 +170,13 @@ impl RelayEngine {
         mut stream_a: Box<dyn TunnelStream>,
         mut stream_b: Box<dyn TunnelStream>,
         cancel_token: CancellationToken,
-        heartbeat_interval: std::time::Duration,
-        idle_timeout: std::time::Duration,
+        heartbeat_interval: Duration,
+        idle_timeout: Duration,
     ) -> Result<(u64, u64), TunnelError> {
+        // Capability queries happen once per direction, outside the hot loop.
+        let caps_a = stream_a.caps();
+        let caps_b = stream_b.caps();
+
         let mut a_to_b = TransferState::new(RELAY_BUFFER_SIZE);
         let mut b_to_a = TransferState::new(RELAY_BUFFER_SIZE);
 
@@ -183,6 +264,7 @@ impl RelayEngine {
                 &mut a_to_b,
                 is_cancelled,
                 &mut progress,
+                caps_b,
             );
             if let Poll::Ready(Err(e)) = res_a_to_b {
                 return Poll::Ready(Err(TunnelError::Io(e)));
@@ -196,6 +278,7 @@ impl RelayEngine {
                 &mut b_to_a,
                 is_cancelled,
                 &mut progress,
+                caps_a,
             );
             if let Poll::Ready(Err(e)) = res_b_to_a {
                 return Poll::Ready(Err(TunnelError::Io(e)));
@@ -217,17 +300,16 @@ impl RelayEngine {
     }
 
     fn poll_transfer_step(
-        cx: &mut std::task::Context<'_>,
+        cx: &mut Context<'_>,
         reader: &mut Box<dyn TunnelStream>,
         writer: &mut Box<dyn TunnelStream>,
         state: &mut TransferState,
         force_stop: bool,
         progress: &mut bool,
+        caps: StreamCaps,
     ) -> Poll<Result<(), std::io::Error>> {
-        let consumes_owned = writer.consumes_owned_write();
-
-        if consumes_owned {
-            // Path A: Writer benefits from owned Bytes buffers (e.g. MuxStream)
+        if caps.owned_write {
+            // Path A: Writer retains owned Bytes buffers with no second copy.
             while let Some(ref chunk) = state.in_flight_chunk {
                 let to_write = if state.chunk_pos == 0 {
                     chunk.clone()
@@ -235,7 +317,7 @@ impl RelayEngine {
                     chunk.slice(state.chunk_pos..)
                 };
 
-                match writer.poll_write_bytes(cx, to_write) {
+                match writer.poll_write_owned(cx, to_write) {
                     Poll::Ready(Ok(0)) => {
                         return Poll::Ready(Err(std::io::Error::new(
                             std::io::ErrorKind::WriteZero,
@@ -275,7 +357,7 @@ impl RelayEngine {
                 }
             }
         } else {
-            // Path B: Standard byte streams (TCP, TLS, WS, H3, QUIC) - zero heap allocations in hot path
+            // Path B: Standard byte streams (TCP, TLS, QUIC) - zero heap allocations in hot path
             while state.write_pos < state.read_pos {
                 match Pin::new(&mut **writer)
                     .poll_write(cx, &state.buffer[state.write_pos..state.read_pos])
@@ -324,7 +406,7 @@ impl RelayEngine {
         }
 
         // Step 3: Flush and Shutdown writer if reader is done and all bytes written
-        let all_written = if consumes_owned {
+        let all_written = if caps.owned_write {
             state.in_flight_chunk.is_none()
         } else {
             state.write_pos == state.read_pos
@@ -339,7 +421,7 @@ impl RelayEngine {
                 Poll::Pending => return Poll::Pending,
             }
 
-            if writer.supports_half_close() {
+            if caps.half_close {
                 match Pin::new(&mut **writer).poll_shutdown(cx) {
                     Poll::Ready(Ok(())) => {
                         state.write_shutdown = true;
@@ -365,38 +447,47 @@ impl RelayEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consts::{DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_IDLE_TIMEOUT};
     use std::io;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::Context;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
+    async fn relay(
+        a: Box<dyn TunnelStream>,
+        b: Box<dyn TunnelStream>,
+    ) -> Result<(u64, u64), TunnelError> {
+        StreamStreamPump::relay_with_heartbeat(
+            a,
+            b,
+            CancellationToken::new(),
+            DEFAULT_HEARTBEAT_INTERVAL,
+            DEFAULT_IDLE_TIMEOUT,
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn test_poll_fn_relay_engine() {
         let (client_app, client_side) = duplex(65536);
         let (server_app, server_side) = duplex(65536);
 
-        // Run relay in a background task
-        let relay_handle = tokio::spawn(async move {
-            RelayEngine::relay(Box::new(client_side), Box::new(server_side)).await
-        });
+        let relay_handle =
+            tokio::spawn(async move { relay(Box::new(client_side), Box::new(server_side)).await });
 
-        // Write from client
         let mut client_app = client_app;
         client_app.write_all(b"request from client").await.unwrap();
         client_app.shutdown().await.unwrap();
 
-        // Read at server
         let mut server_app = server_app;
         let mut buf = [0u8; 19];
         server_app.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"request from client");
 
-        // Write from server
         server_app.write_all(b"response from server").await.unwrap();
         server_app.shutdown().await.unwrap();
 
-        // Read at client
         let mut reply = [0u8; 20];
         client_app.read_exact(&mut reply).await.unwrap();
         assert_eq!(&reply, b"response from server");
@@ -415,21 +506,19 @@ mod tests {
         let trigger_token = cancel_token.clone();
 
         let relay_handle = tokio::spawn(async move {
-            RelayEngine::relay_with_cancel(
+            StreamStreamPump::relay_with_heartbeat(
                 Box::new(client_side),
                 Box::new(server_side),
                 cancel_token,
+                DEFAULT_HEARTBEAT_INTERVAL,
+                DEFAULT_IDLE_TIMEOUT,
             )
             .await
         });
 
-        // Ensure relay task is actively waiting/sleeping in Poll::Pending
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // Cancel token: should immediately wake up the sleeping poll_fn without I/O
         trigger_token.cancel();
 
-        // Must finish promptly without hanging
         let res = tokio::time::timeout(std::time::Duration::from_millis(500), relay_handle)
             .await
             .expect("Relay task did not wake up promptly upon cancellation");
@@ -438,12 +527,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_relay_boxed_consumes_owned_write_delegation() {
+    async fn test_iochannel_forwards_owned_write_capability() {
         use bytes::Bytes;
-        use std::io;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::task::Context;
 
         struct MockOwnedWriter {
             write_bytes_called: Arc<AtomicUsize>,
@@ -480,11 +565,14 @@ mod tests {
         }
 
         impl TunnelStream for MockOwnedWriter {
-            fn consumes_owned_write(&self) -> bool {
-                true
+            fn caps(&self) -> StreamCaps {
+                StreamCaps {
+                    owned_write: true,
+                    half_close: true,
+                }
             }
 
-            fn poll_write_bytes(
+            fn poll_write_owned(
                 &mut self,
                 _cx: &mut Context<'_>,
                 buf: Bytes,
@@ -493,11 +581,8 @@ mod tests {
                 Poll::Ready(Ok(buf.len()))
             }
 
-            fn poll_check_alive(
-                &mut self,
-                _cx: &mut Context<'_>,
-            ) -> Poll<crate::core::stream::HeartbeatStatus> {
-                Poll::Ready(crate::core::stream::HeartbeatStatus::Alive)
+            fn poll_check_alive(&mut self, _cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+                Poll::Ready(HeartbeatStatus::Alive)
             }
         }
 
@@ -510,14 +595,13 @@ mod tests {
         };
 
         let boxed: Box<dyn TunnelStream> = Box::new(mock);
-        assert!(
-            boxed.consumes_owned_write(),
-            "Box<dyn TunnelStream> must forward consumes_owned_write"
-        );
+        assert!(boxed.caps().owned_write);
+        let channel = IoChannel::from_boxed_stream(boxed);
+        assert!(channel.caps().owned_write, "IoChannel must forward caps()");
 
         let (mut client_app, client_side) = duplex(65536);
         let relay_handle =
-            tokio::spawn(async move { RelayEngine::relay(Box::new(client_side), boxed).await });
+            tokio::spawn(async move { relay(Box::new(client_side), Box::new(channel)).await });
 
         client_app
             .write_all(b"payload for owned writer")
@@ -534,7 +618,7 @@ mod tests {
         );
         assert!(
             write_bytes_called.load(Ordering::SeqCst) > 0,
-            "Must call poll_write_bytes via Path A"
+            "Must call poll_write_owned via Path A"
         );
     }
 
@@ -594,12 +678,10 @@ mod tests {
 
         let (_client_app, client_side) = duplex(65536);
 
-        // Run relay with a short 20ms heartbeat interval
-        let cancel = CancellationToken::new();
-        let res = RelayEngine::relay_with_heartbeat(
+        let res = StreamStreamPump::relay_with_heartbeat(
             Box::new(client_side),
             Box::new(dead_stream),
-            cancel,
+            CancellationToken::new(),
             std::time::Duration::from_millis(20),
             std::time::Duration::from_millis(200),
         )
@@ -672,7 +754,7 @@ mod tests {
         let trigger = cancel.clone();
         let pings_in = Arc::clone(&pings);
         let handle = tokio::spawn(async move {
-            RelayEngine::relay_with_heartbeat(
+            StreamStreamPump::relay_with_heartbeat(
                 Box::new(AlwaysActive {
                     pings: Arc::clone(&pings_in),
                 }),
@@ -684,8 +766,6 @@ mod tests {
             .await
         });
 
-        // Many heartbeat ticks elapse, but neither side emits a single probe
-        // because activity is continuously fresh.
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         trigger.cancel();
         tokio::time::timeout(std::time::Duration::from_secs(3), handle)

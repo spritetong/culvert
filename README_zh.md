@@ -43,6 +43,7 @@
 
 - **最小职责原则**：`culvert` 专注于提供底层透明、低延迟、高吞吐的 TCP 端口转发（Opaque Byte Stream），不内置复杂的 SOCKS5/HTTP 业务代理，不包含多余的应用层私有协议。
 - **灵活串接与解耦**：需要上层鉴权、应用协议解析、流量审计或访问控制？只需利用标准网络栈将 `culvert` 与专业的第三方服务或工具串联即可。各个组件各司其职，保证系统架构的高内聚、低耦合与长久可维护性。
+- **三层完全独立**：前端（端口映射服务）、core（隧道会话生命周期）、后端（WS/WSS/H3/QUIC/UDS 的统一中继 I/O）共用中立的 `io` 词汇层；`core::serve` 按通道类型查表选择 I/O pump，自身不搬运字节。**UDP 端口映射尚未实现**：`L4Protocol::Udp`、`IoChannel::Datagram` 与数据报 pump 仅作为扩展点保留，将来新增 UDP 前端无需改动 core。详见 [DESIGN.md §5.7](docs/DESIGN.md#57-three-layer-boundaries-and-the-pump-registry)。
 
 ---
 

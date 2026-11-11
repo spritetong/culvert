@@ -44,22 +44,6 @@ impl TransportDriver for H3TransportDriver {
         auth_token: Option<&str>,
         path: Option<&str>,
         tls: Option<&crate::config::model::TlsConfig>,
-    ) -> Result<Box<dyn TransportListener>, TunnelError> {
-        self.build_listener_with_cancel(
-            listen_addr,
-            auth_token,
-            path,
-            tls,
-            CancellationToken::new(),
-        )
-    }
-
-    fn build_listener_with_cancel(
-        &self,
-        listen_addr: &str,
-        auth_token: Option<&str>,
-        path: Option<&str>,
-        tls: Option<&crate::config::model::TlsConfig>,
         cancel: CancellationToken,
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
         let mut alpn = tls

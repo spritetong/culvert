@@ -10,11 +10,12 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::oneshot;
 
+use culvert::backend::accept_one;
 use culvert::config::model::{AppConfig, EndpointConfig, TlsConfig, TunnelMode};
 use culvert::dialer::endpoint::EndpointContext;
 use culvert::transport::h3::H3Connector;
 use culvert::transport::h3::listener::H3Listener;
-use culvert::transport::{TargetAddr, TransportConnector, TransportListener};
+use culvert::transport::{TargetAddr, TransportConnector};
 
 /// Helper to get an available ephemeral port from the OS that is free for both TCP and UDP.
 fn get_ephemeral_port() -> u16 {
@@ -79,7 +80,7 @@ async fn test_quic_flow_control_hol_blocking_prevention() {
         let mut probe_tx_opt = Some(probe_tx);
 
         for stream_idx in 0..3 {
-            let (mut stream, _meta) = match listener.accept_one().await {
+            let (mut stream, _meta) = match accept_one(&mut listener).await {
                 Ok(pair) => pair,
                 Err(e) => {
                     panic!("Server accept error at stream {}: {:?}", stream_idx, e);

@@ -215,7 +215,7 @@ async fn test_mux_stream_drop_cleans_active_streams() {
 }
 
 #[tokio::test]
-async fn test_mux_poll_write_bytes_and_shutdown_flushes_outbound() {
+async fn test_mux_poll_write_owned_and_shutdown_flushes_outbound() {
     use crate::core::stream::TunnelStream;
     use std::future::poll_fn;
 
@@ -228,9 +228,9 @@ async fn test_mux_poll_write_bytes_and_shutdown_flushes_outbound() {
     let mut client_stream = client_session.open_stream().await.unwrap();
     let mut server_stream = server_session.accept_stream().await.unwrap();
 
-    // Use zero-copy poll_write_bytes on client
+    // Use zero-copy poll_write_owned on client
     let payload = Bytes::from_static(b"zero copy bytes over mux stream");
-    let n = poll_fn(|cx| client_stream.poll_write_bytes(cx, payload.clone()))
+    let n = poll_fn(|cx| client_stream.poll_write_owned(cx, payload.clone()))
         .await
         .unwrap();
     assert_eq!(n, payload.len());
@@ -246,7 +246,7 @@ async fn test_mux_poll_write_bytes_and_shutdown_flushes_outbound() {
 }
 
 #[tokio::test]
-async fn test_mux_poll_write_and_poll_write_bytes_interleaving_no_data_loss() {
+async fn test_mux_poll_write_and_poll_write_owned_interleaving_no_data_loss() {
     use crate::core::stream::TunnelStream;
     use std::future::poll_fn;
     use tokio::io::AsyncWrite;
@@ -260,9 +260,9 @@ async fn test_mux_poll_write_and_poll_write_bytes_interleaving_no_data_loss() {
     let mut client_stream = client_session.open_stream().await.unwrap();
     let mut server_stream = server_session.accept_stream().await.unwrap();
 
-    // 1. First write via poll_write_bytes
+    // 1. First write via poll_write_owned
     let chunk_a = Bytes::from_static(b"chunk_aaa_");
-    let n_a = poll_fn(|cx| client_stream.poll_write_bytes(cx, chunk_a.clone()))
+    let n_a = poll_fn(|cx| client_stream.poll_write_owned(cx, chunk_a.clone()))
         .await
         .unwrap();
     assert_eq!(n_a, chunk_a.len());
@@ -284,7 +284,7 @@ async fn test_mux_poll_write_and_poll_write_bytes_interleaving_no_data_loss() {
     expected.extend_from_slice(b"chunk_bbb_end");
     assert_eq!(
         recv_buf, expected,
-        "Interleaving poll_write_bytes and poll_write must preserve both chunks in exact sequence without data corruption"
+        "Interleaving poll_write_owned and poll_write must preserve both chunks in exact sequence without data corruption"
     );
 
     cancel.cancel();
@@ -347,7 +347,7 @@ async fn test_mux_backpressure_retry_no_duplicate_frames() {
 }
 
 #[tokio::test]
-async fn test_mux_poll_write_bytes_backpressure_retry_no_duplicate_frames() {
+async fn test_mux_poll_write_owned_backpressure_retry_no_duplicate_frames() {
     use crate::core::stream::TunnelStream;
     use crate::mux::frame::MuxFrame;
     use crate::mux::stream::MuxStream;
@@ -364,7 +364,7 @@ async fn test_mux_poll_write_bytes_backpressure_retry_no_duplicate_frames() {
     let mut stream = MuxStream::new(1, tx_frames, rx_data, closed);
 
     let first_payload = Bytes::from_static(b"bytes_1");
-    let n1 = poll_fn(|cx| stream.poll_write_bytes(cx, first_payload.clone()))
+    let n1 = poll_fn(|cx| stream.poll_write_owned(cx, first_payload.clone()))
         .await
         .unwrap();
     assert_eq!(n1, 7);
@@ -372,7 +372,7 @@ async fn test_mux_poll_write_bytes_backpressure_retry_no_duplicate_frames() {
     let second_payload = Bytes::from_static(b"bytes_2_no_dup");
     let pending_observed =
         poll_fn(
-            |cx| match stream.poll_write_bytes(cx, second_payload.clone()) {
+            |cx| match stream.poll_write_owned(cx, second_payload.clone()) {
                 Poll::Pending => Poll::Ready(true),
                 Poll::Ready(_) => panic!("Expected Poll::Pending when outbound is full"),
             },
@@ -383,7 +383,7 @@ async fn test_mux_poll_write_bytes_backpressure_retry_no_duplicate_frames() {
     let frame1 = rx_frames.recv().await.unwrap();
     assert_eq!(frame1.payload.as_ref(), first_payload.as_ref());
 
-    let n2 = poll_fn(|cx| stream.poll_write_bytes(cx, second_payload.clone()))
+    let n2 = poll_fn(|cx| stream.poll_write_owned(cx, second_payload.clone()))
         .await
         .unwrap();
     assert_eq!(n2, second_payload.len());
@@ -392,6 +392,6 @@ async fn test_mux_poll_write_bytes_backpressure_retry_no_duplicate_frames() {
     assert_eq!(frame2.payload.as_ref(), second_payload.as_ref());
     assert!(
         rx_frames.try_recv().is_err(),
-        "poll_write_bytes must not send duplicate frames upon retry"
+        "poll_write_owned must not send duplicate frames upon retry"
     );
 }

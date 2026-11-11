@@ -2,16 +2,17 @@
 // SPDX-License-Identifier: MPL-2.0
 // culvert is licensed under the Mozilla Public License Version 2.0.
 
-//! Transport driver registry for dynamic pluggable protocol dispatch.
+//! Backend driver registry for dynamic pluggable protocol dispatch.
 //! All comments and docstrings must be in English.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-use crate::core::error::TunnelError;
+use crate::backend::{TransportConnector, TransportDriver, TransportListener};
+use crate::config::model::{TlsConfig, TunnelMode};
 use crate::dialer::endpoint::EndpointContext;
-use crate::transport::{TransportConnector, TransportDriver, TransportListener};
+use crate::io::error::TunnelError;
 
 /// Global transport registry managing driver instances.
 #[derive(Clone)]
@@ -57,7 +58,7 @@ impl TransportRegistry {
         &self,
         endpoint: &EndpointContext,
         auth_token: Option<&str>,
-        mode: crate::config::model::TunnelMode,
+        mode: TunnelMode,
     ) -> Result<Box<dyn TransportConnector>, TunnelError> {
         let scheme = endpoint.endpoint.scheme.as_str();
         let driver = self
@@ -74,20 +75,19 @@ impl TransportRegistry {
         listen_addr: &str,
         auth_token: Option<&str>,
         path: Option<&str>,
-        tls: Option<&crate::config::model::TlsConfig>,
+        tls: Option<&TlsConfig>,
         cancel: CancellationToken,
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
         let driver = self
             .get_driver(scheme)
             .ok_or_else(|| TunnelError::UnsupportedScheme(scheme.to_string()))?;
 
-        // Format a full URL for the driver if scheme is provided
         let full_addr = if listen_addr.contains("://") {
             listen_addr.to_string()
         } else {
             format!("{}://{}", scheme, listen_addr)
         };
 
-        driver.build_listener_with_cancel(&full_addr, auth_token, path, tls, cancel)
+        driver.build_listener(&full_addr, auth_token, path, tls, cancel)
     }
 }

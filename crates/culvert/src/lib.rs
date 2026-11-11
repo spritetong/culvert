@@ -5,6 +5,7 @@
 //! culvert core library.
 //! All comments and docstrings must be in English.
 
+pub mod backend;
 pub mod client;
 pub mod common;
 pub mod config;
@@ -13,6 +14,8 @@ pub mod control;
 pub mod core;
 pub mod daemon;
 pub mod dialer;
+pub mod frontend;
+pub mod io;
 pub mod mux;
 pub mod platform;
 pub mod pool;

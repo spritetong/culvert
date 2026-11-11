@@ -22,15 +22,14 @@ use crate::common::{CancelFutureExt, TimeoutOrCancel};
 use crate::consts::DEFAULT_HANDSHAKE_TIMEOUT;
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, BufferedTlsStream, TunnelStream};
+use crate::io::channel::IoChannel;
 use crate::transport::ws::model::WsHandshakeHeaders;
 use crate::transport::ws::stream::WsTunnelStream;
-use crate::transport::{
-    ACCEPTED_STREAM_QUEUE_SIZE, AcceptOutput, StreamMetadata, TransportListener,
-};
+use crate::transport::{ACCEPTED_STREAM_QUEUE_SIZE, AcceptOutput, TransportListener};
 use reusable_future::ReusableFutureRef;
 
 /// Result of an accepted WebSocket connection on the listener.
-type AcceptedResult = Result<(Box<dyn TunnelStream>, StreamMetadata), TunnelError>;
+type AcceptedResult = AcceptOutput;
 
 /// An upgrade future handed back by the HTTP service to its owning connection
 /// task. It is never spawned without an owner.
@@ -281,7 +280,9 @@ impl WsListener {
                                                     Role::Server,
                                                 );
                                                 let item = Ok((
-                                                    Box::new(stream) as Box<dyn TunnelStream>,
+                                                    IoChannel::from_boxed_stream(
+                                                        Box::new(stream) as Box<dyn TunnelStream>
+                                                    ),
                                                     metadata,
                                                 ));
                                                 // A full accepted-stream queue must never

@@ -17,7 +17,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use tokio_util::sync::PollSender;
 
-use crate::core::stream::{HeartbeatStatus, TunnelStream};
+use crate::core::stream::{HeartbeatStatus, StreamCaps, TunnelStream};
 use crate::mux::frame::{MAX_FRAME_PAYLOAD_SIZE, MuxFrame};
 
 type ActiveStreamsMap = Arc<DashMap<u32, (mpsc::Sender<Bytes>, Arc<AtomicBool>)>>;
@@ -173,11 +173,14 @@ impl AsyncWrite for MuxStream {
 }
 
 impl TunnelStream for MuxStream {
-    fn consumes_owned_write(&self) -> bool {
-        true
+    fn caps(&self) -> StreamCaps {
+        StreamCaps {
+            owned_write: true,
+            half_close: true,
+        }
     }
 
-    fn poll_write_bytes(&mut self, cx: &mut Context<'_>, buf: Bytes) -> Poll<io::Result<usize>> {
+    fn poll_write_owned(&mut self, cx: &mut Context<'_>, buf: Bytes) -> Poll<io::Result<usize>> {
         if self.closed.load(Ordering::Acquire) {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,

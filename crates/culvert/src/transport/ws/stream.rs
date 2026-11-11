@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::core::stream::{BoxFuture, HeartbeatStatus, TunnelStream, activity_now_ms};
+use crate::core::stream::{BoxFuture, HeartbeatStatus, StreamCaps, TunnelStream, activity_now_ms};
 
 /// Activity clock for a WebSocket stream, shared between the read and write halves.
 ///
@@ -589,7 +589,7 @@ impl AsyncWrite for WsTunnelStream {
 }
 
 impl TunnelStream for WsTunnelStream {
-    fn poll_write_bytes(&mut self, cx: &mut Context<'_>, buf: Bytes) -> Poll<io::Result<usize>> {
+    fn poll_write_owned(&mut self, cx: &mut Context<'_>, buf: Bytes) -> Poll<io::Result<usize>> {
         if self.peer_closed || self.close_sent || self.fin_sent || self.fin_queued {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -673,9 +673,13 @@ impl TunnelStream for WsTunnelStream {
         }
     }
 
-    fn supports_half_close(&self) -> bool {
-        // Supported via in-band zero-length binary FIN frames without tearing down opposite stream
-        true
+    fn caps(&self) -> StreamCaps {
+        // Owned writes skip a second copy; half-close uses in-band zero-length
+        // binary FIN frames without tearing down the opposite direction.
+        StreamCaps {
+            owned_write: true,
+            half_close: true,
+        }
     }
 
     fn poll_send_ping(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -764,7 +768,7 @@ impl TunnelStream for WsTunnelStream {
 
     fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
         // Only a *failed* write half is a transport failure. Local half-close
-        // flags (`fin_queued` / `fin_sent`) are not: `RelayEngine` calls
+        // flags (`fin_queued` / `fin_sent`) are not: the stream/stream pump calls
         // `poll_shutdown()` on this stream as soon as one direction drains,
         // while the opposite direction may still have a long tail to deliver.
         // Reporting Dead in that window aborts the relay with "unresponsive to
@@ -1011,7 +1015,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ws_poll_write_bytes_zero_copy() {
+    async fn test_ws_poll_write_owned_zero_copy() {
         use std::future::poll_fn;
 
         let (raw_client, raw_server) = duplex(65536);
@@ -1020,7 +1024,7 @@ mod tests {
         let mut server = WsTunnelStream::new(raw_server, Role::Server);
 
         let test_payload = Bytes::from_static(b"zero copy bytes payload transfer");
-        let n = poll_fn(|cx| client.poll_write_bytes(cx, test_payload.clone()))
+        let n = poll_fn(|cx| client.poll_write_owned(cx, test_payload.clone()))
             .await
             .unwrap();
         assert_eq!(n, test_payload.len());
@@ -1237,7 +1241,7 @@ mod tests {
     /// promptly instead of waiting for the idle timeout.
     #[tokio::test]
     async fn test_ws_liveness_sweep_does_not_stall_relay_exit() {
-        use crate::core::relay::RelayEngine;
+        use crate::io::pump::StreamStreamPump;
         use tokio_util::sync::CancellationToken;
 
         let (raw_client, raw_server) = duplex(65536);
@@ -1246,7 +1250,7 @@ mod tests {
 
         let (mut visitor, visitor_side) = duplex(65536);
         let cancel = CancellationToken::new();
-        let relay = tokio::spawn(RelayEngine::relay_with_heartbeat(
+        let relay = tokio::spawn(StreamStreamPump::relay_with_heartbeat(
             Box::new(visitor_side),
             Box::new(server),
             cancel.clone(),
@@ -1327,7 +1331,7 @@ mod tests {
     /// Every heartbeat sweep in that window must leave the relay running.
     #[tokio::test]
     async fn test_ws_liveness_after_half_close_does_not_truncate_response() {
-        use crate::core::relay::RelayEngine;
+        use crate::io::pump::StreamStreamPump;
         use tokio_util::sync::CancellationToken;
 
         let (raw_client, raw_server) = duplex(65536);
@@ -1336,7 +1340,7 @@ mod tests {
 
         let (mut visitor, visitor_side) = duplex(65536);
         let cancel = CancellationToken::new();
-        let relay = tokio::spawn(RelayEngine::relay_with_heartbeat(
+        let relay = tokio::spawn(StreamStreamPump::relay_with_heartbeat(
             Box::new(visitor_side),
             Box::new(server),
             cancel.clone(),
@@ -1426,7 +1430,7 @@ mod tests {
         );
     }
 
-    /// Verifies that calling write or poll_write_bytes after shutdown()
+    /// Verifies that calling write or poll_write_owned after shutdown()
     /// returns BrokenPipe error, enforcing AsyncWrite contract.
     #[tokio::test]
     async fn test_ws_write_after_shutdown_returns_broken_pipe() {
@@ -1444,7 +1448,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
 
         let err_bytes = poll_fn(|cx| {
-            client.poll_write_bytes(cx, bytes::Bytes::from_static(b"post shutdown bytes"))
+            client.poll_write_owned(cx, bytes::Bytes::from_static(b"post shutdown bytes"))
         })
         .await
         .unwrap_err();

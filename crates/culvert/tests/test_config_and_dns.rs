@@ -514,8 +514,8 @@ tunnels:
 
 #[test]
 fn test_mapping_address_three_formats() {
+    use culvert::io::addr::parse_target_addr;
     use culvert::transport::TargetAddr;
-    use culvert::tunnel::forward::parse_target_addr;
 
     // 1. ip:port (port is required)
     let t1 = parse_target_addr("127.0.0.1:8080").unwrap();

@@ -29,6 +29,15 @@ interpret the application protocol, does not proxy UDP datagrams, and does not
 implement SOCKS5 or HTTP proxy semantics. Targets may be TCP addresses
 (`ip:port`, `hostname:port`) or Unix domain sockets (`unix://path`).
 
+The runtime is split into three independent parts — frontend (port mapping
+service), core (tunnel session lifecycle), and backend (uniform I/O over relay
+channels) — sharing a neutral `io` vocabulary. Core dispatches I/O through a
+`PumpRegistry` keyed by channel kind and never moves bytes itself. The
+architecture intentionally leaves `L4Protocol::Udp`, `IoChannel::Datagram`, and
+datagram pumps as **unregistered extension points**; UDP port mapping is not
+implemented in this release and is deferred until the structural split is
+validated. See [DESIGN.md](DESIGN.md#57-three-layer-boundaries-and-the-pump-registry).
+
 ### 1.1 Why this product exists
 
 - A service behind NAT or a restrictive firewall has no public address, but a
@@ -241,7 +250,7 @@ behavior is configurable, the configuration key is given.
   carrying `x-session-id`, and the server pairs it with the waiting inbound
   connection through `SessionManager`. Pairing has a 15-second timeout
   (`DEFAULT_SESSION_PAIR_TIMEOUT`).
-- **FR-5.6** Both sides relay bytes bidirectionally via `RelayEngine`. The
+- **FR-5.6** Both sides are handed to `core::serve` as `IoChannel`s. The
   control channel stays open with activity-gated `Ping`/`Pong` and an idle
   timeout; any inbound frame refreshes the activity deadline, while outbound
   probes alone do not.
@@ -268,10 +277,11 @@ behavior is configurable, the configuration key is given.
   signaling instead of stalling visitors. Relay tasks are owned and awaited by
   their worker; none are detached.
 
-### FR-6 Relay engine
+### FR-6 Stream/stream pump
 
-- **FR-6.1** `RelayEngine::relay_with_heartbeat` drives both directions from a
-  single `poll_fn` state machine with two 64 KB buffers.
+- **FR-6.1** `core::serve` selects a `Pump` by channel-kind pair. The registered
+  `(Stream, Stream)` pump, `StreamStreamPump::relay_with_heartbeat`, drives both
+  directions from a single `poll_fn` state machine with two 64 KB buffers.
 - **FR-6.2** A probe is emitted only when neither direction has moved data for
   one `heartbeat_interval`; a stream silent for `idle_timeout` is closed.
   `idle_timeout` must exceed `heartbeat_interval`. An OS-level `SO_ERROR`
@@ -292,7 +302,8 @@ behavior is configurable, the configuration key is given.
 - **FR-7.2** A tunnel worker that fails is restarted after the fixed delay
   `tunnels[].retry.delay` (default 3 s), up to `retry.max_retries` attempts.
   Omitting `max_retries` retries indefinitely. Permanent errors
-  (`Config`, `UnsupportedScheme`, `AuthFailed`, `Tls`) are not retried.
+  (`Config`, `UnsupportedScheme`, `UnsupportedChannel`, `AuthFailed`, `Tls`)
+  are not retried.
 - **FR-7.3** Shutdown cancels the token and awaits every tracked task.
   `TaskTracker` shares one 5-second grace window across nested trackers;
   abort is a deadline fallback only, after which handles are still awaited.
@@ -325,19 +336,46 @@ behavior is configurable, the configuration key is given.
   count; omitting it auto-detects CPU cores. The CLI `-w / --worker-threads`
   value takes precedence.
 
+### FR-9 Three-layer independence
+
+- **FR-9.1** `core::serve` depends only on the neutral `io` vocabulary; it never
+  names a `Frontend` or `Transport*` trait. The runtime layers build a
+  `PumpRequest` from those traits. Adding a new frontend capability must not
+  require a change to core business logic.
+- **FR-9.2** Both frontend and backend yield `IoChannel = Stream | Datagram`.
+  `core::serve` selects a `Pump` from `PumpRegistry` by
+  `(frontend.kind(), backend.kind())` and contains no match on channel variants
+  and no byte-copying code.
+- **FR-9.3** `frontend::bind` dispatches on `MappingSpec.protocol` through a
+  registry. Only `L4Protocol::Tcp` is registered; a UDP spec fails before any
+  socket is created.
+- **FR-9.4** A `TunnelStream` implementation advertises its write/half-close
+  capabilities through `StreamCaps` (`owned_write`, `half_close`); `IoChannel`
+  forwards the query. The pump reads them once per direction so an owned `Bytes`
+  write path cannot be left unselected.
+- **FR-9.5** The reverse control plane (`control/`, `session/`, `pool/`) is
+  stream-scoped. A datagram frontend bypasses it and is handled entirely by its
+  registered pump.
+- **FR-9.6** UDP port mapping is **not implemented**. `L4Protocol::Udp`,
+  `IoChannel::Datagram`, `DatagramIo`, and the unregistered datagram pump pairs
+  are extension points only; no config field, UDP socket, or datagram driver
+  exists.
+
 ---
 
 ## 5. Non-Functional and Operational Constraints
 
 | ID | Constraint | Implementation basis |
 | :--- | :--- | :--- |
-| NFR-1 | Byte streams are relayed without interpreting application protocols. | `RelayEngine` moves `Bytes` between two `TunnelStream` trait objects. |
+| NFR-1 | Byte streams are relayed without interpreting application protocols. | `StreamStreamPump` moves `Bytes` between two `TunnelStream` trait objects obtained from `IoChannel`. |
 | NFR-2 | Every asynchronous task is owned and awaitable; shutdown cancels then awaits. | `TaskTracker`, `CancelFutureExt`, explicit `shutdown()` on listeners; no `detach_all()` on the normal path. |
 | NFR-3 | Every await is cancellation-aware or bounded by a timeout. | Handshake, activation read, session pairing, relay drain, and pool acquire all have explicit bounds in `consts.rs`. |
 | NFR-4 | Configuration errors are surfaced before the daemon starts. | `ConfigLoader::validate` runs on every startup and on `--check`. |
-| NFR-5 | Unix domain sockets are available through a single platform abstraction. | `platform::GenericListener` / `PlatformUdsListener`, with a dedicated accept thread on Windows. |
-| NFR-6 | The relay hot path uses a single `poll_fn` state machine rather than a per-direction task. | `core/relay.rs`. This is a deliberate performance constraint; it must not be replaced with `tokio::select!` in the hot path. |
+| NFR-5 | Unix domain sockets are available through a single platform abstraction. | `frontend::tcp::TcpFrontend` wraps `platform::GenericListener` / `PlatformUdsListener`, with a dedicated accept thread on Windows. |
+| NFR-6 | The relay hot path uses a single `poll_fn` state machine rather than a per-direction task. | `io/pump.rs`. This is a deliberate performance constraint; it must not be replaced with `tokio::select!` in the hot path. |
 | NFR-7 | Documentation states implemented behavior only. | Unwired options are rejected by the loader and listed in Section 6. |
+| NFR-8 | Frontend, core, and backend are independently replaceable. | `io/`, `frontend/`, `backend/`, `core::serve`, `PumpRegistry`; see FR-9. |
+| NFR-9 | I/O capability is queried, not guessed. | `StreamCaps` / `poll_write_owned` replace the former dead `consumes_owned_write()` + `poll_write_bytes()` pair; `caps()` is read once per direction. |
 
 Performance figures, throughput targets, memory budgets, and latency
 commitments are not specified: they depend on the deployment and are not
@@ -358,7 +396,7 @@ configuration data model; none are part of the runtime data path.
 | Automatic HTTP/3-to-WSS fallback | Not implemented. Each tunnel uses exactly the scheme in its endpoint URL. |
 | P2P, STUN/ICE, NAT hole punching, dual-channel hot standby | Not implemented. |
 | TOML configuration files | Not implemented. Configuration is YAML only. |
-| UDP tunneling, DNS proxying for tunneled clients, SOCKS5, HTTP proxy | Not implemented. |
+| UDP port mapping, UDP tunneling, DNS proxying for tunneled clients, SOCKS5, HTTP proxy | Not implemented. `L4Protocol::Udp`, `IoChannel::Datagram`, `DatagramIo`, and datagram pump slots are unregistered extension points; adding UDP later needs no core change (FR-9). |
 | ACME certificate issuance and renewal | Not implemented. Certificates come from files, an ephemeral self-signed fallback, or an external reverse proxy. |
 | Protocol-level `CMD_TUNNEL_RESET` / `CMD_RESET_ACK` draining and returning streams to the idle pool | Not implemented. Pooled streams are one-shot. |
 | WebSocket SIMD masking claims, hardware acceleration claims | No such implementation is exposed by the product. |
@@ -419,6 +457,7 @@ tunnels:
 | AC-7 | Shutdown cancels and awaits all owned tasks; the watchdog is joined on clean exit. | `daemon.rs` tests, `common/task.rs` tests. |
 | AC-8 | DNS and configuration options parse as documented. | `test_config_and_dns.rs`. |
 | AC-9 | Custom HTTP headers and Host override are applied to outgoing handshakes and validated fail-fast. | `test_http_headers.rs`, `test_config_and_dns.rs`. |
+| AC-10 | Frontend, core, and backend are independently replaceable; `core::serve` dispatches by channel kind, and an unregistered channel pair fails with `UnsupportedChannel`. | `io::pump` / `core::serve` unit tests; a UDP `MappingSpec` is rejected by `frontend::bind`. |
 
 Run the suite with `cargo test --workspace`.
 

@@ -28,7 +28,7 @@ use crate::transport::TargetAddr;
 /// on different local addresses must never share one pool.
 pub fn canonical_reverse_key(addr: &str) -> String {
     let s = addr.trim();
-    match crate::tunnel::forward::parse_target_addr(s) {
+    match crate::io::addr::parse_target_addr(s) {
         Ok(target) => target.to_string(),
         Err(_) => s.to_string(),
     }
