@@ -279,13 +279,18 @@ impl DatagramIo for ConnectedUdpSocket {
 
 /// Creates an IPv6/IPv4 dual-stack TCP listener using `socket2` with `set_only_v6(false)`.
 /// Binds to `[::]:port`. Supported on Windows, Linux, and macOS.
-/// If IPv6 is not supported by the OS, gracefully falls back to IPv4 `0.0.0.0:port`.
+/// If IPv6 is not supported or disabled by the OS, gracefully falls back to IPv4 `0.0.0.0:port`.
 pub fn create_dual_stack_tcp_listener(port: u16) -> io::Result<std::net::TcpListener> {
     match create_ipv6_dual_stack_tcp(port) {
         Ok(l) => Ok(l),
         Err(e) if is_ipv6_unsupported(&e) => {
-            let addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, port);
-            std::net::TcpListener::bind(addr)
+            tracing::warn!(
+                port,
+                error = %e,
+                "IPv6 is unsupported or disabled by OS, falling back :{} to 0.0.0.0:{}",
+                port, port
+            );
+            create_ipv4_tcp_listener(port)
         }
         Err(e) => Err(e),
     }
@@ -305,15 +310,33 @@ fn create_ipv6_dual_stack_tcp(port: u16) -> io::Result<std::net::TcpListener> {
     Ok(socket.into())
 }
 
+fn create_ipv4_tcp_listener(port: u16) -> io::Result<std::net::TcpListener> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    let bind_addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, port);
+    socket.bind(&socket2::SockAddr::from(bind_addr))?;
+    socket.listen(1024)?;
+    Ok(socket.into())
+}
+
 /// Creates an IPv6/IPv4 dual-stack UDP socket using `socket2` with `set_only_v6(false)`.
 /// Binds to `[::]:port`. Supported on Windows, Linux, and macOS.
-/// If IPv6 is not supported by the OS, gracefully falls back to IPv4 `0.0.0.0:port`.
+/// If IPv6 is not supported or disabled by the OS, gracefully falls back to IPv4 `0.0.0.0:port`.
 pub fn create_dual_stack_udp_socket(port: u16) -> io::Result<std::net::UdpSocket> {
     match create_ipv6_dual_stack_udp(port) {
         Ok(s) => Ok(s),
         Err(e) if is_ipv6_unsupported(&e) => {
-            let addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, port);
-            std::net::UdpSocket::bind(addr)
+            tracing::warn!(
+                port,
+                error = %e,
+                "IPv6 is unsupported or disabled by OS, falling back :{} to 0.0.0.0:{}",
+                port, port
+            );
+            create_ipv4_udp_socket(port)
         }
         Err(e) => Err(e),
     }
@@ -332,10 +355,27 @@ fn create_ipv6_dual_stack_udp(port: u16) -> io::Result<std::net::UdpSocket> {
     Ok(socket.into())
 }
 
+fn create_ipv4_udp_socket(port: u16) -> io::Result<std::net::UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    socket.set_reuse_address(true)?;
+    let bind_addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, port);
+    socket.bind(&socket2::SockAddr::from(bind_addr))?;
+    Ok(socket.into())
+}
+
 fn is_ipv6_unsupported(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::Unsupported
-        || err.raw_os_error() == Some(97)
-        || err.raw_os_error() == Some(10047)
+        || err.kind() == io::ErrorKind::AddrNotAvailable
+        || err.raw_os_error() == Some(97) // Linux EAFNOSUPPORT
+        || err.raw_os_error() == Some(99) // Linux EADDRNOTAVAIL (e.g. net.ipv6.conf.all.disable_ipv6=1)
+        || err.raw_os_error() == Some(10047) // Windows WSAEAFNOSUPPORT
+        || err.raw_os_error() == Some(10049) // Windows WSAEADDRNOTAVAIL
+        || err.raw_os_error() == Some(47) // macOS/BSD EAFNOSUPPORT
+        || err.raw_os_error() == Some(49) // macOS/BSD EADDRNOTAVAIL
 }
 
 /// Connects to a destination `TargetAddr` returning either a stream or datagram `IoChannel`
@@ -575,5 +615,37 @@ mod tests {
             assert_eq!(poll_res2, 1);
             assert_eq!(&batch2[0].payload[..], b"udp6");
         }
+    }
+
+    #[test]
+    fn test_is_ipv6_unsupported_error_codes() {
+        assert!(is_ipv6_unsupported(&io::Error::from(io::ErrorKind::Unsupported)));
+        assert!(is_ipv6_unsupported(&io::Error::from(io::ErrorKind::AddrNotAvailable)));
+        assert!(is_ipv6_unsupported(&io::Error::from_raw_os_error(97))); // Linux EAFNOSUPPORT
+        assert!(is_ipv6_unsupported(&io::Error::from_raw_os_error(99))); // Linux EADDRNOTAVAIL
+        assert!(is_ipv6_unsupported(&io::Error::from_raw_os_error(10047))); // Windows WSAEAFNOSUPPORT
+        assert!(is_ipv6_unsupported(&io::Error::from_raw_os_error(10049))); // Windows WSAEADDRNOTAVAIL
+        assert!(is_ipv6_unsupported(&io::Error::from_raw_os_error(47))); // macOS/BSD EAFNOSUPPORT
+        assert!(is_ipv6_unsupported(&io::Error::from_raw_os_error(49))); // macOS/BSD EADDRNOTAVAIL
+
+        // InUse must NOT be considered unsupported IPv6 (it should fail rather than silently bind wrong port)
+        assert!(!is_ipv6_unsupported(&io::Error::from(io::ErrorKind::AddrInUse)));
+        assert!(!is_ipv6_unsupported(&io::Error::from_raw_os_error(98))); // Linux EADDRINUSE
+        assert!(!is_ipv6_unsupported(&io::Error::from_raw_os_error(10048))); // Windows WSAEADDRINUSE
+    }
+
+    #[test]
+    fn test_create_ipv4_fallback_listeners() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let tcp_l = create_ipv4_tcp_listener(port).unwrap();
+        assert_eq!(tcp_l.local_addr().unwrap().port(), port);
+        assert!(tcp_l.local_addr().unwrap().ip().is_unspecified());
+
+        let udp_s = create_ipv4_udp_socket(port).unwrap();
+        assert_eq!(udp_s.local_addr().unwrap().port(), port);
+        assert!(udp_s.local_addr().unwrap().ip().is_unspecified());
     }
 }
