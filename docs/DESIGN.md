@@ -782,8 +782,10 @@ To eliminate port-teardown downtime and WAN reconnection latency upon control ch
 (outbound forward pool and tunnel-level reverse pre-warm workers) and spawns one task per mapping.
 
 Each tunnel possesses a unique `tunnel_id` (either explicitly configured via `uuid` or
-deterministically generated as a UUID v5 from `tag`). Pools can be configured symmetrically via
-scalar `pool_size` or asymmetrically via `pool: { forward: Option<usize>, reverse: Option<usize> }`.
+deterministically generated as a UUID v5 from `tag`). Each direction's pool size is configured
+independently under `mappings.forward.pool_size` / `mappings.reverse.pool_size` (alias `pool`),
+giving asymmetric sizing across directions (e.g. `mappings.forward.pool_size: 8`,
+`mappings.reverse.pool_size: 4`).
 
 ### 7.1 Forward mapping
 

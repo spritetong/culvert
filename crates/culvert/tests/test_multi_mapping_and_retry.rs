@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_util::sync::CancellationToken;
 
 use culvert::config::model::{
@@ -49,6 +49,57 @@ fn spawn_echo_server(cancel_token: CancellationToken) -> (tokio::task::JoinHandl
         }
     });
     (handle, port)
+}
+
+/// Finds an available ephemeral UDP port.
+fn get_udp_ephemeral_port() -> u16 {
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("Failed to bind ephemeral UDP port");
+    udp.local_addr()
+        .expect("Failed to read UDP local_addr")
+        .port()
+}
+
+/// Spawns a UDP echo server bound to `127.0.0.1:0` (supports 0-byte and large datagrams).
+fn spawn_udp_echo_server(cancel_token: CancellationToken) -> (tokio::task::JoinHandle<()>, u16) {
+    let std_udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("Failed to bind UDP echo server");
+    let port = std_udp
+        .local_addr()
+        .expect("Failed to read UDP echo addr")
+        .port();
+    std_udp
+        .set_nonblocking(true)
+        .expect("Failed to set nonblocking UDP echo socket");
+    let socket = UdpSocket::from_std(std_udp).expect("Failed to convert UDP socket");
+    let handle = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => break,
+                res = socket.recv_from(&mut buf) => {
+                    match res {
+                        Ok((n, peer)) => { let _ = socket.send_to(&buf[..n], peer).await; }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+    });
+    (handle, port)
+}
+
+/// Sends one UDP datagram and waits up to 5s for an echoed response.
+async fn udp_roundtrip(client: &UdpSocket, dest: &str, payload: &[u8]) -> Vec<u8> {
+    client
+        .send_to(payload, dest)
+        .await
+        .expect("Failed to send UDP test packet");
+    let mut buf = vec![0u8; payload.len().max(64) + 1024];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+        .await
+        .expect("Timed out waiting for UDP echo response")
+        .expect("Failed to recv UDP echo response");
+    buf.truncate(n);
+    buf
 }
 
 #[tokio::test]
@@ -467,4 +518,111 @@ async fn test_asymmetric_pool_sizing_e2e() {
     })
     .await
     .expect("Timeout waiting for handles to exit in test_asymmetric_pool_sizing_e2e");
+}
+
+#[tokio::test]
+async fn test_udp_reverse_shared_pool_with_uuid_e2e() {
+    let cancel_token = CancellationToken::new();
+
+    let (echo_tcp_handle, echo_tcp_port) = spawn_echo_server(cancel_token.clone());
+    let (echo_udp_handle, echo_udp_port) = spawn_udp_echo_server(cancel_token.clone());
+    let server_ws_port = get_available_port();
+    let rev_tcp_listen_port = get_available_port();
+    let rev_udp_listen_port = get_udp_ephemeral_port();
+
+    let mut app_config = AppConfig {
+        server: Some(ServerConfig {
+            listen: vec![format!("ws://127.0.0.1:{}/udp_rev_cluster", server_ws_port)],
+            token: Some("udp_rev_secret".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    // One tunnel with an explicit UUID: reverse mappings of BOTH protocols share a
+    // single tunnel-scoped inbound pool. This exercises the shared-pool pre-warmer
+    // (which tags pre-warm streams as TCP) serving a UDP reverse listener as well,
+    // proving the hard-coded pre-warm protocol is benign for mixed-protocol sharing.
+    app_config.tunnels.push(TunnelConfig {
+        tag: "udp-rev-shared".to_string(),
+        uuid: Some("660e8400-e29b-41d4-a716-446655440001".to_string()),
+        endpoint: EndpointConfig::Simple(format!(
+            "ws://127.0.0.1:{}/udp_rev_cluster",
+            server_ws_port
+        )),
+        token: Some("udp_rev_secret".to_string()),
+        failover: None,
+        multiplex: None,
+        retry: None,
+        http_headers: None,
+        mappings: TunnelMappingsConfig::reverse_pool(
+            3,
+            vec![
+                MappingRuleConfig::tcp(
+                    format!("127.0.0.1:{}", rev_tcp_listen_port),
+                    format!("127.0.0.1:{}", echo_tcp_port),
+                ),
+                MappingRuleConfig::udp(
+                    format!("127.0.0.1:{}", rev_udp_listen_port),
+                    format!("127.0.0.1:{}", echo_udp_port),
+                ),
+            ],
+        ),
+    });
+
+    let supervisor = TunnelSupervisor::new(app_config, cancel_token.clone());
+    let sup_handle = tokio::spawn(async move {
+        let _ = supervisor.run().await;
+    });
+
+    // Wait for server, listener binding, shared pool replenishment, and the
+    // ReverseReadyNotifier coordination to complete.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // 1. UDP reverse visitor -> local UDP echo via the shared tunnel pool (0-RTT).
+    let udp_client = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind UDP visitor socket");
+    for i in 1..=3 {
+        let msg = format!("UDP REV SHARED {}", i);
+        let resp = udp_roundtrip(
+            &udp_client,
+            &format!("127.0.0.1:{}", rev_udp_listen_port),
+            msg.as_bytes(),
+        )
+        .await;
+        assert_eq!(
+            resp,
+            msg.as_bytes(),
+            "UDP reverse shared-pool relay failed on iteration {}",
+            i
+        );
+    }
+
+    // 2. TCP reverse visitor -> local TCP echo via the same shared tunnel pool.
+    for i in 1..=3 {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", rev_tcp_listen_port))
+            .await
+            .expect("Failed to connect TCP reverse listen port");
+        let msg = format!("TCP REV SHARED {}", i);
+        stream.write_all(msg.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; msg.len()];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(
+            &buf,
+            msg.as_bytes(),
+            "TCP reverse shared-pool relay failed on iteration {}",
+            i
+        );
+    }
+
+    cancel_token.cancel();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (r1, r2, r3) = tokio::join!(echo_tcp_handle, echo_udp_handle, sup_handle);
+        r1.expect("echo_tcp handle panicked");
+        r2.expect("echo_udp handle panicked");
+        r3.expect("sup handle panicked");
+    })
+    .await
+    .expect("Timeout waiting for handles to exit in test_udp_reverse_shared_pool_with_uuid_e2e");
 }
