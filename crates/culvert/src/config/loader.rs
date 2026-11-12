@@ -251,13 +251,38 @@ impl ConfigLoader {
                 Self::validate_http_headers(headers, &format!("tunnel '{}'", tunnel.tag))?;
             }
 
-            if let Some(p) = tunnel.pool_size
-                && p == 0
-            {
-                return Err(TunnelError::Config(format!(
-                    "tunnel '{}': pool_size must be at least 1",
-                    tunnel.tag
-                )));
+            if let Some(ref fwd) = tunnel.mappings.forward {
+                if let Some(p) = fwd.pool_size
+                    && p == 0
+                {
+                    return Err(TunnelError::Config(format!(
+                        "tunnel '{}': forward pool_size must be at least 1",
+                        tunnel.tag
+                    )));
+                }
+                if fwd.pool_size.is_some() && fwd.rules.is_empty() {
+                    return Err(TunnelError::Config(format!(
+                        "tunnel '{}': forward pool_size is configured but no forward rules are defined",
+                        tunnel.tag
+                    )));
+                }
+            }
+
+            if let Some(ref rev) = tunnel.mappings.reverse {
+                if let Some(p) = rev.pool_size
+                    && p == 0
+                {
+                    return Err(TunnelError::Config(format!(
+                        "tunnel '{}': reverse pool_size must be at least 1",
+                        tunnel.tag
+                    )));
+                }
+                if rev.pool_size.is_some() && rev.rules.is_empty() {
+                    return Err(TunnelError::Config(format!(
+                        "tunnel '{}': reverse pool_size is configured but no reverse rules are defined",
+                        tunnel.tag
+                    )));
+                }
             }
 
             if let Some(ref r) = tunnel.retry {
@@ -294,14 +319,8 @@ impl ConfigLoader {
             }
 
             // Port mappings validation
-            if tunnel.mappings.is_empty() {
-                return Err(TunnelError::Config(format!(
-                    "Tunnel '{}' has no port mappings configured. Please provide 'mappings: [...]'.",
-                    tunnel.tag
-                )));
-            }
-
-            for mapping in &tunnel.mappings {
+            let canonical_mappings = tunnel.canonical_mappings()?;
+            for mapping in &canonical_mappings {
                 let _ = crate::io::addr::parse_target_addr(&mapping.listen).map_err(|_| {
                     TunnelError::Config(format!(
                         "tunnel '{}': invalid listen address '{}' in mapping. Expected 'ip:port', 'hostname:port', or 'unix://path'",
@@ -742,9 +761,11 @@ tunnels:
         server_name: "custom.example.com"
         insecure: true
     mappings:
-      - mode: "reverse"
-        listen: "0.0.0.0:2222"
-        target: "127.0.0.1:22"
+      reverse:
+        rules:
+          - protocol: "TCP"
+            listen: "0.0.0.0:2222"
+            target: "127.0.0.1:22"
 "#;
         let config = ConfigLoader::from_yaml_str(yaml).unwrap();
         assert_eq!(config.log.level, "debug");
@@ -763,9 +784,11 @@ tunnels:
   - tag: "mux-tunnel"
     endpoint: "ws://127.0.0.1:8080/tunnel"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:10001"
-        target: "127.0.0.1:10002"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:10001"
+            target: "127.0.0.1:10002"
     multiplex:
       enabled: true
 "#;
@@ -785,9 +808,11 @@ tunnels:
   - tag: "tunnel1"
     endpoint: "ws://127.0.0.1:8080/tunnel"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:10003"
-        target: "127.0.0.1:10004"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:10003"
+            target: "127.0.0.1:10004"
 "#;
         let res = ConfigLoader::from_yaml_str(yaml_bad_ver);
         assert!(res.is_err());
@@ -806,9 +831,11 @@ tunnels:
   - tag: "tunnel2"
     endpoint: "ws://127.0.0.1:8080/tunnel"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:10005"
-        target: "127.0.0.1:10006"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:10005"
+            target: "127.0.0.1:10006"
 "#;
         let res2 = ConfigLoader::from_yaml_str(yaml_contradictory);
         assert!(res2.is_err());
@@ -850,9 +877,11 @@ tunnels:
   - tag: "valid13"
     endpoint: "ws://127.0.0.1:8080/tunnel"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:10007"
-        target: "127.0.0.1:10008"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:10007"
+            target: "127.0.0.1:10008"
 "#;
         assert!(ConfigLoader::from_yaml_str(yaml_valid_max13).is_ok());
     }
@@ -878,9 +907,11 @@ tunnels:
     endpoint: "ws://127.0.0.1:8080/tunnel"
     token: "{}"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:10009"
-        target: "127.0.0.1:10010"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:10009"
+            target: "127.0.0.1:10010"
 "#,
             long_token
         );
@@ -897,9 +928,11 @@ tunnels:
   - tag: "t1"
     endpoint: "ws://127.0.0.1:8080/tunnel"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:10011"
-        target: "127.0.0.1:10012"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:10011"
+            target: "127.0.0.1:10012"
 "#;
         assert!(ConfigLoader::from_yaml_str(yaml_top).is_err());
 
@@ -911,9 +944,11 @@ tunnels:
   - tag: "t1"
     endpoint: "ws://127.0.0.1:8080/tunnel"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:10013"
-        target: "127.0.0.1:10014"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:10013"
+            target: "127.0.0.1:10014"
 "#;
         assert!(ConfigLoader::from_yaml_str(yaml_tls).is_err());
 
@@ -925,9 +960,11 @@ tunnels:
     tls:
       insecure: true
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:10015"
-        target: "127.0.0.1:10016"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:10015"
+            target: "127.0.0.1:10016"
 "#;
         assert!(ConfigLoader::from_yaml_str(yaml_tunnel).is_err());
 
@@ -938,9 +975,11 @@ tunnels:
     endpoint:
       uri: "ws://127.0.0.1:8080/tunnel"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:10017"
-        target: "127.0.0.1:10018"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:10017"
+            target: "127.0.0.1:10018"
 "#;
         assert!(ConfigLoader::from_yaml_str(yaml_ep).is_err());
 
@@ -954,9 +993,11 @@ tunnels:
   - tag: "t1"
     endpoint: "ws://127.0.0.1:8080/tunnel"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:10019"
-        target: "127.0.0.1:10020"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:10019"
+            target: "127.0.0.1:10020"
 "#;
         assert!(ConfigLoader::from_yaml_str(yaml_dns).is_err());
     }
@@ -971,9 +1012,11 @@ tunnels:
       tls:
         insecure: true
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:10021"
-        target: "127.0.0.1:10022"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:10021"
+            target: "127.0.0.1:10022"
 "#;
         let res = ConfigLoader::from_yaml_str(yaml);
         assert!(res.is_err());
@@ -989,15 +1032,19 @@ tunnels:
   - tag: "dup-tag"
     endpoint: "ws://127.0.0.1:8080/tunnel"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:10023"
-        target: "127.0.0.1:10024"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:10023"
+            target: "127.0.0.1:10024"
   - tag: "dup-tag"
     endpoint: "ws://127.0.0.1:8080/tunnel"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:10025"
-        target: "127.0.0.1:10026"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:10025"
+            target: "127.0.0.1:10026"
 "#;
         let res = ConfigLoader::from_yaml_str(yaml_tags);
         assert!(res.is_err());
@@ -1013,15 +1060,19 @@ tunnels:
   - tag: "t1"
     endpoint: "ws://127.0.0.1:8080/tunnel"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:10027"
-        target: "127.0.0.1:10028"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:10027"
+            target: "127.0.0.1:10028"
   - tag: "t2"
     endpoint: "ws://127.0.0.1:8080/tunnel"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:10027"
-        target: "127.0.0.1:10029"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:10027"
+            target: "127.0.0.1:10029"
 "#;
         let res2 = ConfigLoader::from_yaml_str(yaml_ports);
         assert!(res2.is_err());
@@ -1059,11 +1110,13 @@ server:
 tunnels:
   - tag: "pool0"
     endpoint: "ws://127.0.0.1:8080/tunnel"
-    pool_size: 0
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:10030"
-        target: "127.0.0.1:10031"
+      forward:
+        pool_size: 0
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:10030"
+            target: "127.0.0.1:10031"
 "#;
         assert!(ConfigLoader::from_yaml_str(yaml_pool0).is_err());
 
@@ -1075,9 +1128,11 @@ tunnels:
     retry:
       delay: "0s"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:10032"
-        target: "127.0.0.1:10033"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:10032"
+            target: "127.0.0.1:10033"
 "#;
         assert!(ConfigLoader::from_yaml_str(yaml_delay0).is_err());
 
@@ -1088,18 +1143,45 @@ tunnels:
     endpoint: "ws://127.0.0.1:8080/tunnel"
 "#;
         assert!(ConfigLoader::from_yaml_str(yaml_no_map).is_err());
+
+        // Empty mappings
+        let yaml_empty_map = r#"
+tunnels:
+  - tag: "empty-map"
+    endpoint: "ws://127.0.0.1:8080/tunnel"
+    mappings: {}
+"#;
+        assert!(ConfigLoader::from_yaml_str(yaml_empty_map).is_err());
+
+        // Missing protocol in rule
+        let yaml_no_proto = r#"
+tunnels:
+  - tag: "no-proto"
+    endpoint: "ws://127.0.0.1:8080/tunnel"
+    mappings:
+      forward:
+        rules:
+          - listen: "127.0.0.1:10030"
+            target: "127.0.0.1:10031"
+"#;
+        assert!(ConfigLoader::from_yaml_str(yaml_no_proto).is_err());
     }
 
     #[test]
     fn test_load_config_example_file() {
         let path = std::path::Path::new("config-example.yaml");
-        if path.exists() {
-            let config =
-                ConfigLoader::from_file(path).expect("config-example.yaml must parse cleanly");
-            assert_eq!(config.log.level, "info");
-            assert_eq!(config.worker_threads, Some(4));
-            assert_eq!(config.tunnels.len(), 2);
-        }
+        let alt_path = std::path::Path::new("../../config-example.yaml");
+        let p = if path.exists() {
+            path
+        } else if alt_path.exists() {
+            alt_path
+        } else {
+            return;
+        };
+        let config = ConfigLoader::from_file(p).expect("config-example.yaml must parse cleanly");
+        assert_eq!(config.log.level, "info");
+        assert_eq!(config.worker_threads, Some(4));
+        assert_eq!(config.tunnels.len(), 2);
     }
 
     #[test]
@@ -1123,9 +1205,11 @@ tunnels:
     endpoint: "ws://127.0.0.1:8080/tunnel"
     token: ""
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:10040"
-        target: "127.0.0.1:10041"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:10040"
+            target: "127.0.0.1:10041"
 "#;
         let res2 = ConfigLoader::from_yaml_str(yaml_tunnel_empty_token);
         assert!(res2.is_err());
@@ -1159,9 +1243,11 @@ tunnels:
   - tag: "uds-no-path"
     endpoint: "ws+unix://"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:10050"
-        target: "127.0.0.1:10051"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:10050"
+            target: "127.0.0.1:10051"
 "#;
         let res = ConfigLoader::from_yaml_str(yaml);
         assert!(res.is_err());
@@ -1182,9 +1268,11 @@ tunnels:
       enabled: false
       standby_endpoint: "ws://127.0.0.1:8081/tunnel"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:10060"
-        target: "127.0.0.1:10061"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:10060"
+            target: "127.0.0.1:10061"
 "#;
         let res = ConfigLoader::from_yaml_str(yaml);
         assert!(res.is_err());
@@ -1240,21 +1328,26 @@ tunnels:
   - tag: "uds-mapping-tunnel"
     endpoint: "ws://127.0.0.1:8080/tunnel"
     mappings:
-      - mode: "forward"
-        listen: "unix:///tmp/forward_listen.sock"
-        target: "127.0.0.1:8080"
-      - mode: "forward"
-        listen: "127.0.0.1:18080"
-        target: "unix:///tmp/forward_target.sock"
-      - mode: "reverse"
-        listen: "unix:///tmp/reverse_listen.sock"
-        target: "unix:///tmp/reverse_target.sock"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "unix:///tmp/forward_listen.sock"
+            target: "127.0.0.1:8080"
+          - protocol: "TCP"
+            listen: "127.0.0.1:18080"
+            target: "unix:///tmp/forward_target.sock"
+      reverse:
+        rules:
+          - protocol: "TCP"
+            listen: "unix:///tmp/reverse_listen.sock"
+            target: "unix:///tmp/reverse_target.sock"
 "#;
         let res = ConfigLoader::from_yaml_str(yaml);
         assert!(res.is_ok());
         let cfg = res.unwrap();
         let tunnel = &cfg.tunnels[0];
-        assert_eq!(tunnel.mappings.len(), 3);
+        assert_eq!(tunnel.canonical_mappings().unwrap().len(), 3);
+        assert_eq!(tunnel.mappings.rule_count(), 3);
     }
 
     #[test]
@@ -1273,19 +1366,20 @@ tunnels:
       dialer:
         udp_idle_timeout: "3s"
     mappings:
-      - mode: "forward"
-        protocol: "tcp"
-        listen: "127.0.0.1:5353"
-        target: "8.8.8.8:53"
-      - mode: "forward"
-        protocol: "udp"
-        listen: "127.0.0.1:5353"
-        target: "8.8.8.8:53"
-        udp_idle_timeout: "2s"
-      - mode: "reverse"
-        protocol: "udp"
-        listen: "0.0.0.0:15353"
-        target: "127.0.0.1:53"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:5353"
+            target: "8.8.8.8:53"
+          - protocol: "UDP"
+            listen: "127.0.0.1:5353"
+            target: "8.8.8.8:53"
+            udp_idle_timeout: "2s"
+      reverse:
+        rules:
+          - protocol: "UDP"
+            listen: "0.0.0.0:15353"
+            target: "127.0.0.1:53"
 "#;
         let cfg = ConfigLoader::from_yaml_str(yaml).unwrap();
         assert_eq!(
@@ -1296,7 +1390,7 @@ tunnels:
             cfg.server.as_ref().unwrap().udp_idle_timeout,
             Some(Duration::from_secs(20))
         );
-        let m = &cfg.tunnels[0].mappings;
+        let m = cfg.tunnels[0].canonical_mappings().unwrap();
         assert_eq!(m[0].protocol, crate::io::addr::L4Protocol::Tcp);
         assert_eq!(m[1].protocol, crate::io::addr::L4Protocol::Udp);
         assert_eq!(m[1].udp_idle_timeout, Some(Duration::from_secs(2)));
@@ -1312,10 +1406,11 @@ tunnels:
   - tag: "bad-udp-uds"
     endpoint: "ws://127.0.0.1:8080/tunnel"
     mappings:
-      - mode: "forward"
-        protocol: "udp"
-        listen: "unix:///tmp/not_allowed.sock"
-        target: "127.0.0.1:5353"
+      forward:
+        rules:
+          - protocol: "UDP"
+            listen: "unix:///tmp/not_allowed.sock"
+            target: "127.0.0.1:5353"
 "#;
         assert!(ConfigLoader::from_yaml_str(yaml_udp_uds).is_err());
 
@@ -1325,10 +1420,11 @@ tunnels:
   - tag: "bad-udp-uds-target"
     endpoint: "ws://127.0.0.1:8080/tunnel"
     mappings:
-      - mode: "forward"
-        protocol: "udp"
-        listen: "127.0.0.1:5353"
-        target: "unix:///tmp/not_allowed.sock"
+      forward:
+        rules:
+          - protocol: "UDP"
+            listen: "127.0.0.1:5353"
+            target: "unix:///tmp/not_allowed.sock"
 "#;
         assert!(ConfigLoader::from_yaml_str(yaml_udp_uds_tgt).is_err());
 
@@ -1338,14 +1434,14 @@ tunnels:
   - tag: "dup-udp"
     endpoint: "ws://127.0.0.1:8080/tunnel"
     mappings:
-      - mode: "forward"
-        protocol: "udp"
-        listen: "127.0.0.1:5354"
-        target: "127.0.0.1:53"
-      - mode: "forward"
-        protocol: "udp"
-        listen: "127.0.0.1:5354"
-        target: "127.0.0.1:54"
+      forward:
+        rules:
+          - protocol: "UDP"
+            listen: "127.0.0.1:5354"
+            target: "127.0.0.1:53"
+          - protocol: "UDP"
+            listen: "127.0.0.1:5354"
+            target: "127.0.0.1:54"
 "#;
         assert!(ConfigLoader::from_yaml_str(yaml_dup_udp).is_err());
 
@@ -1370,11 +1466,12 @@ tunnels:
   - tag: "zero-map"
     endpoint: "ws://127.0.0.1:8080/tunnel"
     mappings:
-      - mode: "forward"
-        protocol: "udp"
-        listen: "127.0.0.1:5355"
-        target: "127.0.0.1:53"
-        udp_idle_timeout: "0s"
+      forward:
+        rules:
+          - protocol: "UDP"
+            listen: "127.0.0.1:5355"
+            target: "127.0.0.1:53"
+            udp_idle_timeout: "0s"
 "#;
         assert!(ConfigLoader::from_yaml_str(yaml_zero_mapping).is_err());
     }

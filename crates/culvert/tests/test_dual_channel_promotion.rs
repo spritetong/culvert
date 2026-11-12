@@ -266,11 +266,10 @@ mod e2e_reverse_promotion_tests {
 
     use culvert::backend::registry::TransportRegistry;
     use culvert::config::model::{
-        AppConfig, EndpointConfig, PortMappingConfig, ServerConfig, TunnelConfig, TunnelMode,
-        TunnelRetryConfig,
+        AppConfig, EndpointConfig, MappingRuleConfig, ServerConfig, TunnelConfig,
+        TunnelMappingsConfig, TunnelRetryConfig,
     };
     use culvert::dialer::endpoint::EndpointContext;
-    use culvert::io::addr::L4Protocol;
     use culvert::server::ServerRunner;
     use culvert::session::SessionManager;
     use culvert::supervisor::TunnelSupervisor;
@@ -449,22 +448,20 @@ mod e2e_reverse_promotion_tests {
 
         let tunnel_cfg = TunnelConfig {
             tag: "e2e-0xa6-udp".to_string(),
-        uuid: None,
-        pool: None,
+            uuid: None,
             endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/tunnel", proxy.proxy_port)),
             token: Some(auth_token.to_string()),
-            pool_size: Some(3),
             failover: None,
             multiplex: None,
             retry: None,
             http_headers: None,
-            mappings: vec![PortMappingConfig {
-                mode: TunnelMode::Reverse,
-                protocol: L4Protocol::Udp,
-                listen: reverse_listen.clone(),
-                target: format!("127.0.0.1:{}", echo_port),
-                udp_idle_timeout: None,
-            }],
+            mappings: TunnelMappingsConfig::reverse_pool(
+                3,
+                vec![MappingRuleConfig::udp(
+                    reverse_listen.clone(),
+                    format!("127.0.0.1:{}", echo_port),
+                )],
+            ),
         };
         let ep_ctx = EndpointContext::build(&tunnel_cfg.endpoint, &AppConfig::default()).unwrap();
         let c_cancel = cancel.clone();
@@ -563,14 +560,12 @@ mod e2e_reverse_promotion_tests {
         let app_cfg = AppConfig {
             tunnels: vec![TunnelConfig {
                 tag: "e2e-udp-grace".to_string(),
-        uuid: None,
-        pool: None,
+                uuid: None,
                 endpoint: EndpointConfig::Simple(format!(
                     "ws://127.0.0.1:{}/tunnel",
                     proxy.proxy_port
                 )),
                 token: Some(auth_token.to_string()),
-                pool_size: Some(1),
                 failover: None,
                 multiplex: None,
                 retry: Some(TunnelRetryConfig {
@@ -578,13 +573,13 @@ mod e2e_reverse_promotion_tests {
                     max_retries: None,
                 }),
                 http_headers: None,
-                mappings: vec![PortMappingConfig {
-                    mode: TunnelMode::Reverse,
-                    protocol: L4Protocol::Udp,
-                    listen: reverse_listen.clone(),
-                    target: format!("127.0.0.1:{}", echo_port),
-                    udp_idle_timeout: None,
-                }],
+                mappings: TunnelMappingsConfig::reverse_pool(
+                    1,
+                    vec![MappingRuleConfig::udp(
+                        reverse_listen.clone(),
+                        format!("127.0.0.1:{}", echo_port),
+                    )],
+                ),
             }],
             ..Default::default()
         };

@@ -16,8 +16,8 @@ use tokio_util::sync::CancellationToken;
 use culvert::backend::registry::TransportRegistry;
 use culvert::backend::{TransportConnector, TransportDriver, TransportListener};
 use culvert::config::model::{
-    AppConfig, DialerConfig, EndpointConfig, PortMappingConfig, ServerConfig, TlsConfig,
-    TunnelConfig, TunnelMode,
+    AppConfig, DialerConfig, EndpointConfig, MappingRuleConfig, ServerConfig, TlsConfig,
+    TunnelConfig, TunnelMappingsConfig, TunnelMode,
 };
 use culvert::dialer::endpoint::EndpointContext;
 use culvert::io::addr::{L4Protocol, TargetAddr};
@@ -170,21 +170,16 @@ async fn test_forward_udp_ws_unpooled_and_pooled() {
     let unpooled_cfg = TunnelConfig {
         tag: "udp-fwd-unpooled".to_string(),
         uuid: None,
-        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/tunnel", server_ws_port)),
         token: Some(auth_token.to_string()),
-        pool_size: None,
         failover: None,
         multiplex: None,
         retry: None,
         http_headers: None,
-        mappings: vec![PortMappingConfig {
-            mode: TunnelMode::Forward,
-            protocol: L4Protocol::Udp,
-            listen: unpooled_listen.clone(),
-            target: format!("127.0.0.1:{}", echo_port),
-            udp_idle_timeout: None,
-        }],
+        mappings: TunnelMappingsConfig::forward(vec![MappingRuleConfig::udp(
+            unpooled_listen.clone(),
+            format!("127.0.0.1:{}", echo_port),
+        )]),
     };
     let app_cfg = AppConfig::default();
     let ep_ctx1 = EndpointContext::build(&unpooled_cfg.endpoint, &app_cfg).expect("ep_ctx1");
@@ -199,21 +194,19 @@ async fn test_forward_udp_ws_unpooled_and_pooled() {
     let pooled_cfg = TunnelConfig {
         tag: "udp-fwd-pooled".to_string(),
         uuid: None,
-        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/tunnel", server_ws_port)),
         token: Some(auth_token.to_string()),
-        pool_size: Some(4),
         failover: None,
         multiplex: None,
         retry: None,
         http_headers: None,
-        mappings: vec![PortMappingConfig {
-            mode: TunnelMode::Forward,
-            protocol: L4Protocol::Udp,
-            listen: pooled_listen.clone(),
-            target: format!("127.0.0.1:{}", echo_port),
-            udp_idle_timeout: None,
-        }],
+        mappings: TunnelMappingsConfig::forward_pool(
+            4,
+            vec![MappingRuleConfig::udp(
+                pooled_listen.clone(),
+                format!("127.0.0.1:{}", echo_port),
+            )],
+        ),
     };
     let ep_ctx2 = EndpointContext::build(&pooled_cfg.endpoint, &app_cfg).expect("ep_ctx2");
     let c2 = cancel_token.clone();
@@ -311,47 +304,40 @@ async fn test_forward_udp_h3_and_raw_quic() {
         tunnels: vec![
             TunnelConfig {
                 tag: "udp-over-h3".to_string(),
-        uuid: None,
-        pool: None,
+                uuid: None,
                 endpoint: EndpointConfig::Simple(format!(
                     "h3://127.0.0.1:{}/tunnel",
                     h3_server_port
                 )),
                 token: Some("udp_quic_token".to_string()),
-                pool_size: None,
                 failover: None,
                 multiplex: None,
                 retry: None,
                 http_headers: None,
-                mappings: vec![PortMappingConfig {
-                    mode: TunnelMode::Forward,
-                    protocol: L4Protocol::Udp,
-                    listen: h3_listen.clone(),
-                    target: format!("127.0.0.1:{}", echo_port),
-                    udp_idle_timeout: None,
-                }],
+                mappings: TunnelMappingsConfig::forward(vec![MappingRuleConfig::udp(
+                    h3_listen.clone(),
+                    format!("127.0.0.1:{}", echo_port),
+                )]),
             },
             TunnelConfig {
                 tag: "udp-over-quic-pooled".to_string(),
-        uuid: None,
-        pool: None,
+                uuid: None,
                 endpoint: EndpointConfig::Simple(format!(
                     "quic://127.0.0.1:{}/raw",
                     quic_server_port
                 )),
                 token: Some("udp_quic_token".to_string()),
-                pool_size: Some(2),
                 failover: None,
                 multiplex: None,
                 retry: None,
                 http_headers: None,
-                mappings: vec![PortMappingConfig {
-                    mode: TunnelMode::Forward,
-                    protocol: L4Protocol::Udp,
-                    listen: quic_listen.clone(),
-                    target: format!("127.0.0.1:{}", echo_port),
-                    udp_idle_timeout: None,
-                }],
+                mappings: TunnelMappingsConfig::forward_pool(
+                    2,
+                    vec![MappingRuleConfig::udp(
+                        quic_listen.clone(),
+                        format!("127.0.0.1:{}", echo_port),
+                    )],
+                ),
             },
         ],
         ..Default::default()
@@ -416,22 +402,20 @@ async fn test_forward_udp_concurrent_multi_client_nat_demux() {
         }),
         tunnels: vec![TunnelConfig {
             tag: "udp-nat-demux".to_string(),
-        uuid: None,
-        pool: None,
+            uuid: None,
             endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/tunnel", server_ws_port)),
             token: Some("nat_demux_token".to_string()),
-            pool_size: Some(3),
             failover: None,
             multiplex: None,
             retry: None,
             http_headers: None,
-            mappings: vec![PortMappingConfig {
-                mode: TunnelMode::Forward,
-                protocol: L4Protocol::Udp,
-                listen: fwd_listen.clone(),
-                target: format!("127.0.0.1:{}", echo_port),
-                udp_idle_timeout: None,
-            }],
+            mappings: TunnelMappingsConfig::forward_pool(
+                3,
+                vec![MappingRuleConfig::udp(
+                    fwd_listen.clone(),
+                    format!("127.0.0.1:{}", echo_port),
+                )],
+            ),
         }],
         ..Default::default()
     };
@@ -490,31 +474,26 @@ async fn test_same_port_tcp_and_udp_forward_coexistence_and_empty_datagram() {
         }),
         tunnels: vec![TunnelConfig {
             tag: "same-port-tcp-udp".to_string(),
-        uuid: None,
-        pool: None,
+            uuid: None,
             endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/tunnel", server_ws_port)),
             token: Some("dual_proto_token".to_string()),
-            pool_size: Some(4),
             failover: None,
             multiplex: None,
             retry: None,
             http_headers: None,
-            mappings: vec![
-                PortMappingConfig {
-                    mode: TunnelMode::Forward,
-                    protocol: L4Protocol::Tcp,
-                    listen: shared_listen.clone(),
-                    target: format!("127.0.0.1:{}", tcp_echo_port),
-                    udp_idle_timeout: None,
-                },
-                PortMappingConfig {
-                    mode: TunnelMode::Forward,
-                    protocol: L4Protocol::Udp,
-                    listen: shared_listen.clone(),
-                    target: format!("127.0.0.1:{}", udp_echo_port),
-                    udp_idle_timeout: None,
-                },
-            ],
+            mappings: TunnelMappingsConfig::forward_pool(
+                4,
+                vec![
+                    MappingRuleConfig::tcp(
+                        shared_listen.clone(),
+                        format!("127.0.0.1:{}", tcp_echo_port),
+                    ),
+                    MappingRuleConfig::udp(
+                        shared_listen.clone(),
+                        format!("127.0.0.1:{}", udp_echo_port),
+                    ),
+                ],
+            ),
         }],
         ..Default::default()
     };
@@ -605,21 +584,19 @@ async fn test_reverse_udp_ws_pooled_and_signaling_fallback() {
     let tunnel_config = TunnelConfig {
         tag: "rev-udp-pool-and-fallback".to_string(),
         uuid: None,
-        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/tunnel", server_ws_port)),
         token: Some(auth_token.to_string()),
-        pool_size: Some(2),
         failover: None,
         multiplex: None,
         retry: None,
         http_headers: None,
-        mappings: vec![PortMappingConfig {
-            mode: TunnelMode::Reverse,
-            protocol: L4Protocol::Udp,
-            listen: reverse_listen.clone(),
-            target: format!("127.0.0.1:{}", local_echo_port),
-            udp_idle_timeout: None,
-        }],
+        mappings: TunnelMappingsConfig::reverse_pool(
+            2,
+            vec![MappingRuleConfig::udp(
+                reverse_listen.clone(),
+                format!("127.0.0.1:{}", local_echo_port),
+            )],
+        ),
     };
     let app_cfg = AppConfig::default();
     let ep_ctx = EndpointContext::build(&tunnel_config.endpoint, &app_cfg).expect("ep_ctx");
@@ -690,22 +667,20 @@ async fn test_reverse_udp_h3() {
         }),
         tunnels: vec![TunnelConfig {
             tag: "rev-udp-h3".to_string(),
-        uuid: None,
-        pool: None,
+            uuid: None,
             endpoint: EndpointConfig::Simple(format!("h3://127.0.0.1:{}/tunnel", h3_server_port)),
             token: Some("rev_h3_udp_token".to_string()),
-            pool_size: Some(2),
             failover: None,
             multiplex: None,
             retry: None,
             http_headers: None,
-            mappings: vec![PortMappingConfig {
-                mode: TunnelMode::Reverse,
-                protocol: L4Protocol::Udp,
-                listen: reverse_listen.clone(),
-                target: format!("127.0.0.1:{}", local_echo_port),
-                udp_idle_timeout: None,
-            }],
+            mappings: TunnelMappingsConfig::reverse_pool(
+                2,
+                vec![MappingRuleConfig::udp(
+                    reverse_listen.clone(),
+                    format!("127.0.0.1:{}", local_echo_port),
+                )],
+            ),
         }],
         ..Default::default()
     };
@@ -864,21 +839,17 @@ async fn test_udp_nat_idle_timeout_expiration_and_recreation() {
     let tunnel_cfg = TunnelConfig {
         tag: "udp-idle-recreate".to_string(),
         uuid: None,
-        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/tunnel", server_ws_port)),
         token: Some("udp_idle_tok".to_string()),
-        pool_size: None,
         failover: None,
         multiplex: None,
         retry: None,
         http_headers: None,
-        mappings: vec![PortMappingConfig {
-            mode: TunnelMode::Forward,
-            protocol: L4Protocol::Udp,
-            listen: fwd_listen.clone(),
-            target: format!("127.0.0.1:{}", echo_port),
-            udp_idle_timeout: Some(Duration::from_millis(200)),
-        }],
+        mappings: TunnelMappingsConfig::forward(vec![MappingRuleConfig::udp_with_timeout(
+            fwd_listen.clone(),
+            format!("127.0.0.1:{}", echo_port),
+            Duration::from_millis(200),
+        )]),
     };
     let ep_ctx = EndpointContext::build(&tunnel_cfg.endpoint, &app_cfg).expect("ep_ctx");
     let c_cancel = cancel_token.clone();

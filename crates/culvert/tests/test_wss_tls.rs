@@ -22,7 +22,8 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
 use culvert::config::model::{
-    AppConfig, EndpointConfig, PortMappingConfig, ServerConfig, TlsConfig, TunnelConfig, TunnelMode,
+    AppConfig, EndpointConfig, MappingRuleConfig, ServerConfig, TlsConfig, TunnelConfig,
+    TunnelMappingsConfig, TunnelMode,
 };
 use culvert::dialer::endpoint::EndpointContext;
 use culvert::server::ServerRunner;
@@ -305,17 +306,13 @@ async fn test_wss_forward_tunnel_with_custom_ca_and_sni() {
     let tunnel_config = TunnelConfig {
         tag: "test-wss-ca-sni".to_string(),
         uuid: None,
-        pool: None,
         token: Some(auth_token.to_string()),
-        pool_size: None,
         failover: None,
         multiplex: None,
-        mappings: vec![PortMappingConfig {
-            mode: TunnelMode::Forward,
-            listen: format!("127.0.0.1:{}", client_listen_port),
-            target: format!("127.0.0.1:{}", echo_port),
-            ..Default::default()
-        }],
+        mappings: TunnelMappingsConfig::forward(vec![MappingRuleConfig::tcp(
+            format!("127.0.0.1:{}", client_listen_port),
+            format!("127.0.0.1:{}", echo_port),
+        )]),
         retry: None,
         http_headers: None,
         endpoint: EndpointConfig::Detailed {
@@ -426,17 +423,13 @@ async fn test_wss_forward_tunnel_insecure_mode() {
     let tunnel_config = TunnelConfig {
         tag: "test-wss-insecure".to_string(),
         uuid: None,
-        pool: None,
         token: Some(auth_token.to_string()),
-        pool_size: None,
         failover: None,
         multiplex: None,
-        mappings: vec![PortMappingConfig {
-            mode: TunnelMode::Forward,
-            listen: format!("127.0.0.1:{}", client_listen_port),
-            target: format!("127.0.0.1:{}", echo_port),
-            ..Default::default()
-        }],
+        mappings: TunnelMappingsConfig::forward(vec![MappingRuleConfig::tcp(
+            format!("127.0.0.1:{}", client_listen_port),
+            format!("127.0.0.1:{}", echo_port),
+        )]),
         retry: None,
         http_headers: None,
         endpoint: EndpointConfig::Detailed {
@@ -545,17 +538,13 @@ async fn test_wss_mtls_mutual_authentication() {
     let tunnel_config = TunnelConfig {
         tag: "test-wss-mtls".to_string(),
         uuid: None,
-        pool: None,
         token: Some(auth_token.to_string()),
-        pool_size: None,
         failover: None,
         multiplex: None,
-        mappings: vec![PortMappingConfig {
-            mode: TunnelMode::Forward,
-            listen: format!("127.0.0.1:{}", client_listen_port),
-            target: format!("127.0.0.1:{}", echo_port),
-            ..Default::default()
-        }],
+        mappings: TunnelMappingsConfig::forward(vec![MappingRuleConfig::tcp(
+            format!("127.0.0.1:{}", client_listen_port),
+            format!("127.0.0.1:{}", echo_port),
+        )]),
         retry: None,
         http_headers: None,
         endpoint: EndpointConfig::Detailed {
@@ -669,17 +658,13 @@ async fn test_wss_reverse_tunnel_e2e() {
     let tunnel_config = TunnelConfig {
         tag: "test-wss-reverse".to_string(),
         uuid: None,
-        pool: None,
         token: Some(auth_token.to_string()),
-        pool_size: None,
         failover: None,
         multiplex: None,
-        mappings: vec![PortMappingConfig {
-            mode: TunnelMode::Reverse,
-            listen: format!("127.0.0.1:{}", reverse_listen_port),
-            target: format!("127.0.0.1:{}", local_echo_port),
-            ..Default::default()
-        }],
+        mappings: TunnelMappingsConfig::reverse(vec![MappingRuleConfig::tcp(
+            format!("127.0.0.1:{}", reverse_listen_port),
+            format!("127.0.0.1:{}", local_echo_port),
+        )]),
         retry: None,
         http_headers: None,
         endpoint: EndpointConfig::Detailed {

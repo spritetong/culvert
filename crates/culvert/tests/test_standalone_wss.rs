@@ -11,7 +11,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
 use culvert::config::model::{
-    AppConfig, EndpointConfig, PortMappingConfig, ServerConfig, TlsConfig, TunnelConfig, TunnelMode,
+    AppConfig, EndpointConfig, MappingRuleConfig, ServerConfig, TlsConfig, TunnelConfig,
+    TunnelMappingsConfig,
 };
 use culvert::supervisor::TunnelSupervisor;
 
@@ -80,7 +81,6 @@ async fn test_standalone_wss_server_self_signed_direct_termination() {
     app_config.tunnels.push(TunnelConfig {
         tag: "direct-wss-tunnel".to_string(),
         uuid: None,
-        pool: None,
         endpoint: EndpointConfig::Detailed {
             url: format!("wss://127.0.0.1:{}/tunnel", server_wss_port),
             dns: None,
@@ -93,17 +93,14 @@ async fn test_standalone_wss_server_self_signed_direct_termination() {
             http_headers: None,
         },
         token: Some("secret_wss_token".to_string()),
-        pool_size: None,
         failover: None,
         multiplex: None,
         retry: None,
         http_headers: None,
-        mappings: vec![PortMappingConfig {
-            mode: TunnelMode::Forward,
-            listen: format!("127.0.0.1:{}", client_listen_port),
-            target: format!("127.0.0.1:{}", echo_port),
-            ..Default::default()
-        }],
+        mappings: TunnelMappingsConfig::forward(vec![MappingRuleConfig::tcp(
+            format!("127.0.0.1:{}", client_listen_port),
+            format!("127.0.0.1:{}", echo_port),
+        )]),
     });
 
     // 3. Launch supervisor

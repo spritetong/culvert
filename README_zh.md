@@ -59,14 +59,15 @@
 - **连接迁移 (Connection Migration)**：客户端网络在 Wi-Fi、蜂窝网络之间无缝切换时，长连接不中断。
 - **极速握手**：享受 QUIC 的 0-RTT / 1-RTT 握手优势，在 TCP 严苛受限或弱网环境下表现极为出色。
 
-### ⚡ 亮点二：独创 0-RTT Connection Pool（预热双向连接池）
+### ⚡ 亮点二：独特的 0-RTT 双向预热连接池与 Tunnel 级统一共享
 
 常规隧道软件在客户端接收到新连接时，往往才临时向远端发起端到端握手（TCP 握手 + TLS 握手 + 协议协商），这会额外增加 1~3 个 RTT 的网络延迟，对 SSH 按键响应、DNS 查询、MySQL 短查询等低延迟场景极不友好。
 
-`culvert` 创新设计了支持 **TCP 与 UDP 的全链路双向预热连接池**：
+`culvert` 创新设计了支持 **TCP 与 UDP 的全链路双向预热连接池** 与 **Tunnel 级统一共享**：
 
-- **正向模式 (Forward)**：客户端后台自动建立并预热维持一组就绪的空闲连接流。当本地新 TCP 连接或 UDP 客户端会话到达时，毫秒级从池中弹出可用流（0-RTT），通过微秒级带内激活报文（TCP 为 `0xA5`、UDP 为 `0xA7` + 目标地址）瞬间开启转发，客户端后台并发平滑补充新空闲流。
-- **反向模式 (Reverse)**：客户端主动向服务端预先建立反向就绪流并按 `(protocol, listen)` 在服务端侧排队维护。公网 TCP 访客或 UDP 对端接入服务端端口时，服务端秒级弹出可用流并通过单字节激活指令（`0xA5` / `0xA7`）瞬间激活，无须等待控制信令握手往返，真正达成 0-RTT 极速响应！
+- **Tunnel 级统一共享与非对称池配置**：同一个 Tunnel 实例下的所有正向映射共享客户端的正向连接池，所有反向映射共享服务端的反向连接池，由 Tunnel UUID 统一标识与解耦。拥有 $M$ 个映射的 Tunnel 只需维持 $S$ 条预热连接，彻底杜绝 $M \times S$ 的连接浪费，并支持非对称配置（如 `pool: { forward: 8, reverse: 4 }`）。
+- **正向模式 (Forward)**：客户端后台自动建立并预热维持一组就绪的空闲连接流。当本地新 TCP 连接或 UDP 客户端会话到达时，毫秒级从池中弹出可用流（0-RTT），通过带内激活报文（TCP 为 `0xA5`、UDP 为 `0xA7` + 目标地址）瞬间开启转发，客户端后台并发平滑补充新空闲流。
+- **反向模式 (Reverse)**：客户端向服务端预热维持 Tunnel 共享反向流。当外部访客接入服务端的任意反向端口时，服务端弹出空闲流，通过对称的晚绑定目标激活指令（`[magic][len][target_str]`）与 `0xAC` ACK 握手瞬间完成端到端就绪，真正达成全端口 0-RTT 极速响应！
 - **完备的防风暴与控制容灾机制**：内置并发握手信号量（限制最大并发连接建立），避免在弱网断线重连时引发连接风暴；结合指数退避、服务端统一生命周期裁决以及断联时的预热流紧急晋升（`0xA6`）与防重复指令去重机制，确保工业级稳定性。
 
 ---
@@ -169,12 +170,12 @@ flowchart LR
 > `ws+unix:///run/culvert.sock?path=/tunnel&chmod=0o660`  
 > （其中 `chmod` 接受八进制格式，如 `660`、`0660` 或 `0o660`）。
 
-### 端口映射模式与协议说明
+### 端口映射分类与协议说明
 
-| 映射模式 (`mode`) | 支持协议 (`protocol`) | 监听端口位置 | 目标地址拨号端 | 预热连接池 (`pool_size`) | 典型用途 |
+| 映射分类 | 支持协议 (`protocol`) | 监听端口位置 | 目标地址拨号端 | 预热连接池 (`pool_size`) | 典型用途 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `forward` (正向，默认) | `tcp` (默认)、`udp` | 客户端本地主机 | 服务端远程网络 | 支持预热连接池共享 (`0xA5` / `0xA7`) | 访问远程内网私有资源 (如数据库、内网 DNS、后台) |
-| `reverse` (反向) | `tcp` (默认)、`udp` | 服务端公网主机 | 客户端本地网络 | 按映射维护反向就绪池 (`0xA5` / `0xA7`) | 将内网本地服务暴露至公网 (如远程 SSH、WireGuard) |
+| `forward` (正向) | `TCP`、`UDP` (必填) | 客户端本地主机 | 服务端远程网络 | 按 Tunnel 共享预热连接池 (`0xA5` / `0xA7`) | 访问远程内网私有资源 (如数据库、内网 DNS、后台) |
+| `reverse` (反向) | `TCP`、`UDP` (必填) | 服务端公网主机 | 客户端本地网络 | 按 Tunnel 共享反向就绪池 (`0xA5` / `0xA7`) | 将内网本地服务暴露至公网 (如远程 SSH、WireGuard) |
 
 > [!TIP]
 > **同端口 TCP + UDP 共存**：同一个监听 IP 与端口可以同时配置 `protocol: "tcp"` 和 `protocol: "udp"` 映射；同一协议的重复绑定会在 `--check` 阶段报错。UDP 映射不允许在 `listen` 或 `target` 中使用 `unix://` 域套接字路径，但支持通过 `ws+unix://` / `wss+unix://` 隧道端点承载传输。
@@ -231,9 +232,11 @@ tunnels:
     endpoint: "ws://YOUR_SERVER_IP:8080/tunnel"
     token: "PLEASE_REPLACE_WITH_A_SECRET_TOKEN"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:18080"
-        target: "127.0.0.1:8080"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:18080"
+            target: "127.0.0.1:8080"
 ```
 
 分别启动服务端与客户端：
@@ -368,9 +371,9 @@ server:
 ```yaml
 tunnels:
   - tag: "corp-internal"              # 隧道唯一标签
+    # uuid: "550e8400-e29b-41d4-a716-446655440000" # 可选: 显式 Tunnel UUID (默认由 tag 派生确定性 UUID v5)
     endpoint: "wss://tunnel.example.com/tunnel" # 服务端 URL 或包含独立 dns/tls 的对象
     token: "SECURE_AUTH_TOKEN"        # 与服务端一致的验证令牌
-    pool_size: 8                      # 开启 0-RTT 预热连接池大小 (正向与反向均支持)
     http_headers:                     # 可选：连接服务端时携带的自定义 HTTP 头
       Host: "tunnel.example.com"      # 覆盖 Host 标头 (用于反代 vhost 路由)
       User-Agent: "culvert/1.0"
@@ -378,29 +381,53 @@ tunnels:
       delay: "3s"                     # 重连尝试固定间隔
       max_retries: 10                 # 最大重试次数 (缺省表示无限重试)
     mappings:
-      - mode: "forward"               # 正向 TCP 模式 (protocol 默认为 "tcp")
-        protocol: "tcp"               # 可选："tcp" (默认) 或 "udp"
-        listen: "127.0.0.1:13306"
-        target: "10.0.0.5:3306"
-      - mode: "forward"               # 正向 UDP 模式
-        protocol: "udp"
-        listen: "127.0.0.1:15353"
-        target: "1.1.1.1:53"
-        udp_idle_timeout: "15s"       # 可选：覆盖该映射的 UDP NAT 会话过期时间
-      - mode: "reverse"               # 反向模式
-        listen: "0.0.0.0:2222"        # 在服务端绑定的监听端口
-        target: "127.0.0.1:22"        # 客户端本地转发的目标端口
+      # 正向映射：客户端本地监听，流量转发至服务端远端网络
+      forward:
+        pool_size: 8                  # 客户端正向 0-RTT 预热连接池大小 (可选)
+        rules:
+          - protocol: "TCP"           # 必填: 传输层协议 ("TCP" 或 "UDP"，大小写不敏感，不可缺省)
+            listen: "127.0.0.1:13306"
+            target: "10.0.0.5:3306"
+          - protocol: "UDP"
+            listen: "127.0.0.1:15353"
+            target: "1.1.1.1:53"
+            udp_idle_timeout: "15s"   # 可选：覆盖该映射的 UDP NAT 会话过期时间
+      # 反向映射：服务端公网监听，流量穿透转发回客户端本地服务
+      reverse:
+        pool_size: 4                  # 服务端反向 0-RTT 预热连接池大小 (可选)
+        rules:
+          - protocol: "TCP"
+            listen: "0.0.0.0:2222"    # 在服务端绑定的监听端口
+            target: "127.0.0.1:22"    # 客户端本地转发的目标端口
 ```
 
-`mappings` 列表中的每条映射支持以下字段：
+`tunnels[]` 支持以下配置项：
 
 | 字段 | 类型 | 是否必填 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- | :--- |
-| `mode` | 字符串 | 否 | `"forward"` | `"forward"`（正向）或 `"reverse"`（反向）。 |
-| `protocol` | 字符串 | 否 | `"tcp"` | `"tcp"` 或 `"udp"`；同一监听端口可同时绑定 TCP 与 UDP 正向映射。 |
+| `tag` | 字符串 | 是 | — | 隧道唯一标识标签。 |
+| `uuid` | 字符串 | 否 | 由 `tag` 派生 UUID v5 | 显式 Tunnel UUID。同一 Tunnel 下的所有映射共享连接池。 |
+| `endpoint` | 字符串/对象 | 是 | — | 服务端接入点 URL（如 `wss://...`、`h3://...`、`ws+unix://...`）。 |
+| `token` | 字符串 | 否 | `null` | 预共享认证令牌，须与服务端的 `server.token` 保持一致。 |
+| `http_headers` | 映射 | 否 | — | 传输层握手时携带的自定义 HTTP 标头。 |
+| `retry` | 对象 | 否 | — | 自动断线重连配置（包含 `delay`、`max_retries`）。 |
+| `mappings` | 对象 | 是 | — | 包含 `forward`（正向）与 `reverse`（反向）分组的对象，至少包含一条映射规则。 |
+
+`mappings` 下分为 `forward`（正向）与 `reverse`（反向）两类分组，每个分组支持以下字段：
+
+| 字段 | 类型 | 是否必填 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- | :--- |
+| `pool_size` | 整数 | 否 | 无连接池 | 该方向共享的 0-RTT 预热连接池大小（须 $\ge 1$）。支持别名 `pool`。 |
+| `rules` | 列表 | 是 | `[]` | 映射规则列表（亦支持别名 `ports`、`items`）。 |
+
+每条映射规则 (`rules[]`) 支持以下字段：
+
+| 字段 | 类型 | 是否必填 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- | :--- |
+| `protocol` | 字符串 | **是 (强制)** | **无缺省值** | 传输层协议，必须显式设置为 `"TCP"` 或 `"UDP"`（大小写不敏感，不允许缺省）。 |
 | `listen` | 字符串 | 是 | — | `ip:port`、`hostname:port`、`[ipv6]:port` 或 `unix://path`（仅 TCP 支持 `unix://`）。 |
 | `target` | 字符串 | 是 | — | `ip:port`、`hostname:port`、`[ipv6]:port` 或 `unix://path`（仅 TCP 支持 `unix://`）。 |
-| `udp_idle_timeout` | 时长 | 否 | `dialer.udp_idle_timeout` (`30s`) | 覆盖客户端侧 UDP 会话空闲超时；服务端侧使用 `server.udp_idle_timeout`。须 `> 0`。 |
+| `udp_idle_timeout` | 时长 | 否 | `dialer.udp_idle_timeout` (`30s`) | 仅 UDP 有效：覆盖客户端侧 UDP 会话空闲超时。须 `> 0`。 |
 
 ---
 
@@ -547,11 +574,13 @@ tunnels:
   - tag: "office-ssh"
     endpoint: "wss://tunnel.example.com/tunnel"
     token: "CHANGE_ME"
-    pool_size: 4                     # 预热 4 条空闲反向流，访客连接 0-RTT 秒级就绪
     mappings:
-      - mode: "reverse"
-        listen: "0.0.0.0:2222"       # 在服务端绑定的监听端口
-        target: "127.0.0.1:22"       # 客户端本地 SSH 端口
+      reverse:
+        pool_size: 4                 # 预热 4 条空闲反向流，访客连接 0-RTT 秒级就绪
+        rules:
+          - protocol: "TCP"
+            listen: "0.0.0.0:2222"   # 在服务端绑定的监听端口
+            target: "127.0.0.1:22"   # 客户端本地 SSH 端口
 ```
 
 外部访客连接：
@@ -585,44 +614,51 @@ tunnels:
   - tag: "h3-fast-link"
     endpoint: "h3://YOUR_SERVER_IP:8443/tunnel"
     token: "CHANGE_ME"
-    pool_size: 4
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:13306"
-        target: "127.0.0.1:3306"
+      forward:
+        pool_size: 4
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:13306"
+            target: "127.0.0.1:3306"
 ```
 
 ---
 
 ### 3. 多端口集群共用单条隧道与连接池
 
-一个隧道配置项下可以聚合多个正向与反向端口映射，支持 TCP、UDP 端口以及 Unix 域套接字（如 Docker daemon）：
+一个隧道配置项下可以聚合多个正向与反向端口映射，支持 TCP、UDP 端口以及 Unix 域套接字，并按 Tunnel UUID 统一共享正向与反向连接池：
 
 ```yaml
 tunnels:
   - tag: "dev-cluster"
+    # uuid: "550e8400-e29b-41d4-a716-446655440000"  # 可选显式 UUID (缺省由 tag 派生确定性 UUID v5)
     endpoint: "wss://tunnel.example.com/tunnel"
     token: "CHANGE_ME"
-    pool_size: 8
     mappings:
-      # 正向访问远程开发机 MySQL (TCP)
-      - mode: "forward"
-        listen: "127.0.0.1:13306"
-        target: "10.0.0.5:3306"
-      # 正向访问远程 Docker 守护进程 (TCP -> UDS)
-      - mode: "forward"
-        listen: "127.0.0.1:18000"
-        target: "unix:///var/run/docker.sock"
-      # 正向代理内网 DNS 解析 (UDP)
-      - mode: "forward"
-        protocol: "udp"
-        listen: "127.0.0.1:15353"
-        target: "1.1.1.1:53"
-        udp_idle_timeout: "15s"
-      # 反向暴露本地调试 Web 服务 (TCP)
-      - mode: "reverse"
-        listen: "0.0.0.0:8000"
-        target: "127.0.0.1:3000"
+      forward:
+        pool_size: 8                 # 正向映射共享的连接池大小
+        rules:
+          # 正向访问远程开发机 MySQL (TCP)
+          - protocol: "TCP"
+            listen: "127.0.0.1:13306"
+            target: "10.0.0.5:3306"
+          # 正向访问远程 Docker 守护进程 (TCP -> UDS)
+          - protocol: "TCP"
+            listen: "127.0.0.1:18000"
+            target: "unix:///var/run/docker.sock"
+          # 正向代理内网 DNS 解析 (UDP)
+          - protocol: "UDP"
+            listen: "127.0.0.1:15353"
+            target: "1.1.1.1:53"
+            udp_idle_timeout: "15s"
+      reverse:
+        pool_size: 4                 # 反向映射共享的连接池大小
+        rules:
+          # 反向暴露本地调试 Web 服务 (TCP)
+          - protocol: "TCP"
+            listen: "0.0.0.0:8000"
+            target: "127.0.0.1:3000"
 ```
 
 ---
@@ -636,18 +672,21 @@ tunnels:
   - tag: "udp-services"
     endpoint: "quic://server.example.com:8443/tunnel"
     token: "CHANGE_ME"
-    pool_size: 4                     # 支持 0-RTT UDP 流预热激活 (0xA7)
     mappings:
-      - mode: "forward"
-        protocol: "udp"
-        listen: "127.0.0.1:1053"
-        target: "10.0.0.2:53"
-        udp_idle_timeout: "15s"      # 短生命周期 DNS 会话 15 秒空闲自动回收
-      - mode: "reverse"
-        protocol: "udp"
-        listen: "0.0.0.0:51820"      # 在服务端暴露的 WireGuard 公网端口
-        target: "127.0.0.1:51820"    # NAT 内网本机 WireGuard 服务
-        udp_idle_timeout: "120s"     # 长周期 VPN 会话可设置更长的空闲超时
+      forward:
+        pool_size: 4                 # 支持 0-RTT UDP 流预热激活 (0xA7)
+        rules:
+          - protocol: "UDP"
+            listen: "127.0.0.1:1053"
+            target: "10.0.0.2:53"
+            udp_idle_timeout: "15s"  # 短生命周期 DNS 会话 15 秒空闲自动回收
+      reverse:
+        pool_size: 4
+        rules:
+          - protocol: "UDP"
+            listen: "0.0.0.0:51820"  # 在服务端暴露的 WireGuard 公网端口
+            target: "127.0.0.1:51820"# NAT 内网本机 WireGuard 服务
+            udp_idle_timeout: "120s" # 长周期 VPN 会话可设置更长的空闲超时
 ```
 
 ---

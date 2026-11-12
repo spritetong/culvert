@@ -64,14 +64,15 @@ In production networking, engineers frequently encounter restrictive environment
 - **Connection Migration**: QUIC preserves active connections when clients switch between Wi-Fi and cellular networks.
 - **Rapid Handshakes**: Takes full advantage of 0-RTT and 1-RTT connection establishment, delivering high stability and responsiveness where TCP is restricted or unreliable.
 
-### ⚡ Highlight 2: Unique 0-RTT Connection Pool (Bidirectional Pre-Warmed Streams)
+### ⚡ Highlight 2: Unique 0-RTT Connection Pool (Bidirectional Pre-Warmed Streams & Unified Per-Tunnel Sharing)
 
 Traditional tunneling tools initiate an end-to-end handshake (TCP + TLS + HTTP Upgrade/CONNECT) only after an inbound visitor arrives, adding 1 to 3 RTTs of latency before data can flow. This noticeable lag impairs interactive sessions like SSH, DNS lookups, or bursty short connections like MySQL queries.
 
-`culvert` implements a **bidirectional pre-warmed stream pool** for both TCP and UDP:
+`culvert` implements a **bidirectional pre-warmed stream pool** for both TCP and UDP with **unified per-tunnel sharing**:
 
-- **Forward Mode**: The client automatically maintains a pool of pre-warmed idle streams in the background. When a local TCP connection or UDP client flow arrives, an idle stream is acquired instantly (0-RTT), activated via a lightweight in-band packet (`0xA5` for TCP or `0xA7` for UDP + target address), and data transfer begins immediately while the pool is replenished asynchronously.
-- **Reverse Mode**: The client pre-establishes idle reverse streams queued per `(protocol, listen)` on the server. When an external TCP visitor or UDP peer arrives at the server port, the server pops an idle stream and activates it with a single byte (`0xA5` TCP / `0xA7` UDP) without round-trip signaling.
+- **Unified Per-Tunnel Pools**: All mappings within the same tunnel cluster share a single forward connection pool on the client and a single reverse connection pool on the server, coordinated by a unique Tunnel UUID. A tunnel with $M$ mappings needs only $S$ pooled streams rather than $M \times S$, eliminating connection waste while allowing asymmetric pool sizing (e.g. `mappings.forward.pool_size: 8`, `mappings.reverse.pool_size: 4`).
+- **Forward Mode**: The client automatically maintains a pool of pre-warmed idle streams in the background. When a local TCP connection or UDP client flow arrives, an idle stream is acquired instantly (0-RTT), activated via an in-band packet (`0xA5` for TCP or `0xA7` for UDP + target address), and data transfer begins immediately while the pool is replenished asynchronously.
+- **Reverse Mode**: The client pre-establishes idle reverse streams under the tunnel's shared server pool. When an external TCP visitor or UDP peer arrives at any reverse port, the server pops an idle stream, activates it via symmetrical late-binding target activation (`[magic][len][target_str]`), and receives an instant `0xAC` ACK, achieving 0-RTT readiness across all reverse ports.
 - **Storm protection & emergency failover**: Handshake concurrency is governed by a semaphore to prevent connection storms on reconnect, backed by exponential backoff, server-authoritative stream lifecycles, and emergency control promotion (`0xA6`).
 
 ---
@@ -174,15 +175,15 @@ flowchart LR
 > `ws+unix:///run/culvert.sock?path=/tunnel&chmod=0o660`  
 > (`chmod` accepts octal values like `660`, `0660`, or `0o660`).
 
-### Port Mapping Modes & Protocols
+### Port Mapping Categories & Protocols
 
-| Mode (`mode`) | Supported Protocols (`protocol`) | Listener Bound On | Target Dialed By | Stream Pool (`pool_size`) | Primary Application |
+| Category | Supported Protocols (`protocol`) | Listener Bound On | Target Dialed By | Stream Pool (`pool_size`) | Primary Application |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `forward` (default) | `tcp` (default), `udp` | Client host | Ingress server | Shared pre-warmed pool (`0xA5` / `0xA7`) | Access remote private resources (DBs, internal DNS, APIs) |
-| `reverse` | `tcp` (default), `udp` | Ingress server | Client host | Per-mapping 0-RTT inbound pool (`0xA5` / `0xA7`) | Expose private NAT services to the public (SSH, WireGuard, game servers) |
+| `forward` | `TCP`, `UDP` (mandatory) | Client host | Ingress server | Shared tunnel pre-warmed pool (`0xA5` / `0xA7`) | Access remote private resources (DBs, internal DNS, APIs) |
+| `reverse` | `TCP`, `UDP` (mandatory) | Ingress server | Client host | Shared tunnel 0-RTT inbound pool (`0xA5` / `0xA7`) | Expose private NAT services to the public (SSH, WireGuard, game servers) |
 
 > [!TIP]
-> **Same-Port TCP + UDP Coexistence**: A single tunnel (or different tunnels) may bind both `protocol: "tcp"` and `protocol: "udp"` on the exact same `listen` IP and port, while duplicate binds on the same protocol are caught during `--check`. UDP mappings reject `unix://` addresses in `listen`/`target`, while still tunneling cleanly over `ws+unix://` and `wss+unix://` server endpoints.
+> **Same-Port TCP + UDP Coexistence**: A single tunnel (or different tunnels) may bind both `protocol: "TCP"` and `protocol: "UDP"` on the exact same `listen` IP and port, while duplicate binds on the same protocol are caught during `--check`. UDP mappings reject `unix://` addresses in `listen`/`target`, while still tunneling cleanly over `ws+unix://` and `wss+unix://` server endpoints.
 
 ---
 
@@ -236,9 +237,11 @@ tunnels:
     endpoint: "ws://server.example.com:8080/tunnel"
     token: "PLEASE_REPLACE_WITH_A_SECRET_TOKEN"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:18080"
-        target: "127.0.0.1:8080"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:18080"
+            target: "127.0.0.1:8080"
 ```
 
 Start both processes:
@@ -373,9 +376,9 @@ server:
 ```yaml
 tunnels:
   - tag: "corp-internal"              # Unique identifier for this tunnel
+    # uuid: "550e8400-e29b-41d4-a716-446655440000" # Optional: explicit Tunnel UUID (defaults to deterministic UUID v5 from tag)
     endpoint: "wss://tunnel.example.com/tunnel" # Ingress URL or endpoint object
     token: "SECURE_AUTH_TOKEN"        # Must match server.token
-    pool_size: 8                      # Pre-warmed 0-RTT stream pool size
     http_headers:                     # Optional: custom HTTP headers sent during handshake
       Host: "tunnel.example.com"      # Override Host header (e.g. for reverse proxy vhost routing)
       User-Agent: "culvert/1.0"
@@ -383,29 +386,53 @@ tunnels:
       delay: "3s"                     # Delay between reconnect attempts
       max_retries: 10                 # Maximum retry attempts (omit for infinite)
     mappings:
-      - mode: "forward"               # Forward TCP mode (protocol defaults to "tcp")
-        protocol: "tcp"               # Optional: "tcp" (default) or "udp"
-        listen: "127.0.0.1:13306"
-        target: "10.0.0.5:3306"
-      - mode: "forward"               # Forward UDP mode
-        protocol: "udp"
-        listen: "127.0.0.1:15353"
-        target: "1.1.1.1:53"
-        udp_idle_timeout: "15s"       # Optional: per-mapping override for UDP NAT idle expiry
-      - mode: "reverse"               # Reverse mode
-        listen: "0.0.0.0:2222"        # Bound on the remote server
-        target: "127.0.0.1:22"        # Dialed by the local client
+      # Forward mappings: client listens locally and relays traffic to remote server network
+      forward:
+        pool_size: 8                  # Client-side 0-RTT pre-warmed connection pool size (optional)
+        rules:
+          - protocol: "TCP"           # Mandatory: L4 protocol ("TCP" or "UDP", case-insensitive, no default)
+            listen: "127.0.0.1:13306"
+            target: "10.0.0.5:3306"
+          - protocol: "UDP"
+            listen: "127.0.0.1:15353"
+            target: "1.1.1.1:53"
+            udp_idle_timeout: "15s"   # Optional: per-mapping override for UDP NAT idle expiry
+      # Reverse mappings: server listens on public port and penetrates NAT back to client services
+      reverse:
+        pool_size: 4                  # Server-side 0-RTT pre-warmed connection pool size (optional)
+        rules:
+          - protocol: "TCP"
+            listen: "0.0.0.0:2222"    # Bound on the remote server
+            target: "127.0.0.1:22"    # Dialed by the local client
 ```
 
-Each entry in `mappings` accepts:
+Each tunnel entry accepts:
 
 | Key | Type | Required | Default | Notes |
 | :--- | :--- | :--- | :--- | :--- |
-| `mode` | string | No | `"forward"` | `"forward"` or `"reverse"`. |
-| `protocol` | string | No | `"tcp"` | `"tcp"` or `"udp"`. Same-port TCP+UDP forward mappings are allowed. |
+| `tag` | string | Yes | — | Unique identifier tag for the tunnel. |
+| `uuid` | string | No | UUID v5 from `tag` | Optional explicit Tunnel UUID. Mappings under the same tunnel share connection pools. |
+| `endpoint` | string / object | Yes | — | Server ingress URL (e.g. `wss://...`, `h3://...`, `ws+unix://...`). |
+| `token` | string | No | `null` | Pre-shared authentication token matching `server.token`. |
+| `http_headers` | map | No | — | Custom HTTP headers sent during transport handshake. |
+| `retry` | object | No | — | Automatic reconnect configuration (`delay`, `max_retries`). |
+| `mappings` | object | Yes | — | Object containing `forward` and `reverse` mapping groups, with at least one rule. |
+
+`mappings` contains two categories, `forward` and `reverse`, each supporting:
+
+| Key | Type | Required | Default | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| `pool_size` | integer | No | No pool | Shared 0-RTT pre-warmed connection pool size for this direction (must be $\ge 1$). Alias: `pool`. |
+| `rules` | list | Yes | `[]` | List of mapping rules (aliases: `ports`, `items`). |
+
+Each mapping rule in `rules[]` accepts:
+
+| Key | Type | Required | Default | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| `protocol` | string | **Yes (mandatory)** | **No default** | L4 protocol, must be explicitly set to `"TCP"` or `"UDP"` (case-insensitive). |
 | `listen` | string | Yes | — | `ip:port`, `hostname:port`, `[ipv6]:port`, or `unix://path` (TCP only). |
 | `target` | string | Yes | — | `ip:port`, `hostname:port`, `[ipv6]:port`, or `unix://path` (TCP only). |
-| `udp_idle_timeout` | duration | No | `dialer.udp_idle_timeout` (`30s`) | Overrides `dialer.udp_idle_timeout` on the tunnel client side; server-side UDP flows use `server.udp_idle_timeout`. Must be `> 0`. |
+| `udp_idle_timeout` | duration | No | `dialer.udp_idle_timeout` (`30s`) | UDP only: overrides client-side UDP session idle timeout. Must be `> 0`. |
 
 ---
 
@@ -552,11 +579,13 @@ tunnels:
   - tag: "office-ssh"
     endpoint: "wss://tunnel.example.com/tunnel"
     token: "CHANGE_ME"
-    pool_size: 4                     # Pre-warms 4 idle reverse streams for 0-RTT activation
     mappings:
-      - mode: "reverse"
-        listen: "0.0.0.0:2222"       # Bound on the remote server
-        target: "127.0.0.1:22"       # Local SSH port
+      reverse:
+        pool_size: 4                 # Pre-warms 4 idle reverse streams for 0-RTT activation
+        rules:
+          - protocol: "TCP"
+            listen: "0.0.0.0:2222"   # Bound on the remote server
+            target: "127.0.0.1:22"   # Local SSH port
 ```
 
 Connect via SSH:
@@ -590,44 +619,51 @@ tunnels:
   - tag: "h3-fast-link"
     endpoint: "h3://server.example.com:8443/tunnel"
     token: "CHANGE_ME"
-    pool_size: 4
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:13306"
-        target: "127.0.0.1:3306"
+      forward:
+        pool_size: 4
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:13306"
+            target: "127.0.0.1:3306"
 ```
 
 ---
 
 ### 3. Multi-Mapping Cluster with Shared Connection Pool
 
-A single tunnel endpoint can aggregate multiple forward and reverse mappings across TCP, UDP, and Unix domain sockets:
+A single tunnel endpoint can aggregate multiple forward and reverse mappings across TCP, UDP, and Unix domain sockets, sharing forward and reverse connection pools per Tunnel UUID:
 
 ```yaml
 tunnels:
   - tag: "dev-cluster"
+    # uuid: "550e8400-e29b-41d4-a716-446655440000"  # Optional explicit UUID (defaults to deterministic UUID v5 from tag)
     endpoint: "wss://tunnel.example.com/tunnel"
     token: "CHANGE_ME"
-    pool_size: 8
     mappings:
-      # Forward mapping to remote MySQL database (TCP)
-      - mode: "forward"
-        listen: "127.0.0.1:13306"
-        target: "10.0.0.5:3306"
-      # Forward mapping to remote Docker daemon socket (TCP -> UDS)
-      - mode: "forward"
-        listen: "127.0.0.1:18000"
-        target: "unix:///var/run/docker.sock"
-      # Forward UDP DNS traffic on the loopback resolver port
-      - mode: "forward"
-        protocol: "udp"
-        listen: "127.0.0.1:15353"
-        target: "1.1.1.1:53"
-        udp_idle_timeout: "15s"
-      # Reverse mapping exposing local dev server (TCP)
-      - mode: "reverse"
-        listen: "0.0.0.0:8000"
-        target: "127.0.0.1:3000"
+      forward:
+        pool_size: 8                 # Shared forward pool for all forward mappings
+        rules:
+          # Forward mapping to remote MySQL database (TCP)
+          - protocol: "TCP"
+            listen: "127.0.0.1:13306"
+            target: "10.0.0.5:3306"
+          # Forward mapping to remote Docker daemon socket (TCP -> UDS)
+          - protocol: "TCP"
+            listen: "127.0.0.1:18000"
+            target: "unix:///var/run/docker.sock"
+          # Forward UDP DNS traffic on the loopback resolver port
+          - protocol: "UDP"
+            listen: "127.0.0.1:15353"
+            target: "1.1.1.1:53"
+            udp_idle_timeout: "15s"
+      reverse:
+        pool_size: 4                 # Shared reverse pool for all reverse mappings
+        rules:
+          # Reverse mapping exposing local dev server (TCP)
+          - protocol: "TCP"
+            listen: "0.0.0.0:8000"
+            target: "127.0.0.1:3000"
 ```
 
 ---
@@ -641,18 +677,21 @@ tunnels:
   - tag: "udp-services"
     endpoint: "quic://server.example.com:8443/tunnel"
     token: "CHANGE_ME"
-    pool_size: 4                     # Supports 0-RTT UDP activation (0xA7)
     mappings:
-      - mode: "forward"
-        protocol: "udp"
-        listen: "127.0.0.1:1053"
-        target: "10.0.0.2:53"
-        udp_idle_timeout: "15s"      # Reclaim short-lived DNS NAT flows after 15s
-      - mode: "reverse"
-        protocol: "udp"
-        listen: "0.0.0.0:51820"      # Public WireGuard UDP port on server
-        target: "127.0.0.1:51820"    # Local WireGuard daemon behind NAT
-        udp_idle_timeout: "120s"     # Keep long-lived VPN peer sessions warm longer
+      forward:
+        pool_size: 4                 # Supports 0-RTT UDP activation (0xA7)
+        rules:
+          - protocol: "UDP"
+            listen: "127.0.0.1:1053"
+            target: "10.0.0.2:53"
+            udp_idle_timeout: "15s"  # Reclaim short-lived DNS NAT flows after 15s
+      reverse:
+        pool_size: 4
+        rules:
+          - protocol: "UDP"
+            listen: "0.0.0.0:51820"  # Public WireGuard UDP port on server
+            target: "127.0.0.1:51820"# Local WireGuard daemon behind NAT
+            udp_idle_timeout: "120s" # Keep long-lived VPN peer sessions warm longer
 ```
 
 ---

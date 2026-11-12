@@ -12,7 +12,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
 use culvert::config::model::{
-    AppConfig, EndpointConfig, PortMappingConfig, ServerConfig, TunnelConfig, TunnelMode,
+    AppConfig, EndpointConfig, MappingRuleConfig, ServerConfig, TunnelConfig, TunnelMappingsConfig,
 };
 use culvert::dialer::endpoint::EndpointContext;
 use culvert::server::ServerRunner;
@@ -101,18 +101,14 @@ async fn test_forward_tunnel_ws_e2e() {
     let tunnel_config = TunnelConfig {
         tag: "test-forward".to_string(),
         uuid: None,
-        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://{}/tunnel", server_listen)),
         token: Some(auth_token.to_string()),
-        pool_size: None,
         failover: None,
         multiplex: None,
-        mappings: vec![PortMappingConfig {
-            mode: TunnelMode::Forward,
-            listen: client_listen.clone(),
-            target: format!("127.0.0.1:{}", echo_port),
-            ..Default::default()
-        }],
+        mappings: TunnelMappingsConfig::forward(vec![MappingRuleConfig::tcp(
+            client_listen.clone(),
+            format!("127.0.0.1:{}", echo_port),
+        )]),
         retry: None,
         http_headers: None,
     };
@@ -201,18 +197,14 @@ async fn test_reverse_tunnel_ws_e2e() {
     let tunnel_config = TunnelConfig {
         tag: "test-reverse".to_string(),
         uuid: None,
-        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://{}/tunnel", server_ws_listen)),
         token: Some(auth_token.to_string()),
-        pool_size: None,
         failover: None,
         multiplex: None,
-        mappings: vec![PortMappingConfig {
-            mode: TunnelMode::Reverse,
-            listen: reverse_listen.clone(),
-            target: format!("127.0.0.1:{}", local_echo_port),
-            ..Default::default()
-        }],
+        mappings: TunnelMappingsConfig::reverse(vec![MappingRuleConfig::tcp(
+            reverse_listen.clone(),
+            format!("127.0.0.1:{}", local_echo_port),
+        )]),
         retry: None,
         http_headers: None,
     };
@@ -300,18 +292,17 @@ async fn test_reverse_tunnel_with_inbound_pool_e2e() {
     let tunnel_config = TunnelConfig {
         tag: "test-reverse-pool".to_string(),
         uuid: None,
-        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://{}/tunnel", server_ws_listen)),
         token: Some(auth_token.to_string()),
-        pool_size: Some(4),
         failover: None,
         multiplex: None,
-        mappings: vec![PortMappingConfig {
-            mode: TunnelMode::Reverse,
-            listen: reverse_listen.clone(),
-            target: format!("127.0.0.1:{}", local_echo_port),
-            ..Default::default()
-        }],
+        mappings: TunnelMappingsConfig::reverse_pool(
+            4,
+            vec![MappingRuleConfig::tcp(
+                reverse_listen.clone(),
+                format!("127.0.0.1:{}", local_echo_port),
+            )],
+        ),
         retry: None,
         http_headers: None,
     };
@@ -408,18 +399,17 @@ async fn test_reverse_pool_burst_falls_back_to_signaling_e2e() {
     let tunnel_config = TunnelConfig {
         tag: "test-reverse-burst".to_string(),
         uuid: None,
-        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://{}/tunnel", server_ws_listen)),
         token: Some(auth_token.to_string()),
-        pool_size: Some(2),
         failover: None,
         multiplex: None,
-        mappings: vec![PortMappingConfig {
-            mode: TunnelMode::Reverse,
-            listen: reverse_listen.clone(),
-            target: format!("127.0.0.1:{}", local_echo_port),
-            ..Default::default()
-        }],
+        mappings: TunnelMappingsConfig::reverse_pool(
+            2,
+            vec![MappingRuleConfig::tcp(
+                reverse_listen.clone(),
+                format!("127.0.0.1:{}", local_echo_port),
+            )],
+        ),
         retry: None,
         http_headers: None,
     };
@@ -495,18 +485,14 @@ async fn test_supervisor_multi_tunnel_concurrency_e2e() {
     app_config.tunnels.push(TunnelConfig {
         tag: "fwd-tunnel".to_string(),
         uuid: None,
-        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/ws", server_ws_port)),
         token: Some(auth_token.to_string()),
-        pool_size: None,
         failover: None,
         multiplex: None,
-        mappings: vec![PortMappingConfig {
-            mode: TunnelMode::Forward,
-            listen: format!("127.0.0.1:{}", fwd_listen_port),
-            target: format!("127.0.0.1:{}", echo_fwd_port),
-            ..Default::default()
-        }],
+        mappings: TunnelMappingsConfig::forward(vec![MappingRuleConfig::tcp(
+            format!("127.0.0.1:{}", fwd_listen_port),
+            format!("127.0.0.1:{}", echo_fwd_port),
+        )]),
         retry: None,
         http_headers: None,
     });
@@ -514,18 +500,14 @@ async fn test_supervisor_multi_tunnel_concurrency_e2e() {
     app_config.tunnels.push(TunnelConfig {
         tag: "rev-tunnel".to_string(),
         uuid: None,
-        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/ws", server_ws_port)),
         token: Some(auth_token.to_string()),
-        pool_size: None,
         failover: None,
         multiplex: None,
-        mappings: vec![PortMappingConfig {
-            mode: TunnelMode::Reverse,
-            listen: format!("127.0.0.1:{}", rev_listen_port),
-            target: format!("127.0.0.1:{}", echo_rev_port),
-            ..Default::default()
-        }],
+        mappings: TunnelMappingsConfig::reverse(vec![MappingRuleConfig::tcp(
+            format!("127.0.0.1:{}", rev_listen_port),
+            format!("127.0.0.1:{}", echo_rev_port),
+        )]),
         retry: None,
         http_headers: None,
     });

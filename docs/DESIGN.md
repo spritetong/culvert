@@ -188,11 +188,9 @@ structs are too. `EndpointConfig` and `DnsResolverConfig` implement custom
 | `dialer` | `Option<DialerConfig>` | `connect_timeout`, `tcp_nodelay`, `bind_interface`, `heartbeat_interval`, `idle_timeout`, `udp_idle_timeout`. |
 | `tls` | `Option<TlsConfig>` | `server_name`, `insecure`, `alpn`, `ca_certificate`, `client_certificate`, `client_key`, `certificate`, `key`, `min_version`, `max_version`. |
 | `server` | `Option<ServerConfig>` | `listen`, `token`, `default_target`, `certificate`, `key`, `tls`, `heartbeat_interval`, `idle_timeout`, `udp_idle_timeout`. |
-| `tunnels` | `Vec<TunnelConfig>` (defaulted) | `tag`, `endpoint`, `token`, `pool_size`, `http_headers`, `failover`, `multiplex`, `retry`, `mappings`. |
+| `tunnels` | `Vec<TunnelConfig>` (defaulted) | `tag`, `endpoint`, `token`, `uuid`, `http_headers`, `failover`, `multiplex`, `retry`, `mappings`. |
 
-`TunnelConfig` requires at least one `PortMappingConfig { mode, protocol, listen,
-target, udp_idle_timeout }`; `mode` defaults to `forward` and `protocol` defaults
-to `tcp`. `TunnelRetryConfig { delay, max_retries }` uses a separate duration
+`TunnelConfig` requires a `mappings` object (`TunnelMappingsConfig`) containing `forward` and/or `reverse` groups (`MappingGroupConfig`), each with an optional `pool_size` and a list of `MappingRuleConfig { protocol, listen, target, udp_idle_timeout }`. `protocol` is mandatory and must be explicitly set to `"TCP"` or `"UDP"` (case-insensitive, no default value). `TunnelRetryConfig { delay, max_retries }` uses a separate duration
 deserializer that accepts seconds, `Ns`, or `Nms`.
 
 Durations (`dialer`, `server`, `retry`) accept a raw integer (seconds) or a

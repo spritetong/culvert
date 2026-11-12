@@ -76,13 +76,13 @@ behavior is configurable, the configuration key is given.
 | :--- | :--- | :--- |
 | UC-1 | Publish a local service on a remote host (reverse mapping) | Client behind NAT connects to the ingress endpoint, sends `RegisterReverse`, the server binds the requested TCP/UDS or UDP address, and each inbound connection or UDP NAT flow is relayed back to the client's local target. |
 | UC-2 | Reach a private service from a local port (forward mapping) | Client binds `mappings.listen` locally (TCP or UDP); each local connection or UDP client flow opens a tunnel stream to the ingress endpoint; the server opens the corresponding TCP/UDS connection or `ConnectedUdpSocket` to `mappings.target` and relays in both directions. |
-| UC-3 | Carry several ports over one endpoint (cluster) | One `tunnels` entry declares several `mappings` (TCP and/or UDP, even sharing the same port). Forward mappings share the outbound pool, and reverse mappings share a unified inbound pool keyed by Tunnel UUID when `pool_size` or `pool.reverse` is set; in-band 0-RTT target activation (`[magic][len][target]` symmetrically with forward mode with `0xAC` ACK) is used when idle streams exist, eliminating per-mapping connection proliferation and falling back to signaling when the pool is empty or activation fails. |
+| UC-3 | Carry several ports over one endpoint (cluster) | One `tunnels` entry declares `mappings` containing `forward` and/or `reverse` groups (TCP and/or UDP, even sharing the same port). Forward mappings share the outbound pool, and reverse mappings share a unified inbound pool keyed by Tunnel UUID when `pool_size` is set; in-band 0-RTT target activation (`[magic][len][target]` symmetrically with forward mode with `0xAC` ACK) is used when idle streams exist, eliminating per-mapping connection proliferation and falling back to signaling when the pool is empty or activation fails. |
 | UC-4 | Reach a Unix domain socket through a tunnel | TCP `mappings.target` or `mappings.listen` uses `unix://path`; the ingress side or client side binds/connects the socket directly. |
 | UC-5 | Deploy behind a reverse proxy | `server.listen` uses `ws+unix://...` or `ws://127.0.0.1:...`; the proxy handles public TLS and forwards the configured HTTP path to culvert (capable of carrying both TCP and UDP mappings). |
 | UC-6 | Deploy without a reverse proxy | `server.listen` uses a TLS scheme (`wss`, `h3`, `https`, `quic`, `wss+unix`). culvert terminates TLS using the configured certificate and key, or an ephemeral self-signed certificate when neither is provided. |
 | UC-7 | Apply per-endpoint network policy | `tunnels[].endpoint` can be an object with its own `dns`, `dialer`, and `tls` blocks, overriding the global defaults for that endpoint only. |
 | UC-8 | Validate a deployment file before starting | `culvert --check -c <file>` parses and validates the configuration without starting listeners or tunnels. |
-| UC-9 | Forward or expose UDP services | Setting `protocol: "udp"` demultiplexes inbound UDP datagrams per peer `SocketAddr` into `IoChannel::Datagram` flows, frames packets with `[u16 len \| payload]` over pooled or on-demand relay streams, and expires idle NAT flows after `udp_idle_timeout`. |
+| UC-9 | Forward or expose UDP services | Setting `protocol: "UDP"` demultiplexes inbound UDP datagrams per peer `SocketAddr` into `IoChannel::Datagram` flows, frames packets with `[u16 len \| payload]` over pooled or on-demand relay streams, and expires idle NAT flows after `udp_idle_timeout`. |
 
 ---
 
@@ -175,14 +175,7 @@ behavior is configurable, the configuration key is given.
   merged field-by-field: endpoint value, then global value, then built-in
   default.
 - **FR-3.4** A `tls` block on a non-TLS endpoint scheme is rejected.
-- **FR-3.5** Every tunnel requires a unique non-empty `tag` and a non-empty
-  `mappings` list. Each mapping accepts an optional `protocol` (`tcp` by
-  default, or `udp`) and an optional `udp_idle_timeout`. `listen` and `target`
-  must parse as `ip:port`, `hostname:port`, `[ipv6]:port`, or (for TCP mappings
-  only) `unix://path`; the port must be present and non-zero for non-UDS forms.
-  UDP mappings must not specify `unix://` domain socket addresses for `listen`
-  or `target` (though UDP mappings may tunnel over `ws+unix://` / `wss+unix://`
-  transport endpoints).
+- **FR-3.5** Every tunnel requires a unique non-empty `tag` and a `mappings` object containing `forward` and/or `reverse` groups with at least one mapping rule. Each mapping rule requires a mandatory `protocol` (`"TCP"` or `"UDP"`, case-insensitive, with no default allowed) and an optional `udp_idle_timeout`. `listen` and `target` must parse as `ip:port`, `hostname:port`, `[ipv6]:port`, or (for TCP mappings only) `unix://path`; the port must be present and non-zero for non-UDS forms. UDP mappings must not specify `unix://` domain socket addresses for `listen` or `target` (though UDP mappings may tunnel over `ws+unix://` / `wss+unix://` transport endpoints).
 - **FR-3.6** Duplicate `(protocol, listen)` pairs across forward mappings are
   rejected; a TCP mapping and a UDP mapping may bind the same local port.
   Reverse listen addresses are not subject to this duplicate check.
@@ -206,13 +199,12 @@ behavior is configurable, the configuration key is given.
   (`TcpFrontend` for `tcp`, `UdpFrontend` for `udp`) and relays each accepted
   connection or per-peer UDP NAT flow to `mappings.target` through the ingress
   endpoint.
-- **FR-4.2** When `pool_size` (or `pool.forward`) is set to a positive value, all forward mappings
+- **FR-4.2** When `mappings.forward.pool_size` is set to a positive value, all forward mappings
   of that tunnel share one `ReplenishingStreamPool`. Without pool configuration, each
   accepted connection or UDP flow opens a new transport stream through a
   connector shared by that mapping, tagging the request with `protocol`
   (`x-tunnel-proto: tcp | udp` on HTTP/WS, or `StreamMetadata.protocol` on raw QUIC).
-  Tunnels support asymmetric pool sizing via `pool: { forward: Option<usize>, reverse: Option<usize> }`,
-  falling back to scalar `pool_size` when direction-specific values are not provided.
+  Tunnels configure direction-specific pools under `mappings.forward.pool_size` and `mappings.reverse.pool_size`.
 - **FR-4.3** Pooled forward streams are pre-warmed without a fixed backend
   target or L4 protocol. The server keeps them idle and does not dial any
   target service or allocate a `ConnectedUdpSocket` until the client sends an
@@ -251,7 +243,7 @@ behavior is configurable, the configuration key is given.
 - **FR-5.2** Control messages are encoded with MessagePack
   (`to_vec_named`) over a length-delimited frame. Variants are
   `RegisterReverse`, `RegisterAck`, `NewConnection`, `Ping`, `Pong`.
-- **FR-5.3** When `pool_size` or `pool.reverse` is configured on a tunnel with reverse mappings,
+- **FR-5.3** When `mappings.reverse.pool_size` is configured on a tunnel with reverse mappings,
   the client pre-warms a single shared pool of idle reverse streams for the entire tunnel
   (`mode = reverse`, `pool_idle = true`, `tunnel_id = tunnel_uuid`).
   On the server side, `SessionManager` maintains a unified `ReverseInboundPool` per Tunnel UUID (`tunnel_id`).
@@ -487,26 +479,29 @@ tunnels:
   - tag: "corp-cluster"
     endpoint: "ws://127.0.0.1:8080/tunnel"
     token: "SECURE_PRESHARED_TOKEN"
-    pool_size: 8
     retry:
       delay: "3s"
       max_retries: 10
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:13306"
-        target: "10.0.0.5:3306"
-      - mode: "forward"
-        protocol: "udp"
-        listen: "127.0.0.1:15353"
-        target: "1.1.1.1:53"
-        udp_idle_timeout: "15s"
-      - mode: "reverse"
-        listen: "0.0.0.0:2222"
-        target: "127.0.0.1:22"
-      - mode: "reverse"
-        protocol: "udp"
-        listen: "0.0.0.0:51820"
-        target: "127.0.0.1:51820"
+      forward:
+        pool_size: 8
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:13306"
+            target: "10.0.0.5:3306"
+          - protocol: "UDP"
+            listen: "127.0.0.1:15353"
+            target: "1.1.1.1:53"
+            udp_idle_timeout: "15s"
+      reverse:
+        pool_size: 4
+        rules:
+          - protocol: "TCP"
+            listen: "0.0.0.0:2222"
+            target: "127.0.0.1:22"
+          - protocol: "UDP"
+            listen: "0.0.0.0:51820"
+            target: "127.0.0.1:51820"
 ```
 
 ---

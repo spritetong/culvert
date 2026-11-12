@@ -12,6 +12,7 @@ use culvert::config::loader::ConfigLoader;
 use culvert::config::model::{DnsConfig, DnsStrategy, TunnelMode};
 use culvert::dialer::dns::{CachedDnsResolver, DnsResolver};
 use culvert::dialer::endpoint::EndpointContext;
+use culvert::io::addr::L4Protocol;
 
 #[test]
 fn test_complex_yaml_config_parsing() {
@@ -56,11 +57,13 @@ server:
 tunnels:
   - tag: "ssh-reverse"
     mappings:
-      - mode: "reverse"
-        listen: "0.0.0.0:2222"
-        target: "127.0.0.1:22"
+      reverse:
+        pool_size: 4
+        rules:
+          - protocol: "TCP"
+            listen: "0.0.0.0:2222"
+            target: "127.0.0.1:22"
     token: "tunnel_secret_token_1"
-    pool_size: 4
     endpoint:
       url: "wss://vps.example.com:443/ws"
       dns:
@@ -73,9 +76,11 @@ tunnels:
 
   - tag: "web-forward"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:8000"
-        target: "internal.corp:80"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:8000"
+            target: "internal.corp:80"
     token: "tunnel_secret_token_2"
     endpoint: "ws://10.0.0.1:8080/tunnel"
 "#,
@@ -132,11 +137,13 @@ tunnels:
 
     // Tunnel 1: detailed endpoint overriding global dns/tls/dialer
     let t1 = &app_config.tunnels[0];
+    let m1 = t1.canonical_mappings().unwrap();
     assert_eq!(t1.tag, "ssh-reverse");
-    assert_eq!(t1.mappings[0].mode, TunnelMode::Reverse);
-    assert_eq!(t1.mappings[0].listen, "0.0.0.0:2222");
-    assert_eq!(t1.mappings[0].target, "127.0.0.1:22");
-    assert_eq!(t1.pool_size, Some(4));
+    assert_eq!(m1[0].mode, TunnelMode::Reverse);
+    assert_eq!(m1[0].protocol, L4Protocol::Tcp);
+    assert_eq!(m1[0].listen, "0.0.0.0:2222");
+    assert_eq!(m1[0].target, "127.0.0.1:22");
+    assert_eq!(t1.reverse_pool_size(), Some(4));
     assert_eq!(t1.endpoint.url(), "wss://vps.example.com:443/ws");
 
     let ep_ctx1 = EndpointContext::build(&t1.endpoint, &app_config)
@@ -155,10 +162,12 @@ tunnels:
 
     // Tunnel 2: simple endpoint inheriting global defaults
     let t2 = &app_config.tunnels[1];
+    let m2 = t2.canonical_mappings().unwrap();
     assert_eq!(t2.tag, "web-forward");
-    assert_eq!(t2.mappings[0].mode, TunnelMode::Forward);
-    assert_eq!(t2.mappings[0].listen, "127.0.0.1:8000");
-    assert_eq!(t2.mappings[0].target, "internal.corp:80");
+    assert_eq!(m2[0].mode, TunnelMode::Forward);
+    assert_eq!(m2[0].protocol, L4Protocol::Tcp);
+    assert_eq!(m2[0].listen, "127.0.0.1:8000");
+    assert_eq!(m2[0].target, "internal.corp:80");
     assert_eq!(t2.endpoint.url(), "ws://10.0.0.1:8080/tunnel");
 
     let ep_ctx2 = EndpointContext::build(&t2.endpoint, &app_config)
@@ -372,9 +381,11 @@ tunnels:
       delay: "1s"
       max_retries: 5
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:{}"
-        target: "127.0.0.1:{}"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:{}"
+            target: "127.0.0.1:{}"
 "#,
         port_listen, port_listen, port_target
     );
@@ -477,15 +488,19 @@ tunnels:
   - tag: "ws-tunnel"
     endpoint: "ws://127.0.0.1:8080/plain"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:10001"
-        target: "127.0.0.1:80"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:10001"
+            target: "127.0.0.1:80"
   - tag: "ws-unix-tunnel"
     endpoint: "ws+unix:///run/app.sock?path=/api/ws"
     mappings:
-      - mode: "forward"
-        listen: "unix:///run/local_fwd.sock"
-        target: "unix:///run/local_backend.sock"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "unix:///run/local_fwd.sock"
+            target: "unix:///run/local_backend.sock"
 "#;
     let config = ConfigLoader::from_yaml_str(yaml).expect("Failed to parse valid config");
     let server = config.server.expect("Server config should be present");
@@ -570,9 +585,11 @@ tunnels:
   - tag: "uds-test"
     endpoint: "uds:///run/a.sock"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:8080"
-        target: "127.0.0.1:80"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:8080"
+            target: "127.0.0.1:80"
 "#;
     assert!(ConfigLoader::from_yaml_str(client_yaml).is_err());
 }
@@ -598,9 +615,11 @@ tunnels:
         heartbeat_interval: "20s"
         idle_timeout: "60s"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:18080"
-        target: "127.0.0.1:8080"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:18080"
+            target: "127.0.0.1:8080"
 "#;
 
     let app_cfg = ConfigLoader::from_yaml_str(yaml)
@@ -696,9 +715,11 @@ tunnels:
       dialer:
         idle_timeout: "30s"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:18080"
-        target: "127.0.0.1:8080"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:18080"
+            target: "127.0.0.1:8080"
 "#;
     let err = ConfigLoader::from_yaml_str(merged).unwrap_err();
     let msg = err.to_string();
@@ -730,9 +751,11 @@ tunnels:
       User-Agent: "culvert-agent/1.0"
       X-Custom-Auth: "custom-token-xyz"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:18080"
-        target: "127.0.0.1:8080"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:18080"
+            target: "127.0.0.1:8080"
 "#;
     let config =
         ConfigLoader::from_yaml_str(yaml).expect("Failed to parse config with http_headers");
@@ -787,9 +810,11 @@ tunnels:
     http_headers:
       "": "some-value"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:18080"
-        target: "127.0.0.1:8080"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:18080"
+            target: "127.0.0.1:8080"
 "#;
     let err = ConfigLoader::from_yaml_str(yaml_empty_name).unwrap_err();
     assert!(
@@ -808,9 +833,11 @@ tunnels:
     http_headers:
       "Invalid Header Name": "some-value"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:18080"
-        target: "127.0.0.1:8080"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:18080"
+            target: "127.0.0.1:8080"
 "#;
     let err = ConfigLoader::from_yaml_str(yaml_invalid_name).unwrap_err();
     assert!(
@@ -828,9 +855,11 @@ tunnels:
     http_headers:
       \"X-Injected\": \"line1\\r\\nInjected-Header: evil\"
     mappings:
-      - mode: \"forward\"
-        listen: \"127.0.0.1:18080\"
-        target: \"127.0.0.1:8080\"
+      forward:
+        rules:
+          - protocol: \"TCP\"
+            listen: \"127.0.0.1:18080\"
+            target: \"127.0.0.1:8080\"
 ";
     let err = ConfigLoader::from_yaml_str(yaml_crlf_value).unwrap_err();
     assert!(

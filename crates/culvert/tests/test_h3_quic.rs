@@ -11,7 +11,9 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use culvert::backend::accept_one;
-use culvert::config::model::{AppConfig, EndpointConfig, PortMappingConfig, TlsConfig, TunnelMode};
+use culvert::config::model::{
+    AppConfig, EndpointConfig, MappingRuleConfig, TlsConfig, TunnelMappingsConfig, TunnelMode,
+};
 use culvert::core::error::TunnelError;
 use culvert::core::stream::TunnelStream;
 use culvert::dialer::endpoint::EndpointContext;
@@ -421,19 +423,18 @@ async fn test_h3_tunnel_pool_prewarm_and_activation_end_to_end() {
         }),
         tunnels: vec![culvert::config::model::TunnelConfig {
             tag: "bench-h3-pool".to_string(),
-        uuid: None,
-        pool: None,
+            uuid: None,
             token: None,
             endpoint: EndpointConfig::Simple(format!("h3://{}/tunnel", server_h3_listen)),
-            pool_size: Some(4), // Pre-warm 4 connections in pool!
             failover: None,
             multiplex: None,
-            mappings: vec![PortMappingConfig {
-                mode: TunnelMode::Forward,
-                listen: client_listen.clone(),
-                target: format!("127.0.0.1:{}", echo_port),
-                ..Default::default()
-            }],
+            mappings: TunnelMappingsConfig::forward_pool(
+                4,
+                vec![MappingRuleConfig::tcp(
+                    client_listen.clone(),
+                    format!("127.0.0.1:{}", echo_port),
+                )],
+            ),
             retry: None,
             http_headers: None,
         }],
@@ -524,19 +525,18 @@ async fn test_quic_raw_tunnel_pool_prewarm_and_activation_end_to_end() {
         }),
         tunnels: vec![culvert::config::model::TunnelConfig {
             tag: "bench-quic-pool".to_string(),
-        uuid: None,
-        pool: None,
+            uuid: None,
             token: None,
             endpoint: EndpointConfig::Simple(format!("quic://{}/raw", server_quic_listen)),
-            pool_size: Some(4),
             failover: None,
             multiplex: None,
-            mappings: vec![PortMappingConfig {
-                mode: TunnelMode::Forward,
-                listen: client_listen.clone(),
-                target: format!("127.0.0.1:{}", echo_port),
-                ..Default::default()
-            }],
+            mappings: TunnelMappingsConfig::forward_pool(
+                4,
+                vec![MappingRuleConfig::tcp(
+                    client_listen.clone(),
+                    format!("127.0.0.1:{}", echo_port),
+                )],
+            ),
             retry: None,
             http_headers: None,
         }],
@@ -655,19 +655,18 @@ async fn test_quic_raw_forward_stress_throughput() {
         }),
         tunnels: vec![culvert::config::model::TunnelConfig {
             tag: "bench-quic-stress".to_string(),
-        uuid: None,
-        pool: None,
+            uuid: None,
             token: None,
             endpoint: EndpointConfig::Simple(format!("quic://{}/raw", server_quic_listen)),
-            pool_size: Some(4),
             failover: None,
             multiplex: None,
-            mappings: vec![PortMappingConfig {
-                mode: TunnelMode::Forward,
-                listen: client_listen.clone(),
-                target: format!("127.0.0.1:{}", sink_port),
-                ..Default::default()
-            }],
+            mappings: TunnelMappingsConfig::forward_pool(
+                4,
+                vec![MappingRuleConfig::tcp(
+                    client_listen.clone(),
+                    format!("127.0.0.1:{}", sink_port),
+                )],
+            ),
             retry: None,
             http_headers: None,
         }],
@@ -758,19 +757,18 @@ async fn test_h3_concurrent_forward_stress() {
         }),
         tunnels: vec![culvert::config::model::TunnelConfig {
             tag: "bench-h3-conc".to_string(),
-        uuid: None,
-        pool: None,
+            uuid: None,
             token: None,
             endpoint: EndpointConfig::Simple(format!("h3://{}/tunnel", server_h3_listen)),
-            pool_size: Some(4),
             failover: None,
             multiplex: None,
-            mappings: vec![PortMappingConfig {
-                mode: TunnelMode::Forward,
-                listen: client_listen.clone(),
-                target: format!("127.0.0.1:{}", echo_port),
-                ..Default::default()
-            }],
+            mappings: TunnelMappingsConfig::forward_pool(
+                4,
+                vec![MappingRuleConfig::tcp(
+                    client_listen.clone(),
+                    format!("127.0.0.1:{}", echo_port),
+                )],
+            ),
             retry: None,
             http_headers: None,
         }],

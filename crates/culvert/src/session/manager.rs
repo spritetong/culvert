@@ -415,14 +415,14 @@ impl SessionManager {
         tunnel_id: &str,
         pool: &Arc<ReverseInboundPool>,
     ) {
-        if let Some(slot) = self.tunnel_pools.get(tunnel_id) {
-            if Arc::ptr_eq(&slot.pool, pool) {
-                let prev = slot.listener_count.fetch_sub(1, Ordering::Relaxed);
-                if prev <= 1 {
-                    drop(slot);
-                    if let Some((_, removed)) = self.tunnel_pools.remove(tunnel_id) {
-                        removed.pool.drain();
-                    }
+        if let Some(slot) = self.tunnel_pools.get(tunnel_id)
+            && Arc::ptr_eq(&slot.pool, pool)
+        {
+            let prev = slot.listener_count.fetch_sub(1, Ordering::Relaxed);
+            if prev <= 1 {
+                drop(slot);
+                if let Some((_, removed)) = self.tunnel_pools.remove(tunnel_id) {
+                    removed.pool.drain();
                 }
             }
         }
@@ -503,10 +503,10 @@ impl SessionManager {
         target_opt: Option<&TargetAddr>,
         stream: Box<dyn TunnelStream>,
     ) -> bool {
-        if let Some(tid) = tunnel_id {
-            if let Some(slot) = self.tunnel_pools.get(tid) {
-                return slot.pool.push(stream);
-            }
+        if let Some(tid) = tunnel_id
+            && let Some(slot) = self.tunnel_pools.get(tid)
+        {
+            return slot.pool.push(stream);
         }
         self.push_idle_stream(protocol, target_opt, stream)
     }

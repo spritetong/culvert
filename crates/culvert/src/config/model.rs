@@ -597,13 +597,11 @@ pub enum TunnelMode {
     Reverse,
 }
 
-/// Individual bidirectional port mapping definition.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+/// An individual port mapping rule within a forward or reverse group.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct PortMappingConfig {
-    #[serde(default = "default_mapping_mode")]
-    pub mode: TunnelMode,
-    #[serde(default)]
+pub struct MappingRuleConfig {
+    /// Transport-layer protocol (TCP or UDP, case-insensitive). Required; cannot be omitted.
     pub protocol: L4Protocol,
     pub listen: String,
     pub target: String,
@@ -611,8 +609,194 @@ pub struct PortMappingConfig {
     pub udp_idle_timeout: Option<Duration>,
 }
 
-fn default_mapping_mode() -> TunnelMode {
-    TunnelMode::Forward
+impl MappingRuleConfig {
+    pub fn tcp(listen: impl Into<String>, target: impl Into<String>) -> Self {
+        Self {
+            protocol: L4Protocol::Tcp,
+            listen: listen.into(),
+            target: target.into(),
+            udp_idle_timeout: None,
+        }
+    }
+
+    pub fn udp(listen: impl Into<String>, target: impl Into<String>) -> Self {
+        Self {
+            protocol: L4Protocol::Udp,
+            listen: listen.into(),
+            target: target.into(),
+            udp_idle_timeout: None,
+        }
+    }
+
+    pub fn udp_with_timeout(
+        listen: impl Into<String>,
+        target: impl Into<String>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            protocol: L4Protocol::Udp,
+            listen: listen.into(),
+            target: target.into(),
+            udp_idle_timeout: Some(timeout),
+        }
+    }
+
+    pub fn new(protocol: L4Protocol, listen: impl Into<String>, target: impl Into<String>) -> Self {
+        Self {
+            protocol,
+            listen: listen.into(),
+            target: target.into(),
+            udp_idle_timeout: None,
+        }
+    }
+}
+
+/// A group of mapping rules for a specific direction (forward or reverse), with an optional connection pool size.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MappingGroupConfig {
+    /// 0-RTT pre-warmed connection pool capacity for this direction.
+    #[serde(default, alias = "pool")]
+    pub pool_size: Option<usize>,
+
+    /// Port mapping rules in this group.
+    #[serde(default, alias = "ports", alias = "items")]
+    pub rules: Vec<MappingRuleConfig>,
+}
+
+impl MappingGroupConfig {
+    pub fn new(rules: Vec<MappingRuleConfig>) -> Self {
+        Self {
+            pool_size: None,
+            rules,
+        }
+    }
+
+    pub fn with_pool(pool_size: usize, rules: Vec<MappingRuleConfig>) -> Self {
+        Self {
+            pool_size: Some(pool_size),
+            rules,
+        }
+    }
+}
+
+/// Categorized port mappings partitioned into `forward` and `reverse` sections.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TunnelMappingsConfig {
+    #[serde(default)]
+    pub forward: Option<MappingGroupConfig>,
+
+    #[serde(default)]
+    pub reverse: Option<MappingGroupConfig>,
+}
+
+impl TunnelMappingsConfig {
+    pub fn forward(rules: Vec<MappingRuleConfig>) -> Self {
+        Self {
+            forward: Some(MappingGroupConfig::new(rules)),
+            reverse: None,
+        }
+    }
+
+    pub fn forward_pool(pool_size: usize, rules: Vec<MappingRuleConfig>) -> Self {
+        Self {
+            forward: Some(MappingGroupConfig::with_pool(pool_size, rules)),
+            reverse: None,
+        }
+    }
+
+    pub fn reverse(rules: Vec<MappingRuleConfig>) -> Self {
+        Self {
+            forward: None,
+            reverse: Some(MappingGroupConfig::new(rules)),
+        }
+    }
+
+    pub fn reverse_pool(pool_size: usize, rules: Vec<MappingRuleConfig>) -> Self {
+        Self {
+            forward: None,
+            reverse: Some(MappingGroupConfig::with_pool(pool_size, rules)),
+        }
+    }
+
+    pub fn forward_and_reverse(
+        forward: MappingGroupConfig,
+        reverse: MappingGroupConfig,
+    ) -> Self {
+        Self {
+            forward: Some(forward),
+            reverse: Some(reverse),
+        }
+    }
+
+    pub fn from_port_mappings(
+        mappings: Vec<PortMappingConfig>,
+        forward_pool: Option<usize>,
+        reverse_pool: Option<usize>,
+    ) -> Self {
+        let mut fwd_rules = Vec::new();
+        let mut rev_rules = Vec::new();
+        for m in mappings {
+            let rule = MappingRuleConfig {
+                protocol: m.protocol,
+                listen: m.listen,
+                target: m.target,
+                udp_idle_timeout: m.udp_idle_timeout,
+            };
+            match m.mode {
+                TunnelMode::Forward => fwd_rules.push(rule),
+                TunnelMode::Reverse => rev_rules.push(rule),
+            }
+        }
+        Self {
+            forward: if !fwd_rules.is_empty() || forward_pool.is_some() {
+                Some(MappingGroupConfig {
+                    pool_size: forward_pool,
+                    rules: fwd_rules,
+                })
+            } else {
+                None
+            },
+            reverse: if !rev_rules.is_empty() || reverse_pool.is_some() {
+                Some(MappingGroupConfig {
+                    pool_size: reverse_pool,
+                    rules: rev_rules,
+                })
+            } else {
+                None
+            },
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        let f_empty = self.forward.as_ref().is_none_or(|g| g.rules.is_empty());
+        let r_empty = self.reverse.as_ref().is_none_or(|g| g.rules.is_empty());
+        f_empty && r_empty
+    }
+
+    pub fn rule_count(&self) -> usize {
+        let f = self.forward.as_ref().map_or(0, |g| g.rules.len());
+        let r = self.reverse.as_ref().map_or(0, |g| g.rules.len());
+        f + r
+    }
+}
+
+impl From<Vec<PortMappingConfig>> for TunnelMappingsConfig {
+    fn from(mappings: Vec<PortMappingConfig>) -> Self {
+        Self::from_port_mappings(mappings, None, None)
+    }
+}
+
+/// Canonical internal representation of a port mapping bound to a specific tunnel mode.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PortMappingConfig {
+    pub mode: TunnelMode,
+    pub protocol: L4Protocol,
+    pub listen: String,
+    pub target: String,
+    #[serde(with = "humantime_serde_opt", default)]
+    pub udp_idle_timeout: Option<Duration>,
 }
 
 /// Tunnel retry configuration.
@@ -673,19 +857,6 @@ where
     }
 }
 
-/// Asymmetric connection pool configuration for a tunnel instance.
-#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct TunnelPoolConfig {
-    /// Outbound stream pool capacity for forward mappings.
-    #[serde(default)]
-    pub forward: Option<usize>,
-
-    /// Inbound stream pool capacity for reverse mappings.
-    #[serde(default)]
-    pub reverse: Option<usize>,
-}
-
 /// Configuration for an individual tunnel instance.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -697,11 +868,6 @@ pub struct TunnelConfig {
     pub uuid: Option<String>,
     pub endpoint: EndpointConfig,
     pub token: Option<String>,
-    #[serde(default)]
-    pub pool_size: Option<usize>,
-    /// Asymmetric pool configuration separating forward and reverse pool capacities.
-    #[serde(default)]
-    pub pool: Option<TunnelPoolConfig>,
     pub failover: Option<FailoverConfig>,
     pub multiplex: Option<MultiplexConfig>,
     pub retry: Option<TunnelRetryConfig>,
@@ -710,9 +876,8 @@ pub struct TunnelConfig {
     #[serde(default)]
     pub http_headers: Option<std::collections::HashMap<String, String>>,
 
-    /// Multiple bidirectional port mappings sharing this endpoint and connection pool.
-    #[serde(default)]
-    pub mappings: Vec<PortMappingConfig>,
+    /// Directional port mappings categorized into forward and reverse groups.
+    pub mappings: TunnelMappingsConfig,
 }
 
 impl TunnelConfig {
@@ -720,24 +885,50 @@ impl TunnelConfig {
     pub fn canonical_mappings(
         &self,
     ) -> Result<Vec<PortMappingConfig>, crate::core::error::TunnelError> {
-        if !self.mappings.is_empty() {
-            Ok(self.mappings.clone())
-        } else {
+        let mut list = Vec::new();
+
+        if let Some(ref fwd) = self.mappings.forward {
+            for r in &fwd.rules {
+                list.push(PortMappingConfig {
+                    mode: TunnelMode::Forward,
+                    protocol: r.protocol,
+                    listen: r.listen.clone(),
+                    target: r.target.clone(),
+                    udp_idle_timeout: r.udp_idle_timeout,
+                });
+            }
+        }
+
+        if let Some(ref rev) = self.mappings.reverse {
+            for r in &rev.rules {
+                list.push(PortMappingConfig {
+                    mode: TunnelMode::Reverse,
+                    protocol: r.protocol,
+                    listen: r.listen.clone(),
+                    target: r.target.clone(),
+                    udp_idle_timeout: r.udp_idle_timeout,
+                });
+            }
+        }
+
+        if list.is_empty() {
             Err(crate::core::error::TunnelError::Config(format!(
-                "Tunnel '{}' has no port mappings configured. Please provide 'mappings: [...]'.",
+                "Tunnel '{}' has no port mappings configured. Please provide 'mappings.forward' or 'mappings.reverse' with at least one rule.",
                 self.tag
             )))
+        } else {
+            Ok(list)
         }
     }
 
-    /// Effective forward pool size: prefers `pool.forward`, falls back to scalar `pool_size`.
+    /// Effective forward pool size from `mappings.forward.pool_size`.
     pub fn forward_pool_size(&self) -> Option<usize> {
-        self.pool.as_ref().and_then(|p| p.forward).or(self.pool_size)
+        self.mappings.forward.as_ref().and_then(|g| g.pool_size)
     }
 
-    /// Effective reverse pool size: prefers `pool.reverse`, falls back to scalar `pool_size`.
+    /// Effective reverse pool size from `mappings.reverse.pool_size`.
     pub fn reverse_pool_size(&self) -> Option<usize> {
-        self.pool.as_ref().and_then(|p| p.reverse).or(self.pool_size)
+        self.mappings.reverse.as_ref().and_then(|g| g.pool_size)
     }
 
     /// Effective tunnel UUID: prefers configured `uuid`, falls back to deterministic UUID v5 from `tag`.

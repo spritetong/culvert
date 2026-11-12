@@ -216,7 +216,7 @@ pub async fn run_forward_tunnel(
     let protocol = mapping.protocol;
     let udp_idle_timeout = mapping.udp_idle_timeout;
 
-    let pool = if let Some(size) = config.pool_size.filter(|&s| s > 0) {
+    let pool = if let Some(size) = config.forward_pool_size().filter(|&s| s > 0) {
         let connector: Arc<dyn TransportConnector> =
             Arc::from(transport_registry.create_connector(
                 &endpoint_ctx,

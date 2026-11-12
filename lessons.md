@@ -287,3 +287,30 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
 - **References**:
   - Implementation: [listener.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/transport/h3/listener.rs) (`request_tasks.spawn` timeout_or_cancel, `accept` cancel-aware lock), [session.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/mux/session.rs) (writer flush timeout, `accept_stream` cancellation), [stream.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/transport/h3/stream.rs) (`H3TunnelStream` Drop aborts background pump tasks), [uds.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/transport/uds.rs), [ws/listener.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/transport/ws/listener.rs), [udp.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/frontend/udp.rs)
   - Tests: [tests.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/mux/tests.rs#L398) (`test_mux_accept_stream_immediate_cancellation`), [stream.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/transport/h3/stream.rs#L713) (`test_h3_stream_drop_aborts_background_tasks`)
+
+---
+
+## 6. Configuration Schema Design & Deserialization Boundaries
+
+### 6.1 Group-Partitioned Mappings with Canonical Flattening & Strict Enums
+
+- **Problem / Trap (Redundancy & Decoupling)**:
+  - Flattened mapping lists with repeated `mode: "forward"` or `mode: "reverse"` entries and ambiguous top-level `pool_size` lead to confusing configurations when forward and reverse rules coexist in one tunnel.
+  - However, directly refactoring internal downstream runtime loops (which iterate over flat collections of `(mode, protocol, listen, target)`) to reflect hierarchical schema layouts risks widespread ripple effects and regressions across connection dispatchers, reverse supervisors, and stream pumps.
+- **Problem / Trap (Case-Insensitive Mandatory Enums in Serde)**:
+  - Using serde `rename_all = "lowercase"` or `rename_all = "UPPERCASE"` rejects case variations (e.g. `TCP` vs `tcp`).
+  - Adding `#[serde(default)]` to fallback to TCP makes the protocol optional, violating requirements where protocol specification must be mandatory without silent defaults.
+- **Solution**:
+  1. **Hierarchical User Schema (`TunnelMappingsConfig`)**:
+     - Partition configuration into `mappings.forward` and `mappings.reverse` (`MappingGroupConfig`), each with its own `pool_size` (or `pool`) and `rules` (or `ports`/`items`).
+     - Remove redundant `mode` from individual rules.
+  2. **Canonical Flattening Layer (`canonical_mappings`)**:
+     - Provide `canonical_mappings(&self) -> Result<Vec<PortMappingConfig>, TunnelError>` on `TunnelConfig`.
+     - Validates at least one rule exists across all groups, injects the implicit `TunnelMode::Forward` / `TunnelMode::Reverse`, and produces the flat representation expected by downstream runtimes.
+     - Preserves existing relay pipelines, server registration loops, and frontend listeners untouched.
+  3. **Explicit Case-Insensitive `FromStr` Deserializer without Defaults**:
+     - Implement custom `Deserialize` for `L4Protocol` via `FromStr` that parses `"tcp"`, `"TCP"`, `"udp"`, `"UDP"` case-insensitively.
+     - Omit `#[serde(default)]` on `MappingRuleConfig.protocol` to ensure serde strictly rejects missing protocol fields with descriptive errors.
+- **References**:
+  - Implementation: [model.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/config/model.rs), [addr.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/io/addr.rs), [loader.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/config/loader.rs)
+

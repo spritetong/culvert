@@ -66,45 +66,52 @@ server:
 
 # Concurrent multi-tunnel definitions (single endpoint can carry multiple port mappings)
 tunnels:
-  # Tunnel 1: Cluster with multiple port mappings sharing one 0-RTT connection pool
+  # Tunnel 1: Cluster with forward and reverse mappings sharing 0-RTT connection pools
   - tag: "corp-cluster"
+    # uuid: "550e8400-e29b-41d4-a716-446655440000"  # Optional: explicit Tunnel UUID (defaults to deterministic UUID v5 from tag)
     endpoint: "ws://127.0.0.1:8080/tunnel"
     token: "SECURE_PRESHARED_TOKEN"
-    pool_size: 8
     retry:
       delay: "3s"
       max_retries: 10
     mappings:
-      # Forward TCP mapping (protocol defaults to "tcp"): local 15201 -> remote 5201 (iperf3)
-      - mode: "forward"
-        protocol: "tcp"             # Optional: "tcp" (default) or "udp"
-        listen: "127.0.0.1:15201"
-        target: "127.0.0.1:5201"
-      # Forward TCP mapping: local 13306 -> remote 3306 (MySQL)
-      - mode: "forward"
-        listen: "127.0.0.1:13306"
-        target: "10.0.0.5:3306"
-      # Forward TCP mapping to Unix domain socket: local 18000 -> remote unix socket
-      # TCP mappings support 3 formats: ip:port, hostname:port, unix://path (UDP rejects unix://)
-      - mode: "forward"
-        listen: "127.0.0.1:18000"
-        target: "unix:///var/run/docker.sock"
-      # Forward UDP mapping: local 15353/udp -> remote 1.1.1.1:53/udp (TCP and UDP may share a port)
-      - mode: "forward"
-        protocol: "udp"
-        listen: "127.0.0.1:15353"
-        target: "1.1.1.1:53"
-        udp_idle_timeout: "15s"     # Optional: per-mapping override for UDP NAT session expiry
-      # Reverse TCP mapping: remote 2222 -> local 22 (SSH)
-      - mode: "reverse"
-        listen: "0.0.0.0:2222"
-        target: "127.0.0.1:22"
-      # Reverse UDP mapping: remote 51820/udp -> local 51820/udp (WireGuard)
-      - mode: "reverse"
-        protocol: "udp"
-        listen: "0.0.0.0:51820"
-        target: "127.0.0.1:51820"
-        udp_idle_timeout: "60s"
+      # Forward mappings: client binds local ports, forwards to remote network
+      forward:
+        pool_size: 8            # Client-side forward connection pool size (0-RTT for outbound traffic)
+        rules:
+          # Protocol is mandatory (TCP or UDP, case-insensitive)
+          # Forward TCP mapping: local 15201 -> remote 5201 (iperf3)
+          - protocol: "TCP"
+            listen: "127.0.0.1:15201"
+            target: "127.0.0.1:5201"
+          # Forward TCP mapping: local 13306 -> remote 3306 (MySQL)
+          - protocol: "TCP"
+            listen: "127.0.0.1:13306"
+            target: "10.0.0.5:3306"
+          # Forward TCP mapping to Unix domain socket: local 18000 -> remote unix socket
+          # TCP mappings support 3 formats: ip:port, hostname:port, unix://path (UDP rejects unix://)
+          - protocol: "TCP"
+            listen: "127.0.0.1:18000"
+            target: "unix:///var/run/docker.sock"
+          # Forward UDP mapping: local 15353/udp -> remote 1.1.1.1:53/udp (TCP and UDP may share a port)
+          - protocol: "UDP"
+            listen: "127.0.0.1:15353"
+            target: "1.1.1.1:53"
+            udp_idle_timeout: "15s"     # Optional: per-mapping override for UDP NAT session expiry
+
+      # Reverse mappings: server binds remote ports, relays back to client's local network
+      reverse:
+        pool_size: 4            # Server-side reverse connection pool size (0-RTT for inbound traffic)
+        rules:
+          # Reverse TCP mapping: remote 2222 -> local 22 (SSH)
+          - protocol: "TCP"
+            listen: "0.0.0.0:2222"
+            target: "127.0.0.1:22"
+          # Reverse UDP mapping: remote 51820/udp -> local 51820/udp (WireGuard)
+          - protocol: "UDP"
+            listen: "0.0.0.0:51820"
+            target: "127.0.0.1:51820"
+            udp_idle_timeout: "60s"
 
   # Tunnel 2: Multi-port tunnel with HTTP/3 & custom HTTP headers
   - tag: "cloud-h3-forward"
@@ -116,6 +123,8 @@ tunnels:
       User-Agent: "culvert/1.0"
       # X-Custom-Auth: "secret"
     mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:18080"
-        target: "10.0.0.8:8080"
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:18080"
+            target: "10.0.0.8:8080"

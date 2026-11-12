@@ -11,8 +11,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
 use culvert::config::model::{
-    AppConfig, EndpointConfig, PortMappingConfig, ServerConfig, TunnelConfig, TunnelMode,
-    TunnelPoolConfig, TunnelRetryConfig,
+    AppConfig, EndpointConfig, MappingGroupConfig, MappingRuleConfig, ServerConfig, TunnelConfig,
+    TunnelMappingsConfig, TunnelRetryConfig,
 };
 use culvert::supervisor::TunnelSupervisor;
 
@@ -75,10 +75,8 @@ async fn test_multi_mapping_shared_pool_and_path_matching_e2e() {
     app_config.tunnels.push(TunnelConfig {
         tag: "shared-pool-cluster".to_string(),
         uuid: None,
-        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/secret_path", server_ws_port)),
         token: None,
-        pool_size: Some(4), // 4 idle pre-warmed streams shared across all mappings
         failover: None,
         multiplex: None,
         retry: Some(TunnelRetryConfig {
@@ -86,20 +84,19 @@ async fn test_multi_mapping_shared_pool_and_path_matching_e2e() {
             max_retries: Some(5),
         }),
         http_headers: None,
-        mappings: vec![
-            PortMappingConfig {
-                mode: TunnelMode::Forward,
-                listen: format!("127.0.0.1:{}", map1_listen_port),
-                target: format!("127.0.0.1:{}", echo_target1_port),
-                ..Default::default()
-            },
-            PortMappingConfig {
-                mode: TunnelMode::Forward,
-                listen: format!("127.0.0.1:{}", map2_listen_port),
-                target: format!("127.0.0.1:{}", echo_target2_port),
-                ..Default::default()
-            },
-        ],
+        mappings: TunnelMappingsConfig::forward_pool(
+            4,
+            vec![
+                MappingRuleConfig::tcp(
+                    format!("127.0.0.1:{}", map1_listen_port),
+                    format!("127.0.0.1:{}", echo_target1_port),
+                ),
+                MappingRuleConfig::tcp(
+                    format!("127.0.0.1:{}", map2_listen_port),
+                    format!("127.0.0.1:{}", echo_target2_port),
+                ),
+            ],
+        ),
     });
 
     let supervisor = TunnelSupervisor::new(app_config, cancel_token.clone());
@@ -171,20 +168,16 @@ async fn test_path_mismatch_rejection() {
     app_config.tunnels.push(TunnelConfig {
         tag: "wrong-path-tunnel".to_string(),
         uuid: None,
-        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/wrong_path", server_ws_port)),
         token: None,
-        pool_size: None,
         failover: None,
         multiplex: None,
         retry: None,
         http_headers: None,
-        mappings: vec![PortMappingConfig {
-            mode: TunnelMode::Forward,
-            listen: format!("127.0.0.1:{}", client_listen_port),
-            target: format!("127.0.0.1:{}", echo_port),
-            ..Default::default()
-        }],
+        mappings: TunnelMappingsConfig::forward(vec![MappingRuleConfig::tcp(
+            format!("127.0.0.1:{}", client_listen_port),
+            format!("127.0.0.1:{}", echo_port),
+        )]),
     });
 
     let supervisor = TunnelSupervisor::new(app_config, cancel_token.clone());
@@ -241,28 +234,28 @@ async fn test_cluster_mixed_forward_and_reverse_with_pool_e2e() {
     app_config.tunnels.push(TunnelConfig {
         tag: "mixed-cluster".to_string(),
         uuid: None,
-        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/cluster_ws", server_ws_port)),
         token: Some("cluster_mixed_pool_secret".to_string()),
-        pool_size: Some(4), // Outbound pool for forward, Inbound pool for reverse
         failover: None,
         multiplex: None,
         retry: None,
         http_headers: None,
-        mappings: vec![
-            PortMappingConfig {
-                mode: TunnelMode::Forward,
-                listen: format!("127.0.0.1:{}", fwd_listen_port),
-                target: format!("127.0.0.1:{}", echo_fwd_port),
-                ..Default::default()
-            },
-            PortMappingConfig {
-                mode: TunnelMode::Reverse,
-                listen: format!("127.0.0.1:{}", rev_listen_port),
-                target: format!("127.0.0.1:{}", echo_rev_port),
-                ..Default::default()
-            },
-        ],
+        mappings: TunnelMappingsConfig::forward_and_reverse(
+            MappingGroupConfig::with_pool(
+                4,
+                vec![MappingRuleConfig::tcp(
+                    format!("127.0.0.1:{}", fwd_listen_port),
+                    format!("127.0.0.1:{}", echo_fwd_port),
+                )],
+            ),
+            MappingGroupConfig::with_pool(
+                4,
+                vec![MappingRuleConfig::tcp(
+                    format!("127.0.0.1:{}", rev_listen_port),
+                    format!("127.0.0.1:{}", echo_rev_port),
+                )],
+            ),
+        ),
     });
 
     let supervisor = TunnelSupervisor::new(app_config, cancel_token.clone());
@@ -330,31 +323,25 @@ async fn test_multi_reverse_mapping_shared_pool_with_uuid_e2e() {
     app_config.tunnels.push(TunnelConfig {
         tag: "shared-rev-cluster".to_string(),
         uuid: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
-        pool: Some(TunnelPoolConfig {
-            forward: None,
-            reverse: Some(3),
-        }),
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/rev_cluster", server_ws_port)),
         token: Some("shared_rev_secret".to_string()),
-        pool_size: None,
         failover: None,
         multiplex: None,
         retry: None,
         http_headers: None,
-        mappings: vec![
-            PortMappingConfig {
-                mode: TunnelMode::Reverse,
-                listen: format!("127.0.0.1:{}", rev1_listen_port),
-                target: format!("127.0.0.1:{}", echo1_port),
-                ..Default::default()
-            },
-            PortMappingConfig {
-                mode: TunnelMode::Reverse,
-                listen: format!("127.0.0.1:{}", rev2_listen_port),
-                target: format!("127.0.0.1:{}", echo2_port),
-                ..Default::default()
-            },
-        ],
+        mappings: TunnelMappingsConfig::reverse_pool(
+            3,
+            vec![
+                MappingRuleConfig::tcp(
+                    format!("127.0.0.1:{}", rev1_listen_port),
+                    format!("127.0.0.1:{}", echo1_port),
+                ),
+                MappingRuleConfig::tcp(
+                    format!("127.0.0.1:{}", rev2_listen_port),
+                    format!("127.0.0.1:{}", echo2_port),
+                ),
+            ],
+        ),
     });
 
     let supervisor = TunnelSupervisor::new(app_config, cancel_token.clone());
@@ -422,31 +409,28 @@ async fn test_asymmetric_pool_sizing_e2e() {
     app_config.tunnels.push(TunnelConfig {
         tag: "asym-pool-tunnel".to_string(),
         uuid: None,
-        pool: Some(TunnelPoolConfig {
-            forward: Some(2),
-            reverse: Some(4),
-        }),
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/asym_cluster", server_ws_port)),
         token: Some("asym_pool_secret".to_string()),
-        pool_size: None,
         failover: None,
         multiplex: None,
         retry: None,
         http_headers: None,
-        mappings: vec![
-            PortMappingConfig {
-                mode: TunnelMode::Forward,
-                listen: format!("127.0.0.1:{}", fwd_listen_port),
-                target: format!("127.0.0.1:{}", echo_fwd_port),
-                ..Default::default()
-            },
-            PortMappingConfig {
-                mode: TunnelMode::Reverse,
-                listen: format!("127.0.0.1:{}", rev_listen_port),
-                target: format!("127.0.0.1:{}", echo_rev_port),
-                ..Default::default()
-            },
-        ],
+        mappings: TunnelMappingsConfig::forward_and_reverse(
+            MappingGroupConfig::with_pool(
+                2,
+                vec![MappingRuleConfig::tcp(
+                    format!("127.0.0.1:{}", fwd_listen_port),
+                    format!("127.0.0.1:{}", echo_fwd_port),
+                )],
+            ),
+            MappingGroupConfig::with_pool(
+                4,
+                vec![MappingRuleConfig::tcp(
+                    format!("127.0.0.1:{}", rev_listen_port),
+                    format!("127.0.0.1:{}", echo_rev_port),
+                )],
+            ),
+        ),
     });
 
     let supervisor = TunnelSupervisor::new(app_config, cancel_token.clone());

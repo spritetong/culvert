@@ -14,7 +14,8 @@ use tokio_util::sync::CancellationToken;
 
 use culvert::client::ClientRunner;
 use culvert::config::model::{
-    AppConfig, EndpointConfig, PortMappingConfig, ServerConfig, TunnelConfig, TunnelMode,
+    AppConfig, EndpointConfig, MappingRuleConfig, ServerConfig, TunnelConfig, TunnelMappingsConfig,
+    TunnelMode,
 };
 use culvert::dialer::endpoint::EndpointContext;
 use culvert::server::ServerRunner;
@@ -136,20 +137,16 @@ async fn test_e2e_ws_tunnel_with_custom_host_and_headers() {
     let tunnel_config = TunnelConfig {
         tag: "custom-headers-e2e".to_string(),
         uuid: None,
-        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/tunnel", server_port)),
         token: Some(auth_token.to_string()),
-        pool_size: None,
         failover: None,
         multiplex: None,
         retry: None,
         http_headers: Some(custom_headers),
-        mappings: vec![PortMappingConfig {
-            mode: TunnelMode::Forward,
-            listen: format!("127.0.0.1:{}", client_port),
-            target: format!("127.0.0.1:{}", echo_port),
-            ..Default::default()
-        }],
+        mappings: TunnelMappingsConfig::forward(vec![MappingRuleConfig::tcp(
+            format!("127.0.0.1:{}", client_port),
+            format!("127.0.0.1:{}", echo_port),
+        )]),
     };
 
     let client_runner = ClientRunner::new(tunnel_config).unwrap();

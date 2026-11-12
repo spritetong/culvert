@@ -11,8 +11,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 /// Transport-layer protocol of a port mapping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum L4Protocol {
     #[default]
     Tcp,
@@ -20,7 +19,7 @@ pub enum L4Protocol {
 }
 
 impl L4Protocol {
-    /// Returns the lowercase canonical string representation (`"tcp"` or `"udp"`).
+    /// Returns the canonical display string (`"tcp"` or `"udp"`).
     #[inline]
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -44,10 +43,48 @@ impl std::str::FromStr for L4Protocol {
             "tcp" => Ok(Self::Tcp),
             "udp" => Ok(Self::Udp),
             other => Err(TunnelError::Config(format!(
-                "Unsupported L4 protocol '{}'. Expected 'tcp' or 'udp'.",
+                "Unsupported L4 protocol '{}'. Expected 'TCP' or 'UDP'.",
                 other
             ))),
         }
+    }
+}
+
+impl Serialize for L4Protocol {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Tcp => serializer.serialize_str("TCP"),
+            Self::Udp => serializer.serialize_str("UDP"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for L4Protocol {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct L4ProtocolVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for L4ProtocolVisitor {
+            type Value = L4Protocol;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a protocol string: 'TCP' or 'UDP'")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<L4Protocol, E>
+            where
+                E: serde::de::Error,
+            {
+                value.parse().map_err(serde::de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_str(L4ProtocolVisitor)
     }
 }
 
@@ -353,5 +390,25 @@ mod tests {
         let p2p_peer: PeerAddr = "node_abc123".into();
         assert_eq!(p2p_peer, PeerAddr::P2p("node_abc123".into()));
         assert_eq!(p2p_peer.to_string(), "p2p://node_abc123");
+    }
+
+    #[test]
+    fn test_l4_protocol_case_insensitive_deserialization() {
+        let tcp_upper: L4Protocol = serde_yaml::from_str("TCP").unwrap();
+        assert_eq!(tcp_upper, L4Protocol::Tcp);
+        let tcp_lower: L4Protocol = serde_yaml::from_str("tcp").unwrap();
+        assert_eq!(tcp_lower, L4Protocol::Tcp);
+
+        let udp_upper: L4Protocol = serde_yaml::from_str("UDP").unwrap();
+        assert_eq!(udp_upper, L4Protocol::Udp);
+        let udp_lower: L4Protocol = serde_yaml::from_str("udp").unwrap();
+        assert_eq!(udp_lower, L4Protocol::Udp);
+
+        assert!(serde_yaml::from_str::<L4Protocol>("http").is_err());
+        assert!(serde_yaml::from_str::<L4Protocol>("\"\"").is_err());
+
+        // Serializes as uppercase TCP/UDP
+        assert_eq!(serde_yaml::to_string(&L4Protocol::Tcp).unwrap().trim(), "TCP");
+        assert_eq!(serde_yaml::to_string(&L4Protocol::Udp).unwrap().trim(), "UDP");
     }
 }

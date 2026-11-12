@@ -218,21 +218,22 @@ pub async fn run_reverse_mapping(
         let pool_cancel = cancel_token.child_token();
         let mut pool_tracker = TaskTracker::<()>::new(pool_cancel.clone());
 
-        if tunnel_id.is_none() {
-            if let Some(size) = pool_workers {
-                // One worker holds at most one idle stream, so an unbounded config
-                // value would spawn an unbounded number of dialing tasks.
-                let listen_target = crate::io::addr::parse_target_addr(&listen)
-                    .unwrap_or_else(|_| dummy_target.clone());
-                debug!(
-                    tag = %tag,
-                    size,
-                    "Pre-warming reverse inbound pool connections"
-                );
+        if tunnel_id.is_none()
+            && let Some(size) = pool_workers
+        {
+            // One worker holds at most one idle stream, so an unbounded config
+            // value would spawn an unbounded number of dialing tasks.
+            let listen_target = crate::io::addr::parse_target_addr(&listen)
+                .unwrap_or_else(|_| dummy_target.clone());
+            debug!(
+                tag = %tag,
+                size,
+                "Pre-warming reverse inbound pool connections"
+            );
 
-                // Throttle concurrent outbound dial handshakes across all workers in this
-                // reverse mapping to protect low-bandwidth links from connection storms.
-                // Symmetrically matches Forward mode's POOL_MAX_CONCURRENT_CONNECTS.
+            // Throttle concurrent outbound dial handshakes across all workers in this
+            // reverse mapping to protect low-bandwidth links from connection storms.
+            // Symmetrically matches Forward mode's POOL_MAX_CONCURRENT_CONNECTS.
                 let dial_semaphore =
                     Arc::new(tokio::sync::Semaphore::new(POOL_MAX_CONCURRENT_CONNECTS));
 
@@ -393,7 +394,6 @@ pub async fn run_reverse_mapping(
                         relays.shutdown_and_wait().await;
                     });
                 }
-            }
         }
 
         // Main event loop handling incoming connection alerts from remote server
@@ -559,10 +559,10 @@ pub async fn run_shared_reverse_pool(
     }
 
     // Await control channel registration before dialing pre-warm pool connections
-    if let Some(ref ready) = reverse_ready {
-        if !ready.wait_ready(&cancel_token).await {
-            return Ok(());
-        }
+    if let Some(ref ready) = reverse_ready
+        && !ready.wait_ready(&cancel_token).await
+    {
+        return Ok(());
     }
 
     info!(
@@ -745,6 +745,7 @@ pub async fn run_reverse_tunnel(
     })?;
     let listen = mapping.listen.clone();
     let target = mapping.target.clone();
+    let rev_pool = config.reverse_pool_size();
     run_reverse_mapping(
         config.tag,
         mapping.protocol,
@@ -754,7 +755,7 @@ pub async fn run_reverse_tunnel(
         config.token,
         endpoint_ctx,
         transport_registry,
-        config.pool_size,
+        rev_pool,
         None,
         None,
         cancel_token,

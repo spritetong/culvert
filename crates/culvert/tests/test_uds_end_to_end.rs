@@ -61,21 +61,20 @@ async fn test_e2e_server_uds_url_and_mappings() {
         }),
         tunnels: vec![TunnelConfig {
             tag: "uds-to-uds-forward".to_string(),
-        uuid: None,
-        pool: None,
+            uuid: None,
             endpoint: EndpointConfig::Simple(server_sock_url),
             token: Some("secret123".to_string()),
-            pool_size: Some(2),
             retry: None,
             http_headers: None,
             failover: None,
             multiplex: None,
-            mappings: vec![PortMappingConfig {
-                mode: TunnelMode::Forward,
-                listen: forward_sock_path.clone(),
-                target: target_sock_path.clone(),
-                ..Default::default()
-            }],
+            mappings: TunnelMappingsConfig::forward_pool(
+                2,
+                vec![MappingRuleConfig::tcp(
+                    forward_sock_path.clone(),
+                    target_sock_path.clone(),
+                )],
+            ),
         }],
     };
 
@@ -155,21 +154,17 @@ async fn test_e2e_reverse_mapping_uds() {
         }),
         tunnels: vec![TunnelConfig {
             tag: "uds-reverse-tunnel".to_string(),
-        uuid: None,
-        pool: None,
+            uuid: None,
             endpoint: EndpointConfig::Simple(server_sock_url),
             token: Some("rev_secret".to_string()),
-            pool_size: None,
             retry: None,
             http_headers: None,
             failover: None,
             multiplex: None,
-            mappings: vec![PortMappingConfig {
-                mode: TunnelMode::Reverse,
-                listen: rev_external_str.clone(),
-                target: rev_target_str.clone(),
-                ..Default::default()
-            }],
+            mappings: TunnelMappingsConfig::reverse(vec![MappingRuleConfig::tcp(
+                rev_external_str.clone(),
+                rev_target_str.clone(),
+            )]),
         }],
     };
 
@@ -261,21 +256,20 @@ async fn test_e2e_server_ws_unix_with_query_path() {
         }),
         tunnels: vec![TunnelConfig {
             tag: "ws-unix-tunnel".to_string(),
-        uuid: None,
-        pool: None,
+            uuid: None,
             endpoint: EndpointConfig::Simple(client_endpoint),
             token: Some("token123".to_string()),
-            pool_size: Some(2),
             retry: None,
             http_headers: None,
             failover: None,
             multiplex: None,
-            mappings: vec![PortMappingConfig {
-                mode: TunnelMode::Forward,
-                listen: fwd_listen_str.clone(),
-                target: target_sock_str.clone(),
-                ..Default::default()
-            }],
+            mappings: TunnelMappingsConfig::forward_pool(
+                2,
+                vec![MappingRuleConfig::tcp(
+                    fwd_listen_str.clone(),
+                    target_sock_str.clone(),
+                )],
+            ),
         }],
     };
 
