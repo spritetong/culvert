@@ -198,3 +198,26 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
   3. **Flow Control HoL Probe**: Saturate multiple sibling streams with tens of megabytes of unread data; verify that a newly opened probe stream on the same connection completes prompt transfers without timing out.
 - **References**:
   - Probe Tests: [test_idle_probe.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/tests/test_idle_probe.rs), [test_quic_flow_control_hol.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/tests/test_quic_flow_control_hol.rs)
+
+### 5.3 Event Loop Await Constraints & Future Abort Drop Guards
+- **Problem / Trap (Unconstrained Blocking Awaits in Event Loops)**:
+  - Inside a `tokio::select!` event loop, if a branch executes an async call containing an unconstrained blocking `await` (e.g. `router.send(notify_msg).await`, `idle_pool.promote_idle(...).await`, or `event_tx.send(...).await`), execution suspends inside that sub-operation.
+  - While suspended, the event loop cannot poll its cancellation branch (`_ = cancel_token.cancelled()`). If the remote peer, network buffer, or channel consumer stalls, the entire event loop hangs until timeout (or indefinitely), delaying or deadlocking graceful shutdown.
+- **Problem / Trap (Future Abort Resource Leaks)**:
+  - When parent task trackers (`TaskTracker::shutdown_and_wait`) enforce deadlines and abort outstanding tasks (`abort_all()`), the in-flight future is dropped at whatever `.await` point it was currently parked.
+  - Any sequential cleanup code placed after the event loop (e.g. `session_mgr.unregister_pool(...)`, `session_mgr.remove(&session_id)`) is **completely skipped**.
+  - Stale pools and abandoned session registrations remain orphaned in memory across subsequent reconnects or incoming streams.
+- **Solution & Principles**:
+  1. **Strict Cancel Token Constraints for Event Loops**:
+     - All blocking awaits executed in or synchronously invoked by an event loop MUST be constrained by `cancel_with(cancel_token)` or bounded timeouts.
+     - Extract complex, multi-branch visitor handling into dedicated helper functions (e.g. `handle_accepted_reverse_visitor`).
+     - **Principle of Internal Cancellation Awareness**: If an async helper function internally constrains all its blocking awaits with `cancel_token`, the event loop caller does NOT need redundant outer `.cancel_with(cancel_token)` wrappers. Keep logic lean and precise.
+  2. **Event Loops vs. Spawned Worker Tasks**:
+     - Detached worker tasks spawned from the event loop run their own futures. When the event loop terminates, the task tracker automatically cancels and drops them. Not every await in spawned worker tasks requires artificial cancellation wrappers unless it holds shared state.
+  3. **RAII Drop Guards for Future Abort Safety**:
+     - Never rely solely on post-loop sequential cleanup statements for resources registered in shared state.
+     - Wrap registered shared resources in RAII drop guards (`ReversePoolGuard`, `PendingSessionGuard`, `ActiveStreamGuard`).
+     - If the future is aborted mid-flight, Rust's drop semantics guarantee that `guard.drop()` unregisters the pool and cleans up pending session entries.
+- **References**:
+  - Implementation: [manager.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/session/manager.rs) (`PendingSessionGuard`, `ReversePoolGuard`), [runner.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/server/runner.rs) (`handle_accepted_reverse_visitor`, `ReversePoolGuard`)
+  - Integration Tests: [runner.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/server/runner.rs#L1934-L2060) (`test_reverse_control_cancels_promptly_during_stalled_visitor_signaling`, `test_reverse_control_future_abort_cleans_up_resources`)

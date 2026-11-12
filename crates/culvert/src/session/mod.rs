@@ -7,4 +7,6 @@
 
 pub mod manager;
 
-pub use manager::{ReverseGraceHandle, ReverseGraceReattach, SessionManager};
+pub use manager::{
+    PendingSessionGuard, ReverseGraceHandle, ReverseGraceReattach, ReversePoolGuard, SessionManager,
+};

@@ -611,9 +611,16 @@ impl SignalingChannel {
                                     // Activity clock already refreshed above
                                 }
                                 app_msg => {
-                                    if event_tx.send(Ok(app_msg)).await.is_err() {
-                                        debug!("Signaling event receiver dropped; closing actor");
-                                        break;
+                                    match event_tx.send(Ok(app_msg)).cancel_with(&cancel_token).await {
+                                        Some(Ok(())) => {}
+                                        Some(Err(_)) => {
+                                            debug!("Signaling event receiver dropped; closing actor");
+                                            break;
+                                        }
+                                        None => {
+                                            debug!("Signaling actor stopping on cancellation signal");
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -621,7 +628,7 @@ impl SignalingChannel {
                         Some(Err(e)) => {
                             let is_last_actor = _guard.active_actors.load(Ordering::SeqCst) <= 1;
                             if is_last_actor {
-                                let _ = event_tx.send(Err(e)).await;
+                                let _ = event_tx.send(Err(e)).cancel_with(&cancel_token).await;
                             } else {
                                 warn!(error = %e, "Signaling transport failed while sibling channel remains active");
                             }

@@ -30,11 +30,10 @@ use crate::control::{
 use crate::core::error::TunnelError;
 use crate::core::serve::serve;
 use crate::core::stream::TunnelStream;
-use crate::frontend::{self, FrontendOutput};
+use crate::frontend::{self, FrontendAccept, FrontendOutput};
 use crate::io::addr::{L4Protocol, MappingSpec};
 use crate::io::pump::{PumpCtx, PumpRequest};
-use crate::session::manager::ReverseInboundPool;
-use crate::session::{ReverseGraceHandle, ReverseGraceReattach, SessionManager};
+use crate::session::{ReverseGraceHandle, ReverseGraceReattach, ReversePoolGuard, SessionManager};
 use crate::transport::{TargetAddr, TransportRegistry};
 use reusable_future::ReusableFutureRef;
 
@@ -515,7 +514,7 @@ impl ServerRunner {
         sig_config: SignalingConfig,
         cancel_token: &CancellationToken,
         session_mgr: &SessionManager,
-        idle_pool: &mut Arc<ReverseInboundPool>,
+        pool_guard: &mut ReversePoolGuard,
         router: &SignalingRouter,
         sig_rx: &SignalingReceiver,
         grace_handle: &mut Option<ReverseGraceHandle>,
@@ -525,10 +524,23 @@ impl ServerRunner {
     ) -> bool {
         // Arm the pool notifier BEFORE calling `promote_idle` so an inbound idle
         // stream pushed concurrently is never missed between the check and select!
-        let next_notify = Box::pin(idle_pool.notified_owned());
-        if let Some(promoted_stream) = idle_pool.promote_idle(idle_timeout).await
-            && let Some(sink) = sig_rx.event_sink()
-        {
+        let next_notify = Box::pin(pool_guard.notified_owned());
+        let frame_timeout = reverse_frame_timeout(idle_timeout);
+        let promote_fut = async {
+            timeout(frame_timeout, pool_guard.promote_idle(idle_timeout))
+                .await
+                .ok()
+                .flatten()
+        };
+        let Some(promoted_stream) = promote_fut.cancel_with(cancel_token).await.flatten() else {
+            if cancel_token.is_cancelled() {
+                return false;
+            }
+            *pool_notify = Some(next_notify);
+            return false;
+        };
+
+        if let Some(sink) = sig_rx.event_sink() {
             info!(addr = %listen_addr, "{}", context_msg);
             let new_handle = SignalingChannel::spawn_with_event_sink(
                 promoted_stream,
@@ -545,7 +557,7 @@ impl ServerRunner {
                     sig_config,
                     cancel_token,
                     session_mgr,
-                    idle_pool,
+                    pool_guard,
                     router,
                     sig_rx,
                     grace_handle,
@@ -577,13 +589,16 @@ impl ServerRunner {
         sig_config: SignalingConfig,
         cancel_token: &CancellationToken,
         session_mgr: &SessionManager,
-        idle_pool: &mut Arc<ReverseInboundPool>,
+        pool_guard: &mut ReversePoolGuard,
         router: &SignalingRouter,
         sig_rx: &SignalingReceiver,
         grace_handle: &mut Option<ReverseGraceHandle>,
         grace_deadline: &mut Option<Pin<Box<Sleep>>>,
         pool_notify: &mut Option<Pin<Box<OwnedNotified>>>,
     ) {
+        if cancel_token.is_cancelled() {
+            return;
+        }
         if router.promote_standby_if_closed() {
             debug!(addr = %listen_addr, "Primary reverse signaling channel closed; failed over to standby");
             return;
@@ -604,7 +619,7 @@ impl ServerRunner {
             sig_config,
             cancel_token,
             session_mgr,
-            idle_pool,
+            pool_guard,
             router,
             sig_rx,
             grace_handle,
@@ -614,6 +629,10 @@ impl ServerRunner {
         )
         .await
         {
+            return;
+        }
+
+        if cancel_token.is_cancelled() {
             return;
         }
 
@@ -638,7 +657,7 @@ impl ServerRunner {
         sig_config: SignalingConfig,
         cancel_token: &CancellationToken,
         session_mgr: &SessionManager,
-        idle_pool: &mut Arc<ReverseInboundPool>,
+        pool_guard: &mut ReversePoolGuard,
         router: &SignalingRouter,
         sig_rx: &SignalingReceiver,
         grace_handle: &mut Option<ReverseGraceHandle>,
@@ -653,11 +672,11 @@ impl ServerRunner {
 
         // Register the new pool generation BEFORE sending RegisterAck so the
         // client's freshly spawned pre-warm workers never race ahead of registration.
-        *idle_pool = session_mgr.register_pool(
+        pool_guard.replace_pool(session_mgr.register_pool(
             protocol,
             listen_addr,
             reverse_pool_soft_cap(reattach.pool_size),
-        );
+        ));
 
         if let Some(sink) = sig_rx.event_sink() {
             let new_handle = SignalingChannel::spawn_framed_with_event_sink(
@@ -667,20 +686,222 @@ impl ServerRunner {
                 cancel_token.child_token(),
             );
             router.attach(new_handle);
-            if router
+            let ack_res = router
                 .send(ControlMessage::RegisterAck {
                     listen_addr: listen_addr.to_string(),
                     success: true,
                     error_msg: None,
                 })
-                .await
-                .is_ok()
-            {
+                .cancel_with(cancel_token)
+                .await;
+            if matches!(ack_res, Some(Ok(()))) {
                 info!(addr = %listen_addr, protocol = %protocol, "Reattached reverse control channel within grace period");
-            } else {
+            } else if !cancel_token.is_cancelled() {
                 warn!(addr = %listen_addr, "Failed to send RegisterAck on reattached reverse control channel");
             }
         }
+    }
+
+    /// Dispatches an accepted visitor connection on a reverse listening port:
+    /// tries 0-RTT pooled stream first (falling back to control signaling if activation fails),
+    /// or signals the client over the control channel to dial a dedicated reverse data stream.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_accepted_reverse_visitor(
+        accepted: FrontendAccept,
+        listen_addr: &str,
+        protocol: L4Protocol,
+        idle_timeout: Duration,
+        relay_idle_timeout: Duration,
+        heartbeat_interval: Duration,
+        frame_timeout: Duration,
+        sig_config: SignalingConfig,
+        grace_period: Duration,
+        cancel_token: &CancellationToken,
+        session_mgr: &Arc<SessionManager>,
+        pool_guard: &mut ReversePoolGuard,
+        router: &SignalingRouter,
+        sig_rx: &SignalingReceiver,
+        grace_handle: &mut Option<ReverseGraceHandle>,
+        grace_deadline: &mut Option<Pin<Box<Sleep>>>,
+        pool_notify: &mut Option<Pin<Box<OwnedNotified>>>,
+        local_tracker: &mut TaskTracker<()>,
+    ) {
+        let visitor_stream = accepted.channel;
+        let visitor_addr = accepted.peer;
+        let activation_magic = match protocol {
+            L4Protocol::Tcp => ACTIVATE_STREAM_MAGIC,
+            L4Protocol::Udp => ACTIVATE_STREAM_UDP,
+        };
+
+        // 1. FAST PATH (0-RTT Pool): only pair streams that are fresh and still alive.
+        // A stale generation must fall through to signaling rather than blackhole the visitor.
+        // The server owns the idle-stream lifetime; entries are removed under the pool lock,
+        // and activation is driven in the spawned task so WAN RTT never blocks the accept loop.
+        if let Some(mut candidate) = pool_guard.pop_live(idle_timeout).await {
+            debug!(
+                visitor = %visitor_addr,
+                protocol = %protocol,
+                "Paired reverse visitor with idle pooled stream (0-RTT)"
+            );
+            let router_fallback = router.clone();
+            let session_mgr_fallback = Arc::clone(session_mgr);
+            local_tracker.spawn_with_cancel(move |token| async move {
+                let activate = async {
+                    tokio::io::AsyncWriteExt::write_all(
+                        &mut candidate,
+                        &[activation_magic],
+                    )
+                    .await?;
+                    tokio::io::AsyncWriteExt::flush(&mut candidate).await
+                };
+                match tokio::time::timeout(frame_timeout, activate)
+                    .cancel_with(&token)
+                    .await
+                {
+                    Some(Ok(Ok(()))) => {
+                        let _ = serve(
+                            PumpRequest::new(visitor_stream, candidate),
+                            PumpCtx {
+                                cancel: token,
+                                heartbeat_interval,
+                                idle_timeout: relay_idle_timeout,
+                            },
+                        )
+                        .await;
+                    }
+                    Some(activation_failure) => {
+                        debug!(
+                            "0-RTT pool stream activation failed ({:?}); falling back to control signaling",
+                            activation_failure
+                        );
+                        drop(candidate);
+                        if router_fallback.has_active_channel() {
+                            let session_id = format!(
+                                "sess_{}_{}",
+                                std::process::id(),
+                                REVERSE_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed)
+                            );
+                            let (pair_rx, mut session_guard) =
+                                session_mgr_fallback.register_guarded(session_id.clone());
+                            let notify_msg = ControlMessage::NewConnection {
+                                session_id: session_id.clone(),
+                                client_addr: visitor_addr.to_string(),
+                            };
+                            if router_fallback.send(notify_msg).await.is_ok()
+                                && let Ok(Ok(data_stream)) =
+                                    timeout(DEFAULT_SESSION_PAIR_TIMEOUT, pair_rx).await
+                            {
+                                session_guard.disarm();
+                                let _ = serve(
+                                    PumpRequest::new(visitor_stream, data_stream),
+                                    PumpCtx {
+                                        cancel: token,
+                                        heartbeat_interval,
+                                        idle_timeout: relay_idle_timeout,
+                                    },
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                    None => {}
+                }
+            });
+            return;
+        }
+
+        // 2. SLOW PATH (Fallback): if signaling is temporarily in its grace window with an empty pool,
+        // drop only this fallback visitor without tearing down the bound port.
+        if !router.has_active_channel() {
+            debug!(
+                visitor = %visitor_addr,
+                protocol = %protocol,
+                "Dropping fallback reverse visitor while control channel is in grace period"
+            );
+            return;
+        }
+
+        // Allocate session_id and notify client via control channel
+        let session_id = format!(
+            "sess_{}_{}",
+            std::process::id(),
+            REVERSE_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+
+        debug!(
+            session = %session_id,
+            visitor = %visitor_addr,
+            protocol = %protocol,
+            "External visitor connected to reverse port, notifying client"
+        );
+
+        // Register in session manager with Drop guard before notifying client
+        let (pair_rx, mut session_guard) = session_mgr.register_guarded(session_id.clone());
+
+        // Notify client
+        let notify_msg = ControlMessage::NewConnection {
+            session_id: session_id.clone(),
+            client_addr: visitor_addr.to_string(),
+        };
+
+        // Bounded signaling: must be constrained by cancel_token so shutdown never blocks the accept loop!
+        let notify_res = router.send(notify_msg).cancel_with(cancel_token).await;
+        let Some(notify_res) = notify_res else {
+            // Cancelled: guard drops and removes session automatically.
+            return;
+        };
+
+        match notify_res {
+            Ok(()) => {}
+            Err(TunnelError::ControlProtocol(ref e)) if e.contains("timed out") => {
+                warn!(session = %session_id, "Timed out signaling NewConnection; dropping session and continuing");
+                return;
+            }
+            Err(e) => {
+                warn!(session = %session_id, "Failed to notify client over control channel: {:?}", e);
+                drop(session_guard);
+                Self::handle_signaling_disconnect(
+                    listen_addr,
+                    protocol,
+                    idle_timeout,
+                    grace_period,
+                    sig_config,
+                    cancel_token,
+                    session_mgr,
+                    pool_guard,
+                    router,
+                    sig_rx,
+                    grace_handle,
+                    grace_deadline,
+                    pool_notify,
+                )
+                .await;
+                return;
+            }
+        }
+
+        // Spawn pairing relay task
+        let session_id_clone = session_id.clone();
+        local_tracker.spawn_with_cancel(move |token| async move {
+            match timeout(DEFAULT_SESSION_PAIR_TIMEOUT, pair_rx).await {
+                Ok(Ok(data_stream)) => {
+                    session_guard.disarm();
+                    debug!(session = %session_id_clone, "Reverse data stream paired, starting relay");
+                    let _ = serve(
+                        PumpRequest::new(visitor_stream, data_stream),
+                        PumpCtx {
+                            cancel: token,
+                            heartbeat_interval,
+                            idle_timeout: relay_idle_timeout,
+                        },
+                    )
+                    .await;
+                }
+                _ => {
+                    warn!(session = %session_id_clone, "Timed out waiting for reverse data stream pairing");
+                }
+            }
+        });
     }
 
     /// Handles a reverse control channel: binds requested port on server and notifies client.
@@ -749,13 +970,13 @@ impl ServerRunner {
             }
         };
 
-        // Register the inbound pool BEFORE acknowledging. The client starts its
-        // pre-warm workers as soon as RegisterAck arrives; a late registration
-        // would discard the whole first generation and delay the first 0-RTT pair.
-        // The soft cap is derived from the worker count the client negotiated,
-        // so both ends size the same pool.
-        let mut idle_pool =
-            session_mgr.register_pool(protocol, &listen_addr, reverse_pool_soft_cap(pool_size));
+        // Register the inbound pool BEFORE acknowledging, wrapped in an RAII Drop guard
+        // so pool registration is cleaned up even if this future is cancelled or aborted.
+        let mut pool_guard = session_mgr.register_pool_guarded(
+            protocol,
+            &listen_addr,
+            reverse_pool_soft_cap(pool_size),
+        );
 
         let sig_config = SignalingConfig {
             heartbeat_interval,
@@ -771,12 +992,12 @@ impl ServerRunner {
                 success: true,
                 error_msg: None,
             })
+            .cancel_with(&cancel_token)
             .await;
-        if ack_sent.is_err() {
+        if !matches!(ack_sent, Some(Ok(()))) {
             warn!(addr = %listen_addr, "Failed to send RegisterAck; dropping reverse listener");
             frontend.shutdown().await;
             drop(frontend);
-            session_mgr.unregister_pool(protocol, &listen_addr, &idle_pool);
             return;
         }
 
@@ -784,10 +1005,6 @@ impl ServerRunner {
         let relay_idle_timeout = match protocol {
             L4Protocol::Tcp => idle_timeout,
             L4Protocol::Udp => udp_idle_timeout,
-        };
-        let activation_magic = match protocol {
-            L4Protocol::Tcp => ACTIVATE_STREAM_MAGIC,
-            L4Protocol::Udp => ACTIVATE_STREAM_UDP,
         };
         let grace_period = reverse_grace_period(idle_timeout);
         let mut grace_handle: Option<ReverseGraceHandle> = None;
@@ -819,7 +1036,7 @@ impl ServerRunner {
                         sig_config,
                         &cancel_token,
                         &session_mgr,
-                        &mut idle_pool,
+                        &mut pool_guard,
                         &router,
                         &sig_rx,
                         &mut grace_handle,
@@ -840,7 +1057,7 @@ impl ServerRunner {
                         sig_config,
                         &cancel_token,
                         &session_mgr,
-                        &mut idle_pool,
+                        &mut pool_guard,
                         &router,
                         &sig_rx,
                         &mut grace_handle,
@@ -863,7 +1080,7 @@ impl ServerRunner {
                             sig_config,
                             &cancel_token,
                             &session_mgr,
-                            &mut idle_pool,
+                            &mut pool_guard,
                             &router,
                             &sig_rx,
                             &mut grace_handle,
@@ -889,7 +1106,7 @@ impl ServerRunner {
                                 sig_config,
                                 &cancel_token,
                                 &session_mgr,
-                                &mut idle_pool,
+                                &mut pool_guard,
                                 &router,
                                 &sig_rx,
                                 &mut grace_handle,
@@ -903,179 +1120,27 @@ impl ServerRunner {
                 accept_res = &mut accept_slot => {
                     match accept_res {
                         Ok(accepted) => {
-                            let visitor_stream = accepted.channel;
-                            let visitor_addr = accepted.peer;
-                            // 1. FAST PATH (0-RTT Pool): only pair streams that are
-                            // fresh and still alive. A stale generation must fall
-                            // through to signaling rather than blackhole the visitor.
-                            // The server owns the idle-stream lifetime; entries are
-                            // removed under the pool lock, and activation is driven
-                            // in the spawned task so WAN RTT never blocks the accept loop.
-                            if let Some(mut candidate) = idle_pool.pop_live(idle_timeout).await {
-                                debug!(
-                                    visitor = %visitor_addr,
-                                    protocol = %protocol,
-                                    "Paired reverse visitor with idle pooled stream (0-RTT)"
-                                );
-                                let router_fallback = router.clone();
-                                let session_mgr_fallback = Arc::clone(&session_mgr);
-                                local_tracker.spawn_with_cancel(move |token| async move {
-                                    let activate = async {
-                                        tokio::io::AsyncWriteExt::write_all(
-                                            &mut candidate,
-                                            &[activation_magic],
-                                        )
-                                        .await?;
-                                        tokio::io::AsyncWriteExt::flush(&mut candidate).await
-                                    };
-                                    match tokio::time::timeout(frame_timeout, activate)
-                                        .cancel_with(&token)
-                                        .await
-                                    {
-                                        Some(Ok(Ok(()))) => {
-                                            let _ = serve(
-                                                PumpRequest::new(visitor_stream, candidate),
-                                                PumpCtx {
-                                                    cancel: token,
-                                                    heartbeat_interval,
-                                                    idle_timeout: relay_idle_timeout,
-                                                },
-                                            ).await;
-                                        }
-                                        Some(activation_failure) => {
-                                            debug!(
-                                                "0-RTT pool stream activation failed ({:?}); falling back to control signaling",
-                                                activation_failure
-                                            );
-                                            drop(candidate);
-                                            if router_fallback.has_active_channel() {
-                                                let session_id = format!(
-                                                    "sess_{}_{}",
-                                                    std::process::id(),
-                                                    REVERSE_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed)
-                                                );
-                                                let pair_rx = session_mgr_fallback.register(session_id.clone());
-                                                let notify_msg = ControlMessage::NewConnection {
-                                                    session_id: session_id.clone(),
-                                                    client_addr: visitor_addr.to_string(),
-                                                };
-                                                if router_fallback.send(notify_msg).await.is_ok() {
-                                                    if let Ok(Ok(data_stream)) = timeout(DEFAULT_SESSION_PAIR_TIMEOUT, pair_rx).await {
-                                                        let _ = serve(
-                                                            PumpRequest::new(visitor_stream, data_stream),
-                                                            PumpCtx {
-                                                                cancel: token,
-                                                                heartbeat_interval,
-                                                                idle_timeout: relay_idle_timeout,
-                                                            },
-                                                        ).await;
-                                                        return;
-                                                    }
-                                                    session_mgr_fallback.remove(&session_id);
-                                                } else {
-                                                    session_mgr_fallback.remove(&session_id);
-                                                }
-                                            }
-                                        }
-                                        None => {}
-                                    }
-                                });
-                                continue;
-                            }
-
-                            // 2. SLOW PATH (Fallback): if signaling is temporarily in
-                            // its grace window with an empty pool, drop only this
-                            // fallback visitor without tearing down the bound port.
-                            if !router.has_active_channel() {
-                                debug!(
-                                    visitor = %visitor_addr,
-                                    protocol = %protocol,
-                                    "Dropping fallback reverse visitor while control channel is in grace period"
-                                );
-                                continue;
-                            }
-
-                            // Allocate session_id and notify client via control channel
-                            let session_id = format!(
-                                "sess_{}_{}",
-                                std::process::id(),
-                                REVERSE_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed)
-                            );
-
-                            debug!(
-                                session = %session_id,
-                                visitor = %visitor_addr,
-                                protocol = %protocol,
-                                "External visitor connected to reverse port, notifying client"
-                            );
-
-                            // Register in session manager before notifying client
-                            let pair_rx = session_mgr.register(session_id.clone());
-
-                            // Notify client
-                            let notify_msg = ControlMessage::NewConnection {
-                                session_id: session_id.clone(),
-                                client_addr: visitor_addr.to_string(),
-                            };
-
-                            // Bounded signaling: a stalled or dead control channel
-                            // must never block the accept loop and starve later
-                            // visitors. Individual timeouts drop the session;
-                            // transport failures transition to promotion / grace.
-                            let notify_res = router.send(notify_msg).await;
-                            match notify_res {
-                                Ok(()) => {}
-                                Err(TunnelError::ControlProtocol(ref e)) if e.contains("timed out") => {
-                                    warn!(session = %session_id, "Timed out signaling NewConnection; dropping session and continuing");
-                                    session_mgr.remove(&session_id);
-                                    continue;
-                                }
-                                Err(e) => {
-                                    warn!(session = %session_id, "Failed to notify client over control channel: {:?}", e);
-                                    session_mgr.remove(&session_id);
-                                    Self::handle_signaling_disconnect(
-                                        &listen_addr,
-                                        protocol,
-                                        idle_timeout,
-                                        grace_period,
-                                        sig_config,
-                                        &cancel_token,
-                                        &session_mgr,
-                                        &mut idle_pool,
-                                        &router,
-                                        &sig_rx,
-                                        &mut grace_handle,
-                                        &mut grace_deadline,
-                                        &mut pool_notify,
-                                    )
-                                    .await;
-                                    continue;
-                                }
-                            }
-
-                            // Spawn pairing relay task
-                            let session_mgr_clone = Arc::clone(&session_mgr);
-                            let session_id_clone = session_id.clone();
-
-                            local_tracker.spawn_with_cancel(move |token| async move {
-                                match timeout(DEFAULT_SESSION_PAIR_TIMEOUT, pair_rx).await {
-                                    Ok(Ok(data_stream)) => {
-                                        debug!(session = %session_id_clone, "Reverse data stream paired, starting relay");
-                                                        let _ = serve(
-                                                            PumpRequest::new(visitor_stream, data_stream),
-                                                            PumpCtx {
-                                                                cancel: token,
-                                                                heartbeat_interval,
-                                                                idle_timeout: relay_idle_timeout,
-                                                            },
-                                                        ).await;
-                                    }
-                                    _ => {
-                                        warn!(session = %session_id_clone, "Timed out waiting for reverse data stream pairing");
-                                        session_mgr_clone.remove(&session_id_clone);
-                                    }
-                                }
-                            });
+                            Self::handle_accepted_reverse_visitor(
+                                accepted,
+                                &listen_addr,
+                                protocol,
+                                idle_timeout,
+                                relay_idle_timeout,
+                                heartbeat_interval,
+                                frame_timeout,
+                                sig_config,
+                                grace_period,
+                                &cancel_token,
+                                &session_mgr,
+                                &mut pool_guard,
+                                &router,
+                                &sig_rx,
+                                &mut grace_handle,
+                                &mut grace_deadline,
+                                &mut pool_notify,
+                                &mut local_tracker,
+                            )
+                            .await;
                         }
                         Err(e) => {
                             if !cancel_token.is_cancelled() && !matches!(e, TunnelError::Shutdown) {
@@ -1095,7 +1160,7 @@ impl ServerRunner {
         // binds after the OS socket has been released.
         frontend.shutdown().await;
         drop(frontend);
-        session_mgr.unregister_pool(protocol, &listen_addr, &idle_pool);
+        drop(pool_guard);
         if let Some(g) = grace_handle.take() {
             g.finish();
         }
@@ -1861,5 +1926,140 @@ mod tests {
         drop(visitor);
         cancel_token.cancel();
         let _ = handle.await;
+    }
+
+    /// Verifies that when the event loop is inside `router.send(notify_msg)` awaiting a stalled peer,
+    /// triggering `cancel_token` cancels the loop immediately rather than waiting for the timeout,
+    /// and that `PendingSessionGuard` and `ReversePoolGuard` cleanly release all registrations.
+    #[tokio::test]
+    async fn test_reverse_control_cancels_promptly_during_stalled_visitor_signaling() {
+        use futures_util::{SinkExt, StreamExt};
+
+        let (client, server) = tokio::io::duplex(32);
+        let mut ctrl_client = FramedControlStream::new(client);
+        let session_mgr = Arc::new(SessionManager::new());
+        let cancel_token = CancellationToken::new();
+
+        let listen_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let listen_addr = format!("127.0.0.1:{}", listen_port);
+
+        let s_mgr = Arc::clone(&session_mgr);
+        let c_token = cancel_token.clone();
+        let l_addr = listen_addr.clone();
+
+        // 30-second idle timeout so any unconstrained await would hang for 10s
+        let handle = tokio::spawn(async move {
+            ServerRunner::handle_reverse_control(
+                Box::new(server),
+                s_mgr,
+                c_token,
+                Duration::from_secs(30),
+                crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
+                crate::consts::DEFAULT_UDP_IDLE_TIMEOUT,
+            )
+            .await;
+        });
+
+        // Register reverse port
+        ctrl_client
+            .send(ControlMessage::RegisterReverse {
+                listen_addr: listen_addr.clone(),
+                target_addr: "127.0.0.1:9099".to_string(),
+                pool_size: None,
+                protocol: L4Protocol::Tcp,
+            })
+            .await
+            .unwrap();
+
+        let ack = ctrl_client.next().await.unwrap().unwrap();
+        assert!(matches!(
+            ack,
+            ControlMessage::RegisterAck { success: true, .. }
+        ));
+        assert_eq!(session_mgr.pool_count(), 1);
+
+        // Connect visitor. Duplex buffer is 32 bytes and client does not read,
+        // so router.send(NewConnection) blocks immediately.
+        let visitor = tokio::net::TcpStream::connect(&l_addr).await.unwrap();
+
+        // Give event loop a few milliseconds to hit router.send
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Cancel the token! Must respond immediately (< 500ms), NOT 10s timeout!
+        cancel_token.cancel();
+
+        let exit_res = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(
+            exit_res.is_ok(),
+            "Event loop did not respond immediately to cancel_token while awaiting router.send!"
+        );
+
+        drop(visitor);
+        // Both the pool and any pending session must be cleaned up cleanly on exit:
+        assert_eq!(session_mgr.pool_count(), 0);
+        assert_eq!(session_mgr.len(), 0);
+    }
+
+    /// Verifies that if `handle_reverse_control` task is aborted abruptly (simulating TaskTracker timeout fallback),
+    /// RAII drop guards (`ReversePoolGuard`) guarantee the pool is unregistered from SessionManager.
+    #[tokio::test]
+    async fn test_reverse_control_future_abort_cleans_up_resources() {
+        use futures_util::{SinkExt, StreamExt};
+
+        let (client, server) = tokio::io::duplex(1024);
+        let mut ctrl_client = FramedControlStream::new(client);
+        let session_mgr = Arc::new(SessionManager::new());
+        let cancel_token = CancellationToken::new();
+
+        let listen_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let listen_addr = format!("127.0.0.1:{}", listen_port);
+
+        let s_mgr = Arc::clone(&session_mgr);
+        let c_token = cancel_token.clone();
+
+        let handle = tokio::spawn(async move {
+            ServerRunner::handle_reverse_control(
+                Box::new(server),
+                s_mgr,
+                c_token,
+                Duration::from_secs(30),
+                crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
+                crate::consts::DEFAULT_UDP_IDLE_TIMEOUT,
+            )
+            .await;
+        });
+
+        // Register reverse port
+        ctrl_client
+            .send(ControlMessage::RegisterReverse {
+                listen_addr: listen_addr.clone(),
+                target_addr: "127.0.0.1:9099".to_string(),
+                pool_size: None,
+                protocol: L4Protocol::Tcp,
+            })
+            .await
+            .unwrap();
+
+        let ack = ctrl_client.next().await.unwrap().unwrap();
+        assert!(matches!(
+            ack,
+            ControlMessage::RegisterAck { success: true, .. }
+        ));
+        assert_eq!(session_mgr.pool_count(), 1);
+
+        // Abruptly abort the task (simulating tokio abort / TaskTracker forced abort)
+        handle.abort();
+        let _ = handle.await;
+
+        // Pool MUST be unregistered from session_mgr via ReversePoolGuard Drop:
+        assert_eq!(session_mgr.pool_count(), 0);
     }
 }

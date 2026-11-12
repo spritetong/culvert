@@ -129,11 +129,16 @@ impl ReverseInboundPool {
     pub async fn promote_idle(&self, max_age: Duration) -> Option<Box<dyn TunnelStream>> {
         use tokio::io::AsyncWriteExt;
         let mut stream = self.pop_live(max_age).await?;
-        if stream
-            .write_all(&[crate::consts::ACTIVATE_STREAM_PROMOTE])
+        let write_fut = async {
+            stream
+                .write_all(&[crate::consts::ACTIVATE_STREAM_PROMOTE])
+                .await?;
+            stream.flush().await
+        };
+        // Bounded write: an unread or dead stream buffer must never hang promote_idle indefinitely.
+        if tokio::time::timeout(Duration::from_secs(1), write_fut)
             .await
-            .is_ok()
-            && stream.flush().await.is_ok()
+            .is_ok_and(|r| r.is_ok())
         {
             Some(stream)
         } else {
@@ -214,6 +219,101 @@ impl Drop for ReverseGraceHandle {
     }
 }
 
+/// RAII drop guard that unregisters a pending reverse session from [`SessionManager`]
+/// if the pairing future is dropped, cancelled, or aborted before completion.
+pub struct PendingSessionGuard {
+    manager: Arc<SessionManager>,
+    session_id: String,
+    active: bool,
+}
+
+impl PendingSessionGuard {
+    /// Creates a new guard for the given session.
+    pub fn new(manager: Arc<SessionManager>, session_id: String) -> Self {
+        Self {
+            manager,
+            session_id,
+            active: true,
+        }
+    }
+
+    /// Returns the session ID being guarded.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Disarms the guard when pairing completes successfully, preventing cleanup on drop.
+    pub fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for PendingSessionGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.manager.remove(&self.session_id);
+        }
+    }
+}
+
+/// RAII drop guard that ensures an inbound reverse stream pool is cleanly unregistered
+/// from [`SessionManager`] when the owning listener task completes, errors, or is aborted.
+pub struct ReversePoolGuard {
+    manager: Arc<SessionManager>,
+    protocol: L4Protocol,
+    listen_addr: String,
+    pool: Arc<ReverseInboundPool>,
+}
+
+impl ReversePoolGuard {
+    /// Creates a new guard for the registered reverse pool.
+    pub fn new(
+        manager: Arc<SessionManager>,
+        protocol: L4Protocol,
+        listen_addr: String,
+        pool: Arc<ReverseInboundPool>,
+    ) -> Self {
+        Self {
+            manager,
+            protocol,
+            listen_addr,
+            pool,
+        }
+    }
+
+    /// Returns a reference to the guarded inbound pool.
+    pub fn pool(&self) -> &Arc<ReverseInboundPool> {
+        &self.pool
+    }
+
+    /// Returns a mutable reference to the guarded inbound pool.
+    pub fn pool_mut(&mut self) -> &mut Arc<ReverseInboundPool> {
+        &mut self.pool
+    }
+
+    /// Replaces the active pool with a new generation, unregistering the superseded generation first.
+    pub fn replace_pool(&mut self, new_pool: Arc<ReverseInboundPool>) {
+        self.manager
+            .unregister_pool(self.protocol, &self.listen_addr, &self.pool);
+        self.pool = new_pool;
+    }
+}
+
+impl std::ops::Deref for ReversePoolGuard {
+    type Target = Arc<ReverseInboundPool>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.pool
+    }
+}
+
+impl Drop for ReversePoolGuard {
+    fn drop(&mut self) {
+        self.manager
+            .unregister_pool(self.protocol, &self.listen_addr, &self.pool);
+    }
+}
+
 /// Thread-safe in-memory routing table for matching incoming reverse data streams
 /// and managing pre-warmed inbound stream pools.
 #[derive(Clone, Default)]
@@ -240,6 +340,22 @@ impl SessionManager {
         let (tx, rx) = oneshot::channel();
         self.pending_sessions.insert(session_id, tx);
         rx
+    }
+
+    /// Registers a pending session and returns both the stream receiver and an RAII [`PendingSessionGuard`].
+    ///
+    /// If the awaiting task is cancelled, dropped, or aborted before pairing finishes,
+    /// [`PendingSessionGuard`]'s `Drop` implementation automatically removes the session.
+    pub fn register_guarded(
+        self: &Arc<Self>,
+        session_id: String,
+    ) -> (
+        oneshot::Receiver<Box<dyn TunnelStream>>,
+        PendingSessionGuard,
+    ) {
+        let rx = self.register(session_id.clone());
+        let guard = PendingSessionGuard::new(Arc::clone(self), session_id);
+        (rx, guard)
     }
 
     /// Delivers an incoming reverse data stream to the waiting task.
@@ -302,6 +418,18 @@ impl SessionManager {
         let key = canonical_reverse_key(protocol, listen_addr);
         self.reverse_pools
             .remove_if(&key, |_, current| Arc::ptr_eq(current, pool));
+    }
+
+    /// Registers an inbound pool for a `(protocol, listen_addr)` reverse listener,
+    /// returning an RAII [`ReversePoolGuard`] that automatically unregisters it on abort or exit.
+    pub fn register_pool_guarded(
+        self: &Arc<Self>,
+        protocol: L4Protocol,
+        listen_addr: &str,
+        capacity: usize,
+    ) -> ReversePoolGuard {
+        let pool = self.register_pool(protocol, listen_addr, capacity);
+        ReversePoolGuard::new(Arc::clone(self), protocol, listen_addr.to_string(), pool)
     }
 
     /// Pushes a pre-warmed idle reverse stream into the matching listener's pool.
@@ -739,5 +867,63 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(200), notified)
             .await
             .expect("push must wake owned notifier");
+    }
+
+    #[tokio::test]
+    async fn test_pending_session_guard_cleans_up_on_drop() {
+        let manager = Arc::new(SessionManager::new());
+        let session_id = "sess_abort_test_01".to_string();
+        let (_rx, guard) = manager.register_guarded(session_id.clone());
+        assert_eq!(manager.len(), 1);
+
+        // Aborting/dropping the task or guard drops the guard without disarming:
+        drop(guard);
+        assert_eq!(manager.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_pending_session_guard_disarm_retains_session() {
+        let manager = Arc::new(SessionManager::new());
+        let session_id = "sess_disarm_test_02".to_string();
+        let (rx, mut guard) = manager.register_guarded(session_id.clone());
+        assert_eq!(manager.len(), 1);
+
+        let (client, _server) = duplex(64);
+        manager.fulfill(&session_id, Box::new(client)).unwrap();
+        guard.disarm();
+        drop(guard);
+
+        let stream = rx.await.unwrap();
+        drop(stream);
+        assert_eq!(manager.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_reverse_pool_guard_unregisters_on_drop() {
+        let manager = Arc::new(SessionManager::new());
+        assert_eq!(manager.pool_count(), 0);
+
+        let guard = manager.register_pool_guarded(L4Protocol::Tcp, "127.0.0.1:9999", 4);
+        assert_eq!(manager.pool_count(), 1);
+
+        drop(guard);
+        assert_eq!(manager.pool_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_reverse_pool_guard_replace_pool() {
+        let manager = Arc::new(SessionManager::new());
+        let mut guard = manager.register_pool_guarded(L4Protocol::Tcp, "127.0.0.1:9998", 4);
+        let (c1, _) = duplex(64);
+        assert!(guard.push(Box::new(c1)));
+        assert_eq!(guard.len(), 1);
+
+        let new_pool = manager.register_pool(L4Protocol::Tcp, "127.0.0.1:9998", 8);
+        guard.replace_pool(new_pool);
+        assert_eq!(manager.pool_count(), 1);
+        assert_eq!(guard.len(), 0);
+
+        drop(guard);
+        assert_eq!(manager.pool_count(), 0);
     }
 }
