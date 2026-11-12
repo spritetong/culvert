@@ -76,7 +76,7 @@ behavior is configurable, the configuration key is given.
 | :--- | :--- | :--- |
 | UC-1 | Publish a local service on a remote host (reverse mapping) | Client behind NAT connects to the ingress endpoint, sends `RegisterReverse`, the server binds the requested TCP/UDS or UDP address, and each inbound connection or UDP NAT flow is relayed back to the client's local target. |
 | UC-2 | Reach a private service from a local port (forward mapping) | Client binds `mappings.listen` locally (TCP or UDP); each local connection or UDP client flow opens a tunnel stream to the ingress endpoint; the server opens the corresponding TCP/UDS connection or `ConnectedUdpSocket` to `mappings.target` and relays in both directions. |
-| UC-3 | Carry several ports over one endpoint (cluster) | One `tunnels` entry declares several `mappings` (TCP and/or UDP, even sharing the same port). Forward mappings share the outbound pool, and reverse mappings maintain per-`(protocol, listen)` inbound pools when `pool_size` is set; in-band 0-RTT activation (`0xA5` TCP / `0xA7` UDP) is used when idle streams exist, falling back to signaling when the pool is empty. |
+| UC-3 | Carry several ports over one endpoint (cluster) | One `tunnels` entry declares several `mappings` (TCP and/or UDP, even sharing the same port). Forward mappings share the outbound pool, and reverse mappings maintain per-`(protocol, listen)` inbound pools when `pool_size` is set; in-band 0-RTT activation (`0xA5` TCP / `0xA7` UDP with `0xAC` ACK) is used when idle streams exist, falling back to signaling when the pool is empty or activation fails. |
 | UC-4 | Reach a Unix domain socket through a tunnel | TCP `mappings.target` or `mappings.listen` uses `unix://path`; the ingress side or client side binds/connects the socket directly. |
 | UC-5 | Deploy behind a reverse proxy | `server.listen` uses `ws+unix://...` or `ws://127.0.0.1:...`; the proxy handles public TLS and forwards the configured HTTP path to culvert (capable of carrying both TCP and UDP mappings). |
 | UC-6 | Deploy without a reverse proxy | `server.listen` uses a TLS scheme (`wss`, `h3`, `https`, `quic`, `wss+unix`). culvert terminates TLS using the configured certificate and key, or an ephemeral self-signed certificate when neither is provided. |
@@ -115,7 +115,7 @@ behavior is configurable, the configuration key is given.
 | Mode | Listener location | Target location | Protocols | Pool |
 | :--- | :--- | :--- | :--- | :--- |
 | `forward` (default) | Client host | Dialed by the ingress server | `tcp` (default; IP/host/UDS), `udp` (IP/host) | Shared outbound pool when `pool_size > 0` (`0xA5` TCP / `0xA7` UDP) |
-| `reverse` | Ingress server (registered over a control channel) | Dialed by the client host | `tcp` (default; IP/host/UDS), `udp` (IP/host) | Per-`(protocol, listen)` inbound pool when `pool_size > 0` (`0xA5`/`0xA7` 0-RTT with signaling fallback) |
+| `reverse` | Ingress server (registered over a control channel) | Dialed by the client host | `tcp` (default; IP/host/UDS), `udp` (IP/host) | Per-`(protocol, listen)` inbound pool when `pool_size > 0` (`0xA5`/`0xA7` 0-RTT with `0xAC` round-trip ACK and signaling fallback) |
 
 ---
 
@@ -258,19 +258,25 @@ behavior is configurable, the configuration key is given.
 - **FR-5.4** Fast path (0-RTT): For each inbound connection or new UDP peer
   flow on the reverse listener, if an idle stream is available in the inbound
   pool, the server pops it, writes the single-byte activation signal (`0xA5` for
-  TCP, `0xA7` for UDP), and immediately relays with the inbound channel without
-  control signaling. The client reads `0xA5` / `0xA7` (or `0xA6` to promote the
-  stream into a replacement signaling channel), dials local `mappings.target`
-  (TCP/UDS or `ConnectedUdpSocket`), starts relaying, and replenishes the
-  inbound pool in the background.
+  TCP, `0xA7` for UDP), and reads back `0xAC` (`ACTIVATE_STREAM_ACK`) bounded by
+  `reverse_frame_timeout(idle_timeout)`. The client worker reads `0xA5` / `0xA7`
+  (or `0xA6` to promote the stream into a replacement signaling channel), echoes
+  `0xAC` with a 2-second timeout, dials local `mappings.target` (TCP/UDS or
+  `ConnectedUdpSocket`), starts relaying, and replenishes the inbound pool in the
+  background. This round-trip acknowledgment guarantees that silently-dead
+  (half-open) idle streams where server writes succeed into the OS kernel buffer
+  are detected rather than blackholing the visitor.
 - **FR-5.5** Fallback path (on-demand signaling): If no idle stream is
-  available (e.g. pool exhausted under burst or `pool_size` not set), the server
-  allocates a session id, registers a pending session, and sends
-  `NewConnection { session_id, client_addr }` over the control channel. The
-  client opens the local target channel matching its `protocol` (`Tcp` or
-  `Udp`), opens a `reverse-data` stream carrying `x-session-id` and `x-tunnel-proto`,
-  and the server pairs it with the waiting inbound channel through
-  `SessionManager`. Pairing has a 15-second timeout (`DEFAULT_SESSION_PAIR_TIMEOUT`).
+  available (e.g. pool exhausted under burst or `pool_size` not set), or if
+  fast-path 0-RTT activation fails (missing `0xAC` ACK, timeout, or I/O error),
+  the server routes the visitor through an internal failover channel to
+  `signal_new_connection`: it allocates a session id, registers a pending session
+  guard in `SessionManager`, and sends `NewConnection { session_id, client_addr }`
+  over the control channel. The client opens the local target channel matching
+  its `protocol` (`Tcp` or `Udp`), opens a `reverse-data` stream carrying
+  `x-session-id` and `x-tunnel-proto`, and the server pairs it with the waiting
+  inbound channel through `SessionManager`. Pairing has a 10-second timeout
+  (`DEFAULT_SESSION_PAIR_TIMEOUT`).
 - **FR-5.6** Both sides are handed to `core::serve` as `IoChannel`s. The
   control channel stays open inside a `SignalingChannel` actor with
   activity-gated `Ping`/`Pong` and an idle timeout, backed by a `SignalingRouter`

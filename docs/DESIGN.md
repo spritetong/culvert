@@ -657,6 +657,7 @@ Magic byte values:
 - `0xA6` (`ACTIVATE_STREAM_PROMOTE`): emergency promotion of an idle reverse pool
   stream into a replacement `SignalingChannel`.
 - `0xA7` (`ACTIVATE_STREAM_UDP`): UDP forward/reverse stream activation.
+- `0xAC` (`ACTIVATE_STREAM_ACK`): reverse worker round-trip activation acknowledgment byte.
 
 - In **Forward mode**: Produced by `ReplenishingStreamPool::encode_activation_with_proto`
   on the client, written before any application data. The server reads the magic
@@ -664,10 +665,14 @@ Magic byte values:
   rejects lengths `>= 512`, parses the string with `parse_target_addr`, and only
   then dials the target (TCP/UDS or `ConnectedUdpSocket`). An invalid magic byte
   or a closed idle stream terminates that connection.
-- In **Reverse mode**: The server sends a single `0xA5` (TCP) or `0xA7` (UDP)
-  byte directly down the popped idle reverse stream to trigger activation on the
-  client (or `0xA6` to promote an idle stream to control signaling). Target
-  address and protocol are already statically configured on the client.
+- In **Reverse mode**: The server writes `0xA5` (TCP) or `0xA7` (UDP) directly down
+  the popped idle reverse stream, flushes, and reads back `0xAC` (`ACTIVATE_STREAM_ACK`)
+  bounded by `reverse_frame_timeout(idle_timeout)` before pairing. The client worker
+  reads the magic byte (or `0xA6` to promote an idle stream to control signaling),
+  echoes `0xAC` within a 2-second timeout before dialing the local target, and begins
+  relaying. This round-trip acknowledgment prevents silently dead (half-open) idle
+  connections — where server writes succeed into the local socket send buffer — from
+  blackholing visitors.
 
 ### 6.2 Reverse control channel, SignalingChannel & Inbound Pool
 
@@ -704,21 +709,29 @@ For each inbound connection or new UDP client flow on the reverse listener:
 1. **Fast path (0-RTT Pool)**: `pop_live(idle_timeout)` takes the newest idle
    stream, drops entries older than the effective idle window, and verifies the
    rest with `poll_check_alive`. To eliminate WAN RTT latency from the accept
-   loop, stream activation (`write_all(&[activation_magic])` — `0xA5` for TCP
-   or `0xA7` for UDP — and `flush()`) is offloaded directly into the spawned
-   relay task in `local_tracker`. The accept loop returns in 0 ms, allowing
-   hundreds of visitors or UDP NAT flows to be paired in parallel without
-   blocking subsequent accepts. `PumpCtx` passes `idle_timeout` for TCP or
-   `udp_idle_timeout` for UDP.
+   loop, stream activation is offloaded directly into the spawned relay task in
+   `local_tracker`. The accept loop returns in 0 ms, allowing hundreds of visitors
+   or UDP NAT flows to be paired in parallel without blocking subsequent accepts.
+   `PumpCtx` passes `idle_timeout` for TCP or `udp_idle_timeout` for UDP.
+   - **Round-Trip Liveness ACK (`0xAC`)**: In the spawned task, the server writes
+     the activation magic (`0xA5` for TCP or `0xA7` for UDP), flushes, and reads
+     back `ACTIVATE_STREAM_ACK` (`0xAC`) bounded by `reverse_frame_timeout(idle_timeout)`.
+   - **Channel Failover to Signaling**: If activation fails (missing ACK, timeout, or
+     stream I/O error), the candidate is discarded. Because `TaskTracker` is not `Clone`
+     and spawned tasks cannot mutate accept-loop state, the visitor
+     `(visitor_stream, visitor_addr)` is sent through an `mpsc::channel` (`failover_tx`)
+     into the server's main `tokio::select!` event loop, which routes it to
+     `signal_new_connection` so the visitor is never dropped.
 2. **Fallback path (On-demand Signaling)**: If no live stream is available
-   (empty pool, stale entries, or `pool_size` not set), the server allocates a
-   session id (`REVERSE_SESSION_COUNTER`), registers a oneshot receiver in
-   `SessionManager`, and sends `NewConnection` via `SignalingHandle::send`.
+   (empty pool, stale entries, or `pool_size` not set), or if fast-path 0-RTT
+   activation fails, the server routes the visitor to `signal_new_connection`:
+   it allocates a session id (`REVERSE_SESSION_COUNTER`), registers a guarded oneshot
+   receiver in `SessionManager`, and sends `NewConnection` via `SignalingHandle::send`.
    The send is bounded by `reverse_frame_timeout(idle_timeout)` (10 s by default);
    if sending times out on a congested channel, the visitor session is dropped
    and the accept loop continues without tearing down the listening port. The
    paired data stream is delivered by `SessionManager::fulfill`; pairing is
-   bounded by `DEFAULT_SESSION_PAIR_TIMEOUT` (15 s). Both channels then go to
+   bounded by `DEFAULT_SESSION_PAIR_TIMEOUT` (10 s). Both channels then go to
    `core::serve`.
 
 On the client side (`run_reverse_mapping`), `SignalingChannel::spawn` is similarly
@@ -800,7 +813,9 @@ recycle timer**: the server is the sole owner of an idle stream's lifetime, so
 a worker can never close a connection the server has already popped and
 committed to a visitor. Expiry, overflow eviction, re-registration and listener
 teardown all close idle streams from the server side; the worker sees EOF and
-re-dials. Upon activation it opens the local channel via
+re-dials. Upon reading a valid `0xA5` or `0xA7`, the worker echoes `ACTIVATE_STREAM_ACK`
+(`0xAC`) with a bounded 2-second timeout before opening the local channel; failure
+discards and recycles the stream. It then opens the local channel via
 `platform::connect_target_channel_str(&target_clone, protocol)` (TCP/UDS or
 `ConnectedUdpSocket`), hands `core::serve` (with `relay_idle_timeout`) to its own
 `TaskTracker` (never detached), and immediately dials a replacement — one dial
@@ -1026,7 +1041,7 @@ effective configuration values.
 | `POOL_BACKOFF_BASE` / `POOL_BACKOFF_MAX` / `ACTIVE_WAITERS_MAX` | 200 ms / 10 s / 1 s |
 | `DEFAULT_REVERSE_BACKOFF_INITIAL` / `MAX` / reset | 500 ms / 30 s / 30 s |
 | `MAX_ACTIVATION_TARGET_LEN` | 512 bytes |
-| `ACTIVATE_STREAM_MAGIC` / `PROMOTE` / `UDP` | `0xA5` / `0xA6` / `0xA7` |
+| `ACTIVATE_STREAM_MAGIC` / `PROMOTE` / `UDP` / `ACK` | `0xA5` / `0xA6` / `0xA7` / `0xAC` |
 | `HEADER_TUNNEL_PROTO` | `x-tunnel-proto` (`tcp` / `udp`) |
 | `ALPN_H3` / `ALPN_QUIC` | `h3` / `culvert-quic` |
 | QUIC windows | stream 4 MiB, connection 128 MiB, send 128 MiB |
