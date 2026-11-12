@@ -8,6 +8,7 @@
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use bytes::{Buf, Bytes};
@@ -20,7 +21,7 @@ use crate::consts::{
     DEFAULT_H3_FINISH_STREAM_TIMEOUT, DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD,
     H3_STREAM_CHUNK_QUEUE_SIZE,
 };
-use crate::core::stream::{HeartbeatStatus, TunnelStream};
+use crate::core::stream::{HeartbeatStatus, TunnelStream, activity_now_ms};
 
 /// Raw QUIC bidirectional stream adapter directly polling `quinn::SendStream` and `quinn::RecvStream`.
 pub struct QuinnTunnelStream {
@@ -29,6 +30,8 @@ pub struct QuinnTunnelStream {
     conn: Option<quinn::Connection>,
     liveness: Option<QuicLivenessTracker>,
     shutdown_done: bool,
+    read_buf: Option<u8>,
+    last_activity_ms: AtomicU64,
 }
 
 impl QuinnTunnelStream {
@@ -40,6 +43,8 @@ impl QuinnTunnelStream {
             conn: None,
             liveness: None,
             shutdown_done: false,
+            read_buf: None,
+            last_activity_ms: AtomicU64::new(activity_now_ms()),
         }
     }
 
@@ -49,6 +54,12 @@ impl QuinnTunnelStream {
         self.conn = Some(conn);
         self
     }
+
+    #[inline]
+    fn touch_activity(&self) {
+        self.last_activity_ms
+            .store(activity_now_ms(), Ordering::Relaxed);
+    }
 }
 
 impl AsyncRead for QuinnTunnelStream {
@@ -57,7 +68,38 @@ impl AsyncRead for QuinnTunnelStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.recv).poll_read(cx, buf)
+        let mut filled_any = false;
+        if let Some(b) = self.read_buf.take() {
+            buf.put_slice(&[b]);
+            filled_any = true;
+            if buf.remaining() == 0 {
+                self.touch_activity();
+                return Poll::Ready(Ok(()));
+            }
+        }
+        let before = buf.filled().len();
+        match Pin::new(&mut self.recv).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                if buf.filled().len() > before || filled_any {
+                    self.touch_activity();
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => {
+                if filled_any {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Ready(Err(e))
+                }
+            }
+            Poll::Pending => {
+                if filled_any {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
     }
 }
 
@@ -67,7 +109,15 @@ impl AsyncWrite for QuinnTunnelStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        tokio::io::AsyncWrite::poll_write(Pin::new(&mut self.send), cx, buf)
+        match tokio::io::AsyncWrite::poll_write(Pin::new(&mut self.send), cx, buf) {
+            Poll::Ready(Ok(n)) => {
+                if n > 0 {
+                    self.touch_activity();
+                }
+                Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -139,6 +189,10 @@ impl QuicLivenessTracker {
 }
 
 impl TunnelStream for QuinnTunnelStream {
+    fn last_activity_ms(&self) -> Option<u64> {
+        Some(self.last_activity_ms.load(Ordering::Relaxed))
+    }
+
     fn poll_send_ping(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if let Some(ref conn) = self.conn {
             if let Some(reason) = conn.close_reason() {
@@ -160,7 +214,7 @@ impl TunnelStream for QuinnTunnelStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_check_alive(&mut self, _cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+    fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
         if let Some(ref conn) = self.conn {
             if conn.close_reason().is_some() {
                 return Poll::Ready(HeartbeatStatus::Dead);
@@ -172,7 +226,23 @@ impl TunnelStream for QuinnTunnelStream {
                 return Poll::Ready(HeartbeatStatus::Dead);
             }
         }
-        Poll::Ready(HeartbeatStatus::Alive)
+        if self.read_buf.is_some() {
+            return Poll::Ready(HeartbeatStatus::Alive);
+        }
+        let mut b = [0u8; 1];
+        let mut read_buf = ReadBuf::new(&mut b);
+        match Pin::new(&mut self.recv).poll_read(cx, &mut read_buf) {
+            Poll::Ready(Ok(())) if read_buf.filled().is_empty() => {
+                Poll::Ready(HeartbeatStatus::Dead)
+            }
+            Poll::Ready(Ok(())) => {
+                self.read_buf = Some(b[0]);
+                self.touch_activity();
+                Poll::Ready(HeartbeatStatus::Alive)
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(HeartbeatStatus::Dead),
+            Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
+        }
     }
 }
 
@@ -186,6 +256,7 @@ pub struct H3TunnelStream {
     liveness: Option<QuicLivenessTracker>,
     shutdown_done: bool,
     fin_sent: bool,
+    last_activity_ms: AtomicU64,
 }
 
 impl H3TunnelStream {
@@ -210,6 +281,12 @@ impl H3TunnelStream {
         self.liveness = Some(QuicLivenessTracker::new(&conn));
         self.conn = Some(conn);
         self
+    }
+
+    #[inline]
+    fn touch_activity(&self) {
+        self.last_activity_ms
+            .store(activity_now_ms(), Ordering::Relaxed);
     }
 
     fn spawn_split_pump<S, R>(mut send_stream: S, mut recv_stream: R) -> Self
@@ -284,6 +361,7 @@ impl H3TunnelStream {
             liveness: None,
             shutdown_done: false,
             fin_sent: false,
+            last_activity_ms: AtomicU64::new(activity_now_ms()),
         }
     }
 }
@@ -301,6 +379,7 @@ impl AsyncRead for H3TunnelStream {
             if current.has_remaining() {
                 self.read_buf = Some(current);
             }
+            self.touch_activity();
             return Poll::Ready(Ok(()));
         }
 
@@ -312,6 +391,7 @@ impl AsyncRead for H3TunnelStream {
                 if bytes.has_remaining() {
                     self.read_buf = Some(bytes);
                 }
+                self.touch_activity();
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Err(e)),
@@ -355,6 +435,7 @@ impl AsyncWrite for H3TunnelStream {
                 let chunk = Bytes::copy_from_slice(buf);
                 let len = chunk.len();
                 let _ = tx.send_item(chunk);
+                this.touch_activity();
                 Poll::Ready(Ok(len))
             }
             Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
@@ -421,6 +502,10 @@ impl AsyncWrite for H3TunnelStream {
 }
 
 impl TunnelStream for H3TunnelStream {
+    fn last_activity_ms(&self) -> Option<u64> {
+        Some(self.last_activity_ms.load(Ordering::Relaxed))
+    }
+
     fn poll_send_ping(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if let Some(ref conn) = self.conn {
             if let Some(reason) = conn.close_reason() {
@@ -465,6 +550,7 @@ impl TunnelStream for H3TunnelStream {
         }
         match self.rx_inbound.poll_recv(cx) {
             Poll::Ready(Some(Ok(bytes))) => {
+                self.touch_activity();
                 self.read_buf = Some(bytes);
                 Poll::Ready(HeartbeatStatus::Alive)
             }

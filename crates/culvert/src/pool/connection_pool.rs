@@ -518,7 +518,7 @@ impl ReplenishingStreamPool {
                     PoolEvent::Command(cmd_opt) => {
                         match cmd_opt {
                             Some(PoolCommand::Acquire(req)) => {
-                                let (acquired, evicted_dead) = std::future::poll_fn(|cx| {
+                                let (mut acquired, evicted_dead) = std::future::poll_fn(|cx| {
                                     Poll::Ready(take_live_idle_stream(
                                         &mut idle_streams,
                                         cx,
@@ -530,10 +530,14 @@ impl ReplenishingStreamPool {
 
                                 // Invalidate shared sessions once, and only after a
                                 // stream was actually proven dead. Closing the cached
-                                // QUIC/H3 connection for a healthy-but-busy stream
-                                // would tear down every sibling multiplexed stream.
+                                // QUIC/H3 connection invalidates all sibling streams
+                                // belonging to that session. Therefore, discard any
+                                // acquired sibling and remaining idle streams so the
+                                // caller is served by a fresh dial instead of a dead stream.
                                 if evicted_dead {
                                     connector.invalidate_broken_sessions();
+                                    idle_streams.clear();
+                                    acquired = None;
                                 }
 
                                 if let Some(stream) = acquired {
@@ -620,7 +624,8 @@ impl ReplenishingStreamPool {
                     }
                     PoolEvent::StreamsEvicted => {
                         connector.invalidate_broken_sessions();
-                        stats_clone.lock().idle_count = idle_streams.len();
+                        idle_streams.clear();
+                        stats_clone.lock().idle_count = 0;
                     }
                     PoolEvent::HeartbeatTick => {
                         let now = Instant::now();

@@ -917,6 +917,8 @@ impl ServerRunner {
                                     protocol = %protocol,
                                     "Paired reverse visitor with idle pooled stream (0-RTT)"
                                 );
+                                let router_fallback = router.clone();
+                                let session_mgr_fallback = Arc::clone(&session_mgr);
                                 local_tracker.spawn_with_cancel(move |token| async move {
                                     let activate = async {
                                         tokio::io::AsyncWriteExt::write_all(
@@ -930,21 +932,50 @@ impl ServerRunner {
                                         .cancel_with(&token)
                                         .await
                                     {
-                                                        Some(Ok(Ok(()))) => {
-                                                            let _ = serve(
-                                                                PumpRequest::new(visitor_stream, candidate),
-                                                                PumpCtx {
-                                                                    cancel: token,
-                                                                    heartbeat_interval,
-                                                                    idle_timeout: relay_idle_timeout,
-                                                                },
-                                                            ).await;
-                                                        }
-                                        Some(Ok(Err(e))) => {
-                                            debug!("Discarding dead pooled reverse stream: {}", e);
+                                        Some(Ok(Ok(()))) => {
+                                            let _ = serve(
+                                                PumpRequest::new(visitor_stream, candidate),
+                                                PumpCtx {
+                                                    cancel: token,
+                                                    heartbeat_interval,
+                                                    idle_timeout: relay_idle_timeout,
+                                                },
+                                            ).await;
                                         }
-                                        Some(Err(_)) => {
-                                            debug!("Discarding stalled pooled reverse stream");
+                                        Some(activation_failure) => {
+                                            debug!(
+                                                "0-RTT pool stream activation failed ({:?}); falling back to control signaling",
+                                                activation_failure
+                                            );
+                                            drop(candidate);
+                                            if router_fallback.has_active_channel() {
+                                                let session_id = format!(
+                                                    "sess_{}_{}",
+                                                    std::process::id(),
+                                                    REVERSE_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed)
+                                                );
+                                                let pair_rx = session_mgr_fallback.register(session_id.clone());
+                                                let notify_msg = ControlMessage::NewConnection {
+                                                    session_id: session_id.clone(),
+                                                    client_addr: visitor_addr.to_string(),
+                                                };
+                                                if router_fallback.send(notify_msg).await.is_ok() {
+                                                    if let Ok(Ok(data_stream)) = timeout(DEFAULT_SESSION_PAIR_TIMEOUT, pair_rx).await {
+                                                        let _ = serve(
+                                                            PumpRequest::new(visitor_stream, data_stream),
+                                                            PumpCtx {
+                                                                cancel: token,
+                                                                heartbeat_interval,
+                                                                idle_timeout: relay_idle_timeout,
+                                                            },
+                                                        ).await;
+                                                        return;
+                                                    }
+                                                    session_mgr_fallback.remove(&session_id);
+                                                } else {
+                                                    session_mgr_fallback.remove(&session_id);
+                                                }
+                                            }
                                         }
                                         None => {}
                                     }

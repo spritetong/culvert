@@ -107,63 +107,87 @@ pub async fn run_forward_mapping(
                         let tag_for_task = tag.clone();
 
                         conn_tracker.spawn_with_cancel(move |conn_token| async move {
-                            let acquire_fut = async {
-                                if let Some(ref p) = pool_clone {
-                                    p.acquire(Some(&target))
-                                        .await
-                                        .map(IoChannel::from_boxed_stream)
-                                } else if let Some(ref c) = connector_clone {
-                                    c.connect_with_protocol(&target, None, protocol).await
-                                } else {
-                                    Err(TunnelError::Internal("Connector unavailable".into()))
-                                }
-                            };
+                            let mut remote_channel = None;
+                            let mut attempts = 0usize;
+                            let max_attempts = if pool_clone.is_some() { 2 } else { 1 };
 
-                            let Some(remote_res) = acquire_fut.cancel_with(&conn_token).await else {
-                                return;
-                            };
-
-                            match remote_res {
-                                Ok(mut remote_channel) => {
-                                    let _stream_guard = ActiveStreamGuard(pool_for_close.clone());
-
-                                    if pool_clone.is_some() {
-                                        let activation_pkt = ReplenishingStreamPool::encode_activation_with_proto(Some(&target), protocol);
-                                        let Some(write_act_res) = async {
-                                            remote_channel.write_all(&activation_pkt).await?;
-                                            remote_channel.flush().await?;
-                                            Ok::<(), std::io::Error>(())
-                                        }
-                                        .cancel_with(&conn_token)
-                                        .await
-                                        else {
-                                            return;
-                                        };
-
-                                        if let Err(e) = write_act_res {
-                                            debug!("Failed to write stream activation packet: {}", e);
-                                            return;
-                                        }
+                            while attempts < max_attempts {
+                                attempts += 1;
+                                let acquire_fut = async {
+                                    if let Some(ref p) = pool_clone {
+                                        p.acquire(Some(&target))
+                                            .await
+                                            .map(IoChannel::from_boxed_stream)
+                                    } else if let Some(ref c) = connector_clone {
+                                        c.connect_with_protocol(&target, None, protocol).await
+                                    } else {
+                                        Err(TunnelError::Internal("Connector unavailable".into()))
                                     }
+                                };
 
-                                    let _ = serve(
-                                        PumpRequest {
-                                            frontend: accepted.channel,
-                                            backend: remote_channel,
-                                        },
-                                        PumpCtx {
-                                            cancel: conn_token,
-                                            heartbeat_interval: hb_interval,
-                                            idle_timeout,
-                                        },
-                                    ).await;
-                                }
-                                Err(e) => {
-                                    if !conn_token.is_cancelled() {
-                                        warn!(tag = %tag_for_task, "Failed to open remote tunnel stream: {}", e);
+                                let Some(remote_res) = acquire_fut.cancel_with(&conn_token).await else {
+                                    return;
+                                };
+
+                                match remote_res {
+                                    Ok(mut channel) => {
+                                        if pool_clone.is_some() {
+                                            let activation_pkt = ReplenishingStreamPool::encode_activation_with_proto(Some(&target), protocol);
+                                            let Some(write_act_res) = async {
+                                                channel.write_all(&activation_pkt).await?;
+                                                channel.flush().await?;
+                                                Ok::<(), std::io::Error>(())
+                                            }
+                                            .cancel_with(&conn_token)
+                                            .await
+                                            else {
+                                                return;
+                                            };
+
+                                            if let Err(e) = write_act_res {
+                                                if let Some(ref p) = pool_for_close {
+                                                    p.on_stream_closed();
+                                                }
+                                                if attempts < max_attempts {
+                                                    debug!("Pooled stream activation failed (stale stream); retrying once with fresh stream: {}", e);
+                                                    continue;
+                                                }
+                                                debug!("Failed to write stream activation packet: {}", e);
+                                                return;
+                                            }
+                                        }
+                                        remote_channel = Some(channel);
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        if attempts < max_attempts {
+                                            debug!("Acquire failed on attempt {}, retrying: {}", attempts, e);
+                                            continue;
+                                        }
+                                        if !conn_token.is_cancelled() {
+                                            warn!(tag = %tag_for_task, "Failed to open remote tunnel stream: {}", e);
+                                        }
+                                        return;
                                     }
                                 }
                             }
+
+                            let Some(backend) = remote_channel else {
+                                return;
+                            };
+                            let _stream_guard = ActiveStreamGuard(pool_for_close.clone());
+
+                            let _ = serve(
+                                PumpRequest {
+                                    frontend: accepted.channel,
+                                    backend,
+                                },
+                                PumpCtx {
+                                    cancel: conn_token,
+                                    heartbeat_interval: hb_interval,
+                                    idle_timeout,
+                                },
+                            ).await;
                         });
                     }
                     Err(e) => {
