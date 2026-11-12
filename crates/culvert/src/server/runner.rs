@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::futures::OwnedNotified;
+use tokio::sync::mpsc;
 use tokio::time::{Instant, Sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -19,9 +20,9 @@ use tracing::{debug, error, info, warn};
 use crate::common::{CancelFutureExt, TaskTracker, TimeoutOrCancel};
 use crate::config::model::{ServerConfig, TlsConfig, TunnelMode};
 use crate::consts::{
-    ACTIVATE_STREAM_MAGIC, ACTIVATE_STREAM_UDP, DEFAULT_ACTIVATION_READ_TIMEOUT,
-    DEFAULT_SESSION_PAIR_TIMEOUT, MAX_ACTIVATION_TARGET_LEN, POOL_DUMMY_HOST,
-    reverse_frame_timeout, reverse_grace_period, reverse_pool_soft_cap,
+    ACTIVATE_STREAM_ACK, ACTIVATE_STREAM_MAGIC, ACTIVATE_STREAM_UDP,
+    DEFAULT_ACTIVATION_READ_TIMEOUT, DEFAULT_SESSION_PAIR_TIMEOUT, MAX_ACTIVATION_TARGET_LEN,
+    POOL_DUMMY_HOST, reverse_frame_timeout, reverse_grace_period, reverse_pool_soft_cap,
 };
 use crate::control::{
     ControlMessage, FramedControlStream, SignalingChannel, SignalingConfig, SignalingReceiver,
@@ -31,7 +32,7 @@ use crate::core::error::TunnelError;
 use crate::core::serve::serve;
 use crate::core::stream::TunnelStream;
 use crate::frontend::{self, FrontendAccept, FrontendOutput};
-use crate::io::addr::{L4Protocol, MappingSpec};
+use crate::io::addr::{L4Protocol, MappingSpec, PeerAddr};
 use crate::io::pump::{PumpCtx, PumpRequest};
 use crate::session::{ReverseGraceHandle, ReverseGraceReattach, ReversePoolGuard, SessionManager};
 use crate::transport::{TargetAddr, TransportRegistry};
@@ -702,18 +703,17 @@ impl ServerRunner {
         }
     }
 
-    /// Dispatches an accepted visitor connection on a reverse listening port:
-    /// tries 0-RTT pooled stream first (falling back to control signaling if activation fails),
-    /// or signals the client over the control channel to dial a dedicated reverse data stream.
+    /// Signals a new visitor connection to the client over the control channel (slow path).
+    /// Used directly when the inbound pool is empty or as failover when 0-RTT pool stream activation fails.
     #[allow(clippy::too_many_arguments)]
-    async fn handle_accepted_reverse_visitor(
-        accepted: FrontendAccept,
+    async fn signal_new_connection(
+        visitor_stream: crate::io::channel::IoChannel,
+        visitor_addr: PeerAddr,
         listen_addr: &str,
         protocol: L4Protocol,
         idle_timeout: Duration,
         relay_idle_timeout: Duration,
         heartbeat_interval: Duration,
-        frame_timeout: Duration,
         sig_config: SignalingConfig,
         grace_period: Duration,
         cancel_token: &CancellationToken,
@@ -726,91 +726,7 @@ impl ServerRunner {
         pool_notify: &mut Option<Pin<Box<OwnedNotified>>>,
         local_tracker: &mut TaskTracker<()>,
     ) {
-        let visitor_stream = accepted.channel;
-        let visitor_addr = accepted.peer;
-        let activation_magic = match protocol {
-            L4Protocol::Tcp => ACTIVATE_STREAM_MAGIC,
-            L4Protocol::Udp => ACTIVATE_STREAM_UDP,
-        };
-
-        // 1. FAST PATH (0-RTT Pool): only pair streams that are fresh and still alive.
-        // A stale generation must fall through to signaling rather than blackhole the visitor.
-        // The server owns the idle-stream lifetime; entries are removed under the pool lock,
-        // and activation is driven in the spawned task so WAN RTT never blocks the accept loop.
-        if let Some(mut candidate) = pool_guard.pop_live(idle_timeout).await {
-            debug!(
-                visitor = %visitor_addr,
-                protocol = %protocol,
-                "Paired reverse visitor with idle pooled stream (0-RTT)"
-            );
-            let router_fallback = router.clone();
-            let session_mgr_fallback = Arc::clone(session_mgr);
-            local_tracker.spawn_with_cancel(move |token| async move {
-                let activate = async {
-                    tokio::io::AsyncWriteExt::write_all(
-                        &mut candidate,
-                        &[activation_magic],
-                    )
-                    .await?;
-                    tokio::io::AsyncWriteExt::flush(&mut candidate).await
-                };
-                match tokio::time::timeout(frame_timeout, activate)
-                    .cancel_with(&token)
-                    .await
-                {
-                    Some(Ok(Ok(()))) => {
-                        let _ = serve(
-                            PumpRequest::new(visitor_stream, candidate),
-                            PumpCtx {
-                                cancel: token,
-                                heartbeat_interval,
-                                idle_timeout: relay_idle_timeout,
-                            },
-                        )
-                        .await;
-                    }
-                    Some(activation_failure) => {
-                        debug!(
-                            "0-RTT pool stream activation failed ({:?}); falling back to control signaling",
-                            activation_failure
-                        );
-                        drop(candidate);
-                        if router_fallback.has_active_channel() {
-                            let session_id = format!(
-                                "sess_{}_{}",
-                                std::process::id(),
-                                REVERSE_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed)
-                            );
-                            let (pair_rx, session_guard) =
-                                session_mgr_fallback.register_guarded(session_id.clone());
-                            let notify_msg = ControlMessage::NewConnection {
-                                session_id: session_id.clone(),
-                                client_addr: visitor_addr.to_string(),
-                            };
-                            if router_fallback.send(notify_msg).await.is_ok()
-                                && let Ok(Ok(data_stream)) =
-                                    timeout(DEFAULT_SESSION_PAIR_TIMEOUT, pair_rx).await
-                            {
-                                scopeguard::ScopeGuard::into_inner(session_guard);
-                                let _ = serve(
-                                    PumpRequest::new(visitor_stream, data_stream),
-                                    PumpCtx {
-                                        cancel: token,
-                                        heartbeat_interval,
-                                        idle_timeout: relay_idle_timeout,
-                                    },
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                    None => {}
-                }
-            });
-            return;
-        }
-
-        // 2. SLOW PATH (Fallback): if signaling is temporarily in its grace window with an empty pool,
+        // SLOW PATH (Fallback): if signaling is temporarily in its grace window with an empty pool,
         // drop only this fallback visitor without tearing down the bound port.
         if !router.has_active_channel() {
             debug!(
@@ -902,6 +818,121 @@ impl ServerRunner {
                 }
             }
         });
+    }
+
+    /// Dispatches an accepted visitor connection on a reverse listening port:
+    /// tries 0-RTT pooled stream first (falling back to control signaling via failover_tx if activation fails),
+    /// or signals the client over the control channel to dial a dedicated reverse data stream.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_accepted_reverse_visitor(
+        accepted: FrontendAccept,
+        listen_addr: &str,
+        protocol: L4Protocol,
+        idle_timeout: Duration,
+        relay_idle_timeout: Duration,
+        heartbeat_interval: Duration,
+        frame_timeout: Duration,
+        sig_config: SignalingConfig,
+        grace_period: Duration,
+        cancel_token: &CancellationToken,
+        session_mgr: &Arc<SessionManager>,
+        pool_guard: &mut ReversePoolGuard,
+        router: &SignalingRouter,
+        sig_rx: &SignalingReceiver,
+        grace_handle: &mut Option<ReverseGraceHandle>,
+        grace_deadline: &mut Option<Pin<Box<Sleep>>>,
+        pool_notify: &mut Option<Pin<Box<OwnedNotified>>>,
+        local_tracker: &mut TaskTracker<()>,
+        failover_tx: &mpsc::Sender<(crate::io::channel::IoChannel, PeerAddr)>,
+    ) {
+        let visitor_stream = accepted.channel;
+        let visitor_addr = accepted.peer;
+        let activation_magic = match protocol {
+            L4Protocol::Tcp => ACTIVATE_STREAM_MAGIC,
+            L4Protocol::Udp => ACTIVATE_STREAM_UDP,
+        };
+
+        // 1. FAST PATH (0-RTT Pool): only pair streams that are fresh and still alive.
+        // A stale generation must fall through to signaling rather than blackhole the visitor.
+        // The server owns the idle-stream lifetime; entries are removed under the pool lock,
+        // and activation is driven in the spawned task so WAN RTT never blocks the accept loop.
+        if let Some(mut candidate) = pool_guard.pop_live(idle_timeout).await {
+            debug!(
+                visitor = %visitor_addr,
+                protocol = %protocol,
+                "Paired reverse visitor with idle pooled stream (0-RTT)"
+            );
+            let failover_tx = failover_tx.clone();
+            local_tracker.spawn_with_cancel(move |token| async move {
+                let activate = async {
+                    tokio::io::AsyncWriteExt::write_all(
+                        &mut candidate,
+                        &[activation_magic],
+                    )
+                    .await?;
+                    tokio::io::AsyncWriteExt::flush(&mut candidate).await?;
+                    let mut ack = [0u8; 1];
+                    tokio::io::AsyncReadExt::read_exact(&mut candidate, &mut ack).await?;
+                    if ack[0] == ACTIVATE_STREAM_ACK {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Invalid activation ACK byte",
+                        ))
+                    }
+                };
+                match tokio::time::timeout(frame_timeout, activate)
+                    .cancel_with(&token)
+                    .await
+                {
+                    Some(Ok(Ok(()))) => {
+                        let _ = serve(
+                            PumpRequest::new(visitor_stream, candidate),
+                            PumpCtx {
+                                cancel: token,
+                                heartbeat_interval,
+                                idle_timeout: relay_idle_timeout,
+                            },
+                        )
+                        .await;
+                    }
+                    Some(activation_failure) => {
+                        debug!(
+                            "0-RTT pool stream activation failed ({:?}); falling back to control signaling",
+                            activation_failure
+                        );
+                        drop(candidate);
+                        let _ = failover_tx.send((visitor_stream, visitor_addr)).await;
+                    }
+                    None => {}
+                }
+            });
+            return;
+        }
+
+        // 2. SLOW PATH (Fallback):
+        Self::signal_new_connection(
+            visitor_stream,
+            visitor_addr,
+            listen_addr,
+            protocol,
+            idle_timeout,
+            relay_idle_timeout,
+            heartbeat_interval,
+            sig_config,
+            grace_period,
+            cancel_token,
+            session_mgr,
+            pool_guard,
+            router,
+            sig_rx,
+            grace_handle,
+            grace_deadline,
+            pool_notify,
+            local_tracker,
+        )
+        .await;
     }
 
     /// Handles a reverse control channel: binds requested port on server and notifies client.
@@ -1013,6 +1044,10 @@ impl ServerRunner {
         let mut local_tracker = TaskTracker::<()>::new(cancel_token.clone());
         let mut accept_slot: ReusableFutureRef<'static, FrontendOutput> =
             ReusableFutureRef::default();
+        let (failover_tx, mut failover_rx) = mpsc::channel::<(
+            crate::io::channel::IoChannel,
+            PeerAddr,
+        )>(reverse_pool_soft_cap(pool_size) + 16);
 
         loop {
             if accept_slot.is_empty() {
@@ -1023,6 +1058,29 @@ impl ServerRunner {
                 biased;
                 _ = cancel_token.cancelled() => break,
                 Some(_) = local_tracker.join_next(), if !local_tracker.is_empty() => {}
+                Some((visitor_stream, visitor_addr)) = failover_rx.recv() => {
+                    Self::signal_new_connection(
+                        visitor_stream,
+                        visitor_addr,
+                        &listen_addr,
+                        protocol,
+                        idle_timeout,
+                        relay_idle_timeout,
+                        heartbeat_interval,
+                        sig_config,
+                        grace_period,
+                        &cancel_token,
+                        &session_mgr,
+                        &mut pool_guard,
+                        &router,
+                        &sig_rx,
+                        &mut grace_handle,
+                        &mut grace_deadline,
+                        &mut pool_notify,
+                        &mut local_tracker,
+                    )
+                    .await;
+                }
                 Some(reattach) = async {
                     match grace_handle.as_mut() {
                         Some(g) => g.recv().await,
@@ -1139,6 +1197,7 @@ impl ServerRunner {
                                 &mut grace_deadline,
                                 &mut pool_notify,
                                 &mut local_tracker,
+                                &failover_tx,
                             )
                             .await;
                         }
@@ -2061,5 +2120,220 @@ mod tests {
 
         // Pool MUST be unregistered from session_mgr via ReversePoolGuard Drop:
         assert_eq!(session_mgr.pool_count(), 0);
+    }
+
+    /// Verifies that when an idle stream in ReverseInboundPool is silently dead (half-open:
+    /// server write succeeds into buffer, but reading ACTIVATE_STREAM_ACK times out),
+    /// the fast-path activation task drops the dead stream and fails over via failover_tx
+    /// to signal NewConnection over the control channel, so the visitor is NEVER dropped.
+    #[tokio::test]
+    async fn test_reverse_pool_half_open_stream_fails_over_to_signaling() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, server) = tokio::io::duplex(1024);
+        let ctrl_client = FramedControlStream::new(client);
+        let (mut ctrl_tx, mut ctrl_rx) = ctrl_client.split();
+        let session_mgr = Arc::new(SessionManager::new());
+        let cancel_token = CancellationToken::new();
+
+        let listen_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let listen_addr = format!("127.0.0.1:{}", listen_port);
+
+        let s_mgr = Arc::clone(&session_mgr);
+        let c_token = cancel_token.clone();
+        let l_addr = listen_addr.clone();
+
+        let handle = tokio::spawn(async move {
+            ServerRunner::handle_reverse_control(
+                Box::new(server),
+                s_mgr,
+                c_token,
+                Duration::from_millis(1500),
+                crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
+                crate::consts::DEFAULT_UDP_IDLE_TIMEOUT,
+            )
+            .await;
+        });
+
+        // Register reverse port with pool_size = 4
+        ctrl_tx
+            .send(ControlMessage::RegisterReverse {
+                listen_addr: listen_addr.clone(),
+                target_addr: "127.0.0.1:9099".to_string(),
+                pool_size: Some(4),
+                protocol: L4Protocol::Tcp,
+            })
+            .await
+            .unwrap();
+
+        let ack = ctrl_rx.next().await.unwrap().unwrap();
+        assert!(matches!(
+            ack,
+            ControlMessage::RegisterAck { success: true, .. }
+        ));
+
+        // Spawn a background task sending periodic Pings on ctrl_tx to prevent signaling idle timeout
+        let ping_token = cancel_token.child_token();
+        let ping_task = tokio::spawn({
+            let ping_token = ping_token.clone();
+            async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(200));
+                while !ping_token.is_cancelled() {
+                    tokio::select! {
+                        _ = ping_token.cancelled() => break,
+                        _ = interval.tick() => {
+                            if ctrl_tx.send(ControlMessage::Ping).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // Create a half-open mock stream: server can write into it, but client never reads or writes ACK.
+        let (_half_open_client, half_open_server) = tokio::io::duplex(1024);
+        assert!(session_mgr.push_idle_stream(L4Protocol::Tcp, None, Box::new(half_open_server)));
+
+        // A visitor connects to the reverse listening port
+        let mut visitor = tokio::net::TcpStream::connect(&l_addr).await.unwrap();
+
+        // The server fast-path task pops the half-open stream, writes 0xA5, flushes (succeeds into buffer),
+        // and waits for 0xAC ACK. Since half_open_client never sends 0xAC, read_exact times out (1.5s).
+        // Then, the visitor is routed through failover_tx into the select loop, which calls signal_new_connection.
+        // Therefore, ctrl_rx MUST receive ControlMessage::NewConnection (skipping Pong messages)!
+        let session_id = loop {
+            let msg = tokio::time::timeout(Duration::from_secs(5), ctrl_rx.next())
+                .await
+                .expect("Timed out waiting for NewConnection failover")
+                .expect("Control channel closed")
+                .expect("Control decode error");
+            match msg {
+                ControlMessage::NewConnection { session_id, .. } => break session_id,
+                ControlMessage::Pong => continue,
+                other => panic!("Expected NewConnection, got {:?}", other),
+            }
+        };
+
+        // The client connects a dedicated reverse-data stream to complete the pair:
+        let (data_client, data_server) = tokio::io::duplex(1024);
+        session_mgr
+            .fulfill(&session_id, Box::new(data_server))
+            .unwrap();
+
+        // The visitor sends data and data_client echoes back:
+        visitor.write_all(b"hello via failover").await.unwrap();
+        visitor.flush().await.unwrap();
+
+        let mut data_client = data_client;
+        let mut recv_buf = vec![0u8; 18];
+        data_client.read_exact(&mut recv_buf).await.unwrap();
+        assert_eq!(&recv_buf, b"hello via failover");
+
+        data_client.write_all(b"pong from backend").await.unwrap();
+        data_client.flush().await.unwrap();
+
+        let mut reply_buf = vec![0u8; 17];
+        visitor.read_exact(&mut reply_buf).await.unwrap();
+        assert_eq!(&reply_buf, b"pong from backend");
+
+        drop(visitor);
+        drop(data_client);
+        cancel_token.cancel();
+        let _ = ping_task.await;
+        let _ = handle.await;
+    }
+
+    /// Verifies that when an idle stream in ReverseInboundPool actively responds with 0xAC ACK,
+    /// 0-RTT fast path succeeds immediately without control signaling.
+    #[tokio::test]
+    async fn test_reverse_pool_active_ack_fast_path() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, server) = tokio::io::duplex(1024);
+        let mut ctrl_client = FramedControlStream::new(client);
+        let session_mgr = Arc::new(SessionManager::new());
+        let cancel_token = CancellationToken::new();
+
+        let listen_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let listen_addr = format!("127.0.0.1:{}", listen_port);
+
+        let s_mgr = Arc::clone(&session_mgr);
+        let c_token = cancel_token.clone();
+        let l_addr = listen_addr.clone();
+
+        let handle = tokio::spawn(async move {
+            ServerRunner::handle_reverse_control(
+                Box::new(server),
+                s_mgr,
+                c_token,
+                Duration::from_millis(300),
+                crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
+                crate::consts::DEFAULT_UDP_IDLE_TIMEOUT,
+            )
+            .await;
+        });
+
+        ctrl_client
+            .send(ControlMessage::RegisterReverse {
+                listen_addr: listen_addr.clone(),
+                target_addr: "127.0.0.1:9099".to_string(),
+                pool_size: Some(4),
+                protocol: L4Protocol::Tcp,
+            })
+            .await
+            .unwrap();
+
+        let ack = ctrl_client.next().await.unwrap().unwrap();
+        assert!(matches!(
+            ack,
+            ControlMessage::RegisterAck { success: true, .. }
+        ));
+
+        // Create an active worker stream that reads 0xA5 and echoes ACTIVATE_STREAM_ACK (0xAC)
+        let (mut active_client, active_server) = tokio::io::duplex(1024);
+        assert!(session_mgr.push_idle_stream(L4Protocol::Tcp, None, Box::new(active_server)));
+
+        // Worker background task: reads magic byte and echoes 0xAC
+        tokio::spawn(async move {
+            let mut magic = [0u8; 1];
+            active_client.read_exact(&mut magic).await.unwrap();
+            assert_eq!(magic[0], ACTIVATE_STREAM_MAGIC);
+            active_client
+                .write_all(&[ACTIVATE_STREAM_ACK])
+                .await
+                .unwrap();
+            active_client.flush().await.unwrap();
+
+            // Then echo data
+            let mut buf = [0u8; 5];
+            active_client.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"ping!");
+            active_client.write_all(b"pong!").await.unwrap();
+            active_client.flush().await.unwrap();
+        });
+
+        // Visitor connects
+        let mut visitor = tokio::net::TcpStream::connect(&l_addr).await.unwrap();
+        visitor.write_all(b"ping!").await.unwrap();
+        visitor.flush().await.unwrap();
+
+        let mut reply = [0u8; 5];
+        visitor.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"pong!");
+
+        drop(visitor);
+        cancel_token.cancel();
+        let _ = handle.await;
     }
 }

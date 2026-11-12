@@ -15,10 +15,10 @@ use tracing::{debug, error, info, warn};
 use crate::common::{CancelFutureExt, CancellationTokenExt, TaskTracker};
 use crate::config::model::{TunnelConfig, TunnelMode};
 use crate::consts::{
-    ACTIVATE_STREAM_MAGIC, ACTIVATE_STREAM_UDP, DEFAULT_REVERSE_BACKOFF_INITIAL,
-    DEFAULT_REVERSE_BACKOFF_MAX, DEFAULT_REVERSE_PROMOTE_WAIT, POOL_BACKOFF_ACTIVE_WAITERS_MAX,
-    POOL_BACKOFF_BASE, POOL_MAX_CONCURRENT_CONNECTS, REVERSE_BACKOFF_RESET_THRESHOLD,
-    REVERSE_CONTROL_TARGET_HOST, clamp_reverse_pool_size,
+    ACTIVATE_STREAM_ACK, ACTIVATE_STREAM_MAGIC, ACTIVATE_STREAM_UDP,
+    DEFAULT_REVERSE_BACKOFF_INITIAL, DEFAULT_REVERSE_BACKOFF_MAX, DEFAULT_REVERSE_PROMOTE_WAIT,
+    POOL_BACKOFF_ACTIVE_WAITERS_MAX, POOL_BACKOFF_BASE, POOL_MAX_CONCURRENT_CONNECTS,
+    REVERSE_BACKOFF_RESET_THRESHOLD, REVERSE_CONTROL_TARGET_HOST, clamp_reverse_pool_size,
 };
 use crate::control::{ControlMessage, SignalingChannel, SignalingConfig, SignalingRouter};
 use crate::core::error::TunnelError;
@@ -312,6 +312,23 @@ pub async fn run_reverse_mapping(
                             if !token.sleep_or_cancel(Duration::from_millis(100)).await {
                                 break;
                             }
+                            continue;
+                        }
+
+                        // Echo ACTIVATE_STREAM_ACK (0xAC) back to server so server verifies stream liveness
+                        let ack_sent = async {
+                            tokio::io::AsyncWriteExt::write_all(
+                                &mut stream,
+                                &[ACTIVATE_STREAM_ACK],
+                            )
+                            .await?;
+                            tokio::io::AsyncWriteExt::flush(&mut stream).await
+                        };
+                        let ack_res = tokio::time::timeout(Duration::from_secs(2), ack_sent)
+                            .cancel_with(&token)
+                            .await;
+                        if !matches!(ack_res, Some(Ok(Ok(())))) {
+                            debug!("Failed to echo ACTIVATE_STREAM_ACK; recycling reverse worker stream");
                             continue;
                         }
 

@@ -420,6 +420,13 @@ pub const ACTIVATE_STREAM_PROMOTE: u8 = 0xA6;
 /// Activation magic byte sent over pre-warmed pool streams to trigger UDP target dialing.
 pub const ACTIVATE_STREAM_UDP: u8 = 0xA7;
 
+/// Round-trip acknowledgment byte echoed by reverse workers upon receiving
+/// `ACTIVATE_STREAM_MAGIC` (0xA5) or `ACTIVATE_STREAM_UDP` (0xA7).
+///
+/// This protects the 0-RTT inbound pool against silently-dead (half-open) idle streams
+/// where a server write succeeds into the local kernel buffer but the peer has vanished.
+pub const ACTIVATE_STREAM_ACK: u8 = 0xAC;
+
 // =============================================================================
 // 9. Process, CLI & Diagnostics Defaults
 // =============================================================================
