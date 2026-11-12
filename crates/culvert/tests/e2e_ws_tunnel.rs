@@ -100,6 +100,8 @@ async fn test_forward_tunnel_ws_e2e() {
     // 3. Setup client forward tunnel
     let tunnel_config = TunnelConfig {
         tag: "test-forward".to_string(),
+        uuid: None,
+        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://{}/tunnel", server_listen)),
         token: Some(auth_token.to_string()),
         pool_size: None,
@@ -198,6 +200,8 @@ async fn test_reverse_tunnel_ws_e2e() {
     // 3. Setup client reverse tunnel
     let tunnel_config = TunnelConfig {
         tag: "test-reverse".to_string(),
+        uuid: None,
+        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://{}/tunnel", server_ws_listen)),
         token: Some(auth_token.to_string()),
         pool_size: None,
@@ -295,6 +299,8 @@ async fn test_reverse_tunnel_with_inbound_pool_e2e() {
     // 2. Setup client reverse tunnel with pool_size: 4
     let tunnel_config = TunnelConfig {
         tag: "test-reverse-pool".to_string(),
+        uuid: None,
+        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://{}/tunnel", server_ws_listen)),
         token: Some(auth_token.to_string()),
         pool_size: Some(4),
@@ -401,6 +407,8 @@ async fn test_reverse_pool_burst_falls_back_to_signaling_e2e() {
 
     let tunnel_config = TunnelConfig {
         tag: "test-reverse-burst".to_string(),
+        uuid: None,
+        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://{}/tunnel", server_ws_listen)),
         token: Some(auth_token.to_string()),
         pool_size: Some(2),
@@ -486,6 +494,8 @@ async fn test_supervisor_multi_tunnel_concurrency_e2e() {
 
     app_config.tunnels.push(TunnelConfig {
         tag: "fwd-tunnel".to_string(),
+        uuid: None,
+        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/ws", server_ws_port)),
         token: Some(auth_token.to_string()),
         pool_size: None,
@@ -503,6 +513,8 @@ async fn test_supervisor_multi_tunnel_concurrency_e2e() {
 
     app_config.tunnels.push(TunnelConfig {
         tag: "rev-tunnel".to_string(),
+        uuid: None,
+        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/ws", server_ws_port)),
         token: Some(auth_token.to_string()),
         pool_size: None,

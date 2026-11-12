@@ -28,6 +28,8 @@ pub struct StreamMetadata {
     pub pool_idle: bool,
     #[serde(default)]
     pub protocol: L4Protocol,
+    #[serde(default)]
+    pub tunnel_id: Option<String>,
 }
 
 /// Result type produced when accepting a channel from a `TransportListener`.
@@ -70,6 +72,17 @@ pub trait TransportConnector: Send + Sync {
     ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
         let _ = protocol;
         self.connect_pooled(target)
+    }
+
+    /// Opens a pre-warmed pooled stream tagged with an optional Tunnel UUID.
+    fn connect_pooled_with_tunnel<'a>(
+        &'a self,
+        target: &'a TargetAddr,
+        protocol: L4Protocol,
+        tunnel_id: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
+        let _ = tunnel_id;
+        self.connect_pooled_with_protocol(target, protocol)
     }
 
     /// Hints to the connector that underlying streams have failed or become dead,

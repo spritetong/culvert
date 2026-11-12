@@ -29,6 +29,7 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 rmp-serde = "1.3"
 url = "2"
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
 # Logging & Error Handling
 tracing = "0.1"

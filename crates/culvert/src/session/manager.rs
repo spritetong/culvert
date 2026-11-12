@@ -230,13 +230,18 @@ pub struct ReversePoolEntry {
     pub protocol: L4Protocol,
     pub listen_addr: String,
     pub pool: Arc<ReverseInboundPool>,
+    pub tunnel_id: Option<String>,
 }
 
 impl ReversePoolEntry {
     /// Replaces the active pool with a new generation, unregistering the superseded generation first.
     pub fn replace_pool(&mut self, new_pool: Arc<ReverseInboundPool>) {
-        self.manager
-            .unregister_pool(self.protocol, &self.listen_addr, &self.pool);
+        if let Some(ref tid) = self.tunnel_id {
+            self.manager.unregister_tunnel_pool(tid, &self.pool);
+        } else {
+            self.manager
+                .unregister_pool(self.protocol, &self.listen_addr, &self.pool);
+        }
         self.pool = new_pool;
     }
 }
@@ -258,8 +263,18 @@ fn unregister_pending_session((mgr, id): (Arc<SessionManager>, String)) {
 }
 
 fn unregister_pool_entry(e: ReversePoolEntry) {
-    e.manager
-        .unregister_pool(e.protocol, &e.listen_addr, &e.pool);
+    if let Some(ref tid) = e.tunnel_id {
+        e.manager.unregister_tunnel_pool(tid, &e.pool);
+    } else {
+        e.manager
+            .unregister_pool(e.protocol, &e.listen_addr, &e.pool);
+    }
+}
+
+/// Shared pool slot for a tunnel instance, tracking its shared inbound pool and active listener count.
+pub struct TunnelPoolSlot {
+    pub pool: Arc<ReverseInboundPool>,
+    pub listener_count: std::sync::atomic::AtomicUsize,
 }
 
 /// Thread-safe in-memory routing table for matching incoming reverse data streams
@@ -268,6 +283,7 @@ fn unregister_pool_entry(e: ReversePoolEntry) {
 pub struct SessionManager {
     pending_sessions: Arc<DashMap<String, oneshot::Sender<Box<dyn TunnelStream>>>>,
     reverse_pools: Arc<DashMap<String, Arc<ReverseInboundPool>>>,
+    tunnel_pools: Arc<DashMap<String, Arc<TunnelPoolSlot>>>,
     grace_listeners: Arc<DashMap<String, GraceSlot>>,
     next_grace_id: Arc<AtomicU64>,
 }
@@ -278,6 +294,7 @@ impl SessionManager {
         Self {
             pending_sessions: Arc::new(DashMap::new()),
             reverse_pools: Arc::new(DashMap::new()),
+            tunnel_pools: Arc::new(DashMap::new()),
             grace_listeners: Arc::new(DashMap::new()),
             next_grace_id: Arc::new(AtomicU64::new(1)),
         }
@@ -371,6 +388,70 @@ impl SessionManager {
             .remove_if(&key, |_, current| Arc::ptr_eq(current, pool));
     }
 
+    /// Registers or joins a shared inbound pool for a `tunnel_id`.
+    ///
+    /// Multiple reverse listeners with the same `tunnel_id` share this pool.
+    pub fn register_tunnel_pool(
+        &self,
+        tunnel_id: &str,
+        capacity: usize,
+    ) -> Arc<ReverseInboundPool> {
+        let slot = self
+            .tunnel_pools
+            .entry(tunnel_id.to_string())
+            .or_insert_with(|| {
+                Arc::new(TunnelPoolSlot {
+                    pool: Arc::new(ReverseInboundPool::new(capacity)),
+                    listener_count: std::sync::atomic::AtomicUsize::new(0),
+                })
+            });
+        slot.listener_count.fetch_add(1, Ordering::Relaxed);
+        Arc::clone(&slot.pool)
+    }
+
+    /// Unregisters one listener from the shared tunnel pool, draining and removing it when count reaches zero.
+    pub fn unregister_tunnel_pool(
+        &self,
+        tunnel_id: &str,
+        pool: &Arc<ReverseInboundPool>,
+    ) {
+        if let Some(slot) = self.tunnel_pools.get(tunnel_id) {
+            if Arc::ptr_eq(&slot.pool, pool) {
+                let prev = slot.listener_count.fetch_sub(1, Ordering::Relaxed);
+                if prev <= 1 {
+                    drop(slot);
+                    if let Some((_, removed)) = self.tunnel_pools.remove(tunnel_id) {
+                        removed.pool.drain();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Registers an inbound pool for a reverse listener, joining the tunnel-scoped shared pool
+    /// when `tunnel_id` is present, or falling back to a per-`(protocol, listen_addr)` pool.
+    pub fn register_pool_guarded_with_tunnel(
+        self: &Arc<Self>,
+        tunnel_id: Option<String>,
+        protocol: L4Protocol,
+        listen_addr: &str,
+        capacity: usize,
+    ) -> ReversePoolGuard {
+        let pool = if let Some(ref tid) = tunnel_id {
+            self.register_tunnel_pool(tid, capacity)
+        } else {
+            self.register_pool(protocol, listen_addr, capacity)
+        };
+        let entry = ReversePoolEntry {
+            manager: Arc::clone(self),
+            protocol,
+            listen_addr: listen_addr.to_string(),
+            pool,
+            tunnel_id,
+        };
+        scopeguard::guard(entry, unregister_pool_entry as fn(_))
+    }
+
     /// Registers an inbound pool for a `(protocol, listen_addr)` reverse listener,
     /// returning an RAII [`ReversePoolGuard`] that automatically unregisters it on abort or exit.
     pub fn register_pool_guarded(
@@ -379,14 +460,7 @@ impl SessionManager {
         listen_addr: &str,
         capacity: usize,
     ) -> ReversePoolGuard {
-        let pool = self.register_pool(protocol, listen_addr, capacity);
-        let entry = ReversePoolEntry {
-            manager: Arc::clone(self),
-            protocol,
-            listen_addr: listen_addr.to_string(),
-            pool,
-        };
-        scopeguard::guard(entry, unregister_pool_entry as fn(_))
+        self.register_pool_guarded_with_tunnel(None, protocol, listen_addr, capacity)
     }
 
     /// Pushes a pre-warmed idle reverse stream into the matching listener's pool.
@@ -420,9 +494,26 @@ impl SessionManager {
         false
     }
 
+    /// Pushes a pre-warmed idle reverse stream into the matching pool,
+    /// routing by `tunnel_id` when present, or falling back to target routing.
+    pub fn push_idle_stream_with_tunnel(
+        &self,
+        tunnel_id: Option<&str>,
+        protocol: L4Protocol,
+        target_opt: Option<&TargetAddr>,
+        stream: Box<dyn TunnelStream>,
+    ) -> bool {
+        if let Some(tid) = tunnel_id {
+            if let Some(slot) = self.tunnel_pools.get(tid) {
+                return slot.pool.push(stream);
+            }
+        }
+        self.push_idle_stream(protocol, target_opt, stream)
+    }
+
     /// Returns the number of registered reverse inbound pools.
     pub fn pool_count(&self) -> usize {
-        self.reverse_pools.len()
+        self.reverse_pools.len() + self.tunnel_pools.len()
     }
 
     /// Registers a reverse listener entering its grace period so incoming

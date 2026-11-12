@@ -33,6 +33,8 @@ pub enum ControlMessage {
         pool_size: Option<usize>,
         #[serde(default)]
         protocol: L4Protocol,
+        #[serde(default)]
+        tunnel_id: Option<String>,
     },
     /// Server acknowledges the port binding request.
     RegisterAck {
@@ -150,6 +152,7 @@ mod tests {
             target_addr: "127.0.0.1:22".to_string(),
             pool_size: Some(4),
             protocol: L4Protocol::Tcp,
+            tunnel_id: None,
         };
 
         ctrl_a.send(msg.clone()).await.unwrap();
@@ -162,6 +165,7 @@ mod tests {
             target_addr: "127.0.0.1:53".to_string(),
             pool_size: Some(2),
             protocol: L4Protocol::Udp,
+            tunnel_id: Some("test-tunnel-uuid".into()),
         };
 
         ctrl_a.send(udp_msg.clone()).await.unwrap();
@@ -204,6 +208,7 @@ mod tests {
                 target_addr: "127.0.0.1:22".to_string(),
                 pool_size: None,
                 protocol: L4Protocol::Tcp,
+                tunnel_id: None,
             }
         );
     }

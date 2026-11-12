@@ -673,15 +673,35 @@ where
     }
 }
 
+/// Asymmetric connection pool configuration for a tunnel instance.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TunnelPoolConfig {
+    /// Outbound stream pool capacity for forward mappings.
+    #[serde(default)]
+    pub forward: Option<usize>,
+
+    /// Inbound stream pool capacity for reverse mappings.
+    #[serde(default)]
+    pub reverse: Option<usize>,
+}
+
 /// Configuration for an individual tunnel instance.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TunnelConfig {
     pub tag: String,
+    /// Unique identifier for this tunnel instance (Tunnel UUID).
+    /// If omitted, a deterministic UUID v5 derived from `tag` is used.
+    #[serde(default)]
+    pub uuid: Option<String>,
     pub endpoint: EndpointConfig,
     pub token: Option<String>,
     #[serde(default)]
     pub pool_size: Option<usize>,
+    /// Asymmetric pool configuration separating forward and reverse pool capacities.
+    #[serde(default)]
+    pub pool: Option<TunnelPoolConfig>,
     pub failover: Option<FailoverConfig>,
     pub multiplex: Option<MultiplexConfig>,
     pub retry: Option<TunnelRetryConfig>,
@@ -707,6 +727,25 @@ impl TunnelConfig {
                 "Tunnel '{}' has no port mappings configured. Please provide 'mappings: [...]'.",
                 self.tag
             )))
+        }
+    }
+
+    /// Effective forward pool size: prefers `pool.forward`, falls back to scalar `pool_size`.
+    pub fn forward_pool_size(&self) -> Option<usize> {
+        self.pool.as_ref().and_then(|p| p.forward).or(self.pool_size)
+    }
+
+    /// Effective reverse pool size: prefers `pool.reverse`, falls back to scalar `pool_size`.
+    pub fn reverse_pool_size(&self) -> Option<usize> {
+        self.pool.as_ref().and_then(|p| p.reverse).or(self.pool_size)
+    }
+
+    /// Effective tunnel UUID: prefers configured `uuid`, falls back to deterministic UUID v5 from `tag`.
+    pub fn effective_tunnel_id(&self) -> String {
+        if let Some(ref id) = self.uuid {
+            id.clone()
+        } else {
+            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, self.tag.as_bytes()).to_string()
         }
     }
 }

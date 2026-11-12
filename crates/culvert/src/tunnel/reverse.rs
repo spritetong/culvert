@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -15,7 +14,7 @@ use tracing::{debug, error, info, warn};
 use crate::common::{CancelFutureExt, CancellationTokenExt, TaskTracker};
 use crate::config::model::{TunnelConfig, TunnelMode};
 use crate::consts::{
-    ACTIVATE_STREAM_ACK, ACTIVATE_STREAM_MAGIC, ACTIVATE_STREAM_UDP,
+    ACTIVATE_STREAM_ACK,
     DEFAULT_REVERSE_BACKOFF_INITIAL, DEFAULT_REVERSE_BACKOFF_MAX, DEFAULT_REVERSE_PROMOTE_WAIT,
     POOL_BACKOFF_ACTIVE_WAITERS_MAX, POOL_BACKOFF_BASE, POOL_MAX_CONCURRENT_CONNECTS,
     REVERSE_BACKOFF_RESET_THRESHOLD, REVERSE_CONTROL_TARGET_HOST, clamp_reverse_pool_size,
@@ -26,7 +25,36 @@ use crate::core::serve::serve;
 use crate::dialer::endpoint::EndpointContext;
 use crate::io::addr::L4Protocol;
 use crate::io::pump::{PumpCtx, PumpRequest};
+use crate::pool::activation::decode_activation;
 use crate::transport::{TargetAddr, TransportConnector, TransportRegistry};
+
+/// Coordinates readiness between reverse mapping control channel registration and the shared reverse pool.
+#[derive(Default)]
+pub struct ReverseReadyNotifier {
+    is_ready: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl ReverseReadyNotifier {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn mark_ready(&self) {
+        self.is_ready.store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    pub async fn wait_ready(&self, cancel_token: &CancellationToken) -> bool {
+        if self.is_ready.load(std::sync::atomic::Ordering::Acquire) {
+            return true;
+        }
+        tokio::select! {
+            _ = cancel_token.cancelled() => false,
+            _ = self.notify.notified() => true,
+        }
+    }
+}
 
 /// Runs a single reverse mapping control loop.
 #[allow(clippy::too_many_arguments)]
@@ -40,6 +68,8 @@ pub async fn run_reverse_mapping(
     endpoint_ctx: EndpointContext,
     transport_registry: Arc<TransportRegistry>,
     pool_size: Option<usize>,
+    tunnel_id: Option<String>,
+    reverse_ready: Option<Arc<ReverseReadyNotifier>>,
     cancel_token: CancellationToken,
 ) -> Result<(), TunnelError> {
     info!(
@@ -56,10 +86,6 @@ pub async fn run_reverse_mapping(
     let relay_idle_timeout = match protocol {
         L4Protocol::Tcp => idle_timeout,
         L4Protocol::Udp => udp_idle_timeout.unwrap_or_else(|| endpoint_ctx.udp_idle_timeout()),
-    };
-    let expected_activation_magic = match protocol {
-        L4Protocol::Tcp => ACTIVATE_STREAM_MAGIC,
-        L4Protocol::Udp => ACTIVATE_STREAM_UDP,
     };
     // Clamp once and advertise the effective worker count: the server derives
     // its soft cap from exactly this value instead of an independent constant.
@@ -128,6 +154,7 @@ pub async fn run_reverse_mapping(
             target_addr: target_addr.clone(),
             pool_size: pool_workers,
             protocol,
+            tunnel_id: tunnel_id.clone(),
         };
 
         let send_result = router.send(reg_msg).await;
@@ -165,6 +192,9 @@ pub async fn run_reverse_mapping(
                     continue;
                 }
                 info!(tag = %tag, addr = %ack_addr, "Remote server bound reverse port");
+                if let Some(ref ready) = reverse_ready {
+                    ready.mark_ready();
+                }
             }
             Some(Ok(Some(other))) => {
                 warn!(tag = %tag, "Unexpected response to RegisterReverse: {:?}. Retrying in {:?}...", other, backoff);
@@ -188,188 +218,181 @@ pub async fn run_reverse_mapping(
         let pool_cancel = cancel_token.child_token();
         let mut pool_tracker = TaskTracker::<()>::new(pool_cancel.clone());
 
-        if let Some(size) = pool_workers {
-            // One worker holds at most one idle stream, so an unbounded config
-            // value would spawn an unbounded number of dialing tasks.
-            let listen_target = crate::io::addr::parse_target_addr(&listen)
-                .unwrap_or_else(|_| dummy_target.clone());
-            debug!(
-                tag = %tag,
-                size,
-                "Pre-warming reverse inbound pool connections"
-            );
+        if tunnel_id.is_none() {
+            if let Some(size) = pool_workers {
+                // One worker holds at most one idle stream, so an unbounded config
+                // value would spawn an unbounded number of dialing tasks.
+                let listen_target = crate::io::addr::parse_target_addr(&listen)
+                    .unwrap_or_else(|_| dummy_target.clone());
+                debug!(
+                    tag = %tag,
+                    size,
+                    "Pre-warming reverse inbound pool connections"
+                );
 
-            // Throttle concurrent outbound dial handshakes across all workers in this
-            // reverse mapping to protect low-bandwidth links from connection storms.
-            // Symmetrically matches Forward mode's POOL_MAX_CONCURRENT_CONNECTS.
-            let dial_semaphore =
-                Arc::new(tokio::sync::Semaphore::new(POOL_MAX_CONCURRENT_CONNECTS));
+                // Throttle concurrent outbound dial handshakes across all workers in this
+                // reverse mapping to protect low-bandwidth links from connection storms.
+                // Symmetrically matches Forward mode's POOL_MAX_CONCURRENT_CONNECTS.
+                let dial_semaphore =
+                    Arc::new(tokio::sync::Semaphore::new(POOL_MAX_CONCURRENT_CONNECTS));
 
-            let event_sink = sig_rx.event_sink();
-            let router_clone = router.clone();
+                let event_sink = sig_rx.event_sink();
+                let router_clone = router.clone();
 
-            for worker_idx in 0..size {
-                let connector = Arc::clone(&data_connector);
-                let listen_target = listen_target.clone();
-                let target_clone = target_addr.clone();
-                let dial_semaphore = Arc::clone(&dial_semaphore);
-                let router_worker = router_clone.clone();
-                let event_sink_worker = event_sink.clone();
-                let sig_cfg = sig_config;
-                let hb = hb_interval;
-                let idle = relay_idle_timeout;
+                for worker_idx in 0..size {
+                    let connector = Arc::clone(&data_connector);
+                    let listen_target = listen_target.clone();
+                    let target_clone = target_addr.clone();
+                    let dial_semaphore = Arc::clone(&dial_semaphore);
+                    let router_worker = router_clone.clone();
+                    let event_sink_worker = event_sink.clone();
+                    let sig_cfg = sig_config;
+                    let hb = hb_interval;
+                    let idle = relay_idle_timeout;
 
-                pool_tracker.spawn_with_cancel(move |token| async move {
-                    // Every relay this worker starts is owned and awaited; no task
-                    // may outlive the control-channel generation that created it.
-                    let mut relays = TaskTracker::<()>::new(token.child_token());
-                    // Stagger initial backoff slightly by worker index to avoid synchronous lockstep retries
-                    let initial_retry =
-                        POOL_BACKOFF_BASE + Duration::from_millis((worker_idx as u64) * 25);
-                    let mut retry = initial_retry;
+                    pool_tracker.spawn_with_cancel(move |token| async move {
+                        // Every relay this worker starts is owned and awaited; no task
+                        // may outlive the control-channel generation that created it.
+                        let mut relays = TaskTracker::<()>::new(token.child_token());
+                        // Stagger initial backoff slightly by worker index to avoid synchronous lockstep retries
+                        let initial_retry =
+                            POOL_BACKOFF_BASE + Duration::from_millis((worker_idx as u64) * 25);
+                        let mut retry = initial_retry;
 
-                    while !token.is_cancelled() {
-                        let _permit = match dial_semaphore.acquire().cancel_with(&token).await {
-                            Some(Ok(p)) => p,
-                            _ => break,
-                        };
+                        while !token.is_cancelled() {
+                            let _permit = match dial_semaphore.acquire().cancel_with(&token).await {
+                                Some(Ok(p)) => p,
+                                _ => break,
+                            };
 
-                        let conn_res_opt = connector
-                            .connect_pooled_with_protocol(&listen_target, protocol)
-                            .cancel_with(&token)
-                            .await;
-                        drop(_permit);
+                            let conn_res_opt = connector
+                                .connect_pooled_with_protocol(&listen_target, protocol)
+                                .cancel_with(&token)
+                                .await;
+                            drop(_permit);
 
-                        let Some(conn_res) = conn_res_opt else {
-                            break;
-                        };
+                            let Some(conn_res) = conn_res_opt else {
+                                break;
+                            };
 
-                        let mut stream = match conn_res {
-                            Ok(s) => {
-                                retry = initial_retry;
-                                s
-                            }
-                            Err(e) => {
-                                tracing::debug!("Reverse pool pre-warm dial failed: {:?}", e);
-                                if !token.sleep_or_cancel(retry).await {
+                            let mut stream = match conn_res {
+                                Ok(s) => {
+                                    retry = initial_retry;
+                                    s
+                                }
+                                Err(e) => {
+                                    tracing::debug!("Reverse pool pre-warm dial failed: {:?}", e);
+                                    if !token.sleep_or_cancel(retry).await {
+                                        break;
+                                    }
+                                    retry = (retry * 2).min(POOL_BACKOFF_ACTIVE_WAITERS_MAX);
+                                    continue;
+                                }
+                            };
+
+                            let activation_hdr = {
+                                let activation = decode_activation(&mut stream, &token, idle);
+                                tokio::pin!(activation);
+
+                                loop {
+                                    tokio::select! {
+                                        biased;
+                                        _ = token.cancelled() => break None,
+                                        res = &mut activation => {
+                                            break res.ok().flatten();
+                                        }
+                                        Some(_) = relays.join_next(), if !relays.is_empty() => {}
+                                    }
+                                }
+                            };
+
+                            let Some(hdr) = activation_hdr else {
+                                if token.is_cancelled() {
                                     break;
                                 }
-                                retry = (retry * 2).min(POOL_BACKOFF_ACTIVE_WAITERS_MAX);
                                 continue;
-                            }
-                        };
-
-                        // The server is the sole owner of an idle stream's
-                        // lifetime. This worker must NEVER close the stream on
-                        // its own timer: the server may already have popped it
-                        // and be writing the activation byte, and a local
-                        // recycle in that window would blackhole the visitor.
-                        // Eviction, re-registration and listener teardown all
-                        // close the stream from the server side; this worker
-                        // then sees EOF (or cancellation) and re-dials.
-                        // The inner scope releases the stream borrow before the
-                        // stream is moved into the relay task.
-                        let activation_kind = {
-                            let activation = async {
-                                let mut magic = [0u8; 1];
-                                let res = stream.read_exact(&mut magic).await;
-                                (res, magic)
                             };
-                            tokio::pin!(activation);
 
-                            loop {
-                                tokio::select! {
-                                    biased;
-                                    _ = token.cancelled() => break 0u8,
-                                    (res, magic) = &mut activation => {
-                                        if res.is_ok() {
-                                            break magic[0];
-                                        }
-                                        break 0u8;
-                                    }
-                                    Some(_) = relays.join_next(), if !relays.is_empty() => {}
+                            if hdr.is_promotion {
+                                if let Some(ref sink) = event_sink_worker {
+                                    info!("Pre-warmed reverse stream promoted to signaling channel by remote server (0-RTT)");
+                                    let new_handle = SignalingChannel::spawn_with_event_sink(
+                                        stream,
+                                        sig_cfg,
+                                        sink.clone(),
+                                        token.child_token(),
+                                    );
+                                    router_worker.attach(new_handle);
                                 }
-                            }
-                        };
-
-                        if token.is_cancelled() {
-                            break;
-                        }
-
-                        if activation_kind == crate::consts::ACTIVATE_STREAM_PROMOTE {
-                            if let Some(ref sink) = event_sink_worker {
-                                info!("Pre-warmed reverse stream promoted to signaling channel by remote server (0-RTT)");
-                                let new_handle = SignalingChannel::spawn_with_event_sink(
-                                    stream,
-                                    sig_cfg,
-                                    sink.clone(),
-                                    token.child_token(),
-                                );
-                                router_worker.attach(new_handle);
-                            }
-                            continue;
-                        } else if activation_kind != expected_activation_magic {
-                            if !token.sleep_or_cancel(Duration::from_millis(100)).await {
-                                break;
-                            }
-                            continue;
-                        }
-
-                        // Echo ACTIVATE_STREAM_ACK (0xAC) back to server so server verifies stream liveness
-                        let ack_sent = async {
-                            tokio::io::AsyncWriteExt::write_all(
-                                &mut stream,
-                                &[ACTIVATE_STREAM_ACK],
-                            )
-                            .await?;
-                            tokio::io::AsyncWriteExt::flush(&mut stream).await
-                        };
-                        let ack_res = tokio::time::timeout(Duration::from_secs(2), ack_sent)
-                            .cancel_with(&token)
-                            .await;
-                        if !matches!(ack_res, Some(Ok(Ok(())))) {
-                            debug!("Failed to echo ACTIVATE_STREAM_ACK; recycling reverse worker stream");
-                            continue;
-                        }
-
-                        let Some(local_res) =
-                            crate::platform::connect_target_channel_str(&target_clone, protocol)
-                                .cancel_with(&token)
-                                .await
-                        else {
-                            break;
-                        };
-                        let local_channel = match local_res {
-                            Ok(s) => s,
-                            Err(e) => {
-                                error!(
-                                    "Failed to connect to local target {}: {:?}",
-                                    target_clone, e
-                                );
+                                continue;
+                            } else if hdr.protocol != protocol {
                                 if !token.sleep_or_cancel(Duration::from_millis(100)).await {
                                     break;
                                 }
                                 continue;
                             }
-                        };
 
-                        relays.spawn_with_cancel(move |relay_token| async move {
-                            let _ = serve(
-                                PumpRequest::new(local_channel, stream),
-                                PumpCtx {
-                                    cancel: relay_token,
-                                    heartbeat_interval: hb,
-                                    idle_timeout: idle,
-                                },
-                            )
-                            .await;
-                        });
-                        // Loop immediately: the consumed slot is replenished in
-                        // one dial RTT, with no extra control-channel signaling.
-                    }
+                            // Echo ACTIVATE_STREAM_ACK (0xAC) back to server so server verifies stream liveness
+                            let ack_sent = async {
+                                tokio::io::AsyncWriteExt::write_all(
+                                    &mut stream,
+                                    &[ACTIVATE_STREAM_ACK],
+                                )
+                                .await?;
+                                tokio::io::AsyncWriteExt::flush(&mut stream).await
+                            };
+                            let ack_res = tokio::time::timeout(Duration::from_secs(2), ack_sent)
+                                .cancel_with(&token)
+                                .await;
+                            if !matches!(ack_res, Some(Ok(Ok(())))) {
+                                debug!("Failed to echo ACTIVATE_STREAM_ACK; recycling reverse worker stream");
+                                continue;
+                            }
 
-                    relays.shutdown_and_wait().await;
-                });
+                            let target_to_connect = hdr.target.unwrap_or_else(|| {
+                                crate::io::addr::parse_target_addr(&target_clone)
+                                    .unwrap_or_else(|_| TargetAddr::Ip(std::net::SocketAddr::from(([127, 0, 0, 1], 0))))
+                            });
+
+                            let Some(local_res) =
+                                crate::platform::connect_target_channel(&target_to_connect, protocol)
+                                    .cancel_with(&token)
+                                    .await
+                            else {
+                                break;
+                            };
+                            let local_channel = match local_res {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    error!(
+                                        "Failed to connect to local target {}: {:?}",
+                                        target_to_connect, e
+                                    );
+                                    if !token.sleep_or_cancel(Duration::from_millis(100)).await {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            };
+
+                            relays.spawn_with_cancel(move |relay_token| async move {
+                                let _ = serve(
+                                    PumpRequest::new(local_channel, stream),
+                                    PumpCtx {
+                                        cancel: relay_token,
+                                        heartbeat_interval: hb,
+                                        idle_timeout: idle,
+                                    },
+                                )
+                                .await;
+                            });
+                            // Loop immediately: the consumed slot is replenished in
+                            // one dial RTT, with no extra control-channel signaling.
+                        }
+
+                        relays.shutdown_and_wait().await;
+                    });
+                }
             }
         }
 
@@ -520,6 +543,195 @@ pub async fn run_reverse_mapping(
     Ok(())
 }
 
+/// Runs the shared pre-warming worker pool for all reverse mappings under a single tunnel.
+pub async fn run_shared_reverse_pool(
+    tunnel_id: String,
+    pool_size: usize,
+    token: Option<String>,
+    endpoint_ctx: EndpointContext,
+    transport_registry: Arc<TransportRegistry>,
+    reverse_ready: Option<Arc<ReverseReadyNotifier>>,
+    cancel_token: CancellationToken,
+) -> Result<(), TunnelError> {
+    let size = clamp_reverse_pool_size(Some(pool_size)).unwrap_or(0);
+    if size == 0 {
+        return Ok(());
+    }
+
+    // Await control channel registration before dialing pre-warm pool connections
+    if let Some(ref ready) = reverse_ready {
+        if !ready.wait_ready(&cancel_token).await {
+            return Ok(());
+        }
+    }
+
+    info!(
+        tunnel_id = %tunnel_id,
+        pool_size = size,
+        "Starting shared reverse connection pool"
+    );
+
+    let dummy_target = TargetAddr::Domain(REVERSE_CONTROL_TARGET_HOST.to_string(), 0);
+    let hb_interval = endpoint_ctx.heartbeat_interval();
+    let idle_timeout = endpoint_ctx.idle_timeout();
+    let udp_idle_timeout = endpoint_ctx.udp_idle_timeout();
+
+    let data_connector: Arc<dyn TransportConnector> =
+        Arc::from(transport_registry.create_connector(
+            &endpoint_ctx,
+            token.as_deref(),
+            TunnelMode::Reverse,
+        )?);
+
+    let dial_semaphore = Arc::new(tokio::sync::Semaphore::new(POOL_MAX_CONCURRENT_CONNECTS));
+    let mut pool_tracker = TaskTracker::<()>::new(cancel_token.clone());
+
+    for worker_idx in 0..size {
+        let connector = Arc::clone(&data_connector);
+        let dummy_target = dummy_target.clone();
+        let dial_semaphore = Arc::clone(&dial_semaphore);
+        let tunnel_id = tunnel_id.clone();
+
+        pool_tracker.spawn_with_cancel(move |worker_token| async move {
+            let mut relays = TaskTracker::<()>::new(worker_token.child_token());
+            let initial_retry =
+                POOL_BACKOFF_BASE + Duration::from_millis((worker_idx as u64) * 25);
+            let mut retry = initial_retry;
+
+            while !worker_token.is_cancelled() {
+                let _permit = match dial_semaphore.acquire().cancel_with(&worker_token).await {
+                    Some(Ok(p)) => p,
+                    _ => break,
+                };
+
+                let conn_res_opt = connector
+                    .connect_pooled_with_tunnel(&dummy_target, L4Protocol::Tcp, Some(&tunnel_id))
+                    .cancel_with(&worker_token)
+                    .await;
+                drop(_permit);
+
+                let Some(conn_res) = conn_res_opt else {
+                    break;
+                };
+
+                let mut stream = match conn_res {
+                    Ok(s) => {
+                        retry = initial_retry;
+                        s
+                    }
+                    Err(e) => {
+                        tracing::debug!("Shared reverse pool pre-warm dial failed: {:?}", e);
+                        if !worker_token.sleep_or_cancel(retry).await {
+                            break;
+                        }
+                        retry = (retry * 2).min(POOL_BACKOFF_ACTIVE_WAITERS_MAX);
+                        continue;
+                    }
+                };
+
+                // Server is sole owner of idle stream lifetime; await activation from server.
+                let activation_hdr = {
+                    let activation = decode_activation(&mut stream, &worker_token, idle_timeout);
+                    tokio::pin!(activation);
+
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = worker_token.cancelled() => break None,
+                            res = &mut activation => {
+                                break res.ok().flatten();
+                            }
+                            Some(_) = relays.join_next(), if !relays.is_empty() => {}
+                        }
+                    }
+                };
+
+                let Some(hdr) = activation_hdr else {
+                    if worker_token.is_cancelled() {
+                        break;
+                    }
+                    continue;
+                };
+
+                if hdr.is_promotion {
+                    continue;
+                }
+
+                let target = match hdr.target {
+                    Some(t) => t,
+                    None => {
+                        tracing::debug!("Activated reverse stream had no target specified; skipping");
+                        continue;
+                    }
+                };
+
+                // Echo ACTIVATE_STREAM_ACK (0xAC) back to server so server verifies stream liveness
+                let ack_sent = async {
+                    tokio::io::AsyncWriteExt::write_all(
+                        &mut stream,
+                        &[ACTIVATE_STREAM_ACK],
+                    )
+                    .await?;
+                    tokio::io::AsyncWriteExt::flush(&mut stream).await
+                };
+                let ack_res = tokio::time::timeout(Duration::from_secs(2), ack_sent)
+                    .cancel_with(&worker_token)
+                    .await;
+                if !matches!(ack_res, Some(Ok(Ok(())))) {
+                    tracing::debug!("Failed to echo ACTIVATE_STREAM_ACK; recycling reverse worker stream");
+                    continue;
+                }
+
+                let proto = hdr.protocol;
+                let relay_idle = match proto {
+                    L4Protocol::Tcp => idle_timeout,
+                    L4Protocol::Udp => udp_idle_timeout,
+                };
+
+                let Some(local_res) =
+                    crate::platform::connect_target_channel(&target, proto)
+                        .cancel_with(&worker_token)
+                        .await
+                else {
+                    break;
+                };
+
+                let local_channel = match local_res {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to connect to local target {}: {:?}",
+                            target, e
+                        );
+                        if !worker_token.sleep_or_cancel(Duration::from_millis(100)).await {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+
+                relays.spawn_with_cancel(move |relay_token| async move {
+                    let _ = serve(
+                        PumpRequest::new(local_channel, stream),
+                        PumpCtx {
+                            cancel: relay_token,
+                            heartbeat_interval: hb_interval,
+                            idle_timeout: relay_idle,
+                        },
+                    )
+                    .await;
+                });
+            }
+
+            relays.shutdown_and_wait().await;
+        });
+    }
+
+    cancel_token.cancelled().await;
+    pool_tracker.shutdown_and_wait().await;
+    Ok(())
+}
+
 /// Runs a reverse tunnel worker that requests a remote listener on the server and streams traffic back locally.
 pub async fn run_reverse_tunnel(
     config: TunnelConfig,
@@ -543,6 +755,8 @@ pub async fn run_reverse_tunnel(
         endpoint_ctx,
         transport_registry,
         config.pool_size,
+        None,
+        None,
         cancel_token,
     )
     .await
@@ -642,6 +856,8 @@ mod tests {
                 None,
                 ep_ctx,
                 reg,
+                None,
+                None,
                 None,
                 cancel_clone,
             )
@@ -783,6 +999,8 @@ mod tests {
                 ep_ctx,
                 reg,
                 Some(24),
+                None,
+                None,
                 cancel_clone,
             )
             .await
@@ -900,6 +1118,8 @@ mod tests {
                 ep_ctx,
                 reg,
                 Some(1),
+                None,
+                None,
                 cancel_clone,
             )
             .await

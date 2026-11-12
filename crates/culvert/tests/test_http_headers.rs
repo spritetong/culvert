@@ -135,6 +135,8 @@ async fn test_e2e_ws_tunnel_with_custom_host_and_headers() {
 
     let tunnel_config = TunnelConfig {
         tag: "custom-headers-e2e".to_string(),
+        uuid: None,
+        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/tunnel", server_port)),
         token: Some(auth_token.to_string()),
         pool_size: None,

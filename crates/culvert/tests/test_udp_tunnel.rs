@@ -169,6 +169,8 @@ async fn test_forward_udp_ws_unpooled_and_pooled() {
     let unpooled_listen = format!("127.0.0.1:{}", unpooled_udp_port);
     let unpooled_cfg = TunnelConfig {
         tag: "udp-fwd-unpooled".to_string(),
+        uuid: None,
+        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/tunnel", server_ws_port)),
         token: Some(auth_token.to_string()),
         pool_size: None,
@@ -196,6 +198,8 @@ async fn test_forward_udp_ws_unpooled_and_pooled() {
     let pooled_listen = format!("127.0.0.1:{}", pooled_udp_port);
     let pooled_cfg = TunnelConfig {
         tag: "udp-fwd-pooled".to_string(),
+        uuid: None,
+        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/tunnel", server_ws_port)),
         token: Some(auth_token.to_string()),
         pool_size: Some(4),
@@ -307,6 +311,8 @@ async fn test_forward_udp_h3_and_raw_quic() {
         tunnels: vec![
             TunnelConfig {
                 tag: "udp-over-h3".to_string(),
+        uuid: None,
+        pool: None,
                 endpoint: EndpointConfig::Simple(format!(
                     "h3://127.0.0.1:{}/tunnel",
                     h3_server_port
@@ -327,6 +333,8 @@ async fn test_forward_udp_h3_and_raw_quic() {
             },
             TunnelConfig {
                 tag: "udp-over-quic-pooled".to_string(),
+        uuid: None,
+        pool: None,
                 endpoint: EndpointConfig::Simple(format!(
                     "quic://127.0.0.1:{}/raw",
                     quic_server_port
@@ -408,6 +416,8 @@ async fn test_forward_udp_concurrent_multi_client_nat_demux() {
         }),
         tunnels: vec![TunnelConfig {
             tag: "udp-nat-demux".to_string(),
+        uuid: None,
+        pool: None,
             endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/tunnel", server_ws_port)),
             token: Some("nat_demux_token".to_string()),
             pool_size: Some(3),
@@ -480,6 +490,8 @@ async fn test_same_port_tcp_and_udp_forward_coexistence_and_empty_datagram() {
         }),
         tunnels: vec![TunnelConfig {
             tag: "same-port-tcp-udp".to_string(),
+        uuid: None,
+        pool: None,
             endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/tunnel", server_ws_port)),
             token: Some("dual_proto_token".to_string()),
             pool_size: Some(4),
@@ -592,6 +604,8 @@ async fn test_reverse_udp_ws_pooled_and_signaling_fallback() {
 
     let tunnel_config = TunnelConfig {
         tag: "rev-udp-pool-and-fallback".to_string(),
+        uuid: None,
+        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/tunnel", server_ws_port)),
         token: Some(auth_token.to_string()),
         pool_size: Some(2),
@@ -676,6 +690,8 @@ async fn test_reverse_udp_h3() {
         }),
         tunnels: vec![TunnelConfig {
             tag: "rev-udp-h3".to_string(),
+        uuid: None,
+        pool: None,
             endpoint: EndpointConfig::Simple(format!("h3://127.0.0.1:{}/tunnel", h3_server_port)),
             token: Some("rev_h3_udp_token".to_string()),
             pool_size: Some(2),
@@ -847,6 +863,8 @@ async fn test_udp_nat_idle_timeout_expiration_and_recreation() {
     };
     let tunnel_cfg = TunnelConfig {
         tag: "udp-idle-recreate".to_string(),
+        uuid: None,
+        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/tunnel", server_ws_port)),
         token: Some("udp_idle_tok".to_string()),
         pool_size: None,

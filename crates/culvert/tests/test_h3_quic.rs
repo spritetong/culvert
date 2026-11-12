@@ -421,6 +421,8 @@ async fn test_h3_tunnel_pool_prewarm_and_activation_end_to_end() {
         }),
         tunnels: vec![culvert::config::model::TunnelConfig {
             tag: "bench-h3-pool".to_string(),
+        uuid: None,
+        pool: None,
             token: None,
             endpoint: EndpointConfig::Simple(format!("h3://{}/tunnel", server_h3_listen)),
             pool_size: Some(4), // Pre-warm 4 connections in pool!
@@ -522,6 +524,8 @@ async fn test_quic_raw_tunnel_pool_prewarm_and_activation_end_to_end() {
         }),
         tunnels: vec![culvert::config::model::TunnelConfig {
             tag: "bench-quic-pool".to_string(),
+        uuid: None,
+        pool: None,
             token: None,
             endpoint: EndpointConfig::Simple(format!("quic://{}/raw", server_quic_listen)),
             pool_size: Some(4),
@@ -651,6 +655,8 @@ async fn test_quic_raw_forward_stress_throughput() {
         }),
         tunnels: vec![culvert::config::model::TunnelConfig {
             tag: "bench-quic-stress".to_string(),
+        uuid: None,
+        pool: None,
             token: None,
             endpoint: EndpointConfig::Simple(format!("quic://{}/raw", server_quic_listen)),
             pool_size: Some(4),
@@ -752,6 +758,8 @@ async fn test_h3_concurrent_forward_stress() {
         }),
         tunnels: vec![culvert::config::model::TunnelConfig {
             tag: "bench-h3-conc".to_string(),
+        uuid: None,
+        pool: None,
             token: None,
             endpoint: EndpointConfig::Simple(format!("h3://{}/tunnel", server_h3_listen)),
             pool_size: Some(4),

@@ -304,6 +304,8 @@ async fn test_wss_forward_tunnel_with_custom_ca_and_sni() {
     // 4. Client forward tunnel connecting via wss:// with custom CA and SNI override
     let tunnel_config = TunnelConfig {
         tag: "test-wss-ca-sni".to_string(),
+        uuid: None,
+        pool: None,
         token: Some(auth_token.to_string()),
         pool_size: None,
         failover: None,
@@ -423,6 +425,8 @@ async fn test_wss_forward_tunnel_insecure_mode() {
     // Client connects with insecure: true (without CA cert)
     let tunnel_config = TunnelConfig {
         tag: "test-wss-insecure".to_string(),
+        uuid: None,
+        pool: None,
         token: Some(auth_token.to_string()),
         pool_size: None,
         failover: None,
@@ -540,6 +544,8 @@ async fn test_wss_mtls_mutual_authentication() {
     // Client configures client_certificate and client_key
     let tunnel_config = TunnelConfig {
         tag: "test-wss-mtls".to_string(),
+        uuid: None,
+        pool: None,
         token: Some(auth_token.to_string()),
         pool_size: None,
         failover: None,
@@ -662,6 +668,8 @@ async fn test_wss_reverse_tunnel_e2e() {
     // 4. Reverse tunnel client over WSS with CA cert
     let tunnel_config = TunnelConfig {
         tag: "test-wss-reverse".to_string(),
+        uuid: None,
+        pool: None,
         token: Some(auth_token.to_string()),
         pool_size: None,
         failover: None,

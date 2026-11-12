@@ -79,6 +79,8 @@ async fn test_standalone_wss_server_self_signed_direct_termination() {
     // 2. Configure Client with wss:// and insecure: true to connect directly to the standalone WSS server
     app_config.tunnels.push(TunnelConfig {
         tag: "direct-wss-tunnel".to_string(),
+        uuid: None,
+        pool: None,
         endpoint: EndpointConfig::Detailed {
             url: format!("wss://127.0.0.1:{}/tunnel", server_wss_port),
             dns: None,

@@ -18,7 +18,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::consts::{
-    ACTIVATE_STREAM_MAGIC, ACTIVATE_STREAM_UDP, POOL_ACQUIRE_TIMEOUT,
+    POOL_ACQUIRE_TIMEOUT,
     POOL_BACKOFF_ACTIVE_WAITERS_MAX, POOL_BACKOFF_BASE, POOL_BACKOFF_MAX, POOL_COMMAND_QUEUE_SIZE,
     POOL_DUMMY_HOST, POOL_HEARTBEAT_INTERVAL, POOL_HEARTBEAT_TICK_INTERVAL, POOL_HEARTBEAT_TIMEOUT,
     POOL_MAX_CAPACITY, POOL_MAX_CONCURRENT_CONNECTS,
@@ -668,22 +668,7 @@ impl ReplenishingStreamPool {
         target: Option<&TargetAddr>,
         protocol: L4Protocol,
     ) -> Vec<u8> {
-        let mut pkt = Vec::new();
-        let magic = match protocol {
-            L4Protocol::Tcp => ACTIVATE_STREAM_MAGIC,
-            L4Protocol::Udp => ACTIVATE_STREAM_UDP,
-        };
-        pkt.push(magic);
-        if let Some(t) = target {
-            let s = t.to_string();
-            let b = s.as_bytes();
-            let len = b.len().min(u16::MAX as usize) as u16;
-            pkt.extend_from_slice(&len.to_be_bytes());
-            pkt.extend_from_slice(&b[..len as usize]);
-        } else {
-            pkt.extend_from_slice(&0u16.to_be_bytes());
-        }
-        pkt
+        super::activation::encode_activation_with_proto(target, protocol)
     }
 
     /// Acquires a pre-warmed connection in 0-RTT, or falls back to dialing on demand.

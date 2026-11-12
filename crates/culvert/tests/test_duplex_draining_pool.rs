@@ -94,6 +94,8 @@ async fn test_high_volume_duplex_stream_integrity() {
 
     let tunnel_config = TunnelConfig {
         tag: "test-volume".to_string(),
+        uuid: None,
+        pool: None,
         token: Some(auth_token.to_string()),
         pool_size: None,
         failover: None,
@@ -240,6 +242,8 @@ async fn test_stream_half_close_and_draining() {
 
     let tunnel_config = TunnelConfig {
         tag: "test-draining".to_string(),
+        uuid: None,
+        pool: None,
         token: Some(auth_token.to_string()),
         pool_size: None,
         failover: None,
@@ -336,6 +340,8 @@ async fn test_pool_prewarm_and_reuse() {
     // Configure tunnel with pool_size: 4
     let tunnel_config = TunnelConfig {
         tag: "test-pool".to_string(),
+        uuid: None,
+        pool: None,
         token: Some(auth_token.to_string()),
         pool_size: Some(4), // Pre-warm 4 connections
         failover: None,
@@ -434,6 +440,8 @@ async fn test_pool_resilience_after_disconnect_and_high_churn() {
     // Configure tunnel with pool_size: 4
     let tunnel_config = TunnelConfig {
         tag: "test-pool-churn".to_string(),
+        uuid: None,
+        pool: None,
         token: Some(auth_token.to_string()),
         pool_size: Some(4),
         failover: None,

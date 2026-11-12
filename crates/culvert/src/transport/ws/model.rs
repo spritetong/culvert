@@ -11,7 +11,7 @@ use http::request::Builder as RequestBuilder;
 use crate::config::model::TunnelMode;
 use crate::consts::{
     HEADER_SESSION_ID, HEADER_TARGET_HOST, HEADER_TARGET_PATH, HEADER_TARGET_PORT,
-    HEADER_TUNNEL_AUTH, HEADER_TUNNEL_MODE, HEADER_TUNNEL_POOL, HEADER_TUNNEL_PROTO,
+    HEADER_TUNNEL_AUTH, HEADER_TUNNEL_ID, HEADER_TUNNEL_MODE, HEADER_TUNNEL_POOL, HEADER_TUNNEL_PROTO,
     TUNNEL_MODE_FORWARD, TUNNEL_MODE_REVERSE_CTRL, TUNNEL_MODE_REVERSE_DATA, TUNNEL_POOL_IDLE,
     TUNNEL_PROTO_UDP,
 };
@@ -30,6 +30,7 @@ pub struct WsHandshakeHeaders {
     pub target_path: Option<String>,
     pub pool_idle: bool,
     pub protocol: L4Protocol,
+    pub tunnel_id: Option<String>,
 }
 
 impl WsHandshakeHeaders {
@@ -44,7 +45,14 @@ impl WsHandshakeHeaders {
             target_path: None,
             pool_idle: false,
             protocol: L4Protocol::Tcp,
+            tunnel_id: None,
         }
+    }
+
+    /// Sets the optional tunnel instance identifier (Tunnel UUID).
+    pub fn with_tunnel_id(mut self, tunnel_id: Option<String>) -> Self {
+        self.tunnel_id = tunnel_id;
+        self
     }
 
     /// Sets the L4 mapping protocol (`tcp` or `udp`).
@@ -137,6 +145,11 @@ impl WsHandshakeHeaders {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
+        let tunnel_id = headers
+            .get(HEADER_TUNNEL_ID)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
         let pool_idle = headers
             .get(HEADER_TUNNEL_POOL)
             .and_then(|v| v.to_str().ok())
@@ -162,6 +175,7 @@ impl WsHandshakeHeaders {
             target_path,
             pool_idle,
             protocol,
+            tunnel_id,
         })
     }
 
@@ -191,6 +205,10 @@ impl WsHandshakeHeaders {
 
         if self.protocol == L4Protocol::Udp {
             builder = builder.header(HEADER_TUNNEL_PROTO, TUNNEL_PROTO_UDP);
+        }
+
+        if let Some(ref tid) = self.tunnel_id {
+            builder = builder.header(HEADER_TUNNEL_ID, tid);
         }
 
         if let Some(ref sid) = self.session_id {
@@ -235,6 +253,7 @@ impl WsHandshakeHeaders {
             target,
             pool_idle: self.pool_idle,
             protocol: self.protocol,
+            tunnel_id: self.tunnel_id.clone(),
         }
     }
 }

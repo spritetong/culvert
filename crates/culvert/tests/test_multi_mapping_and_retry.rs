@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use culvert::config::model::{
     AppConfig, EndpointConfig, PortMappingConfig, ServerConfig, TunnelConfig, TunnelMode,
-    TunnelRetryConfig,
+    TunnelPoolConfig, TunnelRetryConfig,
 };
 use culvert::supervisor::TunnelSupervisor;
 
@@ -74,6 +74,8 @@ async fn test_multi_mapping_shared_pool_and_path_matching_e2e() {
 
     app_config.tunnels.push(TunnelConfig {
         tag: "shared-pool-cluster".to_string(),
+        uuid: None,
+        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/secret_path", server_ws_port)),
         token: None,
         pool_size: Some(4), // 4 idle pre-warmed streams shared across all mappings
@@ -168,6 +170,8 @@ async fn test_path_mismatch_rejection() {
     // Client connects to the WRONG path: /wrong_path
     app_config.tunnels.push(TunnelConfig {
         tag: "wrong-path-tunnel".to_string(),
+        uuid: None,
+        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/wrong_path", server_ws_port)),
         token: None,
         pool_size: None,
@@ -236,6 +240,8 @@ async fn test_cluster_mixed_forward_and_reverse_with_pool_e2e() {
 
     app_config.tunnels.push(TunnelConfig {
         tag: "mixed-cluster".to_string(),
+        uuid: None,
+        pool: None,
         endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/cluster_ws", server_ws_port)),
         token: Some("cluster_mixed_pool_secret".to_string()),
         pool_size: Some(4), // Outbound pool for forward, Inbound pool for reverse
@@ -300,4 +306,181 @@ async fn test_cluster_mixed_forward_and_reverse_with_pool_e2e() {
     })
     .await
     .expect("Timeout waiting for handles to exit in test_cluster_mixed_forward_and_reverse_with_pool_e2e");
+}
+
+#[tokio::test]
+async fn test_multi_reverse_mapping_shared_pool_with_uuid_e2e() {
+    let cancel_token = CancellationToken::new();
+
+    let (echo1_handle, echo1_port) = spawn_echo_server(cancel_token.clone());
+    let (echo2_handle, echo2_port) = spawn_echo_server(cancel_token.clone());
+    let server_ws_port = get_available_port();
+    let rev1_listen_port = get_available_port();
+    let rev2_listen_port = get_available_port();
+
+    let mut app_config = AppConfig {
+        server: Some(ServerConfig {
+            listen: vec![format!("ws://127.0.0.1:{}/rev_cluster", server_ws_port)],
+            token: Some("shared_rev_secret".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    app_config.tunnels.push(TunnelConfig {
+        tag: "shared-rev-cluster".to_string(),
+        uuid: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
+        pool: Some(TunnelPoolConfig {
+            forward: None,
+            reverse: Some(3),
+        }),
+        endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/rev_cluster", server_ws_port)),
+        token: Some("shared_rev_secret".to_string()),
+        pool_size: None,
+        failover: None,
+        multiplex: None,
+        retry: None,
+        http_headers: None,
+        mappings: vec![
+            PortMappingConfig {
+                mode: TunnelMode::Reverse,
+                listen: format!("127.0.0.1:{}", rev1_listen_port),
+                target: format!("127.0.0.1:{}", echo1_port),
+                ..Default::default()
+            },
+            PortMappingConfig {
+                mode: TunnelMode::Reverse,
+                listen: format!("127.0.0.1:{}", rev2_listen_port),
+                target: format!("127.0.0.1:{}", echo2_port),
+                ..Default::default()
+            },
+        ],
+    });
+
+    let supervisor = TunnelSupervisor::new(app_config, cancel_token.clone());
+    let sup_handle = tokio::spawn(async move {
+        let _ = supervisor.run().await;
+    });
+
+    // Wait for server, listener binding, and shared pool replenishment
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Test Reverse mapping 1 (server listen 1 -> local echo 1)
+    for i in 1..=3 {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", rev1_listen_port))
+            .await
+            .expect("Failed to connect reverse mapping 1");
+        let msg = format!("MAPPING 1 TEST {}", i);
+        stream.write_all(msg.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; msg.len()];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, msg.as_bytes());
+    }
+
+    // Test Reverse mapping 2 (server listen 2 -> local echo 2)
+    for i in 1..=3 {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", rev2_listen_port))
+            .await
+            .expect("Failed to connect reverse mapping 2");
+        let msg = format!("MAPPING 2 TEST {}", i);
+        stream.write_all(msg.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; msg.len()];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, msg.as_bytes());
+    }
+
+    cancel_token.cancel();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (r1, r2, r3) = tokio::join!(echo1_handle, echo2_handle, sup_handle);
+        r1.expect("echo1 handle panicked");
+        r2.expect("echo2 handle panicked");
+        r3.expect("sup handle panicked");
+    })
+    .await
+    .expect("Timeout waiting for handles to exit in test_multi_reverse_mapping_shared_pool_with_uuid_e2e");
+}
+
+#[tokio::test]
+async fn test_asymmetric_pool_sizing_e2e() {
+    let cancel_token = CancellationToken::new();
+
+    let (echo_fwd_handle, echo_fwd_port) = spawn_echo_server(cancel_token.clone());
+    let (echo_rev_handle, echo_rev_port) = spawn_echo_server(cancel_token.clone());
+    let server_ws_port = get_available_port();
+    let fwd_listen_port = get_available_port();
+    let rev_listen_port = get_available_port();
+
+    let mut app_config = AppConfig {
+        server: Some(ServerConfig {
+            listen: vec![format!("ws://127.0.0.1:{}/asym_cluster", server_ws_port)],
+            token: Some("asym_pool_secret".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    app_config.tunnels.push(TunnelConfig {
+        tag: "asym-pool-tunnel".to_string(),
+        uuid: None,
+        pool: Some(TunnelPoolConfig {
+            forward: Some(2),
+            reverse: Some(4),
+        }),
+        endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/asym_cluster", server_ws_port)),
+        token: Some("asym_pool_secret".to_string()),
+        pool_size: None,
+        failover: None,
+        multiplex: None,
+        retry: None,
+        http_headers: None,
+        mappings: vec![
+            PortMappingConfig {
+                mode: TunnelMode::Forward,
+                listen: format!("127.0.0.1:{}", fwd_listen_port),
+                target: format!("127.0.0.1:{}", echo_fwd_port),
+                ..Default::default()
+            },
+            PortMappingConfig {
+                mode: TunnelMode::Reverse,
+                listen: format!("127.0.0.1:{}", rev_listen_port),
+                target: format!("127.0.0.1:{}", echo_rev_port),
+                ..Default::default()
+            },
+        ],
+    });
+
+    let supervisor = TunnelSupervisor::new(app_config, cancel_token.clone());
+    let sup_handle = tokio::spawn(async move {
+        let _ = supervisor.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Test Forward mapping with pool
+    let mut fwd_client = TcpStream::connect(format!("127.0.0.1:{}", fwd_listen_port))
+        .await
+        .expect("Failed to connect forward port");
+    fwd_client.write_all(b"ASYM FORWARD PING").await.unwrap();
+    let mut fwd_buf = [0u8; 17];
+    fwd_client.read_exact(&mut fwd_buf).await.unwrap();
+    assert_eq!(&fwd_buf, b"ASYM FORWARD PING");
+
+    // Test Reverse mapping with pool
+    let mut rev_client = TcpStream::connect(format!("127.0.0.1:{}", rev_listen_port))
+        .await
+        .expect("Failed to connect reverse port");
+    rev_client.write_all(b"ASYM REVERSE PING").await.unwrap();
+    let mut rev_buf = [0u8; 17];
+    rev_client.read_exact(&mut rev_buf).await.unwrap();
+    assert_eq!(&rev_buf, b"ASYM REVERSE PING");
+
+    cancel_token.cancel();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (r1, r2, r3) = tokio::join!(echo_fwd_handle, echo_rev_handle, sup_handle);
+        r1.expect("echo_fwd handle panicked");
+        r2.expect("echo_rev handle panicked");
+        r3.expect("sup handle panicked");
+    })
+    .await
+    .expect("Timeout waiting for handles to exit in test_asymmetric_pool_sizing_e2e");
 }

@@ -75,6 +75,7 @@ impl WsConnector {
         session_id: Option<&str>,
         pool_idle: bool,
         protocol: L4Protocol,
+        tunnel_id: Option<&str>,
     ) -> Result<IoChannel, TunnelError> {
         let host = &self.endpoint.endpoint.host;
         let port = self.endpoint.endpoint.port;
@@ -151,7 +152,8 @@ impl WsConnector {
             .with_session_id(session_id.map(|s| s.to_string()))
             .with_target(Some(target))
             .with_pool_idle(pool_idle)
-            .with_protocol(protocol);
+            .with_protocol(protocol)
+            .with_tunnel_id(tunnel_id.map(|s| s.to_string()));
 
         req_builder = headers.apply_to_request_builder(req_builder);
 
@@ -184,14 +186,14 @@ impl TransportConnector for WsConnector {
         target: &'a TargetAddr,
         session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
-        Box::pin(self.connect_internal(target, session_id, false, L4Protocol::Tcp))
+        Box::pin(self.connect_internal(target, session_id, false, L4Protocol::Tcp, None))
     }
 
     fn connect_pooled<'a>(
         &'a self,
         target: &'a TargetAddr,
     ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
-        Box::pin(self.connect_internal(target, None, true, L4Protocol::Tcp))
+        Box::pin(self.connect_internal(target, None, true, L4Protocol::Tcp, None))
     }
 
     fn connect_with_protocol<'a>(
@@ -200,7 +202,7 @@ impl TransportConnector for WsConnector {
         session_id: Option<&'a str>,
         protocol: L4Protocol,
     ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
-        Box::pin(self.connect_internal(target, session_id, false, protocol))
+        Box::pin(self.connect_internal(target, session_id, false, protocol, None))
     }
 
     fn connect_pooled_with_protocol<'a>(
@@ -208,6 +210,15 @@ impl TransportConnector for WsConnector {
         target: &'a TargetAddr,
         protocol: L4Protocol,
     ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
-        Box::pin(self.connect_internal(target, None, true, protocol))
+        Box::pin(self.connect_internal(target, None, true, protocol, None))
+    }
+
+    fn connect_pooled_with_tunnel<'a>(
+        &'a self,
+        target: &'a TargetAddr,
+        protocol: L4Protocol,
+        tunnel_id: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
+        Box::pin(self.connect_internal(target, None, true, protocol, tunnel_id))
     }
 }

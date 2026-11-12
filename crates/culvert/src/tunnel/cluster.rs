@@ -34,7 +34,7 @@ pub async fn run_tunnel_cluster(
 
     // Shared connection pool for all forward mappings under this tunnel (only created when forward mappings exist)
     let has_forward_mappings = mappings.iter().any(|m| m.mode == TunnelMode::Forward);
-    let pool = if has_forward_mappings && let Some(size) = config.pool_size.filter(|&s| s > 0) {
+    let pool = if has_forward_mappings && let Some(size) = config.forward_pool_size().filter(|&s| s > 0) {
         let connector: Arc<dyn TransportConnector> =
             Arc::from(transport_registry.create_connector(
                 &endpoint_ctx,
@@ -52,7 +52,37 @@ pub async fn run_tunnel_cluster(
         None
     };
 
+    let tunnel_id = config.effective_tunnel_id();
+    let has_reverse_mappings = mappings.iter().any(|m| m.mode == TunnelMode::Reverse);
+    let reverse_pool_size = config.reverse_pool_size();
+    let reverse_ready = if has_reverse_mappings && reverse_pool_size.is_some_and(|s| s > 0) {
+        Some(Arc::new(crate::tunnel::reverse::ReverseReadyNotifier::new()))
+    } else {
+        None
+    };
+
     let mut tracker = TaskTracker::<Result<(), TunnelError>>::new(cancel_token.clone());
+
+    // Shared reverse connection pool for all reverse mappings under this tunnel
+    if has_reverse_mappings && let Some(rev_size) = reverse_pool_size.filter(|&s| s > 0) {
+        let tid = tunnel_id.clone();
+        let ep = endpoint_ctx.clone();
+        let reg = Arc::clone(&transport_registry);
+        let tok = config.token.clone();
+        let ready = reverse_ready.clone();
+        tracker.spawn_with_cancel(move |token_cancel| async move {
+            crate::tunnel::reverse::run_shared_reverse_pool(
+                tid,
+                rev_size,
+                tok,
+                ep,
+                reg,
+                ready,
+                token_cancel,
+            )
+            .await
+        });
+    }
 
     for (idx, mapping) in mappings.into_iter().enumerate() {
         let mapping_tag = format!("{}-map{}", config.tag, idx + 1);
@@ -68,6 +98,8 @@ pub async fn run_tunnel_cluster(
         let endpoint = endpoint_ctx.clone();
         let token = config.token.clone();
         let pool_clone = pool.clone();
+        let tunnel_id_clone = tunnel_id.clone();
+        let reverse_ready_clone = reverse_ready.clone();
 
         tracker.spawn_with_cancel(move |token_cancel| async move {
             match mode {
@@ -96,7 +128,9 @@ pub async fn run_tunnel_cluster(
                         token,
                         endpoint,
                         registry,
-                        config.pool_size,
+                        reverse_pool_size,
+                        Some(tunnel_id_clone),
+                        reverse_ready_clone,
                         token_cancel,
                     )
                     .await

@@ -200,6 +200,19 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
 - **References**:
   - Implementation: [connection_pool.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/pool/connection_pool.rs)
 
+### 4.4 Coordination Race Between Shared Reverse Pool Pre-Warming & Listener Registration
+
+- **Problem / Trap**: When connection pooling is shared across multiple reverse mappings at the tunnel cluster level (`run_shared_reverse_pool`), if the shared pool pre-warmer task is spawned concurrently and dials pre-warmed idle connections before any reverse mapping's control channel has registered (`RegisterReverse`) and established `tunnel_pools[tunnel_id]`:
+  1. The server receives the pooled stream tagged with `x-tunnel-id`, but finds no matching `TunnelPoolSlot` in `session_mgr.tunnel_pools` because the control channel has not completed its registration handshake (`RegisterReverse`). The server drops the idle stream with "Dropped reverse idle pool stream: no matching listener", causing dial churn and unnecessary backoff.
+  2. In reverse test harnesses or proxy setups that track connection order (e.g. `conn 0` for control channel, `conn 1` for pool stream), concurrent dialing causes connection ordering inversion (`conn 0` becomes an idle pool stream while `conn 1` becomes the control channel), leading to tests killing active relays or asserting on the wrong connection.
+- **Solution**:
+  - Implement a dedicated coordination mechanism (`ReverseReadyNotifier` with atomic boolean flag and `tokio::sync::Notify`).
+  - In `run_tunnel_cluster`, create `ReverseReadyNotifier` and pass it to both `run_shared_reverse_pool` and `run_reverse_mapping`.
+  - `run_shared_reverse_pool` checks `reverse_ready.wait_ready()` before dialing any idle streams.
+  - The first reverse mapping to receive `RegisterAck` invokes `reverse_ready.mark_ready()`, guaranteeing that `tunnel_pools[tunnel_id]` is already registered on the server before the first pre-warmed idle connection arrives.
+- **References**:
+  - Implementation: [reverse.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/tunnel/reverse.rs), [cluster.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/tunnel/cluster.rs)
+
 ---
 
 ## 5. Async Concurrency & Probe-Driven Verification

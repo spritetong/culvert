@@ -351,6 +351,9 @@ pub const HEADER_TUNNEL_AUTH: &str = "x-tunnel-auth";
 /// HTTP Header key for identifying the tunnel session ID.
 pub const HEADER_SESSION_ID: &str = "x-session-id";
 
+/// HTTP Header key for identifying the tunnel instance (Tunnel UUID).
+pub const HEADER_TUNNEL_ID: &str = "x-tunnel-id";
+
 /// HTTP Header key for the tunnel operating mode.
 pub const HEADER_TUNNEL_MODE: &str = "x-tunnel-mode";
 

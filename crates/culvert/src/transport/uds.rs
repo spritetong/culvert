@@ -472,6 +472,7 @@ impl UdsConnector {
         session_id: Option<&str>,
         pool_idle: bool,
         protocol: L4Protocol,
+        tunnel_id: Option<&str>,
     ) -> Result<Box<dyn TunnelStream>, TunnelError> {
         let socket_path = normalize_uds_path(&self.endpoint.endpoint.path);
         let raw_stream = connect_uds(&socket_path).await.map_err(TunnelError::Io)?;
@@ -553,7 +554,8 @@ impl UdsConnector {
             .with_session_id(session_id.map(|s| s.to_string()))
             .with_target(Some(target))
             .with_pool_idle(pool_idle)
-            .with_protocol(protocol);
+            .with_protocol(protocol)
+            .with_tunnel_id(tunnel_id.map(|s| s.to_string()));
 
         let req_builder = headers.apply_to_request_builder(req_builder);
 
@@ -582,7 +584,7 @@ impl TransportConnector for UdsConnector {
         session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
         Box::pin(async move {
-            self.connect_internal(target, session_id, false, L4Protocol::Tcp)
+            self.connect_internal(target, session_id, false, L4Protocol::Tcp, None)
                 .await
                 .map(IoChannel::from_boxed_stream)
         })
@@ -593,7 +595,7 @@ impl TransportConnector for UdsConnector {
         target: &'a TargetAddr,
     ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
         Box::pin(async move {
-            self.connect_internal(target, None, true, L4Protocol::Tcp)
+            self.connect_internal(target, None, true, L4Protocol::Tcp, None)
                 .await
                 .map(IoChannel::from_boxed_stream)
         })
@@ -606,7 +608,7 @@ impl TransportConnector for UdsConnector {
         protocol: L4Protocol,
     ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
         Box::pin(async move {
-            self.connect_internal(target, session_id, false, protocol)
+            self.connect_internal(target, session_id, false, protocol, None)
                 .await
                 .map(IoChannel::from_boxed_stream)
         })
@@ -618,7 +620,20 @@ impl TransportConnector for UdsConnector {
         protocol: L4Protocol,
     ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
         Box::pin(async move {
-            self.connect_internal(target, None, true, protocol)
+            self.connect_internal(target, None, true, protocol, None)
+                .await
+                .map(IoChannel::from_boxed_stream)
+        })
+    }
+
+    fn connect_pooled_with_tunnel<'a>(
+        &'a self,
+        target: &'a TargetAddr,
+        protocol: L4Protocol,
+        tunnel_id: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
+        Box::pin(async move {
+            self.connect_internal(target, None, true, protocol, tunnel_id)
                 .await
                 .map(IoChannel::from_boxed_stream)
         })

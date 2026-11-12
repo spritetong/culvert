@@ -449,6 +449,8 @@ mod e2e_reverse_promotion_tests {
 
         let tunnel_cfg = TunnelConfig {
             tag: "e2e-0xa6-udp".to_string(),
+        uuid: None,
+        pool: None,
             endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/tunnel", proxy.proxy_port)),
             token: Some(auth_token.to_string()),
             pool_size: Some(3),
@@ -561,6 +563,8 @@ mod e2e_reverse_promotion_tests {
         let app_cfg = AppConfig {
             tunnels: vec![TunnelConfig {
                 tag: "e2e-udp-grace".to_string(),
+        uuid: None,
+        pool: None,
                 endpoint: EndpointConfig::Simple(format!(
                     "ws://127.0.0.1:{}/tunnel",
                     proxy.proxy_port

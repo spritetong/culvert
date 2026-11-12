@@ -76,7 +76,7 @@ behavior is configurable, the configuration key is given.
 | :--- | :--- | :--- |
 | UC-1 | Publish a local service on a remote host (reverse mapping) | Client behind NAT connects to the ingress endpoint, sends `RegisterReverse`, the server binds the requested TCP/UDS or UDP address, and each inbound connection or UDP NAT flow is relayed back to the client's local target. |
 | UC-2 | Reach a private service from a local port (forward mapping) | Client binds `mappings.listen` locally (TCP or UDP); each local connection or UDP client flow opens a tunnel stream to the ingress endpoint; the server opens the corresponding TCP/UDS connection or `ConnectedUdpSocket` to `mappings.target` and relays in both directions. |
-| UC-3 | Carry several ports over one endpoint (cluster) | One `tunnels` entry declares several `mappings` (TCP and/or UDP, even sharing the same port). Forward mappings share the outbound pool, and reverse mappings maintain per-`(protocol, listen)` inbound pools when `pool_size` is set; in-band 0-RTT activation (`0xA5` TCP / `0xA7` UDP with `0xAC` ACK) is used when idle streams exist, falling back to signaling when the pool is empty or activation fails. |
+| UC-3 | Carry several ports over one endpoint (cluster) | One `tunnels` entry declares several `mappings` (TCP and/or UDP, even sharing the same port). Forward mappings share the outbound pool, and reverse mappings share a unified inbound pool keyed by Tunnel UUID when `pool_size` or `pool.reverse` is set; in-band 0-RTT target activation (`[magic][len][target]` symmetrically with forward mode with `0xAC` ACK) is used when idle streams exist, eliminating per-mapping connection proliferation and falling back to signaling when the pool is empty or activation fails. |
 | UC-4 | Reach a Unix domain socket through a tunnel | TCP `mappings.target` or `mappings.listen` uses `unix://path`; the ingress side or client side binds/connects the socket directly. |
 | UC-5 | Deploy behind a reverse proxy | `server.listen` uses `ws+unix://...` or `ws://127.0.0.1:...`; the proxy handles public TLS and forwards the configured HTTP path to culvert (capable of carrying both TCP and UDP mappings). |
 | UC-6 | Deploy without a reverse proxy | `server.listen` uses a TLS scheme (`wss`, `h3`, `https`, `quic`, `wss+unix`). culvert terminates TLS using the configured certificate and key, or an ephemeral self-signed certificate when neither is provided. |
@@ -115,7 +115,7 @@ behavior is configurable, the configuration key is given.
 | Mode | Listener location | Target location | Protocols | Pool |
 | :--- | :--- | :--- | :--- | :--- |
 | `forward` (default) | Client host | Dialed by the ingress server | `tcp` (default; IP/host/UDS), `udp` (IP/host) | Shared outbound pool when `pool_size > 0` (`0xA5` TCP / `0xA7` UDP) |
-| `reverse` | Ingress server (registered over a control channel) | Dialed by the client host | `tcp` (default; IP/host/UDS), `udp` (IP/host) | Per-`(protocol, listen)` inbound pool when `pool_size > 0` (`0xA5`/`0xA7` 0-RTT with `0xAC` round-trip ACK and signaling fallback) |
+| `reverse` | Ingress server (registered over a control channel) | Dialed by the client host | `tcp` (default; IP/host/UDS), `udp` (IP/host) | Unified Tunnel-scoped inbound pool when `pool_size > 0` or `pool.reverse > 0` (`[magic][len][target]` symmetric 0-RTT with `0xAC` round-trip ACK and signaling fallback; legacy peers fall back to per-`(protocol, listen)` pool) |
 
 ---
 
@@ -206,11 +206,13 @@ behavior is configurable, the configuration key is given.
   (`TcpFrontend` for `tcp`, `UdpFrontend` for `udp`) and relays each accepted
   connection or per-peer UDP NAT flow to `mappings.target` through the ingress
   endpoint.
-- **FR-4.2** When `pool_size` is set to a positive value, all forward mappings
-  of that tunnel share one `ReplenishingStreamPool`. Without `pool_size`, each
+- **FR-4.2** When `pool_size` (or `pool.forward`) is set to a positive value, all forward mappings
+  of that tunnel share one `ReplenishingStreamPool`. Without pool configuration, each
   accepted connection or UDP flow opens a new transport stream through a
   connector shared by that mapping, tagging the request with `protocol`
   (`x-tunnel-proto: tcp | udp` on HTTP/WS, or `StreamMetadata.protocol` on raw QUIC).
+  Tunnels support asymmetric pool sizing via `pool: { forward: Option<usize>, reverse: Option<usize> }`,
+  falling back to scalar `pool_size` when direction-specific values are not provided.
 - **FR-4.3** Pooled forward streams are pre-warmed without a fixed backend
   target or L4 protocol. The server keeps them idle and does not dial any
   target service or allocate a `ConnectedUdpSocket` until the client sends an
@@ -240,32 +242,32 @@ behavior is configurable, the configuration key is given.
 ### FR-5 Reverse mappings, 0-RTT inbound pool, and control protocol
 
 - **FR-5.1** The client opens a control stream in `reverse-ctrl` mode and
-  sends `RegisterReverse { listen_addr, target_addr, pool_size, protocol }`,
-  where `pool_size` is the effective clamped worker count and `protocol` is
-  `L4Protocol::Tcp` or `L4Protocol::Udp` (both `#[serde(default)]` on the wire so
-  older peers interoperate). The server derives the inbound-queue soft cap from
-  `pool_size`, binds the requested TCP/UDS or UDP frontend, and replies with
+  sends `RegisterReverse { listen_addr, target_addr, pool_size, protocol, tunnel_id }`,
+  where `pool_size` is the effective clamped worker count, `protocol` is
+  `L4Protocol::Tcp` or `L4Protocol::Udp`, and `tunnel_id` is the Tunnel UUID
+  (all `#[serde(default)]` on the wire so older peers interoperate). The server derives
+  the inbound-queue soft cap, binds the requested TCP/UDS or UDP frontend, and replies with
   `RegisterAck { listen_addr, success, error_msg }`.
 - **FR-5.2** Control messages are encoded with MessagePack
   (`to_vec_named`) over a length-delimited frame. Variants are
   `RegisterReverse`, `RegisterAck`, `NewConnection`, `Ping`, `Pong`.
-- **FR-5.3** When `pool_size` is configured on a tunnel with reverse mappings,
-  the client pre-warms idle reverse streams to the server (`mode = reverse`,
-  `pool_idle = true`, `target = listen_addr`, `protocol = mapping.protocol`).
-  The server maintains an inbound stream pool per `(protocol, listen_addr)`
-  key (`{protocol}:{normalized}`) so TCP and UDP reverse pools on the same
-  port remain isolated.
+- **FR-5.3** When `pool_size` or `pool.reverse` is configured on a tunnel with reverse mappings,
+  the client pre-warms a single shared pool of idle reverse streams for the entire tunnel
+  (`mode = reverse`, `pool_idle = true`, `tunnel_id = tunnel_uuid`).
+  On the server side, `SessionManager` maintains a unified `ReverseInboundPool` per Tunnel UUID (`tunnel_id`).
+  All reverse mappings belonging to the same tunnel draw from this shared inbound pool, eliminating the
+  multiplicative $(M \times S)$ stream proliferation. Legacy connections without `tunnel_id` fall back
+  to per-`(protocol, listen_addr)` pools for backward compatibility.
 - **FR-5.4** Fast path (0-RTT): For each inbound connection or new UDP peer
-  flow on the reverse listener, if an idle stream is available in the inbound
-  pool, the server pops it, writes the single-byte activation signal (`0xA5` for
-  TCP, `0xA7` for UDP), and reads back `0xAC` (`ACTIVATE_STREAM_ACK`) bounded by
-  `reverse_frame_timeout(idle_timeout)`. The client worker reads `0xA5` / `0xA7`
-  (or `0xA6` to promote the stream into a replacement signaling channel), echoes
-  `0xAC` with a 2-second timeout, dials local `mappings.target` (TCP/UDS or
-  `ConnectedUdpSocket`), starts relaying, and replenishes the inbound pool in the
-  background. This round-trip acknowledgment guarantees that silently-dead
-  (half-open) idle streams where server writes succeed into the OS kernel buffer
-  are detected rather than blackholing the visitor.
+  flow on any reverse listener of the tunnel, if an idle stream is available in the shared inbound
+  pool, the server pops it and sends the activation packet symmetrically with forward mode:
+  one magic byte (`0xA5` for TCP, `0xA7` for UDP), a two-byte big-endian target length, and the UTF-8
+  target string (`mappings.target`), followed by reading back `0xAC` (`ACTIVATE_STREAM_ACK`) bounded by
+  `reverse_frame_timeout(idle_timeout)`. The client worker reads the activation packet using the unified
+  activation codec, echoes `0xAC` with a 2-second timeout, dials the dynamically received local
+  `mappings.target` (TCP/UDS or `ConnectedUdpSocket`), starts relaying, and replenishes the tunnel's
+  inbound pool in the background. This guarantees that silently-dead (half-open) idle streams are detected
+  rather than blackholing the visitor, while enabling late-binding target routing across mappings.
 - **FR-5.5** Fallback path (on-demand signaling): If no idle stream is
   available (e.g. pool exhausted under burst or `pool_size` not set), or if
   fast-path 0-RTT activation fails (missing `0xAC` ACK, timeout, or I/O error),

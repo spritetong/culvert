@@ -10,18 +10,16 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
 use tokio::sync::futures::OwnedNotified;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, Sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::common::{CancelFutureExt, TaskTracker, TimeoutOrCancel};
+use crate::common::{CancelFutureExt, TaskTracker};
 use crate::config::model::{ServerConfig, TlsConfig, TunnelMode};
 use crate::consts::{
-    ACTIVATE_STREAM_ACK, ACTIVATE_STREAM_MAGIC, ACTIVATE_STREAM_UDP,
-    DEFAULT_ACTIVATION_READ_TIMEOUT, DEFAULT_SESSION_PAIR_TIMEOUT, MAX_ACTIVATION_TARGET_LEN,
+    ACTIVATE_STREAM_ACK, DEFAULT_ACTIVATION_READ_TIMEOUT, DEFAULT_SESSION_PAIR_TIMEOUT,
     POOL_DUMMY_HOST, reverse_frame_timeout, reverse_grace_period, reverse_pool_soft_cap,
 };
 use crate::control::{
@@ -193,74 +191,23 @@ impl ServerRunner {
                                                 // If this stream was pre-warmed as an idle connection in client pool,
                                                 // wait for the client activation signal before touching the target service.
                                                 if metadata.pool_idle {
-                                                    let mut magic = [0u8; 1];
-                                                    let Some(res) = stream.read_exact(&mut magic).cancel_with(&conn_token).await else {
-                                                        return;
-                                                    };
-                                                    match res {
-                                                        Ok(_) if magic[0] == ACTIVATE_STREAM_MAGIC || magic[0] == ACTIVATE_STREAM_UDP => {
-                                                            activated_proto = Some(if magic[0] == ACTIVATE_STREAM_UDP {
-                                                                L4Protocol::Udp
-                                                            } else {
-                                                                L4Protocol::Tcp
-                                                            });
-                                                            // Activated! Check if dynamic target address is appended: [len: u16, target_str] with timeout
-                                                            let mut len_bytes = [0u8; 2];
-                                                            let read_len_res = match stream
-                                                                .read_exact(&mut len_bytes)
-                                                                .timeout_or_cancel(DEFAULT_ACTIVATION_READ_TIMEOUT, &conn_token)
-                                                                .await
-                                                            {
-                                                                TimeoutOrCancel::Ok(r) => r,
-                                                                TimeoutOrCancel::TimedOut => {
-                                                                    debug!("Timed out reading activation target length (10s)");
-                                                                    return;
-                                                                }
-                                                                TimeoutOrCancel::Cancelled => return,
-                                                            };
-                                                            if let Err(e) = read_len_res {
-                                                                debug!("Failed to read activation target length: {}", e);
-                                                                return;
-                                                            }
-                                                            let target_len = u16::from_be_bytes(len_bytes) as usize;
-                                                            if target_len >= MAX_ACTIVATION_TARGET_LEN {
-                                                                warn!("Activation target length too large: {}", target_len);
-                                                                return;
-                                                            }
-                                                            if target_len > 0 {
-                                                                let mut target_bytes = vec![0u8; target_len];
-                                                                let read_target_res = match stream
-                                                                    .read_exact(&mut target_bytes)
-                                                                    .timeout_or_cancel(DEFAULT_ACTIVATION_READ_TIMEOUT, &conn_token)
-                                                                    .await
-                                                                {
-                                                                    TimeoutOrCancel::Ok(r) => r,
-                                                                    TimeoutOrCancel::TimedOut => {
-                                                                        debug!("Timed out reading activation target payload (10s)");
-                                                                        return;
-                                                                    }
-                                                                    TimeoutOrCancel::Cancelled => return,
-                                                                };
-                                                                if let Err(e) = read_target_res {
-                                                                    debug!("Failed to read activation target payload: {}", e);
-                                                                    return;
-                                                                }
-                                                                        if let Ok(t_str) = std::str::from_utf8(&target_bytes)
-                                                                            && let Ok(sa) = crate::io::addr::parse_target_addr(t_str) {
-                                                                                dynamic_target = Some(sa);
-                                                                        }
-                                                                    }
-                                                                }
-                                                                Ok(_) => {
-                                                                    debug!("Received invalid activation magic from pool stream: {:02x}", magic[0]);
-                                                                    return;
-                                                                }
-                                                                Err(_) => {
-                                                                    // Stale or evicted stream closed by client pool without being used
-                                                                    return;
-                                                                }
+                                                    let decoded = crate::pool::activation::decode_activation(
+                                                        &mut stream,
+                                                        &conn_token,
+                                                        DEFAULT_ACTIVATION_READ_TIMEOUT,
+                                                    )
+                                                    .await;
+
+                                                    match decoded {
+                                                        Ok(Some(header)) => {
+                                                            activated_proto = Some(header.protocol);
+                                                            if let Some(t) = header.target {
+                                                                dynamic_target = Some(t);
                                                             }
                                                         }
+                                                        _ => return,
+                                                    }
+                                                }
 
                                                 let effective_proto = activated_proto.unwrap_or(metadata.protocol);
                                                 let relay_idle_timeout = match effective_proto {
@@ -326,7 +273,12 @@ impl ServerRunner {
                                                     }
                                                 } else if metadata.pool_idle {
                                                     // Pre-warmed idle reverse stream arrival: push into inbound pool
-                                                    if !session_mgr.push_idle_stream(metadata.protocol, metadata.target.as_ref(), stream) {
+                                                    if !session_mgr.push_idle_stream_with_tunnel(
+                                                        metadata.tunnel_id.as_deref(),
+                                                        metadata.protocol,
+                                                        metadata.target.as_ref(),
+                                                        stream,
+                                                    ) {
                                                         // Expected briefly while a control channel reconnects:
                                                         // the orphaned worker will recycle after a short cooldown.
                                                         tracing::debug!("Dropped reverse idle pool stream: no matching listener");
@@ -455,7 +407,7 @@ impl ServerRunner {
         ctrl_stream: &mut FramedControlStream<Box<dyn TunnelStream>>,
         idle_timeout: Duration,
         cancel_token: &CancellationToken,
-    ) -> Option<(String, String, Option<usize>, L4Protocol)> {
+    ) -> Option<(String, String, Option<usize>, L4Protocol, Option<String>)> {
         let deadline = Instant::now() + idle_timeout;
         let frame_timeout = reverse_frame_timeout(idle_timeout);
         loop {
@@ -476,7 +428,8 @@ impl ServerRunner {
                     target_addr,
                     pool_size,
                     protocol,
-                })))) => return Some((listen_addr, target_addr, pool_size, protocol)),
+                    tunnel_id,
+                })))) => return Some((listen_addr, target_addr, pool_size, protocol, tunnel_id)),
                 Some(Ok(Some(Ok(ControlMessage::Ping)))) => {
                     let pong = timeout(frame_timeout, ctrl_stream.send(ControlMessage::Pong))
                         .cancel_with(cancel_token)
@@ -613,22 +566,23 @@ impl ServerRunner {
         }
 
         debug!(addr = %listen_addr, "Reverse control channel disconnected; checking for emergency promotion");
-        if Self::try_promote_idle_signaling(
-            listen_addr,
-            protocol,
-            idle_timeout,
-            sig_config,
-            cancel_token,
-            session_mgr,
-            pool_guard,
-            router,
-            sig_rx,
-            grace_handle,
-            grace_deadline,
-            pool_notify,
-            "Promoted idle pool stream to replacement signaling channel (0-RTT)",
-        )
-        .await
+        if pool_guard.tunnel_id.is_none()
+            && Self::try_promote_idle_signaling(
+                listen_addr,
+                protocol,
+                idle_timeout,
+                sig_config,
+                cancel_token,
+                session_mgr,
+                pool_guard,
+                router,
+                sig_rx,
+                grace_handle,
+                grace_deadline,
+                pool_notify,
+                "Promoted idle pool stream to replacement signaling channel (0-RTT)",
+            )
+            .await
         {
             return;
         }
@@ -673,11 +627,19 @@ impl ServerRunner {
 
         // Register the new pool generation BEFORE sending RegisterAck so the
         // client's freshly spawned pre-warm workers never race ahead of registration.
-        pool_guard.replace_pool(session_mgr.register_pool(
-            protocol,
-            listen_addr,
-            reverse_pool_soft_cap(reattach.pool_size),
-        ));
+        let tid_opt = pool_guard.tunnel_id.clone();
+        if let Some(ref tid) = tid_opt {
+            pool_guard.replace_pool(session_mgr.register_tunnel_pool(
+                tid,
+                reverse_pool_soft_cap(reattach.pool_size),
+            ));
+        } else {
+            pool_guard.replace_pool(session_mgr.register_pool(
+                protocol,
+                listen_addr,
+                reverse_pool_soft_cap(reattach.pool_size),
+            ));
+        }
 
         if let Some(sink) = sig_rx.event_sink() {
             let new_handle = SignalingChannel::spawn_framed_with_event_sink(
@@ -827,6 +789,7 @@ impl ServerRunner {
     async fn handle_accepted_reverse_visitor(
         accepted: FrontendAccept,
         listen_addr: &str,
+        target_addr: &str,
         protocol: L4Protocol,
         idle_timeout: Duration,
         relay_idle_timeout: Duration,
@@ -847,10 +810,11 @@ impl ServerRunner {
     ) {
         let visitor_stream = accepted.channel;
         let visitor_addr = accepted.peer;
-        let activation_magic = match protocol {
-            L4Protocol::Tcp => ACTIVATE_STREAM_MAGIC,
-            L4Protocol::Udp => ACTIVATE_STREAM_UDP,
-        };
+        let target_parsed = crate::io::addr::parse_target_addr(target_addr).ok();
+        let activation_pkt = crate::pool::activation::encode_activation_with_proto(
+            target_parsed.as_ref(),
+            protocol,
+        );
 
         // 1. FAST PATH (0-RTT Pool): only pair streams that are fresh and still alive.
         // A stale generation must fall through to signaling rather than blackhole the visitor.
@@ -867,7 +831,7 @@ impl ServerRunner {
                 let activate = async {
                     tokio::io::AsyncWriteExt::write_all(
                         &mut candidate,
-                        &[activation_magic],
+                        &activation_pkt,
                     )
                     .await?;
                     tokio::io::AsyncWriteExt::flush(&mut candidate).await?;
@@ -945,7 +909,7 @@ impl ServerRunner {
         udp_idle_timeout: Duration,
     ) {
         let mut ctrl_stream = FramedControlStream::new(stream);
-        let Some((listen_addr, target_addr, pool_size, protocol)) =
+        let Some((listen_addr, target_addr, pool_size, protocol, tunnel_id)) =
             Self::read_initial_register_reverse(&mut ctrl_stream, idle_timeout, &cancel_token)
                 .await
         else {
@@ -1003,7 +967,8 @@ impl ServerRunner {
 
         // Register the inbound pool BEFORE acknowledging, wrapped in an RAII Drop guard
         // so pool registration is cleaned up even if this future is cancelled or aborted.
-        let mut pool_guard = session_mgr.register_pool_guarded(
+        let mut pool_guard = session_mgr.register_pool_guarded_with_tunnel(
+            tunnel_id,
             protocol,
             &listen_addr,
             reverse_pool_soft_cap(pool_size),
@@ -1181,6 +1146,7 @@ impl ServerRunner {
                             Self::handle_accepted_reverse_visitor(
                                 accepted,
                                 &listen_addr,
+                                &target_addr,
                                 protocol,
                                 idle_timeout,
                                 relay_idle_timeout,
@@ -1342,6 +1308,7 @@ mod tests {
                 target_addr: "127.0.0.1:9099".to_string(),
                 pool_size: None,
                 protocol: L4Protocol::Tcp,
+                tunnel_id: None,
             })
             .await
             .unwrap();
@@ -1391,6 +1358,7 @@ mod tests {
                 target_addr: "127.0.0.1:9099".to_string(),
                 pool_size: None,
                 protocol: L4Protocol::Tcp,
+                tunnel_id: None,
             })
             .await
             .unwrap();
@@ -1483,6 +1451,7 @@ mod tests {
                 target_addr: "127.0.0.1:9099".to_string(),
                 pool_size: Some(2),
                 protocol: L4Protocol::Tcp,
+                tunnel_id: None,
             })
             .await
             .unwrap();
@@ -1531,6 +1500,7 @@ mod tests {
                 target_addr: "127.0.0.1:9099".to_string(),
                 pool_size: Some(2),
                 protocol: L4Protocol::Tcp,
+                tunnel_id: None,
             })
             .await
             .unwrap();
@@ -1602,6 +1572,7 @@ mod tests {
                 target_addr: "127.0.0.1:9099".to_string(),
                 pool_size: Some(2),
                 protocol: L4Protocol::Udp,
+                tunnel_id: None,
             })
             .await
             .unwrap();
@@ -1639,6 +1610,7 @@ mod tests {
                 target_addr: "127.0.0.1:9099".to_string(),
                 pool_size: Some(2),
                 protocol: L4Protocol::Udp,
+                tunnel_id: None,
             })
             .await
             .unwrap();
@@ -1716,6 +1688,7 @@ mod tests {
                 target_addr: "127.0.0.1:9099".to_string(),
                 pool_size: Some(2),
                 protocol: L4Protocol::Tcp,
+                tunnel_id: None,
             })
             .await
             .unwrap();
@@ -1782,6 +1755,7 @@ mod tests {
                 target_addr: "127.0.0.1:9099".to_string(),
                 pool_size: Some(2),
                 protocol: L4Protocol::Tcp,
+                tunnel_id: None,
             })
             .await
             .unwrap();
@@ -1872,6 +1846,7 @@ mod tests {
                 target_addr: "127.0.0.1:9099".to_string(),
                 pool_size: None,
                 protocol: L4Protocol::Tcp,
+                tunnel_id: None,
             })
             .await
             .unwrap();
@@ -1959,6 +1934,7 @@ mod tests {
                 target_addr: "127.0.0.1:9099".to_string(),
                 pool_size: None,
                 protocol: L4Protocol::Tcp,
+                tunnel_id: None,
             })
             .await
             .unwrap();
@@ -2030,6 +2006,7 @@ mod tests {
                 target_addr: "127.0.0.1:9099".to_string(),
                 pool_size: None,
                 protocol: L4Protocol::Tcp,
+                tunnel_id: None,
             })
             .await
             .unwrap();
@@ -2103,6 +2080,7 @@ mod tests {
                 target_addr: "127.0.0.1:9099".to_string(),
                 pool_size: None,
                 protocol: L4Protocol::Tcp,
+                tunnel_id: None,
             })
             .await
             .unwrap();
@@ -2167,6 +2145,7 @@ mod tests {
                 target_addr: "127.0.0.1:9099".to_string(),
                 pool_size: Some(4),
                 protocol: L4Protocol::Tcp,
+                tunnel_id: None,
             })
             .await
             .unwrap();
@@ -2290,6 +2269,7 @@ mod tests {
                 target_addr: "127.0.0.1:9099".to_string(),
                 pool_size: Some(4),
                 protocol: L4Protocol::Tcp,
+                tunnel_id: None,
             })
             .await
             .unwrap();
@@ -2304,11 +2284,21 @@ mod tests {
         let (mut active_client, active_server) = tokio::io::duplex(1024);
         assert!(session_mgr.push_idle_stream(L4Protocol::Tcp, None, Box::new(active_server)));
 
-        // Worker background task: reads magic byte and echoes 0xAC
+        // Worker background task: decodes activation and echoes 0xAC
         tokio::spawn(async move {
-            let mut magic = [0u8; 1];
-            active_client.read_exact(&mut magic).await.unwrap();
-            assert_eq!(magic[0], ACTIVATE_STREAM_MAGIC);
+            let header = crate::pool::activation::decode_activation(
+                &mut active_client,
+                &CancellationToken::new(),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(header.protocol, L4Protocol::Tcp);
+            assert_eq!(
+                header.target.map(|t| t.to_string()),
+                Some("127.0.0.1:9099".to_string())
+            );
             active_client
                 .write_all(&[ACTIVATE_STREAM_ACK])
                 .await

@@ -61,6 +61,8 @@ async fn test_e2e_server_uds_url_and_mappings() {
         }),
         tunnels: vec![TunnelConfig {
             tag: "uds-to-uds-forward".to_string(),
+        uuid: None,
+        pool: None,
             endpoint: EndpointConfig::Simple(server_sock_url),
             token: Some("secret123".to_string()),
             pool_size: Some(2),
@@ -153,6 +155,8 @@ async fn test_e2e_reverse_mapping_uds() {
         }),
         tunnels: vec![TunnelConfig {
             tag: "uds-reverse-tunnel".to_string(),
+        uuid: None,
+        pool: None,
             endpoint: EndpointConfig::Simple(server_sock_url),
             token: Some("rev_secret".to_string()),
             pool_size: None,
@@ -257,6 +261,8 @@ async fn test_e2e_server_ws_unix_with_query_path() {
         }),
         tunnels: vec![TunnelConfig {
             tag: "ws-unix-tunnel".to_string(),
+        uuid: None,
+        pool: None,
             endpoint: EndpointConfig::Simple(client_endpoint),
             token: Some("token123".to_string()),
             pool_size: Some(2),

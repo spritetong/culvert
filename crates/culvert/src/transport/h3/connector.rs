@@ -22,9 +22,9 @@ use crate::consts::{
     DEFAULT_QUIC_MAX_CONCURRENT_UNI_STREAMS, DEFAULT_QUIC_MAX_IDLE_TIMEOUT,
     DEFAULT_QUIC_RECEIVE_WINDOW, DEFAULT_QUIC_SEND_WINDOW, DEFAULT_QUIC_STREAM_RECEIVE_WINDOW,
     DEFAULT_TUNNEL_PATH, H3_FAILURE_SUPPRESSION_COOLDOWN, HEADER_SESSION_ID, HEADER_TUNNEL_AUTH,
-    HEADER_TUNNEL_MODE, HEADER_TUNNEL_POOL, HEADER_TUNNEL_PROTO, HEADER_TUNNEL_TARGET, SCHEME_QUIC,
-    TUNNEL_MODE_FORWARD, TUNNEL_MODE_REVERSE_CTRL, TUNNEL_MODE_REVERSE_DATA, TUNNEL_POOL_IDLE,
-    TUNNEL_PROTO_UDP,
+    HEADER_TUNNEL_ID, HEADER_TUNNEL_MODE, HEADER_TUNNEL_POOL, HEADER_TUNNEL_PROTO, HEADER_TUNNEL_TARGET,
+    SCHEME_QUIC, TUNNEL_MODE_FORWARD, TUNNEL_MODE_REVERSE_CTRL, TUNNEL_MODE_REVERSE_DATA,
+    TUNNEL_POOL_IDLE, TUNNEL_PROTO_UDP,
 };
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, TunnelStream};
@@ -381,6 +381,7 @@ impl H3Connector {
         session_id: Option<&str>,
         pool_idle: bool,
         protocol: L4Protocol,
+        tunnel_id: Option<&str>,
     ) -> Result<Box<dyn TunnelStream>, TunnelError> {
         let session = self.get_or_establish_h3_session().await?;
         let mut send_request = session.sender.clone();
@@ -458,6 +459,10 @@ impl H3Connector {
             req_builder = req_builder.header(HEADER_SESSION_ID, sid);
         }
 
+        if let Some(tid) = tunnel_id {
+            req_builder = req_builder.header(HEADER_TUNNEL_ID, tid);
+        }
+
         let request = req_builder
             .body(())
             .map_err(|e| TunnelError::Config(format!("Invalid request headers: {:?}", e)))?;
@@ -529,6 +534,7 @@ impl H3Connector {
         session_id: Option<&str>,
         pool_idle: bool,
         protocol: L4Protocol,
+        tunnel_id: Option<&str>,
     ) -> Result<Box<dyn TunnelStream>, TunnelError> {
         let session = self.get_or_connect_quic_raw().await?;
         let conn = session.conn.clone();
@@ -557,6 +563,7 @@ impl H3Connector {
             target: Some(target.clone()),
             pool_idle,
             protocol,
+            tunnel_id: tunnel_id.map(|s| s.to_string()),
         };
 
         let handshake_bytes = rmp_serde::to_vec_named(&handshake_meta)
@@ -619,10 +626,10 @@ impl TransportConnector for H3Connector {
     ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
         Box::pin(async move {
             let stream = if self.endpoint.endpoint.scheme == "quic" {
-                self.connect_quic_raw(target, session_id, false, protocol)
+                self.connect_quic_raw(target, session_id, false, protocol, None)
                     .await?
             } else {
-                self.connect_h3(target, session_id, false, protocol).await?
+                self.connect_h3(target, session_id, false, protocol, None).await?
             };
             Ok(IoChannel::from_boxed_stream(stream))
         })
@@ -635,9 +642,25 @@ impl TransportConnector for H3Connector {
     ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
         Box::pin(async move {
             let stream = if self.endpoint.endpoint.scheme == "quic" {
-                self.connect_quic_raw(target, None, true, protocol).await?
+                self.connect_quic_raw(target, None, true, protocol, None).await?
             } else {
-                self.connect_h3(target, None, true, protocol).await?
+                self.connect_h3(target, None, true, protocol, None).await?
+            };
+            Ok(IoChannel::from_boxed_stream(stream))
+        })
+    }
+
+    fn connect_pooled_with_tunnel<'a>(
+        &'a self,
+        target: &'a TargetAddr,
+        protocol: L4Protocol,
+        tunnel_id: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
+        Box::pin(async move {
+            let stream = if self.endpoint.endpoint.scheme == "quic" {
+                self.connect_quic_raw(target, None, true, protocol, tunnel_id).await?
+            } else {
+                self.connect_h3(target, None, true, protocol, tunnel_id).await?
             };
             Ok(IoChannel::from_boxed_stream(stream))
         })

@@ -780,14 +780,18 @@ To eliminate port-teardown downtime and WAN reconnection latency upon control ch
 ## 7. Client Data Path
 
 `ClientRunner::run` builds an `EndpointContext` for each tunnel and spawns one
-`run_tunnel_with_retry` worker. `run_tunnel_cluster` creates the shared pool
-and spawns one task per mapping.
+`run_tunnel_with_retry` worker. `run_tunnel_cluster` creates the shared pools
+(outbound forward pool and tunnel-level reverse pre-warm workers) and spawns one task per mapping.
+
+Each tunnel possesses a unique `tunnel_id` (either explicitly configured via `uuid` or
+deterministically generated as a UUID v5 from `tag`). Pools can be configured symmetrically via
+scalar `pool_size` or asymmetrically via `pool: { forward: Option<usize>, reverse: Option<usize> }`.
 
 ### 7.1 Forward mapping
 
 `run_forward_mapping` builds a `MappingSpec::new(protocol, &listen, &target_str)`
 and calls `frontend::bind`. For each `FrontendAccept` (TCP connection or per-peer
-`UdpFlowChannel`) it either acquires a stream from the shared pool or calls
+`UdpFlowChannel`) it either acquires a stream from the shared forward pool or calls
 `TransportConnector::connect_with_protocol(&target, None, protocol)` on a
 connector shared by the mapping. If a pooled stream was acquired,
 `ReplenishingStreamPool::encode_activation_with_proto(Some(&target), protocol)`
@@ -799,28 +803,25 @@ UDP). An `ActiveStreamGuard` calls `pool.on_stream_closed()` on drop.
 ### 7.2 Reverse mapping
 
 `run_reverse_mapping` opens the control channel with dummy target
-`control:0`, sends `RegisterReverse { listen_addr, target_addr, pool_size, protocol }`,
+`control:0`, sends `RegisterReverse { listen_addr, target_addr, pool_size, protocol, tunnel_id }`,
 awaits `RegisterAck`, and then loops on control messages.
 
-When `pool_size` is configured, `clamp_reverse_pool_size` caps it at
-`POOL_MAX_CAPACITY` = 64 and one worker per slot maintains a pre-warmed idle
-stream connected to the server via `connect_pooled_with_protocol(&listen_target, protocol)`
-(`mode = Reverse`, `pool_idle = true`, `target = listen_addr`, `protocol`). The
-worker waits cancellably for an activation byte (`0xA5` for TCP, `0xA7` for UDP,
-or `0xA6` to promote the idle stream into a signaling channel) and reaps its
-own relay tasks while waiting. It has **no independent
-recycle timer**: the server is the sole owner of an idle stream's lifetime, so
-a worker can never close a connection the server has already popped and
-committed to a visitor. Expiry, overflow eviction, re-registration and listener
-teardown all close idle streams from the server side; the worker sees EOF and
-re-dials. Upon reading a valid `0xA5` or `0xA7`, the worker echoes `ACTIVATE_STREAM_ACK`
-(`0xAC`) with a bounded 2-second timeout before opening the local channel; failure
-discards and recycles the stream. It then opens the local channel via
-`platform::connect_target_channel_str(&target_clone, protocol)` (TCP/UDS or
-`ConnectedUdpSocket`), hands `core::serve` (with `relay_idle_timeout`) to its own
-`TaskTracker` (never detached), and immediately dials a replacement — one dial
-RTT, with no server-side "pool low" message. Pre-warm dials are
-throttled to at most `POOL_MAX_CONCURRENT_CONNECTS` = 16 concurrent handshakes
+When reverse pooling is configured (`reverse_pool_size > 0`), the tunnel cluster pre-warms a single
+shared set of idle reverse streams for the entire tunnel rather than multiplying workers per mapping.
+The worker count is capped at `POOL_MAX_CAPACITY` = 64 (`clamp_reverse_pool_size`). Each worker maintains
+an idle stream connected to the server via `connect_pooled_with_tunnel`
+(`mode = Reverse`, `pool_idle = true`, `tunnel_id = Some(tunnel_id)`).
+
+The worker waits cancellably for an activation packet using the unified `decode_activation_with_proto`
+codec (reading `0xA5` for TCP or `0xA7` for UDP, plus target length and the target string, or `0xA6`
+for signaling promotion) and reaps its own relay tasks while waiting. It has **no independent recycle timer**:
+the server is the sole owner of an idle stream's lifetime. Upon reading a valid activation packet,
+the worker echoes `ACTIVATE_STREAM_ACK` (`0xAC`) with a bounded 2-second timeout before opening the
+dynamically received local target channel via `platform::connect_target_channel_str(&target, protocol)`
+(TCP/UDS or `ConnectedUdpSocket`). It then hands `core::serve` to its own `TaskTracker`, and immediately
+dials a replacement idle stream to replenish the tunnel's shared server-side pool.
+
+Pre-warm dials are throttled to at most `POOL_MAX_CONCURRENT_CONNECTS` = 16 concurrent handshakes
 via a shared semaphore, protecting low-bandwidth links from connection storms.
 Dial failures back off exponentially from 200 ms up to 10 s (`POOL_BACKOFF_MAX`),
 capped at 1 s (`POOL_BACKOFF_ACTIVE_WAITERS_MAX`) when requests await replenishment,
@@ -964,28 +965,12 @@ these loops and in the pool reactor is deliberately retained.
    waits up to 15 s (`DEFAULT_SESSION_PAIR_TIMEOUT`), and the reverse data stream
    is delivered by `fulfill(session_id, stream)`. `remove` clears timed-out
    entries.
-2. **Reverse Inbound Pools**: A `DashMap<String, Arc<ReverseInboundPool>>` keyed
-   by `canonical_reverse_key(protocol, addr)` -> `"{protocol}:{normalized}"`
-   (normalized `TargetAddr` host **and** port or UDS path prefixed by `tcp:` or
-   `udp:`, so listeners sharing a port on different addresses or L4 protocols
-   never collide).
-   Pre-warmed reverse streams (`mode = Reverse`, `pool_idle = true`,
-   `target = listen_addr`, `protocol`) are enqueued via `push_idle_stream`; a known
-   target that matches no pool is dropped rather than guessed into another
-   listener's pool. Each queue is LIFO with a soft cap of
-   `reverse_pool_soft_cap(pool_size) = 2 x` the negotiated worker count:
-   overflow evicts the oldest entry, tolerating one overlapping reconnect
-   generation while preventing unbounded growth. Entries carry their enqueue
-   time; `pop_live(idle_timeout)` lazily closes over-age entries (the only
-   practical defence against a silently expired NAT/QUIC pinhole, since
-   `poll_check_alive` reports `Pending` as healthy) and skips EOF/dead streams.
-   Both eviction and expiry act only on entries still in the queue: `pop_back`
-   removes a stream under the same lock before the activation byte is written,
-   so a committed stream can never be evicted. `drain()` closes a superseded
-   generation on re-registration; listener teardown immediately drops the listening
-   socket and unregisters the pool before awaiting in-flight visitor relays, freeing
-   the port without delay so reconnecting peers never hit port conflicts. Teardown
-   is identity-checked with `remove_if`.
+2. **Reverse Inbound Pools**:
+   - **Tunnel-Scoped Shared Pools**: When `tunnel_id` is present, `SessionManager` manages `DashMap<String, Arc<ReverseInboundPool>>` (`tunnel_reverse_pools`) keyed by `tunnel_id`. All reverse mappings belonging to that tunnel draw from this unified pool. Pre-warmed reverse streams (`mode = Reverse`, `pool_idle = true`, `tunnel_id = Some(tunnel_id)`) are pushed directly into this shared pool.
+   - **Legacy Per-Mapping Pools**: Keyed by `canonical_reverse_key(protocol, addr)` -> `"{protocol}:{normalized}"` for legacy clients without `tunnel_id`.
+   - In both cases, pre-warmed reverse streams are enqueued via `push_idle_stream_with_tunnel`. Each queue is LIFO with a soft cap of `reverse_pool_soft_cap(pool_size) = 2 x` the negotiated worker count: overflow evicts the oldest entry, tolerating one overlapping reconnect generation while preventing unbounded growth. Entries carry their enqueue time; `pop_live(idle_timeout)` lazily closes over-age entries and skips EOF/dead streams.
+   - When an external visitor arrives at any listener of the tunnel, the server pops a stream from the shared pool and writes an activation packet `[magic (1B)][target_len (2B)][target_str (NB)]` symmetrically with forward mode. The client echoes `ACTIVATE_STREAM_ACK (0xAC)`, dynamically binds to the specified target, and begins relaying.
+   - `drain()` closes a superseded generation on re-registration; listener teardown cleanly releases registrations via `ReversePoolGuard` without blocking reconnecting peers.
 
 Errors are `SessionNotFound`, `SessionClosed`, and `SessionPairTimeout`. This
 whole section is stream-scoped at the pool/control boundary while remaining
