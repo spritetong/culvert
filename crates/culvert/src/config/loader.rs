@@ -1530,6 +1530,9 @@ tunnels:
             target: "127.0.0.1:8081"
 "#;
         let err2 = ConfigLoader::from_yaml_str(yaml_dup_port).unwrap_err();
-        assert!(err2.to_string().contains("Duplicate forward tcp mapping listen address"));
+        assert!(
+            err2.to_string()
+                .contains("Duplicate forward tcp mapping listen address")
+        );
     }
 }

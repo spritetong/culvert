@@ -49,11 +49,11 @@ impl GenericListener {
         let listen_addr = parse_listen_addr(addr)?;
         match listen_addr {
             ListenAddr::DualStack(port) => {
-                let std_listener = create_dual_stack_tcp_listener(port)
+                let std_listener = create_dual_stack_tcp_listener(port).map_err(TunnelError::Io)?;
+                std_listener
+                    .set_nonblocking(true)
                     .map_err(TunnelError::Io)?;
-                std_listener.set_nonblocking(true).map_err(TunnelError::Io)?;
-                let listener = TcpListener::from_std(std_listener)
-                    .map_err(TunnelError::Io)?;
+                let listener = TcpListener::from_std(std_listener).map_err(TunnelError::Io)?;
                 Ok(GenericListener::Tcp(Arc::new(listener)))
             }
             ListenAddr::Path(path) => {
@@ -299,7 +299,7 @@ fn configure_reuse(socket: &socket2::Socket) -> io::Result<()> {
     // security posture identical to Unix for both TCP and UDP.
     use std::os::windows::io::AsRawSocket;
     use windows_sys::Win32::Networking::WinSock::{
-        setsockopt, SOCKET, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+        SO_EXCLUSIVEADDRUSE, SOCKET, SOL_SOCKET, setsockopt,
     };
     let s: SOCKET = socket.as_raw_socket() as SOCKET;
     let on: i32 = 1;
@@ -579,7 +579,9 @@ mod tests {
         });
 
         // Client 1 connects via IPv4
-        let mut c1 = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+        let mut c1 = TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
         c1.write_all(b"v4in").await.unwrap();
         let mut resp1 = [0u8; 4];
         c1.read_exact(&mut resp1).await.unwrap();
@@ -621,7 +623,9 @@ mod tests {
 
         // Client 1 (IPv4)
         let c1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        c1.send_to(b"udp4", format!("127.0.0.1:{}", port)).await.unwrap();
+        c1.send_to(b"udp4", format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
 
         let mut slot = ReusableFutureRef::default();
         fe.accept(&mut slot);
@@ -635,15 +639,17 @@ mod tests {
             },
             payload: Bytes::new(),
         }];
-        let poll_res = std::future::poll_fn(|cx| {
-            ch1.poll_recv(cx, &mut batch)
-        }).await.unwrap();
+        let poll_res = std::future::poll_fn(|cx| ch1.poll_recv(cx, &mut batch))
+            .await
+            .unwrap();
         assert_eq!(poll_res, 1);
         assert_eq!(&batch[0].payload[..], b"udp4");
 
         // Client 2 (IPv6)
         if let Ok(c2) = UdpSocket::bind("[::1]:0").await {
-            c2.send_to(b"udp6", format!("[::1]:{}", port)).await.unwrap();
+            c2.send_to(b"udp6", format!("[::1]:{}", port))
+                .await
+                .unwrap();
             let mut slot2 = ReusableFutureRef::default();
             fe.accept(&mut slot2);
             let res2 = (&mut slot2).await.unwrap();
@@ -656,9 +662,9 @@ mod tests {
                 },
                 payload: Bytes::new(),
             }];
-            let poll_res2 = std::future::poll_fn(|cx| {
-                ch2.poll_recv(cx, &mut batch2)
-            }).await.unwrap();
+            let poll_res2 = std::future::poll_fn(|cx| ch2.poll_recv(cx, &mut batch2))
+                .await
+                .unwrap();
             assert_eq!(poll_res2, 1);
             assert_eq!(&batch2[0].payload[..], b"udp6");
         }
@@ -666,8 +672,12 @@ mod tests {
 
     #[test]
     fn test_is_ipv6_unsupported_error_codes() {
-        assert!(is_ipv6_unsupported(&io::Error::from(io::ErrorKind::Unsupported)));
-        assert!(is_ipv6_unsupported(&io::Error::from(io::ErrorKind::AddrNotAvailable)));
+        assert!(is_ipv6_unsupported(&io::Error::from(
+            io::ErrorKind::Unsupported
+        )));
+        assert!(is_ipv6_unsupported(&io::Error::from(
+            io::ErrorKind::AddrNotAvailable
+        )));
         assert!(is_ipv6_unsupported(&io::Error::from_raw_os_error(97))); // Linux EAFNOSUPPORT
         assert!(is_ipv6_unsupported(&io::Error::from_raw_os_error(99))); // Linux EADDRNOTAVAIL
         assert!(is_ipv6_unsupported(&io::Error::from_raw_os_error(10047))); // Windows WSAEAFNOSUPPORT
@@ -676,7 +686,9 @@ mod tests {
         assert!(is_ipv6_unsupported(&io::Error::from_raw_os_error(49))); // macOS/BSD EADDRNOTAVAIL
 
         // InUse must NOT be considered unsupported IPv6 (it should fail rather than silently bind wrong port)
-        assert!(!is_ipv6_unsupported(&io::Error::from(io::ErrorKind::AddrInUse)));
+        assert!(!is_ipv6_unsupported(&io::Error::from(
+            io::ErrorKind::AddrInUse
+        )));
         assert!(!is_ipv6_unsupported(&io::Error::from_raw_os_error(98))); // Linux EADDRINUSE
         assert!(!is_ipv6_unsupported(&io::Error::from_raw_os_error(10048))); // Windows WSAEADDRINUSE
     }

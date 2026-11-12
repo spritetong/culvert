@@ -70,8 +70,8 @@ impl UdpFrontend {
         let listen_target = parse_listen_addr(listen_addr)?;
         let socket = match listen_target {
             ListenAddr::DualStack(port) => {
-                let std_sock = crate::platform::create_dual_stack_udp_socket(port)
-                    .map_err(TunnelError::Io)?;
+                let std_sock =
+                    crate::platform::create_dual_stack_udp_socket(port).map_err(TunnelError::Io)?;
                 std_sock.set_nonblocking(true).map_err(TunnelError::Io)?;
                 UdpSocket::from_std(std_sock).map_err(TunnelError::Io)?
             }

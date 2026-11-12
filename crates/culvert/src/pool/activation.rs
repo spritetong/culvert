@@ -11,8 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::common::{CancelFutureExt, TimeoutOrCancel};
 use crate::consts::{
-    ACTIVATE_STREAM_MAGIC, ACTIVATE_STREAM_PROMOTE, ACTIVATE_STREAM_UDP,
-    MAX_ACTIVATION_TARGET_LEN,
+    ACTIVATE_STREAM_MAGIC, ACTIVATE_STREAM_PROMOTE, ACTIVATE_STREAM_UDP, MAX_ACTIVATION_TARGET_LEN,
 };
 use crate::core::error::TunnelError;
 use crate::io::addr::{L4Protocol, TargetAddr, parse_target_addr};
@@ -29,10 +28,7 @@ pub struct ActivationHeader {
 }
 
 /// Encodes an activation packet with target and protocol: `[magic, len: u16, target_str]`.
-pub fn encode_activation_with_proto(
-    target: Option<&TargetAddr>,
-    protocol: L4Protocol,
-) -> Vec<u8> {
+pub fn encode_activation_with_proto(target: Option<&TargetAddr>, protocol: L4Protocol) -> Vec<u8> {
     let mut pkt = Vec::new();
     let magic = match protocol {
         L4Protocol::Tcp => ACTIVATE_STREAM_MAGIC,
@@ -61,7 +57,10 @@ pub async fn decode_activation<S: AsyncReadExt + Unpin + Send>(
     timeout_duration: Duration,
 ) -> Result<Option<ActivationHeader>, TunnelError> {
     let mut magic = [0u8; 1];
-    let read_magic = stream.read_exact(&mut magic).cancel_with(cancel_token).await;
+    let read_magic = stream
+        .read_exact(&mut magic)
+        .cancel_with(cancel_token)
+        .await;
     let Some(res) = read_magic else {
         return Ok(None);
     };

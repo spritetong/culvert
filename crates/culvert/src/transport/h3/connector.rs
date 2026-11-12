@@ -22,9 +22,9 @@ use crate::consts::{
     DEFAULT_QUIC_MAX_CONCURRENT_UNI_STREAMS, DEFAULT_QUIC_MAX_IDLE_TIMEOUT,
     DEFAULT_QUIC_RECEIVE_WINDOW, DEFAULT_QUIC_SEND_WINDOW, DEFAULT_QUIC_STREAM_RECEIVE_WINDOW,
     DEFAULT_TUNNEL_PATH, H3_FAILURE_SUPPRESSION_COOLDOWN, HEADER_SESSION_ID, HEADER_TUNNEL_AUTH,
-    HEADER_TUNNEL_ID, HEADER_TUNNEL_MODE, HEADER_TUNNEL_POOL, HEADER_TUNNEL_PROTO, HEADER_TUNNEL_TARGET,
-    SCHEME_QUIC, TUNNEL_MODE_FORWARD, TUNNEL_MODE_REVERSE_CTRL, TUNNEL_MODE_REVERSE_DATA,
-    TUNNEL_POOL_IDLE, TUNNEL_PROTO_UDP,
+    HEADER_TUNNEL_ID, HEADER_TUNNEL_MODE, HEADER_TUNNEL_POOL, HEADER_TUNNEL_PROTO,
+    HEADER_TUNNEL_TARGET, SCHEME_QUIC, TUNNEL_MODE_FORWARD, TUNNEL_MODE_REVERSE_CTRL,
+    TUNNEL_MODE_REVERSE_DATA, TUNNEL_POOL_IDLE, TUNNEL_PROTO_UDP,
 };
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, TunnelStream};
@@ -629,7 +629,8 @@ impl TransportConnector for H3Connector {
                 self.connect_quic_raw(target, session_id, false, protocol, None)
                     .await?
             } else {
-                self.connect_h3(target, session_id, false, protocol, None).await?
+                self.connect_h3(target, session_id, false, protocol, None)
+                    .await?
             };
             Ok(IoChannel::from_boxed_stream(stream))
         })
@@ -642,7 +643,8 @@ impl TransportConnector for H3Connector {
     ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
         Box::pin(async move {
             let stream = if self.endpoint.endpoint.scheme == "quic" {
-                self.connect_quic_raw(target, None, true, protocol, None).await?
+                self.connect_quic_raw(target, None, true, protocol, None)
+                    .await?
             } else {
                 self.connect_h3(target, None, true, protocol, None).await?
             };
@@ -658,9 +660,11 @@ impl TransportConnector for H3Connector {
     ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
         Box::pin(async move {
             let stream = if self.endpoint.endpoint.scheme == "quic" {
-                self.connect_quic_raw(target, None, true, protocol, tunnel_id).await?
+                self.connect_quic_raw(target, None, true, protocol, tunnel_id)
+                    .await?
             } else {
-                self.connect_h3(target, None, true, protocol, tunnel_id).await?
+                self.connect_h3(target, None, true, protocol, tunnel_id)
+                    .await?
             };
             Ok(IoChannel::from_boxed_stream(stream))
         })

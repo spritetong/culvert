@@ -34,23 +34,24 @@ pub async fn run_tunnel_cluster(
 
     // Shared connection pool for all forward mappings under this tunnel (only created when forward mappings exist)
     let has_forward_mappings = mappings.iter().any(|m| m.mode == TunnelMode::Forward);
-    let pool = if has_forward_mappings && let Some(size) = config.forward_pool_size().filter(|&s| s > 0) {
-        let connector: Arc<dyn TransportConnector> =
-            Arc::from(transport_registry.create_connector(
-                &endpoint_ctx,
-                config.token.as_deref(),
-                TunnelMode::Forward,
-            )?);
-        Some(Arc::new(ReplenishingStreamPool::new_shared(
-            connector,
-            size,
-            cancel_token.clone(),
-            endpoint_ctx.heartbeat_interval(),
-            endpoint_ctx.idle_timeout(),
-        )))
-    } else {
-        None
-    };
+    let pool =
+        if has_forward_mappings && let Some(size) = config.forward_pool_size().filter(|&s| s > 0) {
+            let connector: Arc<dyn TransportConnector> =
+                Arc::from(transport_registry.create_connector(
+                    &endpoint_ctx,
+                    config.token.as_deref(),
+                    TunnelMode::Forward,
+                )?);
+            Some(Arc::new(ReplenishingStreamPool::new_shared(
+                connector,
+                size,
+                cancel_token.clone(),
+                endpoint_ctx.heartbeat_interval(),
+                endpoint_ctx.idle_timeout(),
+            )))
+        } else {
+            None
+        };
 
     let tunnel_id = config.effective_tunnel_id();
     let has_reverse_mappings = mappings.iter().any(|m| m.mode == TunnelMode::Reverse);

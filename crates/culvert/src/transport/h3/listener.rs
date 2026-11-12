@@ -23,9 +23,10 @@ use crate::consts::{
     DEFAULT_QUIC_MAX_CONCURRENT_BIDI_STREAMS, DEFAULT_QUIC_MAX_CONCURRENT_UNI_STREAMS,
     DEFAULT_QUIC_MAX_IDLE_TIMEOUT, DEFAULT_QUIC_RECEIVE_WINDOW, DEFAULT_QUIC_SEND_WINDOW,
     DEFAULT_QUIC_STREAM_RECEIVE_WINDOW, HEADER_SESSION_ID, HEADER_TARGET_HOST, HEADER_TARGET_PATH,
-    HEADER_TARGET_PORT, HEADER_TUNNEL_AUTH, HEADER_TUNNEL_ID, HEADER_TUNNEL_MODE, HEADER_TUNNEL_POOL,
-    HEADER_TUNNEL_PROTO, HEADER_TUNNEL_TARGET, RAW_QUIC_MAX_AUTH_LEN, RAW_QUIC_MAX_META_LEN,
-    TUNNEL_MODE_REVERSE, TUNNEL_MODE_REVERSE_CTRL, TUNNEL_MODE_REVERSE_DATA, TUNNEL_POOL_IDLE,
+    HEADER_TARGET_PORT, HEADER_TUNNEL_AUTH, HEADER_TUNNEL_ID, HEADER_TUNNEL_MODE,
+    HEADER_TUNNEL_POOL, HEADER_TUNNEL_PROTO, HEADER_TUNNEL_TARGET, RAW_QUIC_MAX_AUTH_LEN,
+    RAW_QUIC_MAX_META_LEN, TUNNEL_MODE_REVERSE, TUNNEL_MODE_REVERSE_CTRL, TUNNEL_MODE_REVERSE_DATA,
+    TUNNEL_POOL_IDLE,
 };
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, TunnelStream};
@@ -181,8 +182,8 @@ impl H3Listener {
 
         let quinn_endpoint = match parsed_listen {
             crate::io::addr::ListenAddr::DualStack(port) => {
-                let udp_socket = crate::platform::create_dual_stack_udp_socket(port)
-                    .map_err(TunnelError::Io)?;
+                let udp_socket =
+                    crate::platform::create_dual_stack_udp_socket(port).map_err(TunnelError::Io)?;
                 let runtime = quinn::default_runtime().ok_or_else(|| {
                     TunnelError::Io(std::io::Error::other("No quinn runtime available"))
                 })?;

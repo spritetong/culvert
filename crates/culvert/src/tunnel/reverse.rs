@@ -14,10 +14,10 @@ use tracing::{debug, error, info, warn};
 use crate::common::{CancelFutureExt, CancellationTokenExt, TaskTracker};
 use crate::config::model::{TunnelConfig, TunnelMode};
 use crate::consts::{
-    ACTIVATE_STREAM_ACK,
-    DEFAULT_REVERSE_BACKOFF_INITIAL, DEFAULT_REVERSE_BACKOFF_MAX, DEFAULT_REVERSE_PROMOTE_WAIT,
-    POOL_BACKOFF_ACTIVE_WAITERS_MAX, POOL_BACKOFF_BASE, POOL_MAX_CONCURRENT_CONNECTS,
-    REVERSE_BACKOFF_RESET_THRESHOLD, REVERSE_CONTROL_TARGET_HOST, clamp_reverse_pool_size,
+    ACTIVATE_STREAM_ACK, DEFAULT_REVERSE_BACKOFF_INITIAL, DEFAULT_REVERSE_BACKOFF_MAX,
+    DEFAULT_REVERSE_PROMOTE_WAIT, POOL_BACKOFF_ACTIVE_WAITERS_MAX, POOL_BACKOFF_BASE,
+    POOL_MAX_CONCURRENT_CONNECTS, REVERSE_BACKOFF_RESET_THRESHOLD, REVERSE_CONTROL_TARGET_HOST,
+    clamp_reverse_pool_size,
 };
 use crate::control::{ControlMessage, SignalingChannel, SignalingConfig, SignalingRouter};
 use crate::core::error::TunnelError;
@@ -41,7 +41,8 @@ impl ReverseReadyNotifier {
     }
 
     pub fn mark_ready(&self) {
-        self.is_ready.store(true, std::sync::atomic::Ordering::Release);
+        self.is_ready
+            .store(true, std::sync::atomic::Ordering::Release);
         self.notify.notify_waiters();
     }
 
@@ -231,7 +232,8 @@ pub async fn run_reverse_mapping(
             // `[::]:port` target would then be unreachable and the reverse inbound
             // relay (TCP *and* UDP) would silently break. Trying the IPv4 form
             // once the IPv6 attempt fails fast keeps the relay working.
-            let listen_targets: Vec<TargetAddr> = match crate::io::addr::parse_listen_addr(&listen) {
+            let listen_targets: Vec<TargetAddr> = match crate::io::addr::parse_listen_addr(&listen)
+            {
                 Ok(crate::io::addr::ListenAddr::DualStack(port)) => vec![
                     TargetAddr::Ip(std::net::SocketAddr::new(
                         std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
@@ -256,24 +258,24 @@ pub async fn run_reverse_mapping(
             // Throttle concurrent outbound dial handshakes across all workers in this
             // reverse mapping to protect low-bandwidth links from connection storms.
             // Symmetrically matches Forward mode's POOL_MAX_CONCURRENT_CONNECTS.
-                let dial_semaphore =
-                    Arc::new(tokio::sync::Semaphore::new(POOL_MAX_CONCURRENT_CONNECTS));
+            let dial_semaphore =
+                Arc::new(tokio::sync::Semaphore::new(POOL_MAX_CONCURRENT_CONNECTS));
 
-                let event_sink = sig_rx.event_sink();
-                let router_clone = router.clone();
+            let event_sink = sig_rx.event_sink();
+            let router_clone = router.clone();
 
-                for worker_idx in 0..size {
-                    let connector = Arc::clone(&data_connector);
-                    let listen_targets = listen_targets.clone();
-                    let target_clone = target_addr.clone();
-                    let dial_semaphore = Arc::clone(&dial_semaphore);
-                    let router_worker = router_clone.clone();
-                    let event_sink_worker = event_sink.clone();
-                    let sig_cfg = sig_config;
-                    let hb = hb_interval;
-                    let idle = relay_idle_timeout;
+            for worker_idx in 0..size {
+                let connector = Arc::clone(&data_connector);
+                let listen_targets = listen_targets.clone();
+                let target_clone = target_addr.clone();
+                let dial_semaphore = Arc::clone(&dial_semaphore);
+                let router_worker = router_clone.clone();
+                let event_sink_worker = event_sink.clone();
+                let sig_cfg = sig_config;
+                let hb = hb_interval;
+                let idle = relay_idle_timeout;
 
-                    pool_tracker.spawn_with_cancel(move |token| async move {
+                pool_tracker.spawn_with_cancel(move |token| async move {
                         // Every relay this worker starts is owned and awaited; no task
                         // may outlive the control-channel generation that created it.
                         let mut relays = TaskTracker::<()>::new(token.child_token());
@@ -425,7 +427,7 @@ pub async fn run_reverse_mapping(
 
                         relays.shutdown_and_wait().await;
                     });
-                }
+            }
         }
 
         // Main event loop handling incoming connection alerts from remote server
@@ -626,8 +628,7 @@ pub async fn run_shared_reverse_pool(
 
         pool_tracker.spawn_with_cancel(move |worker_token| async move {
             let mut relays = TaskTracker::<()>::new(worker_token.child_token());
-            let initial_retry =
-                POOL_BACKOFF_BASE + Duration::from_millis((worker_idx as u64) * 25);
+            let initial_retry = POOL_BACKOFF_BASE + Duration::from_millis((worker_idx as u64) * 25);
             let mut retry = initial_retry;
 
             while !worker_token.is_cancelled() {
@@ -692,25 +693,26 @@ pub async fn run_shared_reverse_pool(
                 let target = match hdr.target {
                     Some(t) => t,
                     None => {
-                        tracing::debug!("Activated reverse stream had no target specified; skipping");
+                        tracing::debug!(
+                            "Activated reverse stream had no target specified; skipping"
+                        );
                         continue;
                     }
                 };
 
                 // Echo ACTIVATE_STREAM_ACK (0xAC) back to server so server verifies stream liveness
                 let ack_sent = async {
-                    tokio::io::AsyncWriteExt::write_all(
-                        &mut stream,
-                        &[ACTIVATE_STREAM_ACK],
-                    )
-                    .await?;
+                    tokio::io::AsyncWriteExt::write_all(&mut stream, &[ACTIVATE_STREAM_ACK])
+                        .await?;
                     tokio::io::AsyncWriteExt::flush(&mut stream).await
                 };
                 let ack_res = tokio::time::timeout(Duration::from_secs(2), ack_sent)
                     .cancel_with(&worker_token)
                     .await;
                 if !matches!(ack_res, Some(Ok(Ok(())))) {
-                    tracing::debug!("Failed to echo ACTIVATE_STREAM_ACK; recycling reverse worker stream");
+                    tracing::debug!(
+                        "Failed to echo ACTIVATE_STREAM_ACK; recycling reverse worker stream"
+                    );
                     continue;
                 }
 
@@ -720,10 +722,9 @@ pub async fn run_shared_reverse_pool(
                     L4Protocol::Udp => udp_idle_timeout,
                 };
 
-                let Some(local_res) =
-                    crate::platform::connect_target_channel(&target, proto)
-                        .cancel_with(&worker_token)
-                        .await
+                let Some(local_res) = crate::platform::connect_target_channel(&target, proto)
+                    .cancel_with(&worker_token)
+                    .await
                 else {
                     break;
                 };
@@ -731,11 +732,11 @@ pub async fn run_shared_reverse_pool(
                 let local_channel = match local_res {
                     Ok(s) => s,
                     Err(e) => {
-                        tracing::error!(
-                            "Failed to connect to local target {}: {:?}",
-                            target, e
-                        );
-                        if !worker_token.sleep_or_cancel(Duration::from_millis(100)).await {
+                        tracing::error!("Failed to connect to local target {}: {:?}", target, e);
+                        if !worker_token
+                            .sleep_or_cancel(Duration::from_millis(100))
+                            .await
+                        {
                             break;
                         }
                         continue;

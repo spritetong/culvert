@@ -528,8 +528,14 @@ mod tests {
         assert!(serde_yaml::from_str::<L4Protocol>("\"\"").is_err());
 
         // Serializes as uppercase TCP/UDP
-        assert_eq!(serde_yaml::to_string(&L4Protocol::Tcp).unwrap().trim(), "TCP");
-        assert_eq!(serde_yaml::to_string(&L4Protocol::Udp).unwrap().trim(), "UDP");
+        assert_eq!(
+            serde_yaml::to_string(&L4Protocol::Tcp).unwrap().trim(),
+            "TCP"
+        );
+        assert_eq!(
+            serde_yaml::to_string(&L4Protocol::Udp).unwrap().trim(),
+            "UDP"
+        );
     }
 
     #[test]

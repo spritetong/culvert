@@ -629,10 +629,9 @@ impl ServerRunner {
         // client's freshly spawned pre-warm workers never race ahead of registration.
         let tid_opt = pool_guard.tunnel_id.clone();
         if let Some(ref tid) = tid_opt {
-            pool_guard.replace_pool(session_mgr.register_tunnel_pool(
-                tid,
-                reverse_pool_soft_cap(reattach.pool_size),
-            ));
+            pool_guard.replace_pool(
+                session_mgr.register_tunnel_pool(tid, reverse_pool_soft_cap(reattach.pool_size)),
+            );
         } else {
             pool_guard.replace_pool(session_mgr.register_pool(
                 protocol,
@@ -811,10 +810,8 @@ impl ServerRunner {
         let visitor_stream = accepted.channel;
         let visitor_addr = accepted.peer;
         let target_parsed = crate::io::addr::parse_target_addr(target_addr).ok();
-        let activation_pkt = crate::pool::activation::encode_activation_with_proto(
-            target_parsed.as_ref(),
-            protocol,
-        );
+        let activation_pkt =
+            crate::pool::activation::encode_activation_with_proto(target_parsed.as_ref(), protocol);
 
         // 1. FAST PATH (0-RTT Pool): only pair streams that are fresh and still alive.
         // A stale generation must fall through to signaling rather than blackhole the visitor.

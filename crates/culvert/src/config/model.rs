@@ -720,10 +720,7 @@ impl TunnelMappingsConfig {
         }
     }
 
-    pub fn forward_and_reverse(
-        forward: MappingGroupConfig,
-        reverse: MappingGroupConfig,
-    ) -> Self {
+    pub fn forward_and_reverse(forward: MappingGroupConfig, reverse: MappingGroupConfig) -> Self {
         Self {
             forward: Some(forward),
             reverse: Some(reverse),

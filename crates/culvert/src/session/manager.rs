@@ -410,11 +410,7 @@ impl SessionManager {
     }
 
     /// Unregisters one listener from the shared tunnel pool, draining and removing it when count reaches zero.
-    pub fn unregister_tunnel_pool(
-        &self,
-        tunnel_id: &str,
-        pool: &Arc<ReverseInboundPool>,
-    ) {
+    pub fn unregister_tunnel_pool(&self, tunnel_id: &str, pool: &Arc<ReverseInboundPool>) {
         if let Some(slot) = self.tunnel_pools.get(tunnel_id)
             && Arc::ptr_eq(&slot.pool, pool)
         {
