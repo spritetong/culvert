@@ -410,7 +410,9 @@ impl TransportListener for UdsListener {
         let cancel = self.cancel_token.clone();
 
         slot.set(move || async move {
-            let mut guard = rx_arc.lock().await;
+            let Some(mut guard) = rx_arc.lock().cancel_with(&cancel).await else {
+                return Err(TunnelError::Shutdown);
+            };
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => Err(TunnelError::Shutdown),

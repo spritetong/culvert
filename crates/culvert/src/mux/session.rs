@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -124,7 +125,7 @@ impl MuxSession {
                     }
                 }
             }
-            let _ = framed_writer.flush().await;
+            let _ = tokio::time::timeout(Duration::from_millis(500), framed_writer.flush()).await;
         });
 
         // Reader task: decodes inbound frames from `framed_reader` and demuxes to streams
@@ -369,8 +370,12 @@ impl MuxSession {
 
     /// Accepts the next incoming logical stream initiated by the remote peer.
     pub async fn accept_stream(&self) -> Option<MuxStream> {
-        let mut rx = self.rx_new_streams.lock().await;
-        rx.recv().await
+        let mut rx = self
+            .rx_new_streams
+            .lock()
+            .cancel_with(&self.cancel_token)
+            .await?;
+        rx.recv().cancel_with(&self.cancel_token).await.flatten()
     }
 
     /// Returns the number of currently active streams in this session.

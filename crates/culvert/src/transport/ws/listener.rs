@@ -363,7 +363,9 @@ impl TransportListener for WsListener {
         let cancel = self.cancel_token.clone();
 
         slot.set(move || async move {
-            let mut guard = rx.lock().await;
+            let Some(mut guard) = rx.lock().cancel_with(&cancel).await else {
+                return Err(TunnelError::Shutdown);
+            };
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => Err(TunnelError::Shutdown),

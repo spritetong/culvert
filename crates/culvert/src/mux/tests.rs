@@ -395,3 +395,29 @@ async fn test_mux_poll_write_owned_backpressure_retry_no_duplicate_frames() {
         "poll_write_owned must not send duplicate frames upon retry"
     );
 }
+
+#[tokio::test]
+async fn test_mux_accept_stream_immediate_cancellation() {
+    let (pipe_client, pipe_server) = duplex(65536);
+    let cancel = CancellationToken::new();
+
+    let _client_session = MuxSession::new(Box::new(pipe_client), true, cancel.clone());
+    let server_session = MuxSession::new(Box::new(pipe_server), false, cancel.clone());
+
+    let cancel_for_task = cancel.clone();
+    let accept_task = tokio::spawn(async move { server_session.accept_stream().await });
+
+    // Ensure accept_task has started waiting
+    tokio::task::yield_now().await;
+
+    // Trigger cancellation
+    cancel_for_task.cancel();
+
+    // accept_stream must unblock immediately and return None
+    let res = tokio::time::timeout(Duration::from_millis(500), accept_task)
+        .await
+        .expect("accept_stream must respond immediately to cancellation")
+        .expect("task must join cleanly");
+
+    assert!(res.is_none());
+}

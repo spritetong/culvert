@@ -221,3 +221,28 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
 - **References**:
   - Implementation: [manager.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/session/manager.rs) (`PendingSessionGuard`, `ReversePoolGuard`), [runner.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/server/runner.rs) (`handle_accepted_reverse_visitor`, `ReversePoolGuard`)
   - Integration Tests: [runner.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/server/runner.rs#L1934-L2060) (`test_reverse_control_cancels_promptly_during_stalled_visitor_signaling`, `test_reverse_control_future_abort_cleans_up_resources`)
+
+### 5.4 Scattered Background Spawn Tasks: Cancellation Responsiveness & Drop Lifecycle
+- **Problem / Trap (Unconstrained Awaits in Scattered Spawn Tasks)**:
+  - Beyond the main event loop, background tasks spawned via `tokio::spawn`, `JoinSet::spawn`, or `TaskTracker::spawn_with_cancel` can silently hold unconstrained awaits.
+  - Examples:
+    - HTTP/3 server `request_tasks.spawn`: `resolver.resolve_request().await` and `stream.send_response().await` were unconstrained by timeouts/cancellation. A slow or hanging client could pin a spawned task in the `JoinSet` until QUIC idle timeout, blocking prompt drain.
+    - Multiplexer writer driver task: When the main loop breaks on cancellation, sequential cleanup `framed_writer.flush().await` can hang indefinitely if the underlying stream socket stalls or the remote peer stopped reading.
+    - `MuxSession::accept_stream()`: Parking on `rx.recv().await` without checking session cancellation delays consumer response during shutdown.
+    - Listener `accept()` slots: Calling `rx.lock().await` without cancellation bounding can stall if cancelled prior to lock acquisition.
+- **Problem / Trap (Leaked Background Pump Tasks on Stream Drop)**:
+  - When an abstraction wraps lower-level asynchronous streams by spawning background pump tasks (e.g. `H3TunnelStream::spawn_split_pump` splitting an HTTP/3 bidirectional stream into independent outbound and inbound tasks):
+  - If the wrapper stream is dropped prematurely (due to relay completion, future abort, or timeout) while a background pump task is awaiting I/O from a stalled peer, the background tasks linger indefinitely until the transport connection closes.
+- **Solution & Principles**:
+  1. **Constrain All Inbound Handshakes and Request Resolutions**:
+     - Spawned request/handshake tasks in listeners must wrap resolution and initial response handshake with `timeout_or_cancel(DEFAULT_HANDSHAKE_TIMEOUT, &cancel_task)`.
+  2. **Post-Loop Socket Flush Timeout**:
+     - Post-loop cleanup awaits like `framed_writer.flush().await` must be bounded with a short timeout (e.g. `Duration::from_millis(500)`).
+  3. **Cancellation-Aware Locks in Reusable Future Slots**:
+     - In `accept(&mut self, slot)` implementations, acquire receiver mutexes via `rx.lock().cancel_with(&cancel).await` so that cancellation immediately aborts without waiting for lock availability.
+  4. **RAII Abort Guards on Stream Wrappers**:
+     - Store `JoinHandle<()>` of spawned background pump tasks in the stream struct (`outbound_task`, `inbound_task`).
+     - Implement `Drop` for the stream wrapper to call `task.abort()`, guaranteeing immediate cancellation and release of underlying QUIC/TCP stream resources on drop.
+- **References**:
+  - Implementation: [listener.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/transport/h3/listener.rs) (`request_tasks.spawn` timeout_or_cancel, `accept` cancel-aware lock), [session.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/mux/session.rs) (writer flush timeout, `accept_stream` cancellation), [stream.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/transport/h3/stream.rs) (`H3TunnelStream` Drop aborts background pump tasks), [uds.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/transport/uds.rs), [ws/listener.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/transport/ws/listener.rs), [udp.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/frontend/udp.rs)
+  - Tests: [tests.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/mux/tests.rs#L398) (`test_mux_accept_stream_immediate_cancellation`), [stream.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/transport/h3/stream.rs#L713) (`test_h3_stream_drop_aborts_background_tasks`)

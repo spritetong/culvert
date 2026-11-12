@@ -257,6 +257,8 @@ pub struct H3TunnelStream {
     shutdown_done: bool,
     fin_sent: bool,
     last_activity_ms: AtomicU64,
+    outbound_task: Option<tokio::task::JoinHandle<()>>,
+    inbound_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl H3TunnelStream {
@@ -300,7 +302,7 @@ impl H3TunnelStream {
         let (tx_shutdown, rx_shutdown) = oneshot::channel::<io::Result<()>>();
 
         // Outbound send task: continuously drains outgoing chunks without being blocked by incoming reading
-        tokio::spawn(async move {
+        let outbound_task = tokio::spawn(async move {
             let mut result = Ok(());
             while let Some(chunk) = rx_outbound.recv().await {
                 if let Err(e) = send_stream.send_chunk(chunk).await {
@@ -334,7 +336,7 @@ impl H3TunnelStream {
         });
 
         // Inbound receive task: continuously receives incoming chunks without being blocked by outgoing writes
-        tokio::spawn(async move {
+        let inbound_task = tokio::spawn(async move {
             loop {
                 match recv_stream.recv_chunk().await {
                     Ok(Some(data)) => {
@@ -362,6 +364,19 @@ impl H3TunnelStream {
             shutdown_done: false,
             fin_sent: false,
             last_activity_ms: AtomicU64::new(activity_now_ms()),
+            outbound_task: Some(outbound_task),
+            inbound_task: Some(inbound_task),
+        }
+    }
+}
+
+impl Drop for H3TunnelStream {
+    fn drop(&mut self) {
+        if let Some(task) = self.outbound_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.inbound_task.take() {
+            task.abort();
         }
     }
 }
@@ -693,5 +708,45 @@ mod tests {
             stream.poll_check_alive(&mut cx),
             Poll::Ready(HeartbeatStatus::Dead)
         );
+    }
+
+    #[tokio::test]
+    async fn test_h3_stream_drop_aborts_background_tasks() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dropped_flag = Arc::new(AtomicBool::new(false));
+        let flag_clone = Arc::clone(&dropped_flag);
+
+        struct Guard(Arc<AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        struct HangingRecvStream(Arc<AtomicBool>);
+        impl H3RecvStream for HangingRecvStream {
+            async fn recv_chunk(&mut self) -> Result<Option<Bytes>, io::Error> {
+                let _guard = Guard(Arc::clone(&self.0));
+                std::future::pending::<()>().await;
+                Ok(None)
+            }
+        }
+
+        let send = MockSendStream {
+            sent: vec![],
+            finished: false,
+        };
+        let recv = HangingRecvStream(flag_clone);
+        let stream = H3TunnelStream::spawn_split_pump(send, recv);
+
+        // Give the spawned task a moment to enter recv_chunk
+        tokio::task::yield_now().await;
+        assert!(!dropped_flag.load(Ordering::SeqCst));
+
+        // Dropping stream must abort the inbound task and drop the hanging future
+        drop(stream);
+        tokio::task::yield_now().await;
+        assert!(dropped_flag.load(Ordering::SeqCst));
     }
 }
