@@ -223,17 +223,29 @@ pub async fn run_reverse_mapping(
         {
             // One worker holds at most one idle stream, so an unbounded config
             // value would spawn an unbounded number of dialing tasks.
-            let listen_target = match crate::io::addr::parse_listen_addr(&listen) {
-                Ok(crate::io::addr::ListenAddr::DualStack(port)) => {
+            //
+            // For a dual-stack `:port` listen address we advertise BOTH the IPv6
+            // (`[::]:port`) and IPv4 (`0.0.0.0:port`) forms as connect-back
+            // candidates. The peer's listener may have fallen back to IPv4-only
+            // (e.g. `disable_ipv6=1` -> EADDRNOTAVAIL/EAFNOSUPPORT); a literal
+            // `[::]:port` target would then be unreachable and the reverse inbound
+            // relay (TCP *and* UDP) would silently break. Trying the IPv4 form
+            // once the IPv6 attempt fails fast keeps the relay working.
+            let listen_targets: Vec<TargetAddr> = match crate::io::addr::parse_listen_addr(&listen) {
+                Ok(crate::io::addr::ListenAddr::DualStack(port)) => vec![
                     TargetAddr::Ip(std::net::SocketAddr::new(
                         std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
                         port,
-                    ))
-                }
-                Ok(crate::io::addr::ListenAddr::Ip(sa)) => TargetAddr::Ip(sa),
-                Ok(crate::io::addr::ListenAddr::Domain(h, p)) => TargetAddr::Domain(h, p),
-                Ok(crate::io::addr::ListenAddr::Path(p)) => TargetAddr::Path(p),
-                Err(_) => dummy_target.clone(),
+                    )),
+                    TargetAddr::Ip(std::net::SocketAddr::new(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                        port,
+                    )),
+                ],
+                Ok(crate::io::addr::ListenAddr::Ip(sa)) => vec![TargetAddr::Ip(sa)],
+                Ok(crate::io::addr::ListenAddr::Domain(h, p)) => vec![TargetAddr::Domain(h, p)],
+                Ok(crate::io::addr::ListenAddr::Path(p)) => vec![TargetAddr::Path(p)],
+                Err(_) => vec![dummy_target.clone()],
             };
             debug!(
                 tag = %tag,
@@ -252,7 +264,7 @@ pub async fn run_reverse_mapping(
 
                 for worker_idx in 0..size {
                     let connector = Arc::clone(&data_connector);
-                    let listen_target = listen_target.clone();
+                    let listen_targets = listen_targets.clone();
                     let target_clone = target_addr.clone();
                     let dial_semaphore = Arc::clone(&dial_semaphore);
                     let router_worker = router_clone.clone();
@@ -276,30 +288,40 @@ pub async fn run_reverse_mapping(
                                 _ => break,
                             };
 
-                            let conn_res_opt = connector
-                                .connect_pooled_with_protocol(&listen_target, protocol)
-                                .cancel_with(&token)
-                                .await;
-                            drop(_permit);
-
-                            let Some(conn_res) = conn_res_opt else {
-                                break;
-                            };
-
-                            let mut stream = match conn_res {
-                                Ok(s) => {
-                                    retry = initial_retry;
-                                    s
-                                }
-                                Err(e) => {
-                                    tracing::debug!("Reverse pool pre-warm dial failed: {:?}", e);
-                                    if !token.sleep_or_cancel(retry).await {
+                            // Try each candidate connect-back target in order; only
+                            // back off once *all* of them fail. A healthy dual-stack
+                            // peer answers on `[::]:port`; an IPv4-only peer answers
+                            // on `0.0.0.0:port` once the v6 attempt fails fast.
+                            let mut stream = None;
+                            for cand in &listen_targets {
+                                match connector
+                                    .connect_pooled_with_protocol(cand, protocol)
+                                    .cancel_with(&token)
+                                    .await
+                                {
+                                    Some(Ok(s)) => {
+                                        stream = Some(s);
                                         break;
                                     }
-                                    retry = (retry * 2).min(POOL_BACKOFF_ACTIVE_WAITERS_MAX);
-                                    continue;
+                                    Some(Err(e)) => {
+                                        tracing::debug!(
+                                            "Reverse pool pre-warm dial failed: {:?}",
+                                            e
+                                        );
+                                    }
+                                    None => break, // cancelled
                                 }
+                            }
+                            drop(_permit);
+
+                            let Some(mut stream) = stream else {
+                                if !token.sleep_or_cancel(retry).await {
+                                    break;
+                                }
+                                retry = (retry * 2).min(POOL_BACKOFF_ACTIVE_WAITERS_MAX);
+                                continue;
                             };
+                            retry = initial_retry;
 
                             let activation_hdr = {
                                 let activation = decode_activation(&mut stream, &token, idle);

@@ -277,6 +277,53 @@ impl DatagramIo for ConnectedUdpSocket {
     }
 }
 
+/// Configures address-reuse semantics on a freshly created listen socket.
+///
+/// **Unix**: `SO_REUSEADDR` lets the socket rebind during `TIME_WAIT` without
+/// allowing a second live socket to claim the same `addr:port` — a single owner
+/// remains, which is what we want.
+///
+/// **Windows**: `SO_REUSEADDR` carries BSD `SO_REUSEPORT` semantics — a second
+/// process can bind the same `addr:port` and will *also* receive (thus
+/// duplicate / intercept) UDP datagrams. We therefore use `SO_EXCLUSIVEADDRUSE`
+/// instead, which blocks co-resident binders while still permitting rebind
+/// during `TIME_WAIT`. This keeps the dual-stack listener's security posture
+/// identical across Windows and Unix for both TCP and UDP.
+#[cfg(windows)]
+fn configure_reuse(socket: &socket2::Socket) -> io::Result<()> {
+    // On Windows, `SO_REUSEADDR` carries BSD `SO_REUSEPORT` semantics: a second
+    // process that also sets `SO_REUSEADDR` can bind the same `addr:port` and
+    // will *also* receive (thus duplicate / intercept) UDP datagrams. We use
+    // `SO_EXCLUSIVEADDRUSE` instead, which blocks any co-resident bind while
+    // still allowing rebind during `TIME_WAIT`. This keeps the listener's
+    // security posture identical to Unix for both TCP and UDP.
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        setsockopt, SOCKET, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+    };
+    let s: SOCKET = socket.as_raw_socket() as SOCKET;
+    let on: i32 = 1;
+    // SAFETY: `on` outlives the call; optval/optlen describe a single i32.
+    let ret = unsafe {
+        setsockopt(
+            s,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            (&on as *const i32).cast::<u8>(),
+            std::mem::size_of::<i32>() as i32,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+#[cfg(not(windows))]
+fn configure_reuse(socket: &socket2::Socket) -> io::Result<()> {
+    socket.set_reuse_address(true)
+}
+
 /// Creates an IPv6/IPv4 dual-stack TCP listener using `socket2` with `set_only_v6(false)`.
 /// Binds to `[::]:port`. Supported on Windows, Linux, and macOS.
 /// If IPv6 is not supported or disabled by the OS, gracefully falls back to IPv4 `0.0.0.0:port`.
@@ -303,7 +350,7 @@ fn create_ipv6_dual_stack_tcp(port: u16) -> io::Result<std::net::TcpListener> {
         Some(socket2::Protocol::TCP),
     )?;
     socket.set_only_v6(false)?;
-    socket.set_reuse_address(true)?;
+    configure_reuse(&socket)?;
     let bind_addr = std::net::SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, port, 0, 0);
     socket.bind(&socket2::SockAddr::from(bind_addr))?;
     socket.listen(1024)?;
@@ -316,7 +363,7 @@ fn create_ipv4_tcp_listener(port: u16) -> io::Result<std::net::TcpListener> {
         socket2::Type::STREAM,
         Some(socket2::Protocol::TCP),
     )?;
-    socket.set_reuse_address(true)?;
+    configure_reuse(&socket)?;
     let bind_addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, port);
     socket.bind(&socket2::SockAddr::from(bind_addr))?;
     socket.listen(1024)?;
@@ -349,7 +396,7 @@ fn create_ipv6_dual_stack_udp(port: u16) -> io::Result<std::net::UdpSocket> {
         Some(socket2::Protocol::UDP),
     )?;
     socket.set_only_v6(false)?;
-    socket.set_reuse_address(true)?;
+    configure_reuse(&socket)?;
     let bind_addr = std::net::SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, port, 0, 0);
     socket.bind(&socket2::SockAddr::from(bind_addr))?;
     Ok(socket.into())
@@ -361,7 +408,7 @@ fn create_ipv4_udp_socket(port: u16) -> io::Result<std::net::UdpSocket> {
         socket2::Type::DGRAM,
         Some(socket2::Protocol::UDP),
     )?;
-    socket.set_reuse_address(true)?;
+    configure_reuse(&socket)?;
     let bind_addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, port);
     socket.bind(&socket2::SockAddr::from(bind_addr))?;
     Ok(socket.into())

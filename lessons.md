@@ -327,11 +327,14 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
 - **Solution**:
   - Create sockets using `socket2::Socket::new(Domain::IPV6, ...)`:
     1. Call `socket.set_only_v6(false)` to explicitly enable dual-stack binding across both Windows and Unix.
-    2. Call `socket.set_reuse_address(true)`.
+    2. Configure address reuse via `configure_reuse()`:
+       - **Unix**: `socket.set_reuse_address(true)` — permits rebind during `TIME_WAIT` while keeping a single live owner of `addr:port`.
+       - **Windows**: `socket.set_exclusive_addr_use(true)` (`SO_EXCLUSIVEADDRUSE`) **instead of** `SO_REUSEADDR`. On Windows `SO_REUSEADDR` carries BSD `SO_REUSEPORT` semantics, letting a second process bind the same `addr:port` and **duplicate/intercept UDP datagrams**. `SO_EXCLUSIVEADDRUSE` blocks that while still allowing `TIME_WAIT` rebind, keeping the security posture identical across platforms.
     3. Bind to `[::]:port` (`SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0)`).
-  - Implement a graceful fallback: If IPv6 socket creation fails due to unsupported address family (`io::ErrorKind::Unsupported`, raw OS error 97 or 10047), automatically fall back to binding an IPv4 socket on `0.0.0.0:port`.
+  - Implement a graceful fallback: If IPv6 socket creation fails, treat it as "IPv6 unsupported / disabled" and fall back to an IPv4 socket on `0.0.0.0:port`. Detection covers `io::ErrorKind::Unsupported`, `io::ErrorKind::AddrNotAvailable`, and the raw OS codes: Linux `EAFNOSUPPORT` (97) / `EADDRNOTAVAIL` (99, e.g. `net.ipv6.conf.all.disable_ipv6=1`), Windows `WSAEAFNOSUPPORT` (10047) / `WSAEADDRNOTAVAIL` (10049), and macOS/BSD `EAFNOSUPPORT` (47) / `EADDRNOTAVAIL` (49). `EADDRINUSE` (98 / 10048) is deliberately **not** treated as unsupported so a genuine port conflict still fails loudly.
+  - Reverse `:port` connect-back: advertise BOTH `[::]:port` and `0.0.0.0:port` as candidates and try them in order. A peer that fell back to IPv4-only would be unreachable via the literal `[::]:port` form, silently breaking the reverse inbound relay (TCP and UDP) — the IPv4 candidate restores it.
 - **References**:
-  - Implementation: [platform/mod.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/platform/mod.rs#L280-L335) (`create_dual_stack_tcp_listener`, `create_dual_stack_udp_socket`)
+  - Implementation: [platform/mod.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/platform/mod.rs#L280-L335) (`create_dual_stack_tcp_listener`, `create_dual_stack_udp_socket`, `configure_reuse`)
 
 ### 7.2 Listen Socket (`ListenAddr`) vs. Connect Destination (`TargetAddr`) Separation
 
