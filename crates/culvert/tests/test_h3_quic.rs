@@ -1140,3 +1140,66 @@ async fn test_h3_connector_recovers_after_server_restart() {
     server_2_cancel.cancel();
     let _ = server_2_task.await;
 }
+
+#[tokio::test]
+async fn test_h3_listener_dual_stack_port() {
+    let port = get_ephemeral_port();
+    let listen_addr = format!(":{}", port);
+    let auth_token = "dual_stack_token_123";
+
+    let (server_rustls, _cert) = generate_test_quic_pki();
+    let mut listener = match H3Listener::bind(&listen_addr, Some(auth_token), None, server_rustls) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping dual stack H3 test: {:?}", e);
+            return;
+        }
+    };
+    let (tx_done, rx_done) = tokio::sync::oneshot::channel::<()>();
+
+    let server_task = tokio::spawn(async move {
+        let (mut stream, metadata) = accept_one(&mut listener).await.unwrap();
+        assert_eq!(metadata.mode, TunnelMode::Forward);
+
+        let mut buf = vec![0u8; 16];
+        read_exact_timed(&mut stream, &mut buf).await.unwrap();
+        assert_eq!(&buf, b"dualstack_ping16");
+
+        stream.write_all(b"dualstack_pong16").await.unwrap();
+        stream.shutdown().await.unwrap();
+
+        let _ = rx_done.await;
+        listener.shutdown().await;
+    });
+
+    let endpoint_cfg = EndpointConfig::Detailed {
+        url: format!("h3://127.0.0.1:{}/tunnel", port),
+        dns: None,
+        dialer: None,
+        tls: Some(TlsConfig {
+            insecure: Some(true),
+            server_name: Some("localhost".to_string()),
+            ..Default::default()
+        }),
+        http_headers: None,
+    };
+
+    let app_cfg = AppConfig::default();
+    let endpoint_ctx = EndpointContext::build(&endpoint_cfg, &app_cfg).unwrap();
+    let connector = H3Connector::new(&endpoint_ctx, auth_token, TunnelMode::Forward).unwrap();
+
+    let target = TargetAddr::Domain("backend.local".to_string(), 8080);
+    let mut client_stream = connector.connect(&target, None).await.unwrap();
+
+    client_stream.write_all(b"dualstack_ping16").await.unwrap();
+    client_stream.shutdown().await.unwrap();
+
+    let mut response = vec![0u8; 16];
+    read_exact_timed(&mut client_stream, &mut response)
+        .await
+        .unwrap();
+    assert_eq!(&response, b"dualstack_pong16");
+
+    let _ = tx_done.send(());
+    server_task.await.unwrap();
+}

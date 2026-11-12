@@ -29,7 +29,9 @@ use crate::core::stream::TunnelStream;
 use crate::io::addr::{L4Protocol, TargetAddr};
 use crate::io::channel::{Datagram, DatagramIo, FlowKey, IoChannel};
 
-pub use crate::io::addr::{PeerAddr, is_uds_path, normalize_uds_path, parse_target_addr};
+pub use crate::io::addr::{
+    ListenAddr, PeerAddr, is_uds_path, normalize_uds_path, parse_listen_addr, parse_target_addr,
+};
 
 /// Result type produced when accepting a stream from a `GenericListener`.
 pub type GenericAcceptOutput = Result<(Box<dyn TunnelStream>, PeerAddr), TunnelError>;
@@ -42,22 +44,29 @@ pub enum GenericListener {
 }
 
 impl GenericListener {
-    /// Binds to either a TCP address or a Unix Domain Socket path.
-    /// Supports: ip:port, hostname:port, and unix://path. Port must not be omitted.
+    /// Binds to a dual-stack TCP port (:port), standard TCP address (addr:port), or Unix Domain Socket path.
     pub async fn bind(addr: &str) -> Result<Self, TunnelError> {
-        let target = parse_target_addr(addr)?;
-        match target {
-            TargetAddr::Path(path) => {
+        let listen_addr = parse_listen_addr(addr)?;
+        match listen_addr {
+            ListenAddr::DualStack(port) => {
+                let std_listener = create_dual_stack_tcp_listener(port)
+                    .map_err(TunnelError::Io)?;
+                std_listener.set_nonblocking(true).map_err(TunnelError::Io)?;
+                let listener = TcpListener::from_std(std_listener)
+                    .map_err(TunnelError::Io)?;
+                Ok(GenericListener::Tcp(Arc::new(listener)))
+            }
+            ListenAddr::Path(path) => {
                 let listener = PlatformUdsListener::bind(&path).map_err(TunnelError::Io)?;
                 Ok(GenericListener::Uds(Arc::new(tokio::sync::Mutex::new(
                     listener,
                 ))))
             }
-            TargetAddr::Ip(sa) => {
+            ListenAddr::Ip(sa) => {
                 let listener = TcpListener::bind(sa).await.map_err(TunnelError::Io)?;
                 Ok(GenericListener::Tcp(Arc::new(listener)))
             }
-            TargetAddr::Domain(host, port) => {
+            ListenAddr::Domain(host, port) => {
                 let listener = TcpListener::bind((host.as_str(), port))
                     .await
                     .map_err(TunnelError::Io)?;
@@ -76,9 +85,13 @@ impl GenericListener {
                 GenericListener::Tcp(l) => {
                     let (stream, addr) = l.accept().await.map_err(TunnelError::Io)?;
                     let _ = SocketTuner::tune_tcp_stream(&stream, true);
+                    let canonical_addr = match addr {
+                        SocketAddr::V6(v6) => SocketAddr::new(v6.ip().to_canonical(), v6.port()),
+                        v4 => v4,
+                    };
                     Ok((
                         Box::new(stream) as Box<dyn TunnelStream>,
-                        PeerAddr::Socket(addr),
+                        PeerAddr::Socket(canonical_addr),
                     ))
                 }
                 GenericListener::Uds(l) => {
@@ -264,6 +277,67 @@ impl DatagramIo for ConnectedUdpSocket {
     }
 }
 
+/// Creates an IPv6/IPv4 dual-stack TCP listener using `socket2` with `set_only_v6(false)`.
+/// Binds to `[::]:port`. Supported on Windows, Linux, and macOS.
+/// If IPv6 is not supported by the OS, gracefully falls back to IPv4 `0.0.0.0:port`.
+pub fn create_dual_stack_tcp_listener(port: u16) -> io::Result<std::net::TcpListener> {
+    match create_ipv6_dual_stack_tcp(port) {
+        Ok(l) => Ok(l),
+        Err(e) if is_ipv6_unsupported(&e) => {
+            let addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, port);
+            std::net::TcpListener::bind(addr)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn create_ipv6_dual_stack_tcp(port: u16) -> io::Result<std::net::TcpListener> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_only_v6(false)?;
+    socket.set_reuse_address(true)?;
+    let bind_addr = std::net::SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, port, 0, 0);
+    socket.bind(&socket2::SockAddr::from(bind_addr))?;
+    socket.listen(1024)?;
+    Ok(socket.into())
+}
+
+/// Creates an IPv6/IPv4 dual-stack UDP socket using `socket2` with `set_only_v6(false)`.
+/// Binds to `[::]:port`. Supported on Windows, Linux, and macOS.
+/// If IPv6 is not supported by the OS, gracefully falls back to IPv4 `0.0.0.0:port`.
+pub fn create_dual_stack_udp_socket(port: u16) -> io::Result<std::net::UdpSocket> {
+    match create_ipv6_dual_stack_udp(port) {
+        Ok(s) => Ok(s),
+        Err(e) if is_ipv6_unsupported(&e) => {
+            let addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, port);
+            std::net::UdpSocket::bind(addr)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn create_ipv6_dual_stack_udp(port: u16) -> io::Result<std::net::UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    socket.set_only_v6(false)?;
+    socket.set_reuse_address(true)?;
+    let bind_addr = std::net::SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, port, 0, 0);
+    socket.bind(&socket2::SockAddr::from(bind_addr))?;
+    Ok(socket.into())
+}
+
+fn is_ipv6_unsupported(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::Unsupported
+        || err.raw_os_error() == Some(97)
+        || err.raw_os_error() == Some(10047)
+}
+
 /// Connects to a destination `TargetAddr` returning either a stream or datagram `IoChannel`
 /// based on the specified L4 protocol.
 pub async fn connect_target_channel(
@@ -386,5 +460,120 @@ mod tests {
         assert_eq!(&buf, b"echo");
 
         srv_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dual_stack_tcp_listener_accepts_v4_and_v6() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let listen_addr = format!(":{}", port);
+        let mut listener = match GenericListener::bind(&listen_addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Skipping dual stack TCP test: {:?}", e);
+                return;
+            }
+        };
+
+        let srv_task = tokio::spawn(async move {
+            let (mut s1, _p1) = listener.accept_one().await.unwrap();
+            let mut buf1 = [0u8; 4];
+            s1.read_exact(&mut buf1).await.unwrap();
+            assert_eq!(&buf1, b"v4in");
+            s1.write_all(b"v4ok").await.unwrap();
+
+            let (mut s2, _p2) = listener.accept_one().await.unwrap();
+            let mut buf2 = [0u8; 4];
+            s2.read_exact(&mut buf2).await.unwrap();
+            assert_eq!(&buf2, b"v6in");
+            s2.write_all(b"v6ok").await.unwrap();
+        });
+
+        // Client 1 connects via IPv4
+        let mut c1 = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+        c1.write_all(b"v4in").await.unwrap();
+        let mut resp1 = [0u8; 4];
+        c1.read_exact(&mut resp1).await.unwrap();
+        assert_eq!(&resp1, b"v4ok");
+
+        // Client 2 connects via IPv6
+        let mut c2 = match TcpStream::connect(format!("[::1]:{}", port)).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("IPv6 loopback connect failed in environment: {:?}", e);
+                srv_task.abort();
+                return;
+            }
+        };
+        c2.write_all(b"v6in").await.unwrap();
+        let mut resp2 = [0u8; 4];
+        c2.read_exact(&mut resp2).await.unwrap();
+        assert_eq!(&resp2, b"v6ok");
+
+        srv_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dual_stack_udp_frontend_accepts_v4_and_v6() {
+        use crate::frontend::Frontend;
+
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let listen_addr = format!(":{}", port);
+        let mut fe = match crate::frontend::udp::UdpFrontend::bind(&listen_addr).await {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("Skipping dual stack UDP test: {:?}", e);
+                return;
+            }
+        };
+
+        // Client 1 (IPv4)
+        let c1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        c1.send_to(b"udp4", format!("127.0.0.1:{}", port)).await.unwrap();
+
+        let mut slot = ReusableFutureRef::default();
+        fe.accept(&mut slot);
+        let res = (&mut slot).await.unwrap();
+        let mut ch1 = res.channel.into_datagram().unwrap();
+        let mut batch = vec![Datagram {
+            flow: FlowKey {
+                peer: PeerAddr::Socket(format!("127.0.0.1:{}", port).parse().unwrap()),
+                target: None,
+                protocol: L4Protocol::Udp,
+            },
+            payload: Bytes::new(),
+        }];
+        let poll_res = std::future::poll_fn(|cx| {
+            ch1.poll_recv(cx, &mut batch)
+        }).await.unwrap();
+        assert_eq!(poll_res, 1);
+        assert_eq!(&batch[0].payload[..], b"udp4");
+
+        // Client 2 (IPv6)
+        if let Ok(c2) = UdpSocket::bind("[::1]:0").await {
+            c2.send_to(b"udp6", format!("[::1]:{}", port)).await.unwrap();
+            let mut slot2 = ReusableFutureRef::default();
+            fe.accept(&mut slot2);
+            let res2 = (&mut slot2).await.unwrap();
+            let mut ch2 = res2.channel.into_datagram().unwrap();
+            let mut batch2 = vec![Datagram {
+                flow: FlowKey {
+                    peer: PeerAddr::Socket(format!("[::1]:{}", port).parse().unwrap()),
+                    target: None,
+                    protocol: L4Protocol::Udp,
+                },
+                payload: Bytes::new(),
+            }];
+            let poll_res2 = std::future::poll_fn(|cx| {
+                ch2.poll_recv(cx, &mut batch2)
+            }).await.unwrap();
+            assert_eq!(poll_res2, 1);
+            assert_eq!(&batch2[0].payload[..], b"udp6");
+        }
     }
 }

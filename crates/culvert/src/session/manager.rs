@@ -33,7 +33,7 @@ use crate::transport::TargetAddr;
 /// listeners coexist on the same port without cross-talk.
 pub fn canonical_reverse_key(protocol: L4Protocol, addr: &str) -> String {
     let s = addr.trim();
-    let normalized = match crate::io::addr::parse_target_addr(s) {
+    let normalized = match crate::io::addr::parse_listen_addr(s) {
         Ok(target) => target.to_string(),
         Err(_) => s.to_string(),
     };

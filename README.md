@@ -358,8 +358,8 @@ tls:
 server:
   listen:
     - "ws+unix:///run/culvert.sock?path=/tunnel&chmod=0o660"
-    - "wss://0.0.0.0:8443/tunnel"
-    - "h3://0.0.0.0:8443/tunnel"
+    - "wss://:8443/tunnel"              # Dual-stack IPv6/IPv4 listen (:port)
+    - "h3://:8443/tunnel"               # Dual-stack IPv6/IPv4 UDP listen (:port)
   token: "SECURE_AUTH_TOKEN"         # Pre-shared token (max 256 bytes)
   default_target: "127.0.0.1:5201"    # Fallback target if none supplied
   heartbeat_interval: "15s"          # Server keepalive interval
@@ -391,7 +391,7 @@ tunnels:
         pool_size: 8                  # Client-side 0-RTT pre-warmed connection pool size (optional)
         rules:
           - protocol: "TCP"           # Mandatory: L4 protocol ("TCP" or "UDP", case-insensitive, no default)
-            listen: "127.0.0.1:13306"
+            listen: ":13306"          # Dual-stack IPv6/IPv4 (:port) or addr:port (e.g. 127.0.0.1:13306)
             target: "10.0.0.5:3306"
           - protocol: "UDP"
             listen: "127.0.0.1:15353"
@@ -402,7 +402,7 @@ tunnels:
         pool_size: 4                  # Server-side 0-RTT pre-warmed connection pool size (optional)
         rules:
           - protocol: "TCP"
-            listen: "0.0.0.0:2222"    # Bound on the remote server
+            listen: ":2222"           # Bound on the remote server (dual-stack :port)
             target: "127.0.0.1:22"    # Dialed by the local client
 ```
 
@@ -430,8 +430,8 @@ Each mapping rule in `rules[]` accepts:
 | Key | Type | Required | Default | Notes |
 | :--- | :--- | :--- | :--- | :--- |
 | `protocol` | string | **Yes (mandatory)** | **No default** | L4 protocol, must be explicitly set to `"TCP"` or `"UDP"` (case-insensitive). |
-| `listen` | string | Yes | — | `ip:port`, `hostname:port`, `[ipv6]:port`, or `unix://path` (TCP only). |
-| `target` | string | Yes | — | `ip:port`, `hostname:port`, `[ipv6]:port`, or `unix://path` (TCP only). |
+| `listen` | string | Yes | — | Listening socket address: `:port` (Dual-stack IPv6/IPv4 binding on `[::]:port` via `socket2` with `set_only_v6(false)` on Windows/Unix), `addr:port` (OS default, e.g. `127.0.0.1:8080`), `hostname:port`, or `unix://path` (TCP only). |
+| `target` | string | Yes | — | Outbound dial destination (`connect`): `ip:port`, `hostname:port`, `[ipv6]:port`, or `unix://path` (TCP only). Host cannot be omitted (`:port` is not valid for target). |
 | `udp_idle_timeout` | duration | No | `dialer.udp_idle_timeout` (`30s`) | UDP only: overrides client-side UDP session idle timeout. Must be `> 0`. |
 
 ---

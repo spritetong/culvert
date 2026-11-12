@@ -314,3 +314,46 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
 - **References**:
   - Implementation: [model.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/config/model.rs), [addr.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/io/addr.rs), [loader.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/config/loader.rs)
 
+---
+
+## 7. Socket Binding & Dual-Stack Networking (`socket2` & Cross-Platform Conventions)
+
+### 7.1 Cross-Platform IPv6/IPv4 Dual-Stack Sockets via `socket2`
+
+- **Problem / Trap (OS Default Divergence on `IPV6_V6ONLY`)**:
+  - On Linux, IPv6 dual-stack behavior depends on the kernel `sysctl net.ipv6.bindv6only` (typically `0`), whereas Windows strictly defaults `IPV6_V6ONLY` to `true` (`1`).
+  - Calling standard library `TcpListener::bind("[::]:port")` or `UdpSocket::bind("[::]:port")` without configuring `IPV6_V6ONLY` results in IPv6-only sockets on Windows, completely rejecting incoming IPv4 traffic.
+  - Furthermore, on OS installations or containers where IPv6 is completely disabled or unsupported, attempting to create `Domain::IPV6` sockets fails with `EAFNOSUPPORT` / `WSAEAFNOSUPPORT` (OS error 10047 on Windows, 97 on Linux).
+- **Solution**:
+  - Create sockets using `socket2::Socket::new(Domain::IPV6, ...)`:
+    1. Call `socket.set_only_v6(false)` to explicitly enable dual-stack binding across both Windows and Unix.
+    2. Call `socket.set_reuse_address(true)`.
+    3. Bind to `[::]:port` (`SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0)`).
+  - Implement a graceful fallback: If IPv6 socket creation fails due to unsupported address family (`io::ErrorKind::Unsupported`, raw OS error 97 or 10047), automatically fall back to binding an IPv4 socket on `0.0.0.0:port`.
+- **References**:
+  - Implementation: [platform/mod.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/platform/mod.rs#L280-L335) (`create_dual_stack_tcp_listener`, `create_dual_stack_udp_socket`)
+
+### 7.2 Listen Socket (`ListenAddr`) vs. Connect Destination (`TargetAddr`) Separation
+
+- **Problem / Trap**:
+  - Conflating `listen` and `target` syntax by accepting `:port` for both. A listener binds locally to incoming network traffic, where `:port` naturally indicates "bind all local interfaces across IPv4 and IPv6".
+  - In contrast, `target` is an outbound destination dialed via `connect()`. A target address of `:8080` lacks a destination host and is semantically invalid. Allowing it leads to vague DNS resolution errors or attempts to connect to `0.0.0.0` or localhost that fail unexpectedly in production.
+- **Solution**:
+  - Split address abstraction into two distinct vocabulary types:
+    - `ListenAddr`: `DualStack(u16)`, `Ip(SocketAddr)`, `Domain(String, u16)`, `Path(PathBuf)`. Parses `:port` into `DualStack(port)`.
+    - `TargetAddr`: `Ip(SocketAddr)`, `Domain(String, u16)`, `Path(PathBuf)`. Strictly rejects any address without a destination host (e.g. `:port`), failing fast at configuration parse and load time.
+- **References**:
+  - Implementation: [addr.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/io/addr.rs#L202-L250), [loader.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/config/loader.rs#L240-L280)
+
+### 7.3 IPv4-Mapped IPv6 Peer Address Normalization
+
+- **Problem / Trap**:
+  - When an IPv4 client connects to a dual-stack socket bound to `[::]:port`, the operating system presents the client address in IPv4-mapped IPv6 format (`::ffff:192.168.1.100` / `SocketAddr::V6`).
+  - Downstream components (such as reverse session registration routing, logging, metrics, or UDP NAT flow tables) compare or log peer addresses. Treating `::ffff:127.0.0.1` and `127.0.0.1` as distinct addresses causes key mismatches, duplicate mappings, and confusing access logs.
+- **Solution**:
+  - In `GenericListener::accept_owned` and `UdpFrontend` datagram loops, normalize accepted peer addresses using `v6.ip().to_canonical()`.
+  - If the IPv6 address is an IPv4-mapped address, `to_canonical()` automatically unwraps it to `IpAddr::V4`, converting `SocketAddr::V6` into clean `SocketAddr::V4`.
+- **References**:
+  - Implementation: [platform/mod.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/platform/mod.rs#L88-L95), [udp.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/frontend/udp.rs#L135-L142)
+
+

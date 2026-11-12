@@ -123,10 +123,7 @@ impl H3Listener {
             listen_addr
         };
 
-        let addr: SocketAddr = match clean_addr.parse() {
-            Ok(a) => a,
-            Err(_) => resolve_listen_socket_addr(clean_addr, listen_addr)?,
-        };
+        let parsed_listen = crate::io::addr::parse_listen_addr(clean_addr)?;
 
         let is_quic_listener = listen_addr.starts_with("quic://");
         let mut rustls_server = server_rustls_config;
@@ -182,10 +179,37 @@ impl H3Listener {
         transport_config.send_window(DEFAULT_QUIC_SEND_WINDOW);
         server_config.transport_config(Arc::new(transport_config));
 
-        let quinn_endpoint =
-            quinn::Endpoint::server(server_config, addr).map_err(TunnelError::Io)?;
+        let quinn_endpoint = match parsed_listen {
+            crate::io::addr::ListenAddr::DualStack(port) => {
+                let udp_socket = crate::platform::create_dual_stack_udp_socket(port)
+                    .map_err(TunnelError::Io)?;
+                let runtime = quinn::default_runtime().ok_or_else(|| {
+                    TunnelError::Io(std::io::Error::other("No quinn runtime available"))
+                })?;
+                quinn::Endpoint::new(
+                    quinn::EndpointConfig::default(),
+                    Some(server_config),
+                    udp_socket,
+                    runtime,
+                )
+                .map_err(TunnelError::Io)?
+            }
+            crate::io::addr::ListenAddr::Ip(addr) => {
+                quinn::Endpoint::server(server_config, addr).map_err(TunnelError::Io)?
+            }
+            crate::io::addr::ListenAddr::Domain(host, port) => {
+                let addr = resolve_listen_socket_addr(&format!("{}:{}", host, port), listen_addr)?;
+                quinn::Endpoint::server(server_config, addr).map_err(TunnelError::Io)?
+            }
+            crate::io::addr::ListenAddr::Path(_) => {
+                return Err(TunnelError::Config(
+                    "HTTP/3 and QUIC listeners do not support Unix Domain Sockets".to_string(),
+                ));
+            }
+        };
 
-        info!(addr = %addr, "Bound HTTP/3 & QUIC listener on UDP socket");
+        let local_addr = quinn_endpoint.local_addr().map_err(TunnelError::Io)?;
+        info!(addr = %local_addr, "Bound HTTP/3 & QUIC listener on UDP socket");
 
         let (tx_streams, rx_streams) = mpsc::channel(ACCEPTED_STREAM_QUEUE_SIZE);
         let cancel_token = cancel.child_token();

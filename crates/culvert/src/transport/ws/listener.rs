@@ -44,6 +44,22 @@ fn bind_std_tcp_listener(
 ) -> Result<std::net::TcpListener, TunnelError> {
     use std::net::ToSocketAddrs;
 
+    if let Some(port_str) = clean_addr.strip_prefix(':') {
+        let port = port_str.parse::<u16>().map_err(|_| {
+            TunnelError::Config(format!(
+                "Invalid listen address '{}': invalid port '{}'",
+                listen_addr, port_str
+            ))
+        })?;
+        if port == 0 {
+            return Err(TunnelError::Config(format!(
+                "Invalid listen address '{}': port must not be 0",
+                listen_addr
+            )));
+        }
+        return crate::platform::create_dual_stack_tcp_listener(port).map_err(TunnelError::Io);
+    }
+
     crate::transport::run_blocking_addr_op(|| {
         let mut last_err: Option<std::io::Error> = None;
         for addr in clean_addr.to_socket_addrs().map_err(|e| {

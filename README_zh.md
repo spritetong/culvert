@@ -353,8 +353,8 @@ tls:
 server:
   listen:
     - "ws+unix:///run/culvert.sock?path=/tunnel&chmod=0o660"
-    - "wss://0.0.0.0:8443/tunnel"
-    - "h3://0.0.0.0:8443/tunnel"
+    - "wss://:8443/tunnel"              # 双栈 IPv6/IPv4 监听 (:port)
+    - "h3://:8443/tunnel"               # 双栈 IPv6/IPv4 UDP 监听 (:port)
   token: "SECURE_AUTH_TOKEN"         # 预共享密钥 (最大 256 字节，非空)
   default_target: "127.0.0.1:5201"    # 默认兜底目标服务
   heartbeat_interval: "15s"          # 服务端连接心跳保活间隔
@@ -386,7 +386,7 @@ tunnels:
         pool_size: 8                  # 客户端正向 0-RTT 预热连接池大小 (可选)
         rules:
           - protocol: "TCP"           # 必填: 传输层协议 ("TCP" 或 "UDP"，大小写不敏感，不可缺省)
-            listen: "127.0.0.1:13306"
+            listen: ":13306"          # 双栈 IPv6/IPv4 (:port) 或 addr:port (如 127.0.0.1:13306)
             target: "10.0.0.5:3306"
           - protocol: "UDP"
             listen: "127.0.0.1:15353"
@@ -397,7 +397,7 @@ tunnels:
         pool_size: 4                  # 服务端反向 0-RTT 预热连接池大小 (可选)
         rules:
           - protocol: "TCP"
-            listen: "0.0.0.0:2222"    # 在服务端绑定的监听端口
+            listen: ":2222"           # 在服务端绑定的监听端口 (双栈 :port)
             target: "127.0.0.1:22"    # 客户端本地转发的目标端口
 ```
 
@@ -425,8 +425,8 @@ tunnels:
 | 字段 | 类型 | 是否必填 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- | :--- |
 | `protocol` | 字符串 | **是 (强制)** | **无缺省值** | 传输层协议，必须显式设置为 `"TCP"` 或 `"UDP"`（大小写不敏感，不允许缺省）。 |
-| `listen` | 字符串 | 是 | — | `ip:port`、`hostname:port`、`[ipv6]:port` 或 `unix://path`（仅 TCP 支持 `unix://`）。 |
-| `target` | 字符串 | 是 | — | `ip:port`、`hostname:port`、`[ipv6]:port` 或 `unix://path`（仅 TCP 支持 `unix://`）。 |
+| `listen` | 字符串 | 是 | — | 本地或远端监听地址：`:port`（通过 `socket2` 设置 `set_only_v6(false)` 在 Windows/Linux/macOS 上绑定 `[::]:port` 实现 IPv6/IPv4 双栈监听）、`addr:port`（操作系统默认配置，如 `127.0.0.1:8080`）、`hostname:port` 或 `unix://path`（仅 TCP 支持）。 |
+| `target` | 字符串 | 是 | — | 出站拨号目标服务（`connect`）：`ip:port`、`hostname:port`、`[ipv6]:port` 或 `unix://path`（仅 TCP 支持）。不可缺省主机（`target` 不接受 `:port`）。 |
 | `udp_idle_timeout` | 时长 | 否 | `dialer.udp_idle_timeout` (`30s`) | 仅 UDP 有效：覆盖客户端侧 UDP 会话空闲超时。须 `> 0`。 |
 
 ---

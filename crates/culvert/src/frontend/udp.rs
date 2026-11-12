@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::common::CancelFutureExt;
 use crate::consts::{ACCEPTED_STREAM_QUEUE_SIZE, UDP_SESSION_CHANNEL_SIZE};
 use crate::frontend::{Frontend, FrontendAccept, FrontendFactory, FrontendOutput};
-use crate::io::addr::{L4Protocol, MappingSpec, PeerAddr, TargetAddr, parse_target_addr};
+use crate::io::addr::{L4Protocol, ListenAddr, MappingSpec, PeerAddr, parse_listen_addr};
 use crate::io::channel::{Datagram, DatagramIo, FlowKey, IoChannel};
 use crate::io::error::TunnelError;
 use crate::io::stream::BoxFuture;
@@ -65,14 +65,21 @@ impl Drop for UdpFrontend {
 
 impl UdpFrontend {
     /// Binds a UDP socket at `listen_addr` and starts the packet demultiplexer task.
+    /// Supports dual-stack `:port`, standard `addr:port`, and `hostname:port`.
     pub async fn bind(listen_addr: &str) -> Result<Self, TunnelError> {
-        let listen_target = parse_target_addr(listen_addr)?;
+        let listen_target = parse_listen_addr(listen_addr)?;
         let socket = match listen_target {
-            TargetAddr::Ip(sa) => UdpSocket::bind(sa).await.map_err(TunnelError::Io)?,
-            TargetAddr::Domain(host, port) => UdpSocket::bind((host.as_str(), port))
+            ListenAddr::DualStack(port) => {
+                let std_sock = crate::platform::create_dual_stack_udp_socket(port)
+                    .map_err(TunnelError::Io)?;
+                std_sock.set_nonblocking(true).map_err(TunnelError::Io)?;
+                UdpSocket::from_std(std_sock).map_err(TunnelError::Io)?
+            }
+            ListenAddr::Ip(sa) => UdpSocket::bind(sa).await.map_err(TunnelError::Io)?,
+            ListenAddr::Domain(host, port) => UdpSocket::bind((host.as_str(), port))
                 .await
                 .map_err(TunnelError::Io)?,
-            TargetAddr::Path(_) => {
+            ListenAddr::Path(_) => {
                 return Err(TunnelError::Config(format!(
                     "UDP frontend does not support Unix domain socket address '{}'",
                     listen_addr
@@ -100,7 +107,7 @@ impl UdpFrontend {
                     res = task_socket.recv_from(&mut buf) => res,
                 };
 
-                let (n, peer_addr) = match recv_res {
+                let (n, raw_peer_addr) = match recv_res {
                     Ok(pair) => pair,
                     Err(e) => {
                         if !task_cancel.is_cancelled() {
@@ -108,6 +115,11 @@ impl UdpFrontend {
                         }
                         continue;
                     }
+                };
+
+                let peer_addr = match raw_peer_addr {
+                    SocketAddr::V6(v6) => SocketAddr::new(v6.ip().to_canonical(), v6.port()),
+                    v4 => v4,
                 };
 
                 let dgram = Datagram {

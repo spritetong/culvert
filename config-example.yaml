@@ -49,11 +49,12 @@ tls:
 server:
   # Supported schemes: ws, wss, https, h3, quic, ws+unix, wss+unix
   # Server listen and client endpoint use the exact same URL format.
+  # Listen supports :port for IPv6/IPv4 dual-stack binding (e.g. "wss://:8443/tunnel" or ":8443").
   listen:
     - "ws+unix:///run/tunnel.sock?path=/tunnel&chmod=0o660"
     - "wss+unix:///run/tunnel2.sock?path=/tunnel"
-    - "wss://0.0.0.0:8443/tunnel"
-    - "h3://0.0.0.0:8443/tunnel"
+    - "wss://:8443/tunnel"
+    - "h3://:8443/tunnel"
     - "ws://127.0.0.1:8080/tunnel"
   token: "SECURE_PRESHARED_TOKEN"   # Optional: omit or null for no-auth mode (empty string "" is rejected)
   default_target: "127.0.0.1:5201"  # Optional: fallback target
@@ -80,9 +81,11 @@ tunnels:
         pool_size: 8            # Client-side forward connection pool size (0-RTT for outbound traffic)
         rules:
           # Protocol is mandatory (TCP or UDP, case-insensitive)
-          # Forward TCP mapping: local 15201 -> remote 5201 (iperf3)
+          # Forward TCP mapping: local :15201 (IPv6/IPv4 dual-stack) -> remote 5201 (iperf3)
+          # Listen supports :port (dual-stack), addr:port (OS default), or unix://path (TCP only).
+          # Target is connect/dial destination: supports addr:port or unix://path (does NOT accept :port).
           - protocol: "TCP"
-            listen: "127.0.0.1:15201"
+            listen: ":15201"
             target: "127.0.0.1:5201"
           # Forward TCP mapping: local 13306 -> remote 3306 (MySQL)
           - protocol: "TCP"
@@ -103,9 +106,9 @@ tunnels:
       reverse:
         pool_size: 4            # Server-side reverse connection pool size (0-RTT for inbound traffic)
         rules:
-          # Reverse TCP mapping: remote 2222 -> local 22 (SSH)
+          # Reverse TCP mapping: remote :2222 (IPv6/IPv4 dual-stack) -> local 22 (SSH)
           - protocol: "TCP"
-            listen: "0.0.0.0:2222"
+            listen: ":2222"
             target: "127.0.0.1:22"
           # Reverse UDP mapping: remote 51820/udp -> local 51820/udp (WireGuard)
           - protocol: "UDP"

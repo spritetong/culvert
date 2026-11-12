@@ -210,12 +210,9 @@ normalizes the socket path, parses `?path=` (prepending `/` if needed) and
 Default ports are 80 for `ws` and 443 for the TLS/QUIC schemes. A UDS endpoint
 must include a socket file path.
 
-`io::addr::TargetAddr` has three variants: `Ip(SocketAddr)`,
-`Domain(String, u16)`, `Path(PathBuf)`. `io::addr::parse_target_addr` accepts
-`unix://path`, bracketed IPv6 with port, `ip:port`, or a validated
-`hostname:port`. A port is mandatory and non-zero for non-UDS forms. Both live
-in the neutral vocabulary layer: config, frontend, core, and backend refer to
-the same type without any of them owning it.
+`io::addr::ListenAddr` has four variants: `DualStack(u16)`, `Ip(SocketAddr)`, `Domain(String, u16)`, `Path(PathBuf)`. `io::addr::parse_listen_addr` accepts `:port` (dual-stack IPv6/IPv4 binding on `[::]:port` via `socket2` with `set_only_v6(false)` on Windows, Linux, and macOS), `addr:port` (OS default configuration), `hostname:port`, or `unix://path`. Dual-stack sockets automatically normalize accepted IPv4-mapped IPv6 peer addresses (`::ffff:x.x.x.x`) to canonical IPv4 addresses via `addr.ip().to_canonical()`.
+
+`io::addr::TargetAddr` has three variants: `Ip(SocketAddr)`, `Domain(String, u16)`, `Path(PathBuf)`. `io::addr::parse_target_addr` accepts `unix://path`, bracketed IPv6 with port, `ip:port`, or a validated `hostname:port`. A port is mandatory and non-zero for non-UDS forms. `TargetAddr` strictly represents outbound `connect` destinations, and passing a `:port` string without host is strictly rejected. Both live in the neutral vocabulary layer: config, frontend, core, and backend refer to the same type without any of them owning it.
 
 `io::addr::L4Protocol` is `Tcp | Udp` (default `Tcp`, serialized lowercase
 `"tcp"` / `"udp"`). `io::addr::MappingSpec { protocol, listen, target }` is the

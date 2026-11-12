@@ -321,9 +321,9 @@ impl ConfigLoader {
             // Port mappings validation
             let canonical_mappings = tunnel.canonical_mappings()?;
             for mapping in &canonical_mappings {
-                let _ = crate::io::addr::parse_target_addr(&mapping.listen).map_err(|_| {
+                let _ = crate::io::addr::parse_listen_addr(&mapping.listen).map_err(|_| {
                     TunnelError::Config(format!(
-                        "tunnel '{}': invalid listen address '{}' in mapping. Expected 'ip:port', 'hostname:port', or 'unix://path'",
+                        "tunnel '{}': invalid listen address '{}' in mapping. Expected ':port', 'ip:port', 'hostname:port', or 'unix://path'",
                         tunnel.tag, mapping.listen
                     ))
                 })?;
@@ -354,13 +354,16 @@ impl ConfigLoader {
                     )));
                 }
 
-                if mapping.mode == crate::config::model::TunnelMode::Forward
-                    && !seen_forward_binds.insert((mapping.protocol, mapping.listen.clone()))
-                {
-                    return Err(TunnelError::Config(format!(
-                        "Duplicate forward {} mapping listen address '{}' in tunnel '{}'. Multiple forward tunnels cannot bind the same local {} address.",
-                        mapping.protocol, mapping.listen, tunnel.tag, mapping.protocol
-                    )));
+                if mapping.mode == crate::config::model::TunnelMode::Forward {
+                    let canonical_listen = crate::io::addr::parse_listen_addr(&mapping.listen)
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|_| mapping.listen.clone());
+                    if !seen_forward_binds.insert((mapping.protocol, canonical_listen)) {
+                        return Err(TunnelError::Config(format!(
+                            "Duplicate forward {} mapping listen address '{}' in tunnel '{}'. Multiple forward tunnels cannot bind the same local {} address.",
+                            mapping.protocol, mapping.listen, tunnel.tag, mapping.protocol
+                        )));
+                    }
                 }
             }
 
@@ -1474,5 +1477,59 @@ tunnels:
             udp_idle_timeout: "0s"
 "#;
         assert!(ConfigLoader::from_yaml_str(yaml_zero_mapping).is_err());
+    }
+
+    #[test]
+    fn test_accept_dual_stack_listen_port_and_reject_port_target() {
+        // Valid dual-stack :port listen configuration
+        let yaml_valid = r#"
+tunnels:
+  - tag: "dual-stack-test"
+    endpoint: "ws://127.0.0.1:8080/tunnel"
+    mappings:
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: ":8080"
+            target: "127.0.0.1:8080"
+          - protocol: "UDP"
+            listen: ":8080"
+            target: "127.0.0.1:8080"
+"#;
+        let cfg = ConfigLoader::from_yaml_str(yaml_valid).unwrap();
+        assert_eq!(cfg.tunnels.len(), 1);
+
+        // Reject :port as target address (target must specify a host)
+        let yaml_invalid_target = r#"
+tunnels:
+  - tag: "invalid-target"
+    endpoint: "ws://127.0.0.1:8080/tunnel"
+    mappings:
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: ":8080"
+            target: ":8080"
+"#;
+        let err = ConfigLoader::from_yaml_str(yaml_invalid_target).unwrap_err();
+        assert!(err.to_string().contains("invalid target address"));
+
+        // Reject duplicate forward :port binding
+        let yaml_dup_port = r#"
+tunnels:
+  - tag: "dup-port"
+    endpoint: "ws://127.0.0.1:8080/tunnel"
+    mappings:
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: ":8080"
+            target: "127.0.0.1:8080"
+          - protocol: "TCP"
+            listen: ":8080"
+            target: "127.0.0.1:8081"
+"#;
+        let err2 = ConfigLoader::from_yaml_str(yaml_dup_port).unwrap_err();
+        assert!(err2.to_string().contains("Duplicate forward tcp mapping listen address"));
     }
 }

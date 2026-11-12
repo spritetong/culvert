@@ -223,8 +223,18 @@ pub async fn run_reverse_mapping(
         {
             // One worker holds at most one idle stream, so an unbounded config
             // value would spawn an unbounded number of dialing tasks.
-            let listen_target = crate::io::addr::parse_target_addr(&listen)
-                .unwrap_or_else(|_| dummy_target.clone());
+            let listen_target = match crate::io::addr::parse_listen_addr(&listen) {
+                Ok(crate::io::addr::ListenAddr::DualStack(port)) => {
+                    TargetAddr::Ip(std::net::SocketAddr::new(
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                        port,
+                    ))
+                }
+                Ok(crate::io::addr::ListenAddr::Ip(sa)) => TargetAddr::Ip(sa),
+                Ok(crate::io::addr::ListenAddr::Domain(h, p)) => TargetAddr::Domain(h, p),
+                Ok(crate::io::addr::ListenAddr::Path(p)) => TargetAddr::Path(p),
+                Err(_) => dummy_target.clone(),
+            };
             debug!(
                 tag = %tag,
                 size,

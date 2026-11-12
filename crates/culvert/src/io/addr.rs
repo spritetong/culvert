@@ -200,6 +200,11 @@ impl From<String> for PeerAddr {
 }
 
 /// Target address abstraction for remote forwarding.
+///
+/// Supports:
+/// 1. `ip:port` (e.g. 127.0.0.1:8080, [::1]:8080)
+/// 2. `hostname:port` (e.g. localhost:8080, example.com:443)
+/// 3. `unix://path` (e.g. unix:///run/tunnel.sock, unix://C:/temp/tunnel.sock)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TargetAddr {
     Ip(SocketAddr),
@@ -213,6 +218,32 @@ impl std::fmt::Display for TargetAddr {
             TargetAddr::Ip(addr) => write!(f, "{}", addr),
             TargetAddr::Domain(host, port) => write!(f, "{}:{}", host, port),
             TargetAddr::Path(path) => write!(f, "unix://{}", path.display()),
+        }
+    }
+}
+
+/// Listen address abstraction for local frontends and servers.
+///
+/// Supports:
+/// 1. `:port` (Dual-stack IPv6/IPv4 binding on `[::]:port` via socket2 `set_only_v6(false)`)
+/// 2. `addr:port` (OS default configuration for IP, e.g. `127.0.0.1:8080`, `0.0.0.0:8080`, `[::1]:8080`)
+/// 3. `hostname:port` (OS default configuration, e.g. `localhost:8080`)
+/// 4. `unix://path` (Unix domain socket path)
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ListenAddr {
+    DualStack(u16),
+    Ip(SocketAddr),
+    Domain(String, u16),
+    Path(PathBuf),
+}
+
+impl std::fmt::Display for ListenAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ListenAddr::DualStack(port) => write!(f, ":{}", port),
+            ListenAddr::Ip(addr) => write!(f, "{}", addr),
+            ListenAddr::Domain(host, port) => write!(f, "{}:{}", host, port),
+            ListenAddr::Path(path) => write!(f, "unix://{}", path.display()),
         }
     }
 }
@@ -284,11 +315,11 @@ fn is_valid_hostname(host: &str) -> bool {
 }
 
 /// Parses a target address string supporting three formats:
-/// 1. ip:port (e.g. 127.0.0.1:8080, [::1]:8080)
-/// 2. hostname:port (e.g. localhost:8080, example.com:443)
-/// 3. unix://path (e.g. unix:///run/tunnel.sock, unix://C:/temp/tunnel.sock)
+/// 1. `ip:port` (e.g. 127.0.0.1:8080, [::1]:8080)
+/// 2. `hostname:port` (e.g. localhost:8080, example.com:443)
+/// 3. `unix://path` (e.g. unix:///run/tunnel.sock, unix://C:/temp/tunnel.sock)
 ///
-/// Port number cannot be omitted for IP and hostname addresses.
+/// Port number cannot be omitted for IP and hostname addresses. Target addresses must specify a host.
 pub fn parse_target_addr(target_str: &str) -> Result<TargetAddr, TunnelError> {
     let target_str = target_str.trim();
     if target_str.starts_with("unix://") {
@@ -307,7 +338,7 @@ pub fn parse_target_addr(target_str: &str) -> Result<TargetAddr, TunnelError> {
         let is_bracketed = host.starts_with('[') && host.ends_with(']');
         if host.contains(':') && !is_bracketed {
             return Err(TunnelError::Config(format!(
-                "Invalid mapping address '{}'. IPv6 addresses with port must be enclosed in brackets (e.g. '[::1]:8080')",
+                "Invalid target address '{}'. IPv6 addresses with port must be enclosed in brackets (e.g. '[::1]:8080')",
                 target_str
             )));
         }
@@ -320,21 +351,21 @@ pub fn parse_target_addr(target_str: &str) -> Result<TargetAddr, TunnelError> {
 
         if clean_host.is_empty() {
             return Err(TunnelError::Config(format!(
-                "Invalid mapping address '{}': missing host",
+                "Invalid target address '{}': missing host. Target must be 'ip:port', 'hostname:port', or 'unix://path'",
                 target_str
             )));
         }
 
         let port = port_str.parse::<u16>().map_err(|_| {
             TunnelError::Config(format!(
-                "Invalid mapping address '{}': invalid port '{}'",
+                "Invalid target address '{}': invalid port '{}'",
                 target_str, port_str
             ))
         })?;
 
         if port == 0 {
             return Err(TunnelError::Config(format!(
-                "Invalid mapping address '{}': port must not be 0",
+                "Invalid target address '{}': port must not be 0",
                 target_str
             )));
         }
@@ -347,8 +378,97 @@ pub fn parse_target_addr(target_str: &str) -> Result<TargetAddr, TunnelError> {
     }
 
     Err(TunnelError::Config(format!(
-        "Invalid mapping address '{}'. Expected 'ip:port', 'hostname:port', or 'unix://path'",
+        "Invalid target address '{}'. Expected 'ip:port', 'hostname:port', or 'unix://path'",
         target_str
+    )))
+}
+
+/// Parses a listen address string supporting four formats:
+/// 1. `:port` (Dual-stack IPv6/IPv4, e.g. `:8080`)
+/// 2. `addr:port` (OS-default configuration for IP, e.g. `127.0.0.1:8080`, `[::1]:8080`, `0.0.0.0:8080`)
+/// 3. `hostname:port` (OS-default configuration, e.g. `localhost:8080`)
+/// 4. `unix://path` (Unix domain socket path)
+///
+/// Port number cannot be omitted for non-UDS addresses.
+pub fn parse_listen_addr(listen_str: &str) -> Result<ListenAddr, TunnelError> {
+    let listen_str = listen_str.trim();
+    if listen_str.starts_with("unix://") {
+        let path = normalize_uds_path(listen_str);
+        if path.as_os_str().is_empty() {
+            return Err(TunnelError::Config(format!(
+                "Invalid listen UDS path: {}",
+                listen_str
+            )));
+        }
+        return Ok(ListenAddr::Path(path));
+    }
+
+    // Dual-stack ":port" format
+    if let Some(port_str) = listen_str.strip_prefix(':') {
+        let port = port_str.parse::<u16>().map_err(|_| {
+            TunnelError::Config(format!(
+                "Invalid listen address '{}': invalid port '{}'",
+                listen_str, port_str
+            ))
+        })?;
+
+        if port == 0 {
+            return Err(TunnelError::Config(format!(
+                "Invalid listen address '{}': port must not be 0",
+                listen_str
+            )));
+        }
+
+        return Ok(ListenAddr::DualStack(port));
+    }
+
+    // Must be ip:port or hostname:port. Port number cannot be omitted.
+    if let Some((host, port_str)) = listen_str.rsplit_once(':') {
+        let is_bracketed = host.starts_with('[') && host.ends_with(']');
+        if host.contains(':') && !is_bracketed {
+            return Err(TunnelError::Config(format!(
+                "Invalid listen address '{}'. IPv6 addresses with port must be enclosed in brackets (e.g. '[::1]:8080')",
+                listen_str
+            )));
+        }
+
+        let clean_host = if is_bracketed {
+            &host[1..host.len() - 1]
+        } else {
+            host
+        };
+
+        if clean_host.is_empty() {
+            return Err(TunnelError::Config(format!(
+                "Invalid listen address '{}': missing host",
+                listen_str
+            )));
+        }
+
+        let port = port_str.parse::<u16>().map_err(|_| {
+            TunnelError::Config(format!(
+                "Invalid listen address '{}': invalid port '{}'",
+                listen_str, port_str
+            ))
+        })?;
+
+        if port == 0 {
+            return Err(TunnelError::Config(format!(
+                "Invalid listen address '{}': port must not be 0",
+                listen_str
+            )));
+        }
+
+        if let Ok(ip) = clean_host.parse::<std::net::IpAddr>() {
+            return Ok(ListenAddr::Ip(std::net::SocketAddr::new(ip, port)));
+        } else if is_valid_hostname(clean_host) {
+            return Ok(ListenAddr::Domain(clean_host.to_string(), port));
+        }
+    }
+
+    Err(TunnelError::Config(format!(
+        "Invalid listen address '{}'. Expected ':port', 'ip:port', 'hostname:port', or 'unix://path'",
+        listen_str
     )))
 }
 
@@ -410,5 +530,37 @@ mod tests {
         // Serializes as uppercase TCP/UDP
         assert_eq!(serde_yaml::to_string(&L4Protocol::Tcp).unwrap().trim(), "TCP");
         assert_eq!(serde_yaml::to_string(&L4Protocol::Udp).unwrap().trim(), "UDP");
+    }
+
+    #[test]
+    fn test_parse_listen_and_target_addr_dual_stack_and_formats() {
+        let l1 = parse_listen_addr(":8080").unwrap();
+        assert_eq!(l1, ListenAddr::DualStack(8080));
+        assert_eq!(l1.to_string(), ":8080");
+
+        // Target parser strictly rejects :port format
+        assert!(parse_target_addr(":8080").is_err());
+
+        let t1 = parse_target_addr("127.0.0.1:8080").unwrap();
+        assert_eq!(t1, TargetAddr::Ip("127.0.0.1:8080".parse().unwrap()));
+        assert_eq!(t1.to_string(), "127.0.0.1:8080");
+
+        let l2 = parse_listen_addr("127.0.0.1:8080").unwrap();
+        assert_eq!(l2, ListenAddr::Ip("127.0.0.1:8080".parse().unwrap()));
+
+        let l3 = parse_listen_addr("[::1]:8080").unwrap();
+        assert_eq!(l3, ListenAddr::Ip("[::1]:8080".parse().unwrap()));
+
+        let l4 = parse_listen_addr("localhost:8080").unwrap();
+        assert_eq!(l4, ListenAddr::Domain("localhost".to_string(), 8080));
+
+        let l5 = parse_listen_addr("unix:///tmp/test.sock").unwrap();
+        assert!(matches!(l5, ListenAddr::Path(_)));
+
+        // Zero and invalid ports are rejected
+        assert!(parse_listen_addr(":0").is_err());
+        assert!(parse_listen_addr(":99999").is_err());
+        assert!(parse_listen_addr(":abc").is_err());
+        assert!(parse_target_addr(":0").is_err());
     }
 }

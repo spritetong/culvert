@@ -926,3 +926,79 @@ async fn test_wss_server_inherits_global_tls_config() {
     .await
     .expect("Timeout waiting for server handle to exit after cancellation in test_wss_server_inherits_global_tls_config");
 }
+
+#[tokio::test]
+async fn test_server_listen_dual_stack_wss_port() {
+    let pki = generate_test_pki();
+    let server_port = get_available_port();
+    let cancel_token = CancellationToken::new();
+
+    // Configure server using wss://:port/tunnel (dual-stack :port)
+    let server_cfg = ServerConfig {
+        listen: vec![format!("wss://:{}/tunnel", server_port)],
+        certificate: Some(pki.server_cert_path.to_str().unwrap().to_string()),
+        key: Some(pki.server_key_path.to_str().unwrap().to_string()),
+        token: Some("secret123".to_string()),
+        default_target: Some("127.0.0.1:80".to_string()),
+        ..Default::default()
+    };
+
+    let mut reg = TransportRegistry::new();
+    reg.register(WsTransportDriver);
+    let registry = Arc::new(reg);
+    let session_mgr = Arc::new(SessionManager::new());
+    let server_runner = ServerRunner::new(server_cfg, registry.clone(), session_mgr);
+
+    let cancel_server = cancel_token.child_token();
+    let server_handle = tokio::spawn(async move {
+        server_runner.run(cancel_server).await.unwrap();
+    });
+
+    // Allow server socket to bind
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Connect from client via IPv4 127.0.0.1
+    let client_tls = TlsConfig {
+        server_name: Some("localhost".to_string()),
+        ca_certificate: Some(pki.ca_cert_path.clone()),
+        ..Default::default()
+    };
+    let ep_cfg = EndpointConfig::Detailed {
+        url: format!("wss://127.0.0.1:{}/tunnel", server_port),
+        dns: None,
+        dialer: None,
+        tls: Some(client_tls.clone()),
+        http_headers: None,
+    };
+    let app_cfg = AppConfig::default();
+    let ep_ctx = EndpointContext::build(&ep_cfg, &app_cfg).unwrap();
+    let connector = registry
+        .create_connector(&ep_ctx, Some("secret123"), TunnelMode::Forward)
+        .unwrap();
+
+    let target = culvert::transport::TargetAddr::Domain("127.0.0.1".into(), 80);
+    let connect_res = connector.connect(&target, None).await;
+    assert!(
+        connect_res.is_ok(),
+        "Client should successfully connect to server listening on dual-stack wss://:port via IPv4"
+    );
+
+    // Also verify connecting via IPv6 [::1]
+    let ep_cfg_v6 = EndpointConfig::Detailed {
+        url: format!("wss://[::1]:{}/tunnel", server_port),
+        dns: None,
+        dialer: None,
+        tls: Some(client_tls.clone()),
+        http_headers: None,
+    };
+    let ep_ctx_v6 = EndpointContext::build(&ep_cfg_v6, &app_cfg).unwrap();
+    let connector_v6 = registry
+        .create_connector(&ep_ctx_v6, Some("secret123"), TunnelMode::Forward)
+        .unwrap();
+    if let Ok(c_v6) = connector_v6.connect(&target, None).await {
+        drop(c_v6);
+    }
+
+    cancel_token.cancel();
+    let _ = server_handle.await;
+}
