@@ -24,16 +24,6 @@ use crate::pool::ReplenishingStreamPool;
 use crate::transport::{TransportConnector, TransportRegistry};
 use reusable_future::ReusableFutureRef;
 
-struct ActiveStreamGuard(Option<Arc<ReplenishingStreamPool>>);
-
-impl Drop for ActiveStreamGuard {
-    fn drop(&mut self) {
-        if let Some(ref p) = self.0 {
-            p.on_stream_closed();
-        }
-    }
-}
-
 /// Runs a single forward mapping listener and forwards inbound connections to remote peer.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_forward_mapping(
@@ -175,7 +165,11 @@ pub async fn run_forward_mapping(
                             let Some(backend) = remote_channel else {
                                 return;
                             };
-                            let _stream_guard = ActiveStreamGuard(pool_for_close.clone());
+                            scopeguard::defer! {
+                                if let Some(ref p) = pool_for_close {
+                                    p.on_stream_closed();
+                                }
+                            }
 
                             let _ = serve(
                                 PumpRequest {

@@ -781,7 +781,7 @@ impl ServerRunner {
                                 std::process::id(),
                                 REVERSE_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed)
                             );
-                            let (pair_rx, mut session_guard) =
+                            let (pair_rx, session_guard) =
                                 session_mgr_fallback.register_guarded(session_id.clone());
                             let notify_msg = ControlMessage::NewConnection {
                                 session_id: session_id.clone(),
@@ -791,7 +791,7 @@ impl ServerRunner {
                                 && let Ok(Ok(data_stream)) =
                                     timeout(DEFAULT_SESSION_PAIR_TIMEOUT, pair_rx).await
                             {
-                                session_guard.disarm();
+                                scopeguard::ScopeGuard::into_inner(session_guard);
                                 let _ = serve(
                                     PumpRequest::new(visitor_stream, data_stream),
                                     PumpCtx {
@@ -836,7 +836,7 @@ impl ServerRunner {
         );
 
         // Register in session manager with Drop guard before notifying client
-        let (pair_rx, mut session_guard) = session_mgr.register_guarded(session_id.clone());
+        let (pair_rx, session_guard) = session_mgr.register_guarded(session_id.clone());
 
         // Notify client
         let notify_msg = ControlMessage::NewConnection {
@@ -885,7 +885,7 @@ impl ServerRunner {
         local_tracker.spawn_with_cancel(move |token| async move {
             match timeout(DEFAULT_SESSION_PAIR_TIMEOUT, pair_rx).await {
                 Ok(Ok(data_stream)) => {
-                    session_guard.disarm();
+                    scopeguard::ScopeGuard::into_inner(session_guard);
                     debug!(session = %session_id_clone, "Reverse data stream paired, starting relay");
                     let _ = serve(
                         PumpRequest::new(visitor_stream, data_stream),

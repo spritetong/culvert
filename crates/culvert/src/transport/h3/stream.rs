@@ -717,17 +717,13 @@ mod tests {
         let dropped_flag = Arc::new(AtomicBool::new(false));
         let flag_clone = Arc::clone(&dropped_flag);
 
-        struct Guard(Arc<AtomicBool>);
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-
         struct HangingRecvStream(Arc<AtomicBool>);
         impl H3RecvStream for HangingRecvStream {
             async fn recv_chunk(&mut self) -> Result<Option<Bytes>, io::Error> {
-                let _guard = Guard(Arc::clone(&self.0));
+                let flag = Arc::clone(&self.0);
+                scopeguard::defer! {
+                    flag.store(true, Ordering::SeqCst);
+                }
                 std::future::pending::<()>().await;
                 Ok(None)
             }

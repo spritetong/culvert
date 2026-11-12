@@ -221,76 +221,18 @@ impl Drop for ReverseGraceHandle {
 
 /// RAII drop guard that unregisters a pending reverse session from [`SessionManager`]
 /// if the pairing future is dropped, cancelled, or aborted before completion.
-pub struct PendingSessionGuard {
-    manager: Arc<SessionManager>,
-    session_id: String,
-    active: bool,
+pub type PendingSessionGuard =
+    scopeguard::ScopeGuard<(Arc<SessionManager>, String), fn((Arc<SessionManager>, String))>;
+
+/// Internal state for a guarded inbound reverse stream pool.
+pub struct ReversePoolEntry {
+    pub manager: Arc<SessionManager>,
+    pub protocol: L4Protocol,
+    pub listen_addr: String,
+    pub pool: Arc<ReverseInboundPool>,
 }
 
-impl PendingSessionGuard {
-    /// Creates a new guard for the given session.
-    pub fn new(manager: Arc<SessionManager>, session_id: String) -> Self {
-        Self {
-            manager,
-            session_id,
-            active: true,
-        }
-    }
-
-    /// Returns the session ID being guarded.
-    pub fn session_id(&self) -> &str {
-        &self.session_id
-    }
-
-    /// Disarms the guard when pairing completes successfully, preventing cleanup on drop.
-    pub fn disarm(&mut self) {
-        self.active = false;
-    }
-}
-
-impl Drop for PendingSessionGuard {
-    fn drop(&mut self) {
-        if self.active {
-            self.manager.remove(&self.session_id);
-        }
-    }
-}
-
-/// RAII drop guard that ensures an inbound reverse stream pool is cleanly unregistered
-/// from [`SessionManager`] when the owning listener task completes, errors, or is aborted.
-pub struct ReversePoolGuard {
-    manager: Arc<SessionManager>,
-    protocol: L4Protocol,
-    listen_addr: String,
-    pool: Arc<ReverseInboundPool>,
-}
-
-impl ReversePoolGuard {
-    /// Creates a new guard for the registered reverse pool.
-    pub fn new(
-        manager: Arc<SessionManager>,
-        protocol: L4Protocol,
-        listen_addr: String,
-        pool: Arc<ReverseInboundPool>,
-    ) -> Self {
-        Self {
-            manager,
-            protocol,
-            listen_addr,
-            pool,
-        }
-    }
-
-    /// Returns a reference to the guarded inbound pool.
-    pub fn pool(&self) -> &Arc<ReverseInboundPool> {
-        &self.pool
-    }
-
-    /// Returns a mutable reference to the guarded inbound pool.
-    pub fn pool_mut(&mut self) -> &mut Arc<ReverseInboundPool> {
-        &mut self.pool
-    }
-
+impl ReversePoolEntry {
     /// Replaces the active pool with a new generation, unregistering the superseded generation first.
     pub fn replace_pool(&mut self, new_pool: Arc<ReverseInboundPool>) {
         self.manager
@@ -299,7 +241,7 @@ impl ReversePoolGuard {
     }
 }
 
-impl std::ops::Deref for ReversePoolGuard {
+impl std::ops::Deref for ReversePoolEntry {
     type Target = Arc<ReverseInboundPool>;
 
     fn deref(&self) -> &Self::Target {
@@ -307,11 +249,17 @@ impl std::ops::Deref for ReversePoolGuard {
     }
 }
 
-impl Drop for ReversePoolGuard {
-    fn drop(&mut self) {
-        self.manager
-            .unregister_pool(self.protocol, &self.listen_addr, &self.pool);
-    }
+/// RAII drop guard that ensures an inbound reverse stream pool is cleanly unregistered
+/// from [`SessionManager`] when the owning listener task completes, errors, or is aborted.
+pub type ReversePoolGuard = scopeguard::ScopeGuard<ReversePoolEntry, fn(ReversePoolEntry)>;
+
+fn unregister_pending_session((mgr, id): (Arc<SessionManager>, String)) {
+    mgr.remove(&id);
+}
+
+fn unregister_pool_entry(e: ReversePoolEntry) {
+    e.manager
+        .unregister_pool(e.protocol, &e.listen_addr, &e.pool);
 }
 
 /// Thread-safe in-memory routing table for matching incoming reverse data streams
@@ -354,7 +302,10 @@ impl SessionManager {
         PendingSessionGuard,
     ) {
         let rx = self.register(session_id.clone());
-        let guard = PendingSessionGuard::new(Arc::clone(self), session_id);
+        let guard = scopeguard::guard(
+            (Arc::clone(self), session_id),
+            unregister_pending_session as fn(_),
+        );
         (rx, guard)
     }
 
@@ -429,7 +380,13 @@ impl SessionManager {
         capacity: usize,
     ) -> ReversePoolGuard {
         let pool = self.register_pool(protocol, listen_addr, capacity);
-        ReversePoolGuard::new(Arc::clone(self), protocol, listen_addr.to_string(), pool)
+        let entry = ReversePoolEntry {
+            manager: Arc::clone(self),
+            protocol,
+            listen_addr: listen_addr.to_string(),
+            pool,
+        };
+        scopeguard::guard(entry, unregister_pool_entry as fn(_))
     }
 
     /// Pushes a pre-warmed idle reverse stream into the matching listener's pool.
@@ -885,13 +842,12 @@ mod tests {
     async fn test_pending_session_guard_disarm_retains_session() {
         let manager = Arc::new(SessionManager::new());
         let session_id = "sess_disarm_test_02".to_string();
-        let (rx, mut guard) = manager.register_guarded(session_id.clone());
+        let (rx, guard) = manager.register_guarded(session_id.clone());
         assert_eq!(manager.len(), 1);
 
         let (client, _server) = duplex(64);
         manager.fulfill(&session_id, Box::new(client)).unwrap();
-        guard.disarm();
-        drop(guard);
+        let _ = scopeguard::ScopeGuard::into_inner(guard);
 
         let stream = rx.await.unwrap();
         drop(stream);

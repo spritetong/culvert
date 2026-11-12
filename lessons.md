@@ -214,12 +214,14 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
      - **Principle of Internal Cancellation Awareness**: If an async helper function internally constrains all its blocking awaits with `cancel_token`, the event loop caller does NOT need redundant outer `.cancel_with(cancel_token)` wrappers. Keep logic lean and precise.
   2. **Event Loops vs. Spawned Worker Tasks**:
      - Detached worker tasks spawned from the event loop run their own futures. When the event loop terminates, the task tracker automatically cancels and drops them. Not every await in spawned worker tasks requires artificial cancellation wrappers unless it holds shared state.
-  3. **RAII Drop Guards for Future Abort Safety**:
+  3. **RAII Drop Guards for Future Abort Safety via `scopeguard`**:
      - Never rely solely on post-loop sequential cleanup statements for resources registered in shared state.
-     - Wrap registered shared resources in RAII drop guards (`ReversePoolGuard`, `PendingSessionGuard`, `ActiveStreamGuard`).
-     - If the future is aborted mid-flight, Rust's drop semantics guarantee that `guard.drop()` unregisters the pool and cleans up pending session entries.
+     - Avoid declaring verbose custom structs and repetitive `impl Drop` boilerplate for execution-scoped cleanups. Instead, use `scopeguard`:
+       - Use `scopeguard::defer! { ... }` for local scope exits (e.g. `p.on_stream_closed()`, `active_actors.fetch_sub(...)`).
+       - Use `scopeguard::guard(state, cleanup_fn)` (`PendingSessionGuard`, `ReversePoolGuard`) when the guard needs to be returned or passed across function boundaries, disarming with `scopeguard::ScopeGuard::into_inner(guard)` upon successful pairing.
+     - If the future is aborted mid-flight, Rust's drop semantics guarantee that the scopeguard runs to unregister pools and clean up pending session entries.
 - **References**:
-  - Implementation: [manager.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/session/manager.rs) (`PendingSessionGuard`, `ReversePoolGuard`), [runner.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/server/runner.rs) (`handle_accepted_reverse_visitor`, `ReversePoolGuard`)
+  - Implementation: [manager.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/session/manager.rs) (`PendingSessionGuard`, `ReversePoolGuard` type aliases using `scopeguard`), [channel.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/control/channel.rs) (`scopeguard::defer!`), [forward.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/tunnel/forward.rs) (`scopeguard::defer!`), [runner.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/server/runner.rs)
   - Integration Tests: [runner.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/server/runner.rs#L1934-L2060) (`test_reverse_control_cancels_promptly_during_stalled_visitor_signaling`, `test_reverse_control_future_abort_cleans_up_resources`)
 
 ### 5.4 Scattered Background Spawn Tasks: Cancellation Responsiveness & Drop Lifecycle

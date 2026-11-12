@@ -395,18 +395,6 @@ impl SignalingReceiver {
     }
 }
 
-struct ActorDropGuard {
-    active_actors: Arc<AtomicUsize>,
-    actor_exit_notify: Arc<Notify>,
-}
-
-impl Drop for ActorDropGuard {
-    fn drop(&mut self) {
-        self.active_actors.fetch_sub(1, Ordering::SeqCst);
-        self.actor_exit_notify.notify_waiters();
-    }
-}
-
 /// Spawns an autonomous signaling actor managing transport framing, keepalive, and timeouts.
 pub struct SignalingChannel;
 
@@ -480,10 +468,6 @@ impl SignalingChannel {
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
         event_sink.active_actors.fetch_add(1, Ordering::SeqCst);
-        let guard = ActorDropGuard {
-            active_actors: event_sink.active_actors,
-            actor_exit_notify: event_sink.actor_exit_notify,
-        };
 
         let frame_timeout = reverse_frame_timeout(config.idle_timeout);
         let (cmd_tx, cmd_rx) = mpsc::channel::<OutboundCommand>(32);
@@ -498,8 +482,7 @@ impl SignalingChannel {
             config,
             frame_timeout,
             cmd_rx,
-            event_sink.tx,
-            guard,
+            event_sink,
             cancel_token,
         ));
 
@@ -511,13 +494,15 @@ impl SignalingChannel {
         config: SignalingConfig,
         frame_timeout: Duration,
         mut cmd_rx: mpsc::Receiver<OutboundCommand>,
-        event_tx: mpsc::Sender<Result<ControlMessage, TunnelError>>,
-        guard: ActorDropGuard,
+        sink: SignalingSink,
         cancel_token: CancellationToken,
     ) where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
-        let _guard = guard;
+        scopeguard::defer! {
+            sink.active_actors.fetch_sub(1, Ordering::SeqCst);
+            sink.actor_exit_notify.notify_waiters();
+        }
         let mut heartbeat = interval(config.heartbeat_interval);
         let mut last_activity_ms = activity_now_ms();
         let idle_deadline = sleep(config.idle_timeout);
@@ -611,7 +596,7 @@ impl SignalingChannel {
                                     // Activity clock already refreshed above
                                 }
                                 app_msg => {
-                                    match event_tx.send(Ok(app_msg)).cancel_with(&cancel_token).await {
+                                    match sink.tx.send(Ok(app_msg)).cancel_with(&cancel_token).await {
                                         Some(Ok(())) => {}
                                         Some(Err(_)) => {
                                             debug!("Signaling event receiver dropped; closing actor");
@@ -626,9 +611,9 @@ impl SignalingChannel {
                             }
                         }
                         Some(Err(e)) => {
-                            let is_last_actor = _guard.active_actors.load(Ordering::SeqCst) <= 1;
+                            let is_last_actor = sink.active_actors.load(Ordering::SeqCst) <= 1;
                             if is_last_actor {
-                                let _ = event_tx.send(Err(e)).cancel_with(&cancel_token).await;
+                                let _ = sink.tx.send(Err(e)).cancel_with(&cancel_token).await;
                             } else {
                                 warn!(error = %e, "Signaling transport failed while sibling channel remains active");
                             }
