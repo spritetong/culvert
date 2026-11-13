@@ -33,20 +33,19 @@ tunnels:
   # Local traffic to 127.0.0.1:15201 is tunneled to remote target 127.0.0.1:5201
   # ----------------------------------------------------------------------------
   - tag: "bench-forward-tunnel"
-    token: "bench_secret_token_123456"
-    mappings:
-      - mode: "forward"
-        listen: "127.0.0.1:15201"
-        target: "127.0.0.1:5201"
-
     # Replace with server IP / domain:
     #   - "ws://127.0.0.1:8080/tunnel"
     #   - "wss://127.0.0.1:8443/tunnel"
     #   - "h3://127.0.0.1:8443/tunnel"
-    #   - "quic://127.0.0.1:8443/raw"
-    #endpoint: "wss+unix://./culvert.sock?path=/tunnel"
-    #ndpoint: "wss+unix:///run/culvert.sock?path=/tunnel"
-    endpoint: "quic://127.0.0.1:8443"
-
-    # Pre-warmed connection pool for 0-RTT tunnel acquisition
-    pool_size: 16
+    #   - "quic://127.0.0.1:8443"
+    #   - "wss+unix:///run/culvert.sock?path=/tunnel"
+    endpoint: "wss://127.0.0.1:8443"
+    token: "bench_secret_token_123456"
+    mappings:
+      forward:
+        # Pre-warmed connection pool for 0-RTT tunnel acquisition
+        pool_size: 16
+        rules:
+          - protocol: tcp
+            listen: "127.0.0.1:15201"
+            target: "127.0.0.1:5201"

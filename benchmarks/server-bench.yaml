@@ -25,7 +25,6 @@ server:
     - "ws://0.0.0.0:8080/tunnel"
     - "wss://0.0.0.0:8443/tunnel"
     - "h3://0.0.0.0:8443/tunnel"
-    #- "wss+unix://./culvert.sock?path=/tunnel"
     #- "wss+unix:///run/culvert.sock?path=/tunnel"
   token: "bench_secret_token_123456"
   # Default backend target (e.g. iperf3 server, nginx, or echo service)

@@ -26,7 +26,6 @@ __pycache__
 *.swp
 *.tmp
 
+/benchmarks
 /config.yaml
 /Makefile
-/wstunnel
-/wstunnel.exe
