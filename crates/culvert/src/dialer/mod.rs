@@ -7,10 +7,12 @@
 
 pub mod dns;
 pub mod endpoint;
+pub mod proxy;
 pub mod tls;
 pub mod unified;
 
 pub use dns::{CachedDnsResolver, DnsResolver};
 pub use endpoint::{Endpoint, EndpointContext};
+pub use proxy::{ProxyConfig, ProxyDialer, ProxyScheme};
 pub use tls::TlsConfigBuilder;
 pub use unified::{DefaultDialer, Dialer};

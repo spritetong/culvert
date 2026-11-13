@@ -359,4 +359,20 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
 - **References**:
   - Implementation: [platform/mod.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/platform/mod.rs#L88-L95), [udp.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/frontend/udp.rs#L135-L142)
 
+---
 
+## 8. Outbound Proxying & Transparent Dialing
+
+### 8.1 Transparent Dialer Decoration & DNS Isolation
+
+- **Problem / Trap**:
+  - In a tunneling client, resolving the destination endpoint's hostname locally when dialing through a proxy causes DNS leaks, DNS cache poisoning, and fails completely for private or split-horizon internal hostnames (e.g. cloud VPC or Kubernetes internal hostnames reachable only through the proxy).
+  - Additionally, modifying transport connectors (`WsConnector`) to support proxying introduces branch complexity into protocol handshakes (TLS, WebSocket Upgrade).
+- **Solution**:
+  - Implement outbound proxies as a transparent `Dialer` decorator (`ProxyDialer` wrapping `DefaultDialer`).
+  - **DNS Isolation**: The inner dialer uses the client's configured `DnsResolver` solely to resolve the proxy server's own IP address (`proxy_host:proxy_port`).
+  - **Target Delegation**: The destination endpoint's `target_host` is never resolved locally; it is passed verbatim to the proxy via HTTP `CONNECT` or SOCKS5 domain address type (`ATYP = 0x03`, SOCKS5h).
+  - **Zero-Touch Transports**: Transports (such as `ws://` and `wss://`) dial via `endpoint.dialer.dial(host, port)`. Because the returned stream is an established, transparent byte tunnel, downstream TLS handshakes and WebSocket upgrades execute with zero modification.
+- **References**:
+  - Implementation: [proxy.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/dialer/proxy.rs)
+  - Integration Test: [test_proxy_e2e.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/tests/test_proxy_e2e.rs)

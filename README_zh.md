@@ -322,6 +322,7 @@ dns:
 
 ```yaml
 dialer:
+  proxy: "http://127.0.0.1:8080"      # 出网代理: http, https, socks5, socks5h (可选 user:pass 认证)
   connect_timeout: "10s"      # TCP 连接建立超时
   tcp_nodelay: true           # 开启 TCP_NODELAY，消除小包延迟
   bind_interface: "eth0"      # 绑定指定出口网卡 (通过 SO_BINDTODEVICE，可选)
@@ -407,7 +408,7 @@ tunnels:
 | :--- | :--- | :--- | :--- | :--- |
 | `tag` | 字符串 | 是 | — | 隧道唯一标识标签。 |
 | `uuid` | 字符串 | 否 | 由 `tag` 派生 UUID v5 | 显式 Tunnel UUID。同一 Tunnel 下的所有映射共享连接池。 |
-| `endpoint` | 字符串/对象 | 是 | — | 服务端接入点 URL（如 `wss://...`、`h3://...`、`ws+unix://...`）。 |
+| `endpoint` | 字符串/对象 | 是 | — | 服务端接入点 URL（如 `wss://...`、`h3://...`、`ws+unix://...`）或包含 `url` 及专用 `dns`、`dialer`（包含 `proxy`）、`tls` 覆盖的对象。 |
 | `token` | 字符串 | 否 | `null` | 预共享认证令牌，须与服务端的 `server.token` 保持一致。 |
 | `http_headers` | 映射 | 否 | — | 传输层握手时携带的自定义 HTTP 标头。 |
 | `retry` | 对象 | 否 | — | 自动断线重连配置（包含 `delay`、`max_retries`）。 |
@@ -688,6 +689,31 @@ tunnels:
             target: "127.0.0.1:51820"# NAT 内网本机 WireGuard 服务
             udp_idle_timeout: "120s" # 长周期 VPN 会话可设置更长的空闲超时
 ```
+
+### 5. 通过出网代理拨号 (企业防火墙 / SOCKS5 穿透)
+
+在受限企业内网或需要经过正向代理的环境中，客户端隧道可以通过 HTTP/HTTPS CONNECT 或 SOCKS5 代理拨号连接服务端：
+
+```yaml
+tunnels:
+  - tag: "corp-proxy-tunnel"
+    endpoint:
+      url: "wss://my-cloud-vps.com:443/tunnel"
+      dialer:
+        # 支持 http, https, socks5, socks5h 协议，支持可选的用户名密码认证:
+        proxy: "http://corporate-proxy.corp.internal:8080" # 或 "socks5://user:pass@127.0.0.1:1080"
+        connect_timeout: "10s"
+    token: "CHANGE_ME"
+    mappings:
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:3000"
+            target: "10.0.0.5:3000"
+```
+
+> [!NOTE]
+> **DNS 隔离保证**：配置 `proxy` 时，本地 DNS 解析仅用于解析代理服务器自身的 IP 地址。目标 Endpoint 域名（如 `my-cloud-vps.com`）由远端代理服务器负责解析，彻底规避本地 DNS 污染、泄露和私网域名无法解析的问题。
 
 ---
 

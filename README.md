@@ -327,6 +327,7 @@ dns:
 
 ```yaml
 dialer:
+  proxy: "http://127.0.0.1:8080"      # Outbound proxy: http, https, socks5, socks5h (with optional user:pass)
   connect_timeout: "10s"      # TCP connection timeout
   tcp_nodelay: true           # Enable TCP_NODELAY to avoid packet coalescing lag
   bind_interface: "eth0"      # Bind outbound interface via SO_BINDTODEVICE (optional)
@@ -412,7 +413,7 @@ Each tunnel entry accepts:
 | :--- | :--- | :--- | :--- | :--- |
 | `tag` | string | Yes | — | Unique identifier tag for the tunnel. |
 | `uuid` | string | No | UUID v5 from `tag` | Optional explicit Tunnel UUID. Mappings under the same tunnel share connection pools. |
-| `endpoint` | string / object | Yes | — | Server ingress URL (e.g. `wss://...`, `h3://...`, `ws+unix://...`). |
+| `endpoint` | string / object | Yes | — | Server ingress URL (e.g. `wss://...`, `h3://...`, `ws+unix://...`) or detailed object with `url` and per-endpoint `dns`, `dialer` (including `proxy`), and `tls` overrides. |
 | `token` | string | No | `null` | Pre-shared authentication token matching `server.token`. |
 | `http_headers` | map | No | — | Custom HTTP headers sent during transport handshake. |
 | `retry` | object | No | — | Automatic reconnect configuration (`delay`, `max_retries`). |
@@ -693,6 +694,31 @@ tunnels:
             target: "127.0.0.1:51820"# Local WireGuard daemon behind NAT
             udp_idle_timeout: "120s" # Keep long-lived VPN peer sessions warm longer
 ```
+
+### 5. Outbound Proxy (Corporate Firewall / SOCKS5 Traversal)
+
+When operating in restricted enterprise networks or behind firewalls, client endpoints can dial out through an intermediate HTTP/HTTPS CONNECT or SOCKS5 proxy:
+
+```yaml
+tunnels:
+  - tag: "corp-proxy-tunnel"
+    endpoint:
+      url: "wss://my-cloud-vps.com:443/tunnel"
+      dialer:
+        # Supports http, https, socks5, socks5h with optional credentials:
+        proxy: "http://corporate-proxy.corp.internal:8080" # or "socks5://user:pass@127.0.0.1:1080"
+        connect_timeout: "10s"
+    token: "CHANGE_ME"
+    mappings:
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:3000"
+            target: "10.0.0.5:3000"
+```
+
+> [!NOTE]
+> **DNS Isolation**: When `proxy` is configured, local DNS resolution is performed solely for the proxy server itself. The destination endpoint hostname (`my-cloud-vps.com`) is delegated directly to the remote proxy, preventing DNS pollution, leaks, and resolution failures on private domains.
 
 ---
 

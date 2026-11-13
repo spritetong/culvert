@@ -113,6 +113,9 @@ impl ConfigLoader {
             if let Some(ref iface) = d.bind_interface {
                 crate::platform::validate_bind_interface(iface)?;
             }
+            if let Some(ref proxy_url) = d.proxy {
+                crate::dialer::proxy::ProxyConfig::parse(proxy_url)?;
+            }
         }
 
         // 6. Server configuration validation
@@ -457,7 +460,25 @@ impl ConfigLoader {
                     if let Some(ref iface) = dl.bind_interface {
                         crate::platform::validate_bind_interface(iface)?;
                     }
+                    if let Some(ref proxy_url) = dl.proxy {
+                        crate::dialer::proxy::ProxyConfig::parse(proxy_url)?;
+                    }
                 }
+            }
+
+            let effective_proxy = match &tunnel.endpoint {
+                crate::config::model::EndpointConfig::Detailed { dialer, .. } => {
+                    dialer.as_ref().and_then(|d| d.proxy.as_ref())
+                }
+                _ => None,
+            }
+            .or_else(|| config.dialer.as_ref().and_then(|d| d.proxy.as_ref()));
+
+            if effective_proxy.is_some() && matches!(ep.scheme.as_str(), "h3" | "quic") {
+                return Err(TunnelError::Config(format!(
+                    "tunnel '{}': endpoint scheme '{}' (QUIC/HTTP3) does not support proxy. Use a TCP/WebSocket scheme (ws://, wss://) when dialing through a proxy.",
+                    tunnel.tag, ep.scheme
+                )));
             }
 
             // Pre-flight check: ensure EndpointContext builds cleanly
@@ -1534,5 +1555,62 @@ tunnels:
             err2.to_string()
                 .contains("Duplicate forward tcp mapping listen address")
         );
+    }
+
+    #[test]
+    fn test_proxy_config_validation() {
+        // Valid HTTP/SOCKS5 proxy on WebSocket endpoint
+        let yaml_valid = r#"
+tunnels:
+  - tag: "proxy-ws"
+    endpoint:
+      url: "wss://remote.server:443/tunnel"
+      dialer:
+        proxy: "http://127.0.0.1:8080"
+    mappings:
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:9000"
+            target: "127.0.0.1:80"
+"#;
+        let cfg = ConfigLoader::from_yaml_str(yaml_valid).unwrap();
+        assert_eq!(cfg.tunnels.len(), 1);
+
+        // Reject invalid proxy scheme
+        let yaml_invalid_scheme = r#"
+tunnels:
+  - tag: "proxy-invalid"
+    endpoint:
+      url: "wss://remote.server:443/tunnel"
+      dialer:
+        proxy: "ftp://127.0.0.1:21"
+    mappings:
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:9000"
+            target: "127.0.0.1:80"
+"#;
+        let err = ConfigLoader::from_yaml_str(yaml_invalid_scheme).unwrap_err();
+        assert!(err.to_string().contains("Unsupported proxy scheme"));
+
+        // Reject proxy configured on QUIC/H3 endpoint
+        let yaml_quic_proxy = r#"
+tunnels:
+  - tag: "proxy-quic"
+    endpoint:
+      url: "h3://remote.server:443/tunnel"
+      dialer:
+        proxy: "http://127.0.0.1:8080"
+    mappings:
+      forward:
+        rules:
+          - protocol: "TCP"
+            listen: "127.0.0.1:9000"
+            target: "127.0.0.1:80"
+"#;
+        let err_quic = ConfigLoader::from_yaml_str(yaml_quic_proxy).unwrap_err();
+        assert!(err_quic.to_string().contains("does not support proxy"));
     }
 }

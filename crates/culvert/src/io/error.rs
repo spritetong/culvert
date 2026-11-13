@@ -40,6 +40,9 @@ pub enum TunnelError {
     #[error("TLS handshake error: {0}")]
     TlsHandshake(String),
 
+    #[error("Proxy error: {0}")]
+    Proxy(String),
+
     #[error("Connection timeout after {0:?}")]
     ConnectTimeout(std::time::Duration),
 

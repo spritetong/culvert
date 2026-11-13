@@ -27,7 +27,9 @@ and serves incoming connections or datagram flows back through the tunnel.
 The data carried over a tunnel is an opaque byte stream (for TCP/UDS) or
 length-framed datagrams (`[u16 payload_len (big-endian) | payload]`, for UDP).
 culvert does not interpret the application protocol and does not implement
-SOCKS5, DNS-specific proxying, or HTTP proxy semantics. TCP mappings support
+inbound SOCKS5, DNS-specific proxying, or HTTP proxy server semantics for
+tunneled clients (outbound client endpoints can connect through intermediate
+HTTP CONNECT or SOCKS5 proxies via `dialer.proxy`). TCP mappings support
 IP/hostname targets (`ip:port`, `hostname:port`) and Unix domain sockets
 (`unix://path`); UDP mappings support IP/hostname addresses (`ip:port`,
 `hostname:port`) with per-peer NAT flow demultiplexing and idle expiration.
@@ -80,9 +82,10 @@ behavior is configurable, the configuration key is given.
 | UC-4 | Reach a Unix domain socket through a tunnel | TCP `mappings.target` or `mappings.listen` uses `unix://path`; the ingress side or client side binds/connects the socket directly. |
 | UC-5 | Deploy behind a reverse proxy | `server.listen` uses `ws+unix://...` or `ws://127.0.0.1:...`; the proxy handles public TLS and forwards the configured HTTP path to culvert (capable of carrying both TCP and UDP mappings). |
 | UC-6 | Deploy without a reverse proxy | `server.listen` uses a TLS scheme (`wss`, `h3`, `https`, `quic`, `wss+unix`). culvert terminates TLS using the configured certificate and key, or an ephemeral self-signed certificate when neither is provided. |
-| UC-7 | Apply per-endpoint network policy | `tunnels[].endpoint` can be an object with its own `dns`, `dialer`, and `tls` blocks, overriding the global defaults for that endpoint only. |
+| UC-7 | Apply per-endpoint network policy | `tunnels[].endpoint` can be an object with its own `dns`, `dialer` (including outbound proxy), and `tls` blocks, overriding the global defaults for that endpoint only. |
 | UC-8 | Validate a deployment file before starting | `culvert --check -c <file>` parses and validates the configuration without starting listeners or tunnels. |
 | UC-9 | Forward or expose UDP services | Setting `protocol: "UDP"` demultiplexes inbound UDP datagrams per peer `SocketAddr` into `IoChannel::Datagram` flows, frames packets with `[u16 len \| payload]` over pooled or on-demand relay streams, and expires idle NAT flows after `udp_idle_timeout`. |
+| UC-10 | Connect through an outbound HTTP/SOCKS5 proxy | Client tunnels dial through an intermediate HTTP/HTTPS CONNECT or SOCKS5 proxy via `dialer.proxy`, keeping target endpoint resolution delegated to the remote proxy. |
 
 ---
 
@@ -192,6 +195,16 @@ behavior is configurable, the configuration key is given.
 - **FR-3.9** `tunnels[].multiplex` and `tunnels[].failover` are present in the
   data model but are rejected by the loader because they are not wired into
   the data path.
+- **FR-3.10** Outbound client proxies: `dialer.proxy` (global or per-endpoint)
+  accepts an HTTP, HTTPS, or SOCKS5 proxy URL (`http://`, `https://`, `socks5://`,
+  `socks5h://`), with optional username/password credentials. When a proxy is
+  configured, the client's local DNS resolver resolves the proxy server's own
+  host only; the target endpoint hostname is passed verbatim to the proxy
+  (via HTTP `CONNECT` or SOCKS5 domain name `ATYP = 0x03`) to eliminate local DNS
+  poisoning and DNS leaks. Transport connectors (`ws://`, `wss://`) tunnel
+  transparently through the established proxy stream with end-to-end TLS and
+  WebSocket upgrade. Configuring a proxy on a QUIC/HTTP/3 endpoint (`h3://`,
+  `quic://`) is rejected at validation time.
 
 ### FR-4 Forward mappings and the stream pool
 
@@ -443,7 +456,7 @@ configuration data model; none are part of the runtime data path.
 | Automatic HTTP/3-to-WSS fallback | Not implemented. Each tunnel uses exactly the scheme in its endpoint URL. |
 | P2P, STUN/ICE, NAT hole punching | Not implemented. |
 | TOML configuration files | Not implemented. Configuration is YAML only. |
-| DNS-specific resolver proxying for tunneled clients, SOCKS5, HTTP proxy | Not implemented (raw DNS UDP traffic can be forwarded via `protocol: "udp"`). |
+| Inbound SOCKS5 / HTTP proxy server for local traffic | Not implemented (culvert is not an inbound proxy server for local applications; client tunnels can dial through outbound HTTP/SOCKS5 proxies via `dialer.proxy`). |
 | ACME certificate issuance and renewal | Not implemented. Certificates come from files, an ephemeral self-signed fallback, or an external reverse proxy. |
 | Protocol-level `CMD_TUNNEL_RESET` / `CMD_RESET_ACK` draining and returning streams to the idle pool | Not implemented. Pooled streams are one-shot. |
 | WebSocket SIMD masking claims, hardware acceleration claims | No such implementation is exposed by the product. |
@@ -521,6 +534,7 @@ tunnels:
 | AC-9 | Custom HTTP headers and Host override are applied to outgoing handshakes and validated fail-fast. | `test_http_headers.rs`, `test_config_and_dns.rs`. |
 | AC-10 | Frontend, core, and backend are independently replaceable; `core::serve` dispatches by channel kind across registered stream and datagram pairs, and an unregistered channel pair fails with `UnsupportedChannel`. | `io::pump`, `frontend`, and `core::serve` unit tests (`test_serve_recognizes_registered_channel_pairs`, `test_registry_extensibility`). |
 | AC-11 | Forward and reverse UDP port mapping (0-byte and multi-KB datagrams, multi-client NAT demux, 0-RTT `0xA7` pool & `NewConnection` fallback, same-port TCP+UDP coexistence, and `udp_idle_timeout` flow expiration/recreation) works end to end across WS, HTTP/3, and raw QUIC. | `crates/culvert/tests/test_udp_tunnel.rs`, `config::loader` & `session::manager` UDP unit tests. |
+| AC-12 | Client tunnels can connect to remote server endpoints through HTTP CONNECT and SOCKS5 proxies with domain delegation and optional authentication. | `test_proxy_e2e.rs`, `dialer::proxy` unit tests. |
 
 Run the suite with `cargo test --workspace`.
 

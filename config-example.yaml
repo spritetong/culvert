@@ -34,6 +34,7 @@ dns:
 
 # Global default dialer settings
 dialer:
+  # proxy: "http://127.0.0.1:8080"  # Optional: outbound HTTP/HTTPS/SOCKS5 proxy (e.g. socks5://user:pass@127.0.0.1:1080)
   connect_timeout: "10s"
   tcp_nodelay: true
   heartbeat_interval: "15s"  # Optional: probe interval when quiet; any RX or real TX suppresses probes (default: 15s)

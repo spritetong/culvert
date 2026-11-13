@@ -185,7 +185,7 @@ structs are too. `EndpointConfig` and `DnsResolverConfig` implement custom
 | `log` | `LogConfig` (defaulted) | `level`, `output`, `no_color`. |
 | `worker_threads` | `Option<usize>` | Tokio worker count; `0` rejected. |
 | `dns` | `Option<DnsConfig>` | `strategy`, `resolvers`, `cache_capacity`. |
-| `dialer` | `Option<DialerConfig>` | `connect_timeout`, `tcp_nodelay`, `bind_interface`, `heartbeat_interval`, `idle_timeout`, `udp_idle_timeout`. |
+| `dialer` | `Option<DialerConfig>` | `connect_timeout`, `tcp_nodelay`, `bind_interface`, `proxy`, `heartbeat_interval`, `idle_timeout`, `udp_idle_timeout`. |
 | `tls` | `Option<TlsConfig>` | `server_name`, `insecure`, `alpn`, `ca_certificate`, `client_certificate`, `client_key`, `certificate`, `key`, `min_version`, `max_version`. |
 | `server` | `Option<ServerConfig>` | `listen`, `token`, `default_target`, `certificate`, `key`, `tls`, `heartbeat_interval`, `idle_timeout`, `udp_idle_timeout`. |
 | `tunnels` | `Vec<TunnelConfig>` (defaulted) | `tag`, `endpoint`, `token`, `uuid`, `http_headers`, `failover`, `multiplex`, `retry`, `mappings`. |
@@ -234,7 +234,7 @@ runtime context for one endpoint:
 ```
 Endpoint { scheme, host, port, path, query }
 dns_resolver   : CachedDnsResolver from effective DnsConfig
-dialer         : DefaultDialer from effective DialerConfig + resolver
+dialer         : DefaultDialer (or ProxyDialer wrapping DefaultDialer if proxy configured)
 dialer_config  : effective DialerConfig (used for heartbeat/idle/connect timeouts)
 tls_config     : Option<TlsConfig>
 http_headers   : Option<HashMap<String, String>>
@@ -283,6 +283,9 @@ Helpers `heartbeat_interval()`, `idle_timeout()`, `connect_timeout()`, and
   `mappings[]`) must be greater than `0`. It is not restricted by
   `heartbeat_interval` because UDP NAT session expiry tracks datagram activity
   independently of transport probes.
+- Any configured `dialer.proxy` (global or per-endpoint) must parse as a valid
+  `http`, `https`, `socks5`, or `socks5h` URL. Configuring a proxy on a
+  QUIC/HTTP/3 endpoint (`h3://`, `quic://`) fails validation fast.
 - `multiplex` and `failover` sections are rejected unconditionally with a
   message stating they are not wired into the data path.
 
@@ -498,6 +501,15 @@ The server caps `auth_len` at 1024 bytes and `meta_len` at 65536 bytes.
   `common::net::tune_tcp_stream` only sets `TCP_NODELAY`.
   `bind_interface` requires `SO_BINDTODEVICE` and is rejected elsewhere by
   `platform::validate_bind_interface`.
+- `dialer::proxy::ProxyDialer` wraps the inner `Dialer` when `dialer.proxy` is
+  configured (`http://`, `https://`, `socks5://`, `socks5h://`). It establishes
+  a TCP connection to the proxy server via the inner dialer (using the local
+  `DnsResolver` exclusively for the proxy host), then executes an HTTP `CONNECT`
+  or SOCKS5 handshake (`ATYP = 0x03` domain name mode, RFC 1928/RFC 1929) passing
+  the target endpoint hostname directly to the proxy. Local DNS resolution is
+  never performed for the destination endpoint, preventing DNS leaks and
+  poisoning. Transports (`ws://`, `wss://`) run transparently over the returned
+  stream without modification.
 - `platform::GenericListener` is either `Tcp(Arc<TcpListener>)` or
   `Uds(Arc<Mutex<PlatformUdsListener>>)`, exposed via `frontend::tcp::TcpFrontend`.
 - `frontend::udp::UdpFrontend` binds a single `tokio::net::UdpSocket`, runs a

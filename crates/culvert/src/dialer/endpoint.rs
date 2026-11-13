@@ -206,12 +206,27 @@ impl EndpointContext {
             udp_idle_timeout: endpoint_dialer
                 .and_then(|d| d.udp_idle_timeout)
                 .or_else(|| global_app.dialer.as_ref().and_then(|d| d.udp_idle_timeout)),
+            proxy: endpoint_dialer
+                .and_then(|d| d.proxy.clone())
+                .or_else(|| global_app.dialer.as_ref().and_then(|d| d.proxy.clone())),
         };
 
-        let dialer: Arc<dyn Dialer> = Arc::new(DefaultDialer::new(
+        let mut dialer: Arc<dyn Dialer> = Arc::new(DefaultDialer::new(
             effective_dialer.clone(),
             Arc::clone(&dns_resolver),
         ));
+
+        if let Some(ref proxy_url) = effective_dialer.proxy {
+            let proxy_config = crate::dialer::proxy::ProxyConfig::parse(proxy_url)?;
+            let handshake_timeout = effective_dialer
+                .connect_timeout
+                .unwrap_or(crate::consts::DEFAULT_CONNECT_TIMEOUT);
+            dialer = Arc::new(crate::dialer::proxy::ProxyDialer::try_new(
+                dialer,
+                proxy_config,
+                handshake_timeout,
+            )?);
+        }
 
         // Resolve effective TLS options based purely on whether endpoint scheme is TLS-based
         let is_tls_scheme = matches!(

@@ -446,6 +446,7 @@ pub struct DialerConfig {
 
     pub tcp_nodelay: Option<bool>,
     pub bind_interface: Option<String>,
+    pub proxy: Option<String>,
 
     #[serde(with = "humantime_serde_opt", default)]
     pub heartbeat_interval: Option<Duration>,
