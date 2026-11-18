@@ -60,14 +60,14 @@ impl Default for QuicConfig {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum QuicCongestion {
-    Cubic,
     Bbr,
+    Cubic,
     NewReno,
 }
 
 impl Default for QuicCongestion {
     fn default() -> Self {
-        Self::Cubic
+        Self::Bbr
     }
 }
 

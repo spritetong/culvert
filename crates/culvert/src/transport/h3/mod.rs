@@ -41,15 +41,16 @@ pub(crate) fn quic_endpoint_config(quic: &QuicConfig) -> Result<quinn::EndpointC
     Ok(config)
 }
 
-/// Applies the exposed QUIC transport knobs. Everything else stays at quinn's
-/// defaults: initial MTU, loss thresholds, and RTT estimation are not config
-/// surface because lowering them trades WAN stability for tail latency.
+/// Applies the exposed QUIC transport knobs and tunes parameters for resilient
+/// WAN and weak network operation.
 pub(crate) fn apply_quic_config(config: &mut quinn::TransportConfig, quic: &QuicConfig) {
     let mut discovery = quinn::MtuDiscoveryConfig::default();
     discovery.upper_bound(effective_mtu(quic));
     config.mtu_discovery_config(Some(discovery));
 
-    if quic.immediate_ack.unwrap_or(true) {
+    // Immediate ACK is opt-in (defaults to false) to adhere to RFC 9000 delayed ACK
+    // behavior, protecting asymmetric and weak network uplinks from ACK saturation.
+    if quic.immediate_ack.unwrap_or(false) {
         let mut ack = quinn::AckFrequencyConfig::default();
         ack.ack_eliciting_threshold(quinn::VarInt::from_u32(
             DEFAULT_QUIC_ACK_ELICITING_THRESHOLD,
@@ -63,13 +64,15 @@ pub(crate) fn apply_quic_config(config: &mut quinn::TransportConfig, quic: &Quic
         config.ack_frequency_config(None);
     }
 
+    // Default to BBR congestion control: model-based rate/RTT tracking is vastly
+    // superior to loss-based Cubic on jittery, lossy, and bufferbloated weak networks.
     match quic.congestion.unwrap_or_default() {
+        QuicCongestion::Bbr => {
+            config.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+        }
         QuicCongestion::Cubic => {
             config
                 .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
-        }
-        QuicCongestion::Bbr => {
-            config.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
         }
         QuicCongestion::NewReno => {
             config.congestion_controller_factory(Arc::new(
@@ -77,6 +80,15 @@ pub(crate) fn apply_quic_config(config: &mut quinn::TransportConfig, quic: &Quic
             ));
         }
     }
+
+    // Weak network enhancements:
+    // 1. Enable fair queuing across concurrent send streams so bulk transfers do not
+    //    starve control messages or heartbeat probes on bandwidth-constrained links.
+    config.send_fairness(true);
+
+    // 2. Expand crypto buffer to 64 KiB so multi-flight handshakes and reordered
+    //    crypto frames under high packet loss do not exhaust buffer space.
+    config.crypto_buffer_size(64 * 1024);
 }
 
 /// HTTP/3 transport driver handling `h3`, `https`, and `quic` schemes.

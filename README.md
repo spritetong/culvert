@@ -441,11 +441,11 @@ Each mapping rule in `rules[]` accepts:
 ```yaml
 quic:
   mtu_upper_bound: 8192   # 1200-65527, applied on both client and server
-  immediate_ack: true     # request ACK for every ack-eliciting packet
-  congestion: cubic       # cubic | bbr | new_reno
+  immediate_ack: false    # default false (RFC delayed ACK; set true for low-latency LAN)
+  congestion: bbr         # bbr (default, robust against loss) | cubic | new_reno
 ```
 
-`mtu_upper_bound` also sets the advertised UDP payload size; the initial MTU stays 1200 so ordinary paths still handshake. Set the same values on both peers. Initial RTT, loss thresholds, and congestion-controller internals are intentionally not configurable. `immediate_ack` defaults to `true` to eliminate delayed ACK timer overhead on quiet or high-bandwidth LAN paths; on asymmetric WAN connections with constrained upstream bandwidth, set `immediate_ack: false` to prevent upstream ACK saturation.
+`mtu_upper_bound` sets the PLPMTUD search ceiling and advertised UDP payload size; initial MTU stays at quinn's safe 1200-byte baseline so ordinary and tunnel paths handshake reliably. `immediate_ack` defaults to `false` to follow RFC 9000 delayed ACK behavior, protecting asymmetric and weak network uplinks from ACK saturation (set `true` for maximum throughput on quiet/LAN paths). `congestion` defaults to `bbr`, which tracks bottleneck bandwidth and round-trip time rather than halving the window on random packet loss (as `cubic` does), dramatically improving performance on lossy or jittery connections. Initial RTT, loss thresholds, and congestion-controller internals are intentionally not configurable.
 
 ---
 

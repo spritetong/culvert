@@ -388,8 +388,8 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
 - **Solution**:
   - Set `EndpointConfig::max_udp_payload_size` on both listener and connector, and raise `MtuDiscoveryConfig::upper_bound` on both transport configs (binding dual-stack sockets on connectors as well). Keep the initial MTU at 1200 so ordinary paths still handshake.
   - Implement `poll_write_owned` for `QuinnTunnelStream` via `SendStream::write_chunks`, and for `H3TunnelStream` by enqueueing the incoming `Bytes` without `copy_from_slice`.
-  - Enable ACK frequency with `ack_eliciting_threshold = 1` and `max_ack_delay = 0` on both endpoints. Keep quinn's default reordering threshold (`2`) so reordered packets do not trigger noisy ACKs. Do not change `initial_rtt`, loss thresholds, or congestion control for a latency tweak: those trade WAN stability for tail latency.
-  - Expose only `quic.mtu_upper_bound`, `quic.immediate_ack`, and `quic.congestion` (`cubic`/`bbr`/`new_reno`) in config. Derive the endpoint's `max_udp_payload_size` from the MTU bound, and validate the bound before starting listeners.
+  - Keep `immediate_ack` opt-in (default `false`) so RFC 9000 delayed ACKs protect asymmetric WAN and mobile return paths from ACK saturation. Default congestion control to BBR (`QuicCongestion::Bbr`) to sustain throughput through random packet loss without Cubic's aggressive window halving. Enable stream `send_fairness` to avoid bulk starvation on narrow pipes, and expand `crypto_buffer_size` to 64 KiB for jittery handshakes.
+  - Expose only `quic.mtu_upper_bound`, `quic.immediate_ack`, and `quic.congestion` (`bbr`/`cubic`/`new_reno`) in config. Derive the endpoint's `max_udp_payload_size` from the MTU bound, and validate the bound before starting listeners.
   - Verify with `crates/culvert/tests/test_quic_throughput.rs`, especially the `full_relay` cases that use the production client/server config.
 - **References**:
   - Constants: [consts.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/consts.rs) (`DEFAULT_QUIC_MTU_UPPER_BOUND`, `DEFAULT_QUIC_MAX_UDP_PAYLOAD_SIZE`)
