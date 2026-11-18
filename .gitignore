@@ -26,6 +26,7 @@ __pycache__
 *.swp
 *.tmp
 
+/.workbuddy-ai
+/docs/config-*
 /benchmarks
-/config.yaml
 /Makefile

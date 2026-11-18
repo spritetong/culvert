@@ -1,3 +1,5 @@
+# AGENTS
+
 ## Lessons Learned
 
 - Before starting a task, read `lessons.md`.

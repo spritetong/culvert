@@ -1,6 +1,6 @@
 # Lessons Learned
 
-A concise, actionable knowledge base of non-obvious bugs, architectural traps, and reusable engineering solutions discovered in `micro-tunnel` (`culvert`), with particular focus on QUIC, HTTP/3, connection pooling, and multiplexed async I/O.
+A concise, actionable knowledge base of non-obvious bugs, architectural traps, and reusable engineering solutions discovered in `culvert`, with particular focus on QUIC, HTTP/3, connection pooling, and multiplexed async I/O.
 
 ---
 
@@ -19,8 +19,8 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
     - `Poll::Pending` $\rightarrow$ stream is healthy and idle, return `Poll::Ready(HeartbeatStatus::Alive)`.
   - In `poll_read`, drain `read_buf` first before delegating to `recv_stream`.
 - **References**:
-  - Implementation: [stream.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/transport/h3/stream.rs#L536-L565)
-  - Probe Test: [test_idle_probe.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/tests/test_idle_probe.rs#L121-L186)
+  - Implementation: [stream.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/h3/stream.rs#L536-L565)
+  - Probe Test: [test_idle_probe.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/tests/test_idle_probe.rs#L121-L186)
 
 ### 1.2 Session Invalidation Kill Race in Multiplexed Connection Pools
 
@@ -34,8 +34,8 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
     4. Fall through to dial a brand-new connection rather than handing out a poisoned sibling.
   - In background heartbeat sweep (`PoolEvent::StreamsEvicted`): If a background eviction invalidates the session, unconditionally clear `idle_streams` and reset `idle_count = 0`.
 - **References**:
-  - Implementation: [connection_pool.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/pool/connection_pool.rs#L148-L200)
-  - Probe Test: [test_idle_probe.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/tests/test_idle_probe.rs#L40-L119)
+  - Implementation: [connection_pool.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/pool/connection_pool.rs#L148-L200)
+  - Probe Test: [test_idle_probe.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/tests/test_idle_probe.rs#L40-L119)
 
 ### 1.3 Stream-Level Activity Clock vs. NAT/Firewall UDP Pinholes
 
@@ -46,7 +46,7 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
   - Update `last_activity_ms` on every successful `poll_read` and `poll_write`.
   - Expose `last_activity_ms` through the `TunnelStream` trait so the connection pool reactor and relay pumps can deterministically retire silent streams before NAT/firewall boundaries expire them.
 - **References**:
-  - Implementation: [stream.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/transport/h3/stream.rs#L210-L215)
+  - Implementation: [stream.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/h3/stream.rs#L210-L215)
 
 ---
 
@@ -61,8 +61,8 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
   - Configure `stream_receive_window = 4 MiB`, `receive_window = 128 MiB`, and `send_window = 128 MiB`.
   - This 1:32 ratio guarantees that up to 32 concurrent unread streams can stall simultaneously before the shared connection window is exhausted, allowing probe packets and active streams to pass without starvation.
 - **References**:
-  - Implementation: [consts.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/consts.rs#L201-L208)
-  - Flow Control Test: [test_quic_flow_control_hol.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/tests/test_quic_flow_control_hol.rs)
+  - Implementation: [consts.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/consts.rs#L201-L208)
+  - Flow Control Test: [test_quic_flow_control_hol.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/tests/test_quic_flow_control_hol.rs)
 
 ### 2.2 Full-Duplex Decoupling & Half-Close Semantics
 
@@ -72,8 +72,8 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
   - Decouple send and receive halves using `h3::client::RequestStream::split()` and bounded mpsc backpressure channels (`PollSender`).
   - Liveness checking is strictly a read-side / transport error determination. Local FIN means "this direction cannot write any more", but the stream remains `HeartbeatStatus::Alive` so the opposite reading direction can cleanly transfer to completion.
 - **References**:
-  - Implementation: [stream.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/transport/h3/stream.rs#L217-L245)
-  - Architecture: [DESIGN.md](file:///d:/githome/spritetong/micro-tunnel/docs/DESIGN.md#L390-L405)
+  - Implementation: [stream.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/h3/stream.rs#L217-L245)
+  - Architecture: [DESIGN.md](file:///d:/githome/spritetong/@github/culvert/docs/DESIGN.md#L390-L405)
 
 ---
 
@@ -105,7 +105,7 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
   - In `RawQuicSession`, retain the owned `quinn::Connection` handle in `H3Connector`'s session cache (`cached_quic_session`).
   - Always configure `transport_config.keep_alive_interval(Some(DEFAULT_QUIC_KEEP_ALIVE_INTERVAL))` (5s) so PING frames maintain the connection even when zero sub-streams exist.
 - **References**:
-  - Implementation: [connector.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/transport/h3/connector.rs#L38-L50)
+  - Implementation: [connector.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/h3/connector.rs#L38-L50)
 
 ### 3.2 Abrupt Stream Drop Triggers `RESET_STREAM` / `STOP_SENDING` Instead of Clean EOF
 
@@ -116,7 +116,7 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
   - Always drive `poll_shutdown` / `finish()` to completion on stream writers before letting the stream drop.
   - In relay pumps, ensure both half-close directions drain buffered data to completion before tearing down stream handles.
 - **References**:
-  - Implementation: [stream.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/transport/h3/stream.rs#L127-L143)
+  - Implementation: [stream.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/h3/stream.rs#L127-L143)
 
 ### 3.3 Server Accept Loop Teardown Kills In-Flight Accepted Streams
 
@@ -129,7 +129,7 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
     ```
 
 - **References**:
-  - Implementation: [listener.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/transport/h3/listener.rs#L528-L531)
+  - Implementation: [listener.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/h3/listener.rs#L528-L531)
 
 ### 3.4 Persistent SendRequest Anchoring & `H3_STREAM_CREATION_ERROR`
 
@@ -139,7 +139,7 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
   - When establishing a new H3 session, always dial a dedicated fresh QUIC connection with ALPN `h3`.
   - Use compare-and-clear (`invalidate_h3_session_if_same(session_id)`) on reconnect to prevent lost updates or stomping over newer sessions dialed concurrently.
 - **References**:
-  - Implementation: [connector.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/transport/h3/connector.rs)
+  - Implementation: [connector.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/h3/connector.rs)
 
 ### 3.5 ALPN Strict Routing & TLS Mode Segregation
 
@@ -148,7 +148,7 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
   - Enforce explicit ALPN differentiation: `h3` for HTTP/3 CONNECT tunnels, and `culvert-quic` for raw bidirectional QUIC byte tunnels.
   - Raw QUIC listeners compare binary pre-shared tokens in constant time (`common::auth::constant_time_token_eq`) over length-prefixed MessagePack metadata frames, avoiding HTTP header parsing overhead and length leakages.
 - **References**:
-  - Architecture: [DESIGN.md](file:///d:/githome/spritetong/micro-tunnel/docs/DESIGN.md#L454-L493)
+  - Architecture: [DESIGN.md](file:///d:/githome/spritetong/@github/culvert/docs/DESIGN.md#L454-L493)
 
 ### 3.6 Zombie Session Reconnect & Fast Failover Bounds
 
@@ -158,8 +158,8 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
   - Implement `QuicLivenessTracker` monitoring UDP datagram progress; if data is transmitted without acknowledgement for `DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD` (10s), signal connection unresponsiveness.
   - Clamp retry concurrency during failure recovery (limit `in_flight` to 1 probe) to prevent connection storms when a remote host is unreachable.
 - **References**:
-  - Implementation: [connector.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/transport/h3/connector.rs)
-  - Integration Test: [test_h3_quic.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/tests/test_h3_quic.rs)
+  - Implementation: [connector.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/h3/connector.rs)
+  - Integration Test: [test_h3_quic.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/tests/test_h3_quic.rs)
 
 ---
 
@@ -173,7 +173,7 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
   - In client forward mapping (`crates/culvert/src/tunnel/forward.rs`), wrap pooled stream acquisition and activation in a 1-attempt retry loop (`attempts < max_attempts`, where `max_attempts = 2` when pooling is enabled).
   - If a pooled stream fails during target activation or initial write, do not drop the visitor; immediately fall back to dialing a fresh dedicated stream and retry activation.
 - **References**:
-  - Implementation: [forward.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/tunnel/forward.rs#L111-L168)
+  - Implementation: [forward.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/tunnel/forward.rs#L111-L168)
 
 ### 4.2 Reverse 0-RTT Pool: Half-Open Activation Trap & Round-Trip ACK Failover
 
@@ -187,8 +187,8 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
   4. Channel-Based Failover: Because `TaskTracker` is not `Clone` and background tasks cannot mutate accept loop state or trigger signaling disconnect handlers, missing ACK sends `(visitor_stream, visitor_addr)` through an `mpsc::channel` (`failover_tx`) into the main `tokio::select!` event loop.
   5. Unified Signaling Helper: The event loop routes failover visitors to `signal_new_connection`, completely unifying empty-pool fallback and half-open activation recovery without dropping visitors.
 - **References**:
-  - Implementation: [consts.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/consts.rs#L420-L428), [reverse.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/tunnel/reverse.rs#L315-L335), [runner.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/server/runner.rs#L710-L925)
-  - Probe Tests: [runner.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/server/runner.rs#L2125-L2245) (`test_reverse_pool_half_open_stream_fails_over_to_signaling`, `test_reverse_pool_active_ack_fast_path`)
+  - Implementation: [consts.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/consts.rs#L420-L428), [reverse.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/tunnel/reverse.rs#L315-L335), [runner.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/server/runner.rs#L710-L925)
+  - Probe Tests: [runner.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/server/runner.rs#L2125-L2245) (`test_reverse_pool_half_open_stream_fails_over_to_signaling`, `test_reverse_pool_active_ack_fast_path`)
 
 ### 4.3 Lockless & Decoupled Active Stream Tracking
 
@@ -198,7 +198,7 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
   - When an acquired stream closes (normally or via panic/cancellation), `ActiveStreamGuard::drop` atomically decrements the counter and sends an `ActiveReleased` hint to wake the pool actor.
   - Active relay throughput is completely unbounded by replenishment rate limits.
 - **References**:
-  - Implementation: [connection_pool.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/pool/connection_pool.rs)
+  - Implementation: [connection_pool.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/pool/connection_pool.rs)
 
 ### 4.4 Coordination Race Between Shared Reverse Pool Pre-Warming & Listener Registration
 
@@ -211,7 +211,7 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
   - `run_shared_reverse_pool` checks `reverse_ready.wait_ready()` before dialing any idle streams.
   - The first reverse mapping to receive `RegisterAck` invokes `reverse_ready.mark_ready()`, guaranteeing that `tunnel_pools[tunnel_id]` is already registered on the server before the first pre-warmed idle connection arrives.
 - **References**:
-  - Implementation: [reverse.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/tunnel/reverse.rs), [cluster.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/tunnel/cluster.rs)
+  - Implementation: [reverse.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/tunnel/reverse.rs), [cluster.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/tunnel/cluster.rs)
 
 ---
 
@@ -224,7 +224,7 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
   - Store accept futures in persistent `reusable_future::ReusableFutureRef` slots allocated outside the select loop.
   - In each loop iteration, poll `&mut slot`. If another select branch fires, the in-flight accept future remains safely preserved in its slot across iterations.
 - **References**:
-  - Implementation: [listener.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/transport/h3/listener.rs)
+  - Implementation: [listener.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/h3/listener.rs)
 
 ### 5.2 Probe-Driven Testing Methodology for Concurrency & Protocol Bugs
 
@@ -234,7 +234,7 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
   2. **Kill-Race Probe**: Populate an idle pool with multiple sibling streams sharing one multiplexed session; force session invalidation on the first acquire, and verify that subsequent acquires do not return dead sibling streams.
   3. **Flow Control HoL Probe**: Saturate multiple sibling streams with tens of megabytes of unread data; verify that a newly opened probe stream on the same connection completes prompt transfers without timing out.
 - **References**:
-  - Probe Tests: [test_idle_probe.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/tests/test_idle_probe.rs), [test_quic_flow_control_hol.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/tests/test_quic_flow_control_hol.rs)
+  - Probe Tests: [test_idle_probe.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/tests/test_idle_probe.rs), [test_quic_flow_control_hol.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/tests/test_quic_flow_control_hol.rs)
 
 ### 5.3 Event Loop Await Constraints & Future Abort Drop Guards
 
@@ -259,8 +259,8 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
        - Use `scopeguard::guard(state, cleanup_fn)` (`PendingSessionGuard`, `ReversePoolGuard`) when the guard needs to be returned or passed across function boundaries, disarming with `scopeguard::ScopeGuard::into_inner(guard)` upon successful pairing.
      - If the future is aborted mid-flight, Rust's drop semantics guarantee that the scopeguard runs to unregister pools and clean up pending session entries.
 - **References**:
-  - Implementation: [manager.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/session/manager.rs) (`PendingSessionGuard`, `ReversePoolGuard` type aliases using `scopeguard`), [channel.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/control/channel.rs) (`scopeguard::defer!`), [forward.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/tunnel/forward.rs) (`scopeguard::defer!`), [runner.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/server/runner.rs)
-  - Integration Tests: [runner.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/server/runner.rs#L1934-L2060) (`test_reverse_control_cancels_promptly_during_stalled_visitor_signaling`, `test_reverse_control_future_abort_cleans_up_resources`)
+  - Implementation: [manager.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/session/manager.rs) (`PendingSessionGuard`, `ReversePoolGuard` type aliases using `scopeguard`), [channel.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/control/channel.rs) (`scopeguard::defer!`), [forward.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/tunnel/forward.rs) (`scopeguard::defer!`), [runner.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/server/runner.rs)
+  - Integration Tests: [runner.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/server/runner.rs#L1934-L2060) (`test_reverse_control_cancels_promptly_during_stalled_visitor_signaling`, `test_reverse_control_future_abort_cleans_up_resources`)
 
 ### 5.4 Scattered Background Spawn Tasks: Cancellation Responsiveness & Drop Lifecycle
 
@@ -285,8 +285,8 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
      - Store `JoinHandle<()>` of spawned background pump tasks in the stream struct (`outbound_task`, `inbound_task`).
      - Implement `Drop` for the stream wrapper to call `task.abort()`, guaranteeing immediate cancellation and release of underlying QUIC/TCP stream resources on drop.
 - **References**:
-  - Implementation: [listener.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/transport/h3/listener.rs) (`request_tasks.spawn` timeout_or_cancel, `accept` cancel-aware lock), [session.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/mux/session.rs) (writer flush timeout, `accept_stream` cancellation), [stream.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/transport/h3/stream.rs) (`H3TunnelStream` Drop aborts background pump tasks), [uds.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/transport/uds.rs), [ws/listener.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/transport/ws/listener.rs), [udp.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/frontend/udp.rs)
-  - Tests: [tests.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/mux/tests.rs#L398) (`test_mux_accept_stream_immediate_cancellation`), [stream.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/transport/h3/stream.rs#L713) (`test_h3_stream_drop_aborts_background_tasks`)
+  - Implementation: [listener.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/h3/listener.rs) (`request_tasks.spawn` timeout_or_cancel, `accept` cancel-aware lock), [session.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/mux/session.rs) (writer flush timeout, `accept_stream` cancellation), [stream.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/h3/stream.rs) (`H3TunnelStream` Drop aborts background pump tasks), [uds.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/uds.rs), [ws/listener.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/ws/listener.rs), [udp.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/frontend/udp.rs)
+  - Tests: [tests.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/mux/tests.rs#L398) (`test_mux_accept_stream_immediate_cancellation`), [stream.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/h3/stream.rs#L713) (`test_h3_stream_drop_aborts_background_tasks`)
 
 ---
 
@@ -312,7 +312,7 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
      - Implement custom `Deserialize` for `L4Protocol` via `FromStr` that parses `"tcp"`, `"TCP"`, `"udp"`, `"UDP"` case-insensitively.
      - Omit `#[serde(default)]` on `MappingRuleConfig.protocol` to ensure serde strictly rejects missing protocol fields with descriptive errors.
 - **References**:
-  - Implementation: [model.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/config/model.rs), [addr.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/io/addr.rs), [loader.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/config/loader.rs)
+  - Implementation: [model.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/config/model.rs), [addr.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/io/addr.rs), [loader.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/config/loader.rs)
 
 ---
 
@@ -334,7 +334,7 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
   - Implement a graceful fallback: If IPv6 socket creation fails, treat it as "IPv6 unsupported / disabled" and fall back to an IPv4 socket on `0.0.0.0:port`. Detection covers `io::ErrorKind::Unsupported`, `io::ErrorKind::AddrNotAvailable`, and the raw OS codes: Linux `EAFNOSUPPORT` (97) / `EADDRNOTAVAIL` (99, e.g. `net.ipv6.conf.all.disable_ipv6=1`), Windows `WSAEAFNOSUPPORT` (10047) / `WSAEADDRNOTAVAIL` (10049), and macOS/BSD `EAFNOSUPPORT` (47) / `EADDRNOTAVAIL` (49). `EADDRINUSE` (98 / 10048) is deliberately **not** treated as unsupported so a genuine port conflict still fails loudly.
   - Reverse `:port` connect-back: advertise BOTH `[::]:port` and `0.0.0.0:port` as candidates and try them in order. A peer that fell back to IPv4-only would be unreachable via the literal `[::]:port` form, silently breaking the reverse inbound relay (TCP and UDP) — the IPv4 candidate restores it.
 - **References**:
-  - Implementation: [platform/mod.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/platform/mod.rs#L280-L335) (`create_dual_stack_tcp_listener`, `create_dual_stack_udp_socket`, `configure_reuse`)
+  - Implementation: [platform/mod.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/platform/mod.rs#L280-L335) (`create_dual_stack_tcp_listener`, `create_dual_stack_udp_socket`, `configure_reuse`)
 
 ### 7.2 Listen Socket (`ListenAddr`) vs. Connect Destination (`TargetAddr`) Separation
 
@@ -346,7 +346,7 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
     - `ListenAddr`: `DualStack(u16)`, `Ip(SocketAddr)`, `Domain(String, u16)`, `Path(PathBuf)`. Parses `:port` into `DualStack(port)`.
     - `TargetAddr`: `Ip(SocketAddr)`, `Domain(String, u16)`, `Path(PathBuf)`. Strictly rejects any address without a destination host (e.g. `:port`), failing fast at configuration parse and load time.
 - **References**:
-  - Implementation: [addr.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/io/addr.rs#L202-L250), [loader.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/config/loader.rs#L240-L280)
+  - Implementation: [addr.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/io/addr.rs#L202-L250), [loader.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/config/loader.rs#L240-L280)
 
 ### 7.3 IPv4-Mapped IPv6 Peer Address Normalization
 
@@ -357,7 +357,7 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
   - In `GenericListener::accept_owned` and `UdpFrontend` datagram loops, normalize accepted peer addresses using `v6.ip().to_canonical()`.
   - If the IPv6 address is an IPv4-mapped address, `to_canonical()` automatically unwraps it to `IpAddr::V4`, converting `SocketAddr::V6` into clean `SocketAddr::V4`.
 - **References**:
-  - Implementation: [platform/mod.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/platform/mod.rs#L88-L95), [udp.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/frontend/udp.rs#L135-L142)
+  - Implementation: [platform/mod.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/platform/mod.rs#L88-L95), [udp.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/frontend/udp.rs#L135-L142)
 
 ---
 
@@ -374,5 +374,5 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
   - **Target Delegation**: The destination endpoint's `target_host` is never resolved locally; it is passed verbatim to the proxy via HTTP `CONNECT` or SOCKS5 domain address type (`ATYP = 0x03`, SOCKS5h).
   - **Zero-Touch Transports**: Transports (such as `ws://` and `wss://`) dial via `endpoint.dialer.dial(host, port)`. Because the returned stream is an established, transparent byte tunnel, downstream TLS handshakes and WebSocket upgrades execute with zero modification.
 - **References**:
-  - Implementation: [proxy.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/src/dialer/proxy.rs)
-  - Integration Test: [test_proxy_e2e.rs](file:///d:/githome/spritetong/micro-tunnel/crates/culvert/tests/test_proxy_e2e.rs)
+  - Implementation: [proxy.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/dialer/proxy.rs)
+  - Integration Test: [test_proxy_e2e.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/tests/test_proxy_e2e.rs)
