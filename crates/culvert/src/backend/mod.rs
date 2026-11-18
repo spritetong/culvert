@@ -6,7 +6,7 @@
 //! `transport/` holds driver implementations and re-exports these traits.
 //! All comments and docstrings must be in English.
 
-use crate::config::model::{TlsConfig, TunnelMode};
+use crate::config::model::{QuicConfig, TlsConfig, TunnelMode};
 use crate::dialer::endpoint::EndpointContext;
 use crate::io::addr::{L4Protocol, TargetAddr};
 use crate::io::channel::IoChannel;
@@ -145,6 +145,7 @@ pub trait TransportDriver: Send + Sync + 'static {
         auth_token: Option<&str>,
         path: Option<&str>,
         tls: Option<&TlsConfig>,
+        quic: &QuicConfig,
         cancel: CancellationToken,
     ) -> Result<Box<dyn TransportListener>, TunnelError>;
 }

@@ -13,10 +13,9 @@ $ProjectRoot = Resolve-Path "$PSScriptRoot/.."
 Set-Location $ProjectRoot
 
 $BinPath = "$ProjectRoot/target/release/culvert.exe"
-if (-not (Test-Path $BinPath)) {
-    Write-Host "[*] Compiling culvert in release mode..." -ForegroundColor Cyan
-    cargo build --release
-}
+Write-Host "[*] Building culvert in release mode..." -ForegroundColor Cyan
+cargo build --release
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Write-Host "[*] Starting culvert client with config: $Config" -ForegroundColor Cyan
 Write-Host "[*] Benchmark ingress tunnel port: 127.0.0.1:15201" -ForegroundColor Yellow

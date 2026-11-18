@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::common::{CancelFutureExt, TaskTracker};
-use crate::config::model::{ServerConfig, TlsConfig, TunnelMode};
+use crate::config::model::{QuicConfig, ServerConfig, TlsConfig, TunnelMode};
 use crate::consts::{
     ACTIVATE_STREAM_ACK, DEFAULT_ACTIVATION_READ_TIMEOUT, DEFAULT_SESSION_PAIR_TIMEOUT,
     POOL_DUMMY_HOST, reverse_frame_timeout, reverse_grace_period, reverse_pool_soft_cap,
@@ -42,6 +42,7 @@ static REVERSE_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 pub struct ServerRunner {
     config: ServerConfig,
     global_tls: Option<TlsConfig>,
+    quic_config: QuicConfig,
     transport_registry: Arc<TransportRegistry>,
     session_manager: Arc<SessionManager>,
 }
@@ -49,9 +50,10 @@ pub struct ServerRunner {
 impl ServerRunner {
     /// Creates a new `ServerRunner` with default transport registry and session manager.
     pub fn from_config(config: ServerConfig) -> Self {
-        Self::with_global_tls(
+        Self::with_quic_config(
             config,
             None,
+            QuicConfig::default(),
             Arc::new(TransportRegistry::default()),
             Arc::new(SessionManager::new()),
         )
@@ -59,9 +61,10 @@ impl ServerRunner {
 
     /// Creates a new `ServerRunner` with global TLS and default registries.
     pub fn from_config_with_tls(config: ServerConfig, global_tls: Option<TlsConfig>) -> Self {
-        Self::with_global_tls(
+        Self::with_quic_config(
             config,
             global_tls,
+            QuicConfig::default(),
             Arc::new(TransportRegistry::default()),
             Arc::new(SessionManager::new()),
         )
@@ -73,7 +76,13 @@ impl ServerRunner {
         transport_registry: Arc<TransportRegistry>,
         session_manager: Arc<SessionManager>,
     ) -> Self {
-        Self::with_global_tls(config, None, transport_registry, session_manager)
+        Self::with_quic_config(
+            config,
+            None,
+            QuicConfig::default(),
+            transport_registry,
+            session_manager,
+        )
     }
 
     /// Creates a new `ServerRunner` with inherited global TLS configuration.
@@ -83,9 +92,27 @@ impl ServerRunner {
         transport_registry: Arc<TransportRegistry>,
         session_manager: Arc<SessionManager>,
     ) -> Self {
+        Self::with_quic_config(
+            config,
+            global_tls,
+            QuicConfig::default(),
+            transport_registry,
+            session_manager,
+        )
+    }
+
+    /// Creates a new `ServerRunner` with explicit QUIC transport tuning.
+    pub fn with_quic_config(
+        config: ServerConfig,
+        global_tls: Option<TlsConfig>,
+        quic_config: QuicConfig,
+        transport_registry: Arc<TransportRegistry>,
+        session_manager: Arc<SessionManager>,
+    ) -> Self {
         Self {
             config,
             global_tls,
+            quic_config,
             transport_registry,
             session_manager,
         }
@@ -126,6 +153,7 @@ impl ServerRunner {
                 .config
                 .udp_idle_timeout
                 .unwrap_or(crate::consts::DEFAULT_UDP_IDLE_TIMEOUT);
+            let quic_config = self.quic_config.clone();
 
             tracker.spawn_with_cancel(move |token| async move {
                 let mut listener = registry.create_listener(
@@ -134,6 +162,7 @@ impl ServerRunner {
                     token_opt.as_deref(),
                     spec_clone.path.as_deref(),
                     server_tls.as_ref(),
+                    &quic_config,
                     token.clone(),
                 )?;
 

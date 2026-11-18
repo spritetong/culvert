@@ -15,10 +15,9 @@ $ProjectRoot = Resolve-Path "$PSScriptRoot/.."
 Set-Location $ProjectRoot
 
 $BinPath = "$ProjectRoot/target/release/culvert.exe"
-if (-not (Test-Path $BinPath)) {
-    Write-Host "[*] Compiling culvert in release mode..." -ForegroundColor Cyan
-    cargo build --release
-}
+Write-Host "[*] Building culvert in release mode..." -ForegroundColor Cyan
+cargo build --release
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # Helper to check if a TCP port is listening
 function Test-PortListening([string]$HostName, [int]$Port) {

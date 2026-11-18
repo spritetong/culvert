@@ -82,6 +82,7 @@ impl TransportDriver for UdsTransportDriver {
         auth_token: Option<&str>,
         path: Option<&str>,
         tls: Option<&crate::config::model::TlsConfig>,
+        _quic: &crate::config::model::QuicConfig,
         cancel: CancellationToken,
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
         let is_wss = socket_path.starts_with("wss+unix://");
@@ -683,7 +684,14 @@ mod tests {
 
         let driver = UdsTransportDriver;
         let url = format!("ws+unix://{}?chmod=0o660", sock_str);
-        let listener = driver.build_listener(&url, None, None, None, CancellationToken::new());
+        let listener = driver.build_listener(
+            &url,
+            None,
+            None,
+            None,
+            &Default::default(),
+            CancellationToken::new(),
+        );
         assert!(listener.is_ok());
 
         assert!(sock_path.exists());

@@ -7,7 +7,7 @@
 
 use std::future::Future;
 use std::io;
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
@@ -21,7 +21,7 @@ use crate::consts::{
     DEFAULT_H3_FINISH_STREAM_TIMEOUT, DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD,
     H3_STREAM_CHUNK_QUEUE_SIZE,
 };
-use crate::core::stream::{HeartbeatStatus, TunnelStream, activity_now_ms};
+use crate::core::stream::{HeartbeatStatus, StreamCaps, TunnelStream, activity_now_ms};
 
 /// Raw QUIC bidirectional stream adapter directly polling `quinn::SendStream` and `quinn::RecvStream`.
 pub struct QuinnTunnelStream {
@@ -189,6 +189,36 @@ impl QuicLivenessTracker {
 }
 
 impl TunnelStream for QuinnTunnelStream {
+    fn caps(&self) -> StreamCaps {
+        StreamCaps {
+            owned_write: true,
+            ..StreamCaps::default()
+        }
+    }
+
+    fn poll_write_owned(&mut self, cx: &mut Context<'_>, chunk: Bytes) -> Poll<io::Result<usize>> {
+        if chunk.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        let this = self;
+        let result = {
+            let mut chunks = [chunk];
+            let mut write = pin!(this.send.write_chunks(&mut chunks));
+            write.as_mut().poll(cx)
+        };
+        match result {
+            Poll::Ready(Ok(written)) => {
+                if written.bytes > 0 {
+                    this.touch_activity();
+                }
+                Poll::Ready(Ok(written.bytes))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
     fn last_activity_ms(&self) -> Option<u64> {
         Some(self.last_activity_ms.load(Ordering::Relaxed))
     }
@@ -289,6 +319,43 @@ impl H3TunnelStream {
     fn touch_activity(&self) {
         self.last_activity_ms
             .store(activity_now_ms(), Ordering::Relaxed);
+    }
+
+    fn poll_write_bytes(&mut self, cx: &mut Context<'_>, chunk: Bytes) -> Poll<io::Result<usize>> {
+        if self.fin_sent {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "HTTP/3 stream write direction closed",
+            )));
+        }
+
+        let tx = match self.tx_outbound.as_mut() {
+            Some(tx) => tx,
+            None => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "HTTP/3 stream write direction closed",
+                )));
+            }
+        };
+
+        if chunk.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        match tx.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => {
+                let len = chunk.len();
+                let _ = tx.send_item(chunk);
+                self.touch_activity();
+                Poll::Ready(Ok(len))
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "HTTP/3 background pump closed",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     fn spawn_split_pump<S, R>(mut send_stream: S, mut recv_stream: R) -> Self
@@ -422,43 +489,8 @@ impl AsyncWrite for H3TunnelStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.fin_sent {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "HTTP/3 stream write direction closed",
-            )));
-        }
-
-        let this = self.get_mut();
-        let tx = match this.tx_outbound.as_mut() {
-            Some(t) => t,
-            None => {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "HTTP/3 stream write direction closed",
-                )));
-            }
-        };
-
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-
-        // Use poll_reserve to properly register async waker instead of spinning in wake_by_ref
-        match tx.poll_reserve(cx) {
-            Poll::Ready(Ok(())) => {
-                let chunk = Bytes::copy_from_slice(buf);
-                let len = chunk.len();
-                let _ = tx.send_item(chunk);
-                this.touch_activity();
-                Poll::Ready(Ok(len))
-            }
-            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                "HTTP/3 background pump closed",
-            ))),
-            Poll::Pending => Poll::Pending,
-        }
+        self.get_mut()
+            .poll_write_bytes(cx, Bytes::copy_from_slice(buf))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -517,6 +549,17 @@ impl AsyncWrite for H3TunnelStream {
 }
 
 impl TunnelStream for H3TunnelStream {
+    fn caps(&self) -> StreamCaps {
+        StreamCaps {
+            owned_write: true,
+            ..StreamCaps::default()
+        }
+    }
+
+    fn poll_write_owned(&mut self, cx: &mut Context<'_>, chunk: Bytes) -> Poll<io::Result<usize>> {
+        self.poll_write_bytes(cx, chunk)
+    }
+
     fn last_activity_ms(&self) -> Option<u64> {
         Some(self.last_activity_ms.load(Ordering::Relaxed))
     }
@@ -688,6 +731,7 @@ mod tests {
         };
         let recv = MockFailingRecvStream { sent_item: false };
         let mut stream = H3TunnelStream::spawn_split_pump(send, recv);
+        assert!(stream.caps().owned_write);
 
         let mut buf = vec![0u8; 18];
         let n = stream.read(&mut buf).await.expect("initial read succeeds");

@@ -56,6 +56,7 @@ if ($engine -eq "iperf3") {
     exit $LASTEXITCODE
 } elseif ($engine -eq "wsl-iperf3") {
     Write-Host "[*] Found iperf3 in WSL. Executing WSL iperf3 benchmark (-P $Streams parallel streams, $DurationSec s duration)..." -ForegroundColor Green
+    Write-Host "[!] WSL loopback adds an extra Windows/WSL boundary; this number is not a clean tunnel throughput figure." -ForegroundColor Yellow
     wsl.exe iperf3 -c $TargetHost -p $TargetPort -P $Streams -t $DurationSec
     exit $LASTEXITCODE
 }

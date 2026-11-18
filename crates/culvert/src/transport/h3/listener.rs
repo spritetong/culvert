@@ -15,8 +15,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use super::{apply_quic_config, quic_endpoint_config};
 use crate::common::{CancelFutureExt, TimeoutOrCancel};
-use crate::config::model::TunnelMode;
+use crate::config::model::{QuicConfig, TunnelMode};
 use crate::consts::{
     ALPN_H3, ALPN_QUIC, AUTH_BEARER_PREFIX, DEFAULT_H3_REQUEST_DRAIN_TIMEOUT,
     DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_QUIC_KEEP_ALIVE_INTERVAL,
@@ -79,11 +80,12 @@ impl H3Listener {
         path: Option<&str>,
         server_rustls_config: rustls::ServerConfig,
     ) -> Result<Self, TunnelError> {
-        Self::bind_with_cancel(
+        Self::bind_with_quic(
             listen_addr,
             auth_token,
             path,
             server_rustls_config,
+            &QuicConfig::default(),
             CancellationToken::new(),
         )
     }
@@ -96,6 +98,25 @@ impl H3Listener {
         server_rustls_config: rustls::ServerConfig,
         cancel: CancellationToken,
     ) -> Result<Self, TunnelError> {
+        Self::bind_with_quic(
+            listen_addr,
+            auth_token,
+            path,
+            server_rustls_config,
+            &QuicConfig::default(),
+            cancel,
+        )
+    }
+
+    /// Binds an `H3Listener` with explicit QUIC transport tuning.
+    pub fn bind_with_quic(
+        listen_addr: &str,
+        auth_token: Option<&str>,
+        path: Option<&str>,
+        server_rustls_config: rustls::ServerConfig,
+        quic: &QuicConfig,
+        cancel: CancellationToken,
+    ) -> Result<Self, TunnelError> {
         Self::bind_with_options(
             listen_addr,
             auth_token,
@@ -104,6 +125,7 @@ impl H3Listener {
             cancel,
             None,
             None,
+            quic,
         )
     }
 
@@ -116,6 +138,7 @@ impl H3Listener {
         cancel: CancellationToken,
         heartbeat_interval: Option<Duration>,
         idle_timeout: Option<Duration>,
+        quic: &QuicConfig,
     ) -> Result<Self, TunnelError> {
         let clean_addr = if let Some(idx) = listen_addr.find("://") {
             let without_scheme = &listen_addr[idx + 3..];
@@ -178,29 +201,43 @@ impl H3Listener {
             .stream_receive_window(quinn::VarInt::from_u32(DEFAULT_QUIC_STREAM_RECEIVE_WINDOW));
         transport_config.receive_window(quinn::VarInt::from_u32(DEFAULT_QUIC_RECEIVE_WINDOW));
         transport_config.send_window(DEFAULT_QUIC_SEND_WINDOW);
+        apply_quic_config(&mut transport_config, quic);
         server_config.transport_config(Arc::new(transport_config));
 
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| TunnelError::Io(std::io::Error::other("No quinn runtime available")))?;
         let quinn_endpoint = match parsed_listen {
             crate::io::addr::ListenAddr::DualStack(port) => {
                 let udp_socket =
                     crate::platform::create_dual_stack_udp_socket(port).map_err(TunnelError::Io)?;
-                let runtime = quinn::default_runtime().ok_or_else(|| {
-                    TunnelError::Io(std::io::Error::other("No quinn runtime available"))
-                })?;
                 quinn::Endpoint::new(
-                    quinn::EndpointConfig::default(),
+                    quic_endpoint_config(quic),
                     Some(server_config),
                     udp_socket,
-                    runtime,
+                    Arc::clone(&runtime),
                 )
                 .map_err(TunnelError::Io)?
             }
             crate::io::addr::ListenAddr::Ip(addr) => {
-                quinn::Endpoint::server(server_config, addr).map_err(TunnelError::Io)?
+                let udp_socket = std::net::UdpSocket::bind(addr).map_err(TunnelError::Io)?;
+                quinn::Endpoint::new(
+                    quic_endpoint_config(quic),
+                    Some(server_config),
+                    udp_socket,
+                    Arc::clone(&runtime),
+                )
+                .map_err(TunnelError::Io)?
             }
             crate::io::addr::ListenAddr::Domain(host, port) => {
                 let addr = resolve_listen_socket_addr(&format!("{}:{}", host, port), listen_addr)?;
-                quinn::Endpoint::server(server_config, addr).map_err(TunnelError::Io)?
+                let udp_socket = std::net::UdpSocket::bind(addr).map_err(TunnelError::Io)?;
+                quinn::Endpoint::new(
+                    quic_endpoint_config(quic),
+                    Some(server_config),
+                    udp_socket,
+                    Arc::clone(&runtime),
+                )
+                .map_err(TunnelError::Io)?
             }
             crate::io::addr::ListenAddr::Path(_) => {
                 return Err(TunnelError::Config(

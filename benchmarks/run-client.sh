@@ -18,10 +18,8 @@ CONFIG="${1:-${SCRIPT_DIR}/client-bench.yaml}"
 
 cd "${PROJECT_ROOT}"
 
-if [ ! -f "${BIN_PATH}" ]; then
-    echo "[*] Compiling culvert in release mode..."
-    cargo build --release
-fi
+echo "[*] Building culvert in release mode..."
+cargo build --release
 
 echo "[*] Starting culvert client with config: ${CONFIG}"
 exec "${BIN_PATH}" -c "${CONFIG}"

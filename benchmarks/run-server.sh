@@ -18,10 +18,8 @@ CONFIG="${1:-${SCRIPT_DIR}/server-bench.yaml}"
 
 cd "${PROJECT_ROOT}"
 
-if [ ! -f "${BIN_PATH}" ]; then
-    echo "[*] Compiling culvert in release mode..."
-    cargo build --release
-fi
+echo "[*] Building culvert in release mode..."
+cargo build --release
 
 # Check and optionally start iperf3. Match a server command line only: a running
 # `iperf3 -c` client has the same process name but is not a backend listener.

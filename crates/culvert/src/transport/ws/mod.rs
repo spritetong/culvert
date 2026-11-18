@@ -49,6 +49,7 @@ impl TransportDriver for WsTransportDriver {
         auth_token: Option<&str>,
         path: Option<&str>,
         tls: Option<&crate::config::model::TlsConfig>,
+        _quic: &crate::config::model::QuicConfig,
         cancel: CancellationToken,
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
         let is_wss = listen_addr.starts_with("wss://") || listen_addr.starts_with("https://");

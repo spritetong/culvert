@@ -861,6 +861,7 @@ mod tests {
             _auth_token: Option<&str>,
             _path: Option<&str>,
             _tls: Option<&crate::config::model::TlsConfig>,
+            _quic: &crate::config::model::QuicConfig,
             _cancel: CancellationToken,
         ) -> Result<Box<dyn TransportListener>, TunnelError> {
             unimplemented!()
@@ -994,6 +995,7 @@ mod tests {
             _auth_token: Option<&str>,
             _path: Option<&str>,
             _tls: Option<&crate::config::model::TlsConfig>,
+            _quic: &crate::config::model::QuicConfig,
             _cancel: CancellationToken,
         ) -> Result<Box<dyn TransportListener>, TunnelError> {
             unimplemented!()
@@ -1112,6 +1114,7 @@ mod tests {
             _auth_token: Option<&str>,
             _path: Option<&str>,
             _tls: Option<&crate::config::model::TlsConfig>,
+            _quic: &crate::config::model::QuicConfig,
             _cancel: CancellationToken,
         ) -> Result<Box<dyn TransportListener>, TunnelError> {
             unimplemented!()

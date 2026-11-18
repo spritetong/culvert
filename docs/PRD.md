@@ -171,7 +171,7 @@ behavior is configurable, the configuration key is given.
 - **FR-3.1** The configuration is YAML. All top-level and nested sections use
   `deny_unknown_fields`; unknown keys are errors.
 - **FR-3.2** Global sections are `log`, `worker_threads`, `dns`, `dialer`,
-  `tls`, `server`, and `tunnels`. The complete key reference is in
+  `tls`, `server`, `tunnels`, and `quic`. The complete key reference is in
   [README.md](../README.md#configuration-reference).
 - **FR-3.3** `tunnels[].endpoint` is either an URL string or an object with
   `url` plus optional `dns`, `dialer`, and `tls` blocks. Effective values are
@@ -435,7 +435,7 @@ behavior is configurable, the configuration key is given.
 | NFR-6 | The relay hot path uses a single `poll_fn` state machine rather than a per-direction task. | `io/pump.rs` (`StreamStreamPump`, `DatagramStreamPump`, `DatagramDatagramPump`). This is a deliberate performance constraint; it must not be replaced with `tokio::select!` in the hot path. |
 | NFR-7 | Documentation states implemented behavior only. | Unwired options are rejected by the loader and listed in Section 6. |
 | NFR-8 | Frontend, core, and backend are independently replaceable. | `io/`, `frontend/`, `backend/`, `core::serve`, `PumpRegistry`; see FR-9. |
-| NFR-9 | I/O capability is queried, not guessed. | `StreamCaps` / `poll_write_owned` replace the former dead `consumes_owned_write()` + `poll_write_bytes()` pair; `caps()` is read once per direction. |
+| NFR-9 | I/O capability is queried, not guessed. | `StreamCaps` / `poll_write_owned` replace the former dead `consumes_owned_write()` + `poll_write_bytes()` pair; `caps()` is read once per direction. WS, QUIC, and H3 advertise owned writes. |
 
 Performance figures, throughput targets, memory budgets, and latency
 commitments are not specified: they depend on the deployment and are not

@@ -39,7 +39,7 @@ tunnels:
     #   - "h3://127.0.0.1:8443/tunnel"
     #   - "quic://127.0.0.1:8443"
     #   - "wss+unix:///run/culvert.sock?path=/tunnel"
-    endpoint: "wss://127.0.0.1:8443"
+    endpoint: "quic://127.0.0.1:8443"
     token: "bench_secret_token_123456"
     mappings:
       forward:

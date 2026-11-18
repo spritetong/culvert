@@ -264,6 +264,28 @@ pub const DEFAULT_QUIC_RECEIVE_WINDOW: u32 = 128 * 1024 * 1024;
 /// Flow control connection send window (128 MiB).
 pub const DEFAULT_QUIC_SEND_WINDOW: u64 = 128 * 1024 * 1024;
 
+/// Upper bound for QUIC path MTU discovery. The initial datagram stays at
+/// quinn's safe 1200-byte default; only paths that actually answer larger
+/// probes use jumbo datagrams.
+pub const DEFAULT_QUIC_MTU_UPPER_BOUND: u16 = 8192;
+
+/// Bounds accepted by quinn's UDP payload configuration.
+pub const MIN_QUIC_MTU_UPPER_BOUND: u16 = 1200;
+pub const MAX_QUIC_MTU_UPPER_BOUND: u16 = 65_527;
+
+/// Maximum UDP payload a QUIC endpoint accepts and advertises. Both sides of
+/// a connection must use the same value before discovery can exceed 1472 bytes.
+pub const DEFAULT_QUIC_MAX_UDP_PAYLOAD_SIZE: u16 = DEFAULT_QUIC_MTU_UPPER_BOUND;
+
+/// Request an ACK for every ack-eliciting packet. Avoids a delayed-ACK timer
+/// from adding up to 25 ms to loss detection and congestion feedback on quiet
+/// tunnel streams.
+pub const DEFAULT_QUIC_ACK_ELICITING_THRESHOLD: u32 = 1;
+
+/// Keep quinn's default reordering tolerance (`packet_threshold - 1`) when
+/// requesting immediate ACKs, so reordered packets do not force spurious ACKs.
+pub const DEFAULT_QUIC_ACK_REORDERING_THRESHOLD: u32 = 2;
+
 /// Duration without received UDP datagrams while transmitting before a QUIC connection is deemed unresponsive.
 ///
 /// 10 seconds prevents false-positive failover or disconnect triggers on high-jitter,

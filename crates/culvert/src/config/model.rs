@@ -28,6 +28,47 @@ pub struct AppConfig {
 
     #[serde(default)]
     pub tunnels: Vec<TunnelConfig>,
+
+    /// QUIC transport tuning shared by client connectors and server listeners.
+    #[serde(default)]
+    pub quic: QuicConfig,
+}
+
+/// QUIC parameters that are safe to expose without changing connection semantics.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct QuicConfig {
+    /// PLPMTUD upper bound. The initial MTU remains 1200 for path safety.
+    pub mtu_upper_bound: Option<u16>,
+    /// Request an ACK for every ack-eliciting packet instead of using delayed ACKs.
+    pub immediate_ack: Option<bool>,
+    /// Congestion controller used by quinn.
+    pub congestion: Option<QuicCongestion>,
+}
+
+impl Default for QuicConfig {
+    fn default() -> Self {
+        Self {
+            mtu_upper_bound: None,
+            immediate_ack: None,
+            congestion: None,
+        }
+    }
+}
+
+/// Supported QUIC congestion controllers.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuicCongestion {
+    Cubic,
+    Bbr,
+    NewReno,
+}
+
+impl Default for QuicCongestion {
+    fn default() -> Self {
+        Self::Cubic
+    }
 }
 
 /// Parses a UDS `chmod=` value. Socket modes are always octal: a plain `660`

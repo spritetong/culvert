@@ -789,9 +789,10 @@ impl TransportDriver for CountingWsDriver {
         auth_token: Option<&str>,
         path: Option<&str>,
         tls: Option<&TlsConfig>,
+        quic: &culvert::config::model::QuicConfig,
         cancel: CancellationToken,
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
-        WsTransportDriver.build_listener(listen_addr, auth_token, path, tls, cancel)
+        WsTransportDriver.build_listener(listen_addr, auth_token, path, tls, quic, cancel)
     }
 }
 

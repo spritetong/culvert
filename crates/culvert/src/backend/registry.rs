@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::{TransportConnector, TransportDriver, TransportListener};
-use crate::config::model::{TlsConfig, TunnelMode};
+use crate::config::model::{QuicConfig, TlsConfig, TunnelMode};
 use crate::dialer::endpoint::EndpointContext;
 use crate::io::error::TunnelError;
 
@@ -76,6 +76,7 @@ impl TransportRegistry {
         auth_token: Option<&str>,
         path: Option<&str>,
         tls: Option<&TlsConfig>,
+        quic: &QuicConfig,
         cancel: CancellationToken,
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
         let driver = self
@@ -88,6 +89,6 @@ impl TransportRegistry {
             format!("{}://{}", scheme, listen_addr)
         };
 
-        driver.build_listener(&full_addr, auth_token, path, tls, cancel)
+        driver.build_listener(&full_addr, auth_token, path, tls, quic, cancel)
     }
 }

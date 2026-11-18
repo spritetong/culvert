@@ -51,6 +51,18 @@ impl ConfigLoader {
             ));
         }
 
+        // 2a. QUIC transport validation
+        if let Some(mtu) = config.quic.mtu_upper_bound
+            && !(crate::consts::MIN_QUIC_MTU_UPPER_BOUND..=crate::consts::MAX_QUIC_MTU_UPPER_BOUND)
+                .contains(&mtu)
+        {
+            return Err(TunnelError::Config(format!(
+                "quic.mtu_upper_bound must be between {} and {}",
+                crate::consts::MIN_QUIC_MTU_UPPER_BOUND,
+                crate::consts::MAX_QUIC_MTU_UPPER_BOUND
+            )));
+        }
+
         // 3. Log level & output validation
         let level = config.log.level.to_lowercase();
         if !matches!(
@@ -799,6 +811,36 @@ tunnels:
             config.tunnels[0].endpoint.url(),
             "wss://tunnel.example.com/ws"
         );
+    }
+
+    #[test]
+    fn test_load_quic_tuning_config() {
+        let yaml = r#"
+server:
+  listen: ["ws://127.0.0.1:8080/tunnel"]
+quic:
+  mtu_upper_bound: 9000
+  immediate_ack: false
+  congestion: bbr
+"#;
+        let config = ConfigLoader::from_yaml_str(yaml).unwrap();
+        assert_eq!(config.quic.mtu_upper_bound, Some(9000));
+        assert_eq!(config.quic.immediate_ack, Some(false));
+        assert_eq!(
+            config.quic.congestion,
+            Some(crate::config::model::QuicCongestion::Bbr)
+        );
+    }
+
+    #[test]
+    fn test_reject_invalid_quic_mtu_upper_bound() {
+        let yaml = r#"
+server:
+  listen: ["ws://127.0.0.1:8080/tunnel"]
+quic:
+  mtu_upper_bound: 1199
+"#;
+        assert!(ConfigLoader::from_yaml_str(yaml).is_err());
     }
 
     #[test]

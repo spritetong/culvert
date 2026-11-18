@@ -293,6 +293,7 @@ Configuration files use standard YAML. `culvert` enforces strict schema validati
 | `tls` | object | No | — | Global TLS certificate, key, and verification options. |
 | `server` | object | No | — | Ingress listener definition. |
 | `tunnels` | list | No | `[]` | List of tunnel clients. |
+| `quic` | object | No | See below | QUIC transport tuning shared by client and server. |
 
 ---
 
@@ -434,6 +435,17 @@ Each mapping rule in `rules[]` accepts:
 | `listen` | string | Yes | — | Listening socket address: `:port` (Dual-stack IPv6/IPv4 binding on `[::]:port` via `socket2` with `set_only_v6(false)` on Windows/Unix), `addr:port` (OS default, e.g. `127.0.0.1:8080`), `hostname:port`, or `unix://path` (TCP only). |
 | `target` | string | Yes | — | Outbound dial destination (`connect`): `ip:port`, `hostname:port`, `[ipv6]:port`, or `unix://path` (TCP only). Host cannot be omitted (`:port` is not valid for target). |
 | `udp_idle_timeout` | duration | No | `dialer.udp_idle_timeout` (`30s`) | UDP only: overrides client-side UDP session idle timeout. Must be `> 0`. |
+
+### 8. `quic`
+
+```yaml
+quic:
+  mtu_upper_bound: 8192   # 1200-65527, applied on both client and server
+  immediate_ack: true     # request ACK for every ack-eliciting packet
+  congestion: cubic       # cubic | bbr | new_reno
+```
+
+`mtu_upper_bound` also sets the advertised UDP payload size; the initial MTU stays 1200 so ordinary paths still handshake. Set the same values on both peers. Initial RTT, loss thresholds, and congestion-controller internals are intentionally not configurable.
 
 ---
 

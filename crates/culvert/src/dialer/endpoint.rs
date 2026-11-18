@@ -8,7 +8,9 @@
 use std::sync::Arc;
 use url::Url;
 
-use crate::config::model::{AppConfig, DialerConfig, DnsConfig, EndpointConfig, TlsConfig};
+use crate::config::model::{
+    AppConfig, DialerConfig, DnsConfig, EndpointConfig, QuicConfig, TlsConfig,
+};
 use crate::core::error::TunnelError;
 use crate::dialer::dns::{CachedDnsResolver, DnsResolver};
 use crate::dialer::unified::{DefaultDialer, Dialer};
@@ -104,6 +106,7 @@ pub struct EndpointContext {
     pub dialer_config: DialerConfig,
     pub tls_config: Option<TlsConfig>,
     pub http_headers: Option<std::collections::HashMap<String, String>>,
+    pub quic_config: QuicConfig,
 }
 
 impl EndpointContext {
@@ -262,6 +265,7 @@ impl EndpointContext {
             dialer_config: effective_dialer,
             tls_config: effective_tls,
             http_headers: endpoint_headers,
+            quic_config: global_app.quic.clone(),
         })
     }
 

@@ -15,6 +15,7 @@ use parking_lot::RwLock;
 use tokio::sync::Mutex;
 use tracing::debug;
 
+use super::{apply_quic_config, quic_endpoint_config};
 use crate::config::model::TunnelMode;
 use crate::consts::{
     ALPN_H3_STR, ALPN_QUIC_STR, AUTH_BEARER_PREFIX, DEFAULT_HANDSHAKE_TIMEOUT,
@@ -84,6 +85,7 @@ impl H3Connector {
     ) -> Result<Self, TunnelError> {
         let scheme = endpoint.endpoint.scheme.as_str();
         let is_quic_raw = scheme == SCHEME_QUIC;
+        let quic = &endpoint.quic_config;
 
         let mut tls_config = endpoint.tls_config.clone().unwrap_or_default();
         if is_quic_raw {
@@ -146,10 +148,16 @@ impl H3Connector {
             .stream_receive_window(quinn::VarInt::from_u32(DEFAULT_QUIC_STREAM_RECEIVE_WINDOW));
         transport_config.receive_window(quinn::VarInt::from_u32(DEFAULT_QUIC_RECEIVE_WINDOW));
         transport_config.send_window(DEFAULT_QUIC_SEND_WINDOW);
+        apply_quic_config(&mut transport_config, quic);
         client_config.transport_config(Arc::new(transport_config));
 
         let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-        let mut quinn_endpoint = quinn::Endpoint::client(bind_addr).map_err(TunnelError::Io)?;
+        let socket = std::net::UdpSocket::bind(bind_addr).map_err(TunnelError::Io)?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| TunnelError::Io(std::io::Error::other("No quinn runtime available")))?;
+        let mut quinn_endpoint =
+            quinn::Endpoint::new(quic_endpoint_config(quic), None, socket, runtime)
+                .map_err(TunnelError::Io)?;
         quinn_endpoint.set_default_client_config(client_config);
 
         Ok(Self {

@@ -13,12 +13,70 @@ pub use connector::H3Connector;
 pub use listener::H3Listener;
 pub use stream::{H3TunnelStream, QuinnTunnelStream};
 
-use crate::config::model::TunnelMode;
-use crate::consts::{ALPN_H3, ALPN_QUIC, SCHEME_H3, SCHEME_HTTPS, SCHEME_QUIC};
+use std::sync::Arc;
+
+use crate::config::model::{QuicConfig, QuicCongestion, TunnelMode};
+use crate::consts::{
+    ALPN_H3, ALPN_QUIC, DEFAULT_QUIC_ACK_ELICITING_THRESHOLD,
+    DEFAULT_QUIC_ACK_REORDERING_THRESHOLD, DEFAULT_QUIC_MTU_UPPER_BOUND, SCHEME_H3, SCHEME_HTTPS,
+    SCHEME_QUIC,
+};
 use crate::core::error::TunnelError;
 use crate::dialer::endpoint::EndpointContext;
 use crate::transport::{TransportConnector, TransportDriver, TransportListener};
 use tokio_util::sync::CancellationToken;
+
+fn effective_mtu(quic: &QuicConfig) -> u16 {
+    quic.mtu_upper_bound.unwrap_or(DEFAULT_QUIC_MTU_UPPER_BOUND)
+}
+
+/// Endpoint-level QUIC socket configuration. `max_udp_payload_size` is also
+/// advertised to the peer, so it must be set on listeners and connectors alike.
+pub(crate) fn quic_endpoint_config(quic: &QuicConfig) -> quinn::EndpointConfig {
+    let mut config = quinn::EndpointConfig::default();
+    config
+        .max_udp_payload_size(effective_mtu(quic))
+        .expect("quic.mtu_upper_bound is validated at config load");
+    config
+}
+
+/// Applies the exposed QUIC transport knobs. Everything else stays at quinn's
+/// defaults: initial MTU, loss thresholds, and RTT estimation are not config
+/// surface because lowering them trades WAN stability for tail latency.
+pub(crate) fn apply_quic_config(config: &mut quinn::TransportConfig, quic: &QuicConfig) {
+    let mut discovery = quinn::MtuDiscoveryConfig::default();
+    discovery.upper_bound(effective_mtu(quic));
+    config.mtu_discovery_config(Some(discovery));
+
+    if quic.immediate_ack.unwrap_or(true) {
+        let mut ack = quinn::AckFrequencyConfig::default();
+        ack.ack_eliciting_threshold(quinn::VarInt::from_u32(
+            DEFAULT_QUIC_ACK_ELICITING_THRESHOLD,
+        ));
+        ack.max_ack_delay(Some(std::time::Duration::ZERO));
+        ack.reordering_threshold(quinn::VarInt::from_u32(
+            DEFAULT_QUIC_ACK_REORDERING_THRESHOLD,
+        ));
+        config.ack_frequency_config(Some(ack));
+    } else {
+        config.ack_frequency_config(None);
+    }
+
+    match quic.congestion.unwrap_or_default() {
+        QuicCongestion::Cubic => {
+            config
+                .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
+        }
+        QuicCongestion::Bbr => {
+            config.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+        }
+        QuicCongestion::NewReno => {
+            config.congestion_controller_factory(Arc::new(
+                quinn::congestion::NewRenoConfig::default(),
+            ));
+        }
+    }
+}
 
 /// HTTP/3 transport driver handling `h3`, `https`, and `quic` schemes.
 pub struct H3TransportDriver;
@@ -44,6 +102,7 @@ impl TransportDriver for H3TransportDriver {
         auth_token: Option<&str>,
         path: Option<&str>,
         tls: Option<&crate::config::model::TlsConfig>,
+        quic: &QuicConfig,
         cancel: CancellationToken,
     ) -> Result<Box<dyn TransportListener>, TunnelError> {
         let mut alpn = tls
@@ -78,7 +137,7 @@ impl TransportDriver for H3TransportDriver {
         )?;
 
         let listener =
-            H3Listener::bind_with_cancel(listen_addr, auth_token, path, server_rustls, cancel)?;
+            H3Listener::bind_with_quic(listen_addr, auth_token, path, server_rustls, quic, cancel)?;
         Ok(Box::new(listener))
     }
 }

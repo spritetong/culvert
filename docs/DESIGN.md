@@ -390,8 +390,19 @@ borrowed write path; `caps().half_close` replaces the old
 query so that the owned path cannot be left unselected: `WsTunnelStream` had a
 zero-copy owned write implementation that the relay never called.
 `poll_write_owned` keeps a borrowed default because byte-oriented transports
-(TCP, TLS, QUIC) have nothing to retain; it is only invoked when
-`owned_write` is true.
+such as TCP and TLS have nothing to retain; QUIC and H3 retain `Bytes` and
+advertise `owned_write = true`.
+
+QUIC tuning lives in the top-level `quic` config block: `mtu_upper_bound`
+(default 8192), `immediate_ack` (default true), and `congestion`
+(`cubic` / `bbr` / `new_reno`, default `cubic`). `mtu_upper_bound` also sets the
+advertised UDP payload size; the initial MTU stays at quinn's 1200-byte default,
+so ordinary Ethernet and IPv6 paths still handshake. `immediate_ack` uses the
+ACK frequency extension to remove delayed-ACK feedback latency; peers without
+the extension keep normal ACK behavior. `AppConfig.quic` flows into both
+`EndpointContext` connectors and `ServerRunner` listeners. Initial RTT, loss
+thresholds, and congestion-controller internals are deliberately not config
+surface.
 
 `BufferedTlsStream` (one-byte pushback) is still present: TLS drivers require
 it. `impl TunnelStream for Box<dyn TunnelStream>` was removed because no
