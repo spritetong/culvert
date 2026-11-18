@@ -468,7 +468,7 @@ async fn full_relay(label: &'static str, scheme: &str, pool_size: usize, streams
     let mut registry = TransportRegistry::new();
     registry.register(culvert::transport::h3::H3TransportDriver);
     let server_config = ServerConfig {
-        // One H3 listener handles both ALPNs (`h3` and `culvert-quic`), matching
+        // One H3 listener handles both ALPNs (`ALPN_H3` and `ALPN_QUIC`), matching
         // benchmarks/server-bench.yaml. Binding quic:// on the same UDP port too
         // would conflict.
         listen: vec![format!("h3://{server_addr}/tunnel")],

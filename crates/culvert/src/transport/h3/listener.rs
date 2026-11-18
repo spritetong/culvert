@@ -153,26 +153,40 @@ impl H3Listener {
         let is_quic_listener = listen_addr.starts_with("quic://");
         let mut rustls_server = server_rustls_config;
         if is_quic_listener {
-            if !rustls_server.alpn_protocols.iter().any(|p| p == ALPN_QUIC) {
-                rustls_server.alpn_protocols.push(ALPN_QUIC.to_vec());
+            if !rustls_server
+                .alpn_protocols
+                .iter()
+                .any(|p| p == ALPN_QUIC.as_bytes())
+            {
+                rustls_server
+                    .alpn_protocols
+                    .push(ALPN_QUIC.as_bytes().to_vec());
             }
         } else {
             // For H3 or generic listen addresses, ensure h3 is prioritized at index 0
             if let Some(pos) = rustls_server
                 .alpn_protocols
                 .iter()
-                .position(|p| p == ALPN_H3)
+                .position(|p| p == ALPN_H3.as_bytes())
             {
                 if pos != 0 {
                     let h3 = rustls_server.alpn_protocols.remove(pos);
                     rustls_server.alpn_protocols.insert(0, h3);
                 }
             } else {
-                rustls_server.alpn_protocols.insert(0, ALPN_H3.to_vec());
+                rustls_server
+                    .alpn_protocols
+                    .insert(0, ALPN_H3.as_bytes().to_vec());
             }
-            // Retain culvert-quic fallback so raw QUIC clients can still negotiate
-            if !rustls_server.alpn_protocols.iter().any(|p| p == ALPN_QUIC) {
-                rustls_server.alpn_protocols.push(ALPN_QUIC.to_vec());
+            // Retain ALPN_QUIC fallback so raw QUIC clients can still negotiate
+            if !rustls_server
+                .alpn_protocols
+                .iter()
+                .any(|p| p == ALPN_QUIC.as_bytes())
+            {
+                rustls_server
+                    .alpn_protocols
+                    .push(ALPN_QUIC.as_bytes().to_vec());
             }
         }
 
@@ -366,7 +380,7 @@ impl H3Listener {
         tx_streams: mpsc::Sender<(Box<dyn TunnelStream>, StreamMetadata)>,
         cancel_token: CancellationToken,
     ) {
-        let is_raw_quic = is_quic_listener || alpn.as_deref() == Some(ALPN_QUIC);
+        let is_raw_quic = is_quic_listener || alpn.as_deref() == Some(ALPN_QUIC.as_bytes());
         debug!(
             alpn = ?alpn.as_ref().map(|b| String::from_utf8_lossy(b)),
             is_quic_listener,

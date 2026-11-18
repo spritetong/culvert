@@ -18,7 +18,7 @@ use tracing::debug;
 use super::{apply_quic_config, quic_endpoint_config};
 use crate::config::model::TunnelMode;
 use crate::consts::{
-    ALPN_H3_STR, ALPN_QUIC_STR, AUTH_BEARER_PREFIX, DEFAULT_HANDSHAKE_TIMEOUT,
+    ALPN_H3, ALPN_QUIC, AUTH_BEARER_PREFIX, DEFAULT_HANDSHAKE_TIMEOUT,
     DEFAULT_QUIC_KEEP_ALIVE_INTERVAL, DEFAULT_QUIC_MAX_CONCURRENT_BIDI_STREAMS,
     DEFAULT_QUIC_MAX_CONCURRENT_UNI_STREAMS, DEFAULT_QUIC_MAX_IDLE_TIMEOUT,
     DEFAULT_QUIC_RECEIVE_WINDOW, DEFAULT_QUIC_SEND_WINDOW, DEFAULT_QUIC_STREAM_RECEIVE_WINDOW,
@@ -91,26 +91,27 @@ impl H3Connector {
         if is_quic_raw {
             match tls_config.alpn.take() {
                 Some(mut list) => {
-                    if !list.iter().any(|p| p == ALPN_QUIC_STR) {
-                        list.push(ALPN_QUIC_STR.to_string());
+                    // Client can override the default ALPN.
+                    if list.is_empty() {
+                        list.push(ALPN_QUIC.to_string());
                     }
                     tls_config.alpn = Some(list);
                 }
                 None => {
-                    tls_config.alpn = Some(vec![ALPN_QUIC_STR.to_string()]);
+                    tls_config.alpn = Some(vec![ALPN_QUIC.to_string()]);
                 }
             }
         } else {
             // For HTTP/3 endpoints, ensure "h3" is included in ALPN protocols
             match tls_config.alpn.take() {
                 Some(mut list) => {
-                    if !list.iter().any(|p| p == ALPN_H3_STR) {
-                        list.push(ALPN_H3_STR.to_string());
+                    if !list.iter().any(|p| p == ALPN_H3) {
+                        list.push(ALPN_H3.to_string());
                     }
                     tls_config.alpn = Some(list);
                 }
                 None => {
-                    tls_config.alpn = Some(vec![ALPN_H3_STR.to_string()]);
+                    tls_config.alpn = Some(vec![ALPN_H3.to_string()]);
                 }
             }
         }
@@ -721,7 +722,7 @@ mod tests {
             .with_no_client_auth()
             .with_single_cert(cert_chain, private_key)
             .unwrap();
-        server_crypto.alpn_protocols = vec![b"culvert-quic".to_vec()];
+        server_crypto.alpn_protocols = vec![ALPN_QUIC.as_bytes().to_vec()];
         let server_config = quinn::ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap(),
         ));
@@ -736,7 +737,7 @@ mod tests {
         let mut client_crypto = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        client_crypto.alpn_protocols = vec![b"culvert-quic".to_vec()];
+        client_crypto.alpn_protocols = vec![ALPN_QUIC.as_bytes().to_vec()];
         let client_config = quinn::ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).unwrap(),
         ));

@@ -501,9 +501,9 @@ The server caps `auth_len` at 1024 bytes and `meta_len` at 65536 bytes.
   applies version bounds and ALPN, installs a no-verification verifier when
   `insecure` is set, and generates an ephemeral self-signed certificate (`rcgen`)
   when no server certificate/key pair is provided.
-- ALPN defaults: `h3` for HTTP/3 endpoints, `culvert-quic` for raw QUIC. The
+- ALPN defaults: `h3` for HTTP/3 endpoints, `quic` for raw QUIC. The
   H3 listener ensures `h3` is first in the server ALPN list and adds
-  `culvert-quic` for `quic://` listeners.
+  `quic` for `quic://` listeners.
 - `dialer::dns::CachedDnsResolver` wraps `hickory-resolver`, with a bounded
   cache (1024 entries, 300 s TTL) and a system/libc fallback. Resolver types
   are `system`, `udp`/`dns`, `tcp`, `tls` (DoT), `https` (DoH). Structured
@@ -1052,7 +1052,7 @@ effective configuration values.
 | `MAX_ACTIVATION_TARGET_LEN` | 512 bytes |
 | `ACTIVATE_STREAM_MAGIC` / `PROMOTE` / `UDP` / `ACK` | `0xA5` / `0xA6` / `0xA7` / `0xAC` |
 | `HEADER_TUNNEL_PROTO` | `x-tunnel-proto` (`tcp` / `udp`) |
-| `ALPN_H3` / `ALPN_QUIC` | `h3` / `culvert-quic` |
+| `ALPN_H3` / `ALPN_QUIC` | `h3` / `quic` |
 | QUIC windows | stream 4 MiB, connection 128 MiB, send 128 MiB |
 | QUIC keep-alive / max idle | 5 s / 30 s |
 | DNS cache capacity / TTL | 1024 entries / 300 s |

@@ -128,11 +128,11 @@ impl TransportDriver for H3TransportDriver {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        if !alpn.iter().any(|p| p == ALPN_H3) {
-            alpn.push(ALPN_H3.to_vec());
+        if !alpn.iter().any(|p| p == ALPN_H3.as_bytes()) {
+            alpn.push(ALPN_H3.as_bytes().to_vec());
         }
-        if !alpn.iter().any(|p| p == ALPN_QUIC) {
-            alpn.push(ALPN_QUIC.to_vec());
+        if !alpn.iter().any(|p| p == ALPN_QUIC.as_bytes()) {
+            alpn.push(ALPN_QUIC.as_bytes().to_vec());
         }
         let cert_str = tls
             .and_then(|t| t.certificate.as_ref())

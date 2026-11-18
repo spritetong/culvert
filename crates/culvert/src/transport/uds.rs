@@ -20,7 +20,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::common::{CancelFutureExt, TimeoutOrCancel};
 use crate::config::model::TunnelMode;
-use crate::consts::{DEFAULT_HANDSHAKE_TIMEOUT, SCHEME_WS_UNIX, SCHEME_WSS_UNIX};
+use crate::consts::{
+    ALPN_H3, ALPN_QUIC, DEFAULT_HANDSHAKE_TIMEOUT, SCHEME_WS_UNIX, SCHEME_WSS_UNIX,
+};
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, BufferedTlsStream, TunnelStream};
 use crate::dialer::endpoint::EndpointContext;
@@ -101,7 +103,7 @@ impl TransportDriver for UdsTransportDriver {
         let alpn = tls.and_then(|t| t.alpn.as_ref()).and_then(|list| {
             let filtered: Vec<Vec<u8>> = list
                 .iter()
-                .filter(|s| *s != "h3" && *s != "culvert-quic")
+                .filter(|s| *s != ALPN_H3 && *s != ALPN_QUIC)
                 .map(|s| s.as_bytes().to_vec())
                 .collect();
             if filtered.is_empty() {

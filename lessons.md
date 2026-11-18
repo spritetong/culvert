@@ -155,7 +155,7 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
 
 - **Problem / Trap**: A single server endpoint accepting both HTTP/3 and raw QUIC on UDP can misroute incoming connections if ALPN negotiation is ambiguous.
 - **Solution**:
-  - Enforce explicit ALPN differentiation: `h3` for HTTP/3 CONNECT tunnels, and `culvert-quic` for raw bidirectional QUIC byte tunnels.
+  - Enforce explicit ALPN differentiation: `h3` for HTTP/3 CONNECT tunnels, and `quic` for raw bidirectional QUIC byte tunnels.
   - Raw QUIC listeners compare binary pre-shared tokens in constant time (`common::auth::constant_time_token_eq`) over length-prefixed MessagePack metadata frames, avoiding HTTP header parsing overhead and length leakages.
 - **References**:
   - Architecture: [DESIGN.md](file:///d:/githome/spritetong/@github/culvert/docs/DESIGN.md#L454-L493)

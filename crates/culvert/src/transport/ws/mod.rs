@@ -16,7 +16,7 @@ pub use model::WsHandshakeHeaders;
 pub use stream::WsTunnelStream;
 
 use crate::config::model::TunnelMode;
-use crate::consts::{SCHEME_WS, SCHEME_WSS};
+use crate::consts::{ALPN_H3, ALPN_QUIC, SCHEME_WS, SCHEME_WSS};
 use crate::core::error::TunnelError;
 use crate::dialer::endpoint::EndpointContext;
 use crate::transport::{TransportConnector, TransportDriver, TransportListener};
@@ -69,7 +69,7 @@ impl TransportDriver for WsTransportDriver {
         let alpn = tls.and_then(|t| t.alpn.as_ref()).and_then(|list| {
             let filtered: Vec<Vec<u8>> = list
                 .iter()
-                .filter(|s| *s != "h3" && *s != "culvert-quic")
+                .filter(|s| *s != ALPN_H3 && *s != ALPN_QUIC)
                 .map(|s| s.as_bytes().to_vec())
                 .collect();
             if filtered.is_empty() {

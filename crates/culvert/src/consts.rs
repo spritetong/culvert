@@ -321,17 +321,11 @@ pub const DEFAULT_DOH_PORT: u16 = 443;
 // 7. Protocol Identifiers, ALPNs & URI Schemes
 // =============================================================================
 
-/// Application-Layer Protocol Negotiation (ALPN) identifier for HTTP/3 (bytes).
-pub const ALPN_H3: &[u8] = b"h3";
+/// ALPN identifier for HTTP/3.
+pub const ALPN_H3: &str = "h3";
 
-/// ALPN identifier for HTTP/3 (str).
-pub const ALPN_H3_STR: &str = "h3";
-
-/// ALPN identifier for raw multiplexed QUIC streams (bytes).
-pub const ALPN_QUIC: &[u8] = b"culvert-quic";
-
-/// ALPN identifier for raw multiplexed QUIC streams (str).
-pub const ALPN_QUIC_STR: &str = "culvert-quic";
+/// ALPN identifier for raw multiplexed QUIC streams.
+pub const ALPN_QUIC: &str = "quic";
 
 /// URI scheme identifier for standard WebSocket.
 pub const SCHEME_WS: &str = "ws";
