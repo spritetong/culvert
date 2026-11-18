@@ -166,17 +166,16 @@ fn take_live_idle_stream(
             heartbeat_interval,
             idle_timeout,
         );
-        let mut dead = expired;
-        if !dead
-            && matches!(
-                idle_streams[idx].stream.poll_check_alive(cx),
-                Poll::Ready(HeartbeatStatus::Dead)
-            )
-        {
-            dead = true;
+        if expired {
+            idle_streams.remove(idx);
+            tracing::debug!("Evicted expired idle stream during acquire inspection");
+            continue;
         }
 
-        if dead {
+        if matches!(
+            idle_streams[idx].stream.poll_check_alive(cx),
+            Poll::Ready(HeartbeatStatus::Dead)
+        ) {
             idle_streams.remove(idx);
             evicted_dead = true;
             tracing::debug!("Evicted dead stream during acquire inspection");
@@ -370,9 +369,8 @@ impl ReplenishingStreamPool {
                     let sweep_now = Instant::now();
                     let now_ms = activity_now_ms();
                     let mut i = 0;
-                    let mut evicted_any = false;
+                    let mut evicted_dead = false;
                     while i < idle_streams.len() {
-                        let mut is_dead = false;
                         let managed = &mut idle_streams[i];
                         let (probe, expired) = heartbeat_timing(
                             managed.stream.last_activity_ms(),
@@ -382,8 +380,13 @@ impl ReplenishingStreamPool {
                         );
 
                         if expired {
-                            is_dead = true;
-                        } else if let Poll::Ready(HeartbeatStatus::Dead) =
+                            tracing::debug!("Evicted expired idle stream during reactor sweep");
+                            idle_streams.swap_remove_back(i);
+                            continue;
+                        }
+
+                        let mut is_dead = false;
+                        if let Poll::Ready(HeartbeatStatus::Dead) =
                             managed.stream.poll_check_alive(cx)
                         {
                             is_dead = true;
@@ -433,13 +436,13 @@ impl ReplenishingStreamPool {
                         if is_dead {
                             tracing::debug!("Evicted dead/hanging stream during reactor sweep");
                             idle_streams.swap_remove_back(i);
-                            evicted_any = true;
+                            evicted_dead = true;
                         } else {
                             i += 1;
                         }
                     }
 
-                    if evicted_any {
+                    if evicted_dead {
                         return Poll::Ready(PoolEvent::StreamsEvicted);
                     }
 

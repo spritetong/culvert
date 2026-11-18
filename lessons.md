@@ -22,19 +22,17 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
   - Implementation: [stream.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/h3/stream.rs#L536-L565)
   - Probe Test: [test_idle_probe.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/tests/test_idle_probe.rs#L121-L186)
 
-### 1.2 Session Invalidation Kill Race in Multiplexed Connection Pools
+### 1.2 Session Invalidation vs. Active Stream Destruction in Multiplexed Connection Pools
 
-- **Problem / Trap**: When multiple idle streams in a pool share a single multiplexed QUIC/H3 session, evicting an over-age or dead stream triggers session invalidation (`connector.invalidate_broken_sessions()`), which calls `conn.close(0x00, b"broken")`.
-- **Symptom**: If the pool reactor pops an idle stream for a caller and simultaneously detects that an adjacent stream is dead, calling `invalidate_broken_sessions()` aborts the underlying QUIC connection. The caller receives a stream whose underlying session was just killed, causing the activation handshake to fail immediately.
+- **Problem / Trap**: When multiple streams share a single multiplexed QUIC/H3 session, two related traps can catastrophic terminate active streams:
+  1. Equating routine idle age expiration (`expired = true`) with actual connection failure (`HeartbeatStatus::Dead`). A pre-warmed idle stream reaching its idle age limit is normal pool turnover; treating it as a dead stream triggers false-positive session invalidations and clears healthy pools.
+  2. Forcibly calling `conn.close(0x00, ...)` inside `connector.invalidate_broken_sessions()` or during single-stream handshake timeouts. In QUIC, calling `conn.close()` transmits a `CONNECTION_CLOSE` frame over UDP, abruptly murdering all concurrent, live in-flight streams (e.g. running iperf3 data/control transfers) sharing that connection.
+- **Symptom**: During long benchmarks or concurrent pool refills, client/server logs show `Remote reset: 0x0` or `Connection closed by client` at the exact 30s `DEFAULT_IDLE_TIMEOUT` mark. Active relays fail with `BrokenPipe`, `ConnectionReset`, or `control socket has closed unexpectedly`.
 - **Solution**:
-  - In `take_live_idle_stream`: If any dead stream is encountered during LIFO scanning (`evicted_dead == true`), treat the entire cached session as compromised:
-    1. Call `connector.invalidate_broken_sessions()`.
-    2. Completely clear the remaining `idle_streams` queue.
-    3. Discard any candidate stream popped during that sweep (`acquired = None`).
-    4. Fall through to dial a brand-new connection rather than handing out a poisoned sibling.
-  - In background heartbeat sweep (`PoolEvent::StreamsEvicted`): If a background eviction invalidates the session, unconditionally clear `idle_streams` and reset `idle_count = 0`.
+  - In `take_live_idle_stream` and reactor background sweeps: Distinguish between routine `expired` streams and `Dead` streams. Expired streams are simply dropped from `idle_streams` without invalidating the connector's shared session or clearing siblings.
+  - In `connector.invalidate_broken_sessions()` and session eviction helpers (`invalidate_h3_session_if_same`, `invalidate_quic_session_if_same`): Never send a hard `conn.close(...)`. Only remove (`take()`) the session from the connector's cache so future calls dial a fresh connection, while allowing active in-flight streams on the old session to drain gracefully to completion.
 - **References**:
-  - Implementation: [connection_pool.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/pool/connection_pool.rs#L148-L200)
+  - Implementation: [connector.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/h3/connector.rs#L670-L685), [connection_pool.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/pool/connection_pool.rs#L148-L200)
   - Probe Test: [test_idle_probe.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/tests/test_idle_probe.rs#L40-L119)
 
 ### 1.3 Stream-Level Activity Clock vs. NAT/Firewall UDP Pinholes
@@ -47,6 +45,18 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
   - Expose `last_activity_ms` through the `TunnelStream` trait so the connection pool reactor and relay pumps can deterministically retire silent streams before NAT/firewall boundaries expire them.
 - **References**:
   - Implementation: [stream.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/h3/stream.rs#L210-L215)
+
+### 1.4 Relay Pump Heartbeat Tick Rate and Half-Close Liveness
+
+- **Problem / Trap**:
+  - In `StreamStreamPump::relay_with_heartbeat`, `heartbeat_timer` was originally set to sleep for the entire `heartbeat_interval` (15s). With `idle_timeout` at 30s (2x interval), any initial traffic offset caused the first 15s tick to see `elapsed < 15s` (skipping probe), and the second 30s tick to see `elapsed >= 30s`, triggering an idle timeout before any probe could ever run!
+  - Furthermore, on half-closed streams (e.g. client finished sending upload data and issued TCP FIN), `stream.poll_check_alive` returns `Dead` on peek (EOF). Calling `poll_check_alive` unconditionally on every heartbeat killed the reverse downloading direction prematurely.
+- **Solution**:
+  - Decouple the timer tick rate from `heartbeat_interval`: poll `heartbeat_timer` on a high-frequency sub-second interval (`min(heartbeat_interval / 2, 500ms)`).
+  - Probe streams before evaluating idle expiration, giving `poll_send_ping` the opportunity to verify underlying transport liveness and refresh `last_activity_ms` when the connection is healthy.
+  - Gate liveness checks and ping probes with direction completion (`!a_to_b.read_done` and `!b_to_a.read_done`) so clean EOF in one direction never aborts the opposite direction.
+- **References**:
+  - Implementation: [pump.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/io/pump.rs#L200-L260)
 
 ---
 

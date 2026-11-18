@@ -198,7 +198,9 @@ impl StreamStreamPump {
         // and achieve zero-allocation, purely event-driven cancellation without polling.
         let mut cancel_fut = pin!(cancel_token.cancelled_owned());
         let mut drain_sleep: Option<Pin<Box<tokio::time::Sleep>>> = None;
-        let mut heartbeat_timer = Box::pin(tokio::time::sleep(heartbeat_interval));
+        let tick_interval = std::cmp::min(heartbeat_interval / 2, Duration::from_millis(500))
+            .max(Duration::from_millis(5));
+        let mut heartbeat_timer = Box::pin(tokio::time::sleep(tick_interval));
 
         poll_fn(|cx| {
             let is_cancelled = cancel_fut.as_mut().poll(cx).is_ready();
@@ -219,52 +221,76 @@ impl StreamStreamPump {
             if heartbeat_timer.as_mut().poll(cx).is_ready() {
                 heartbeat_timer
                     .as_mut()
-                    .reset(tokio::time::Instant::now() + heartbeat_interval);
+                    .reset(tokio::time::Instant::now() + tick_interval);
 
                 let now_ms = activity_now_ms();
-                let (probe_a, expired_a) = heartbeat_timing(
+                let (probe_a, _) = heartbeat_timing(
                     stream_a.last_activity_ms(),
                     now_ms,
                     heartbeat_interval,
                     idle_timeout,
                 );
-                let (probe_b, expired_b) = heartbeat_timing(
+                let (probe_b, _) = heartbeat_timing(
                     stream_b.last_activity_ms(),
                     now_ms,
                     heartbeat_interval,
                     idle_timeout,
                 );
 
-                if expired_a {
-                    return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "Relay stream A idle timeout: no inbound or outbound activity",
-                    ))));
-                }
-                if expired_b {
-                    return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "Relay stream B idle timeout: no inbound or outbound activity",
-                    ))));
-                }
-
-                if probe_a && let Poll::Ready(Err(e)) = stream_a.poll_send_ping(cx) {
+                if !a_to_b.read_done
+                    && probe_a
+                    && let Poll::Ready(Err(e)) = stream_a.poll_send_ping(cx)
+                {
                     return Poll::Ready(Err(TunnelError::Io(e)));
                 }
-                if probe_b && let Poll::Ready(Err(e)) = stream_b.poll_send_ping(cx) {
+                if !b_to_a.read_done
+                    && probe_b
+                    && let Poll::Ready(Err(e)) = stream_b.poll_send_ping(cx)
+                {
                     return Poll::Ready(Err(TunnelError::Io(e)));
                 }
 
-                if let Poll::Ready(HeartbeatStatus::Dead) = stream_a.poll_check_alive(cx) {
+                if !a_to_b.read_done
+                    && let Poll::Ready(HeartbeatStatus::Dead) = stream_a.poll_check_alive(cx)
+                {
                     return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "Relay stream A unresponsive to heartbeats",
                     ))));
                 }
-                if let Poll::Ready(HeartbeatStatus::Dead) = stream_b.poll_check_alive(cx) {
+                if !b_to_a.read_done
+                    && let Poll::Ready(HeartbeatStatus::Dead) = stream_b.poll_check_alive(cx)
+                {
                     return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "Relay stream B unresponsive to heartbeats",
+                    ))));
+                }
+
+                // Re-evaluate idle expiration after probes/pings have had an opportunity to touch activity clock
+                let (_, expired_a) = heartbeat_timing(
+                    stream_a.last_activity_ms(),
+                    now_ms,
+                    heartbeat_interval,
+                    idle_timeout,
+                );
+                let (_, expired_b) = heartbeat_timing(
+                    stream_b.last_activity_ms(),
+                    now_ms,
+                    heartbeat_interval,
+                    idle_timeout,
+                );
+
+                if !a_to_b.read_done && expired_a {
+                    return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Relay stream A idle timeout: no inbound or outbound activity",
+                    ))));
+                }
+                if !b_to_a.read_done && expired_b {
+                    return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Relay stream B idle timeout: no inbound or outbound activity",
                     ))));
                 }
             }
