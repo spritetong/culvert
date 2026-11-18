@@ -718,6 +718,10 @@ impl H3Listener {
         // Each handshake is bounded by a 10s timeout and observes
         // cancellation, so this await is a bounded termination boundary.
         while handshake_tasks.join_next().await.is_some() {}
+
+        // Keep conn alive until closed by peer or cancelled,
+        // preventing premature QUIC teardown while accepted streams are still relaying.
+        let _ = conn.closed().cancel_with(&cancel_token).await;
     }
 }
 

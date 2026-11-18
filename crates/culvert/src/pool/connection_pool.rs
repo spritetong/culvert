@@ -141,11 +141,10 @@ impl ManagedStream {
 /// expired NAT/QUIC pinholes) and removes the first one that can be handed out.
 ///
 /// A stream with an in-flight probe write is healthy but busy, so it is skipped
-/// and *kept* in the queue. Only an over-age stream or one whose liveness probe
-/// reports `Dead` is evicted. The boolean reports whether any stream was
-/// actually evicted, so the caller can avoid handing out a sibling from the
-/// same sweep. The shared transport session itself is never closed here:
-/// other streams may still be carrying live traffic on it.
+/// and *kept* in the queue. An over-age stream is dropped as routine turnover;
+/// a stream whose probe reports `Dead` is dropped and sets the returned flag.
+/// The shared transport session is never closed here: other streams may still
+/// be carrying live traffic on it.
 fn take_live_idle_stream(
     idle_streams: &mut VecDeque<ManagedStream>,
     cx: &mut Context<'_>,
@@ -167,17 +166,16 @@ fn take_live_idle_stream(
             heartbeat_interval,
             idle_timeout,
         );
-        let mut dead = expired;
-        if !dead
-            && matches!(
-                idle_streams[idx].stream.poll_check_alive(cx),
-                Poll::Ready(HeartbeatStatus::Dead)
-            )
-        {
-            dead = true;
+        if expired {
+            idle_streams.remove(idx);
+            tracing::debug!("Evicted expired idle stream during acquire inspection");
+            continue;
         }
 
-        if dead {
+        if matches!(
+            idle_streams[idx].stream.poll_check_alive(cx),
+            Poll::Ready(HeartbeatStatus::Dead)
+        ) {
             idle_streams.remove(idx);
             evicted_dead = true;
             tracing::debug!("Evicted dead stream during acquire inspection");
@@ -371,9 +369,8 @@ impl ReplenishingStreamPool {
                     let sweep_now = Instant::now();
                     let now_ms = activity_now_ms();
                     let mut i = 0;
-                    let mut evicted_any = false;
+                    let mut evicted_dead = false;
                     while i < idle_streams.len() {
-                        let mut is_dead = false;
                         let managed = &mut idle_streams[i];
                         let (probe, expired) = heartbeat_timing(
                             managed.stream.last_activity_ms(),
@@ -383,8 +380,13 @@ impl ReplenishingStreamPool {
                         );
 
                         if expired {
-                            is_dead = true;
-                        } else if let Poll::Ready(HeartbeatStatus::Dead) =
+                            tracing::debug!("Evicted expired idle stream during reactor sweep");
+                            idle_streams.swap_remove_back(i);
+                            continue;
+                        }
+
+                        let mut is_dead = false;
+                        if let Poll::Ready(HeartbeatStatus::Dead) =
                             managed.stream.poll_check_alive(cx)
                         {
                             is_dead = true;
@@ -434,13 +436,13 @@ impl ReplenishingStreamPool {
                         if is_dead {
                             tracing::debug!("Evicted dead/hanging stream during reactor sweep");
                             idle_streams.swap_remove_back(i);
-                            evicted_any = true;
+                            evicted_dead = true;
                         } else {
                             i += 1;
                         }
                     }
 
-                    if evicted_any {
+                    if evicted_dead {
                         return Poll::Ready(PoolEvent::StreamsEvicted);
                     }
 
@@ -529,9 +531,9 @@ impl ReplenishingStreamPool {
                                 })
                                 .await;
 
-                                // A dead or aged idle stream is retired on its own. Closing the
-                                // shared session here would reset every sibling that is still
-                                // relaying live traffic (e.g. the other iperf3 -P streams).
+                                // A dead idle stream is retired on its own; expiry is routine
+                                // turnover. Closing the shared session here would reset every
+                                // sibling still relaying live traffic (e.g. iperf3 -P streams).
                                 // Genuine transport failures invalidate the cached session in
                                 // the connector's own dial path.
                                 if evicted_dead {

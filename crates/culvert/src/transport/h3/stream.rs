@@ -181,6 +181,14 @@ impl QuicLivenessTracker {
         // Transmitting packets while zero packets received for longer than threshold -> zombie!
         if cur_tx > self.last_tx_dgrams && self.last_progress_at.elapsed() >= unresponsive_threshold
         {
+            tracing::warn!(
+                cur_tx,
+                last_tx = self.last_tx_dgrams,
+                cur_rx,
+                last_rx = self.last_rx_dgrams,
+                elapsed = ?self.last_progress_at.elapsed(),
+                "QUIC connection deemed zombie: transmitting with zero RX for longer than threshold"
+            );
             return false;
         }
 
@@ -247,6 +255,7 @@ impl TunnelStream for QuinnTunnelStream {
                     "Underlying QUIC connection unresponsive to pings",
                 )));
             }
+            self.touch_activity();
         }
         Poll::Ready(Ok(()))
     }
@@ -622,6 +631,7 @@ impl TunnelStream for H3TunnelStream {
                     "Underlying QUIC connection unresponsive to pings",
                 )));
             }
+            self.touch_activity();
         }
         if let Poll::Ready(HeartbeatStatus::Dead) = self.poll_check_alive(cx) {
             return Poll::Ready(Err(io::Error::new(

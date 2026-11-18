@@ -171,17 +171,21 @@ pub async fn run_forward_mapping(
                                 }
                             }
 
-                            let _ = serve(
+                            let res = serve(
                                 PumpRequest {
                                     frontend: accepted.channel,
                                     backend,
-                                },
+                                }
+                                ,
                                 PumpCtx {
                                     cancel: conn_token,
                                     heartbeat_interval: hb_interval,
                                     idle_timeout,
                                 },
                             ).await;
+                            if let Err(ref e) = res {
+                                debug!(tag = %tag_for_task, "Client forward relay pump finished with error: {:?}", e);
+                            }
                         });
                     }
                     Err(e) => {

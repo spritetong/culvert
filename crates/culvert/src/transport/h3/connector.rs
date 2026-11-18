@@ -306,10 +306,7 @@ impl H3Connector {
         if let Some(ref current) = *guard
             && current.id == session_id
         {
-            debug!(session_id, "Invalidating and closing broken H3 session");
-            current
-                .conn
-                .close(quinn::VarInt::from_u32(0), b"session invalidated");
+            debug!(session_id, "Invalidating broken H3 session cache");
             *guard = None;
         }
     }
@@ -370,13 +367,7 @@ impl H3Connector {
         if let Some(ref current) = *guard
             && current.id == session_id
         {
-            debug!(
-                session_id,
-                "Invalidating and closing broken raw QUIC session"
-            );
-            current
-                .conn
-                .close(quinn::VarInt::from_u32(0), b"raw session invalidated");
+            debug!(session_id, "Invalidating broken raw QUIC session cache");
             *guard = None;
         }
     }

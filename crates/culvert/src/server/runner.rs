@@ -277,7 +277,7 @@ impl ServerRunner {
                                                     }
                                                 };
 
-                                                let _ = serve(
+                                                let res = serve(
                                                     PumpRequest::new(target_conn, stream),
                                                     PumpCtx {
                                                         cancel: conn_token,
@@ -285,6 +285,9 @@ impl ServerRunner {
                                                         idle_timeout: relay_idle_timeout,
                                                     },
                                                 ).await;
+                                                if let Err(ref e) = res {
+                                                    debug!(target = %target, "Server forward relay pump finished with error: {:?}", e);
+                                                }
                                             }
 
                                             // 2. Reverse mode: Either Control channel or Data channel pairing
