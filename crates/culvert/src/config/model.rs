@@ -36,7 +36,7 @@ pub struct AppConfig {
 }
 
 /// QUIC parameters that are safe to expose without changing connection semantics.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
 pub struct QuicConfig {
     /// PLPMTUD upper bound. The initial MTU remains 1200 for path safety.
@@ -48,7 +48,7 @@ pub struct QuicConfig {
 }
 
 /// Supported QUIC congestion controllers.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum QuicCongestion {
     #[default]
