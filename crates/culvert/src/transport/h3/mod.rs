@@ -32,12 +32,13 @@ fn effective_mtu(quic: &QuicConfig) -> u16 {
 
 /// Endpoint-level QUIC socket configuration. `max_udp_payload_size` is also
 /// advertised to the peer, so it must be set on listeners and connectors alike.
-pub(crate) fn quic_endpoint_config(quic: &QuicConfig) -> quinn::EndpointConfig {
+pub(crate) fn quic_endpoint_config(quic: &QuicConfig) -> Result<quinn::EndpointConfig, TunnelError> {
     let mut config = quinn::EndpointConfig::default();
+    let mtu = effective_mtu(quic);
     config
-        .max_udp_payload_size(effective_mtu(quic))
-        .expect("quic.mtu_upper_bound is validated at config load");
-    config
+        .max_udp_payload_size(mtu)
+        .map_err(|e| TunnelError::Config(format!("Invalid quic.mtu_upper_bound {}: {}", mtu, e)))?;
+    Ok(config)
 }
 
 /// Applies the exposed QUIC transport knobs. Everything else stays at quinn's
@@ -139,5 +140,30 @@ impl TransportDriver for H3TransportDriver {
         let listener =
             H3Listener::bind_with_quic(listen_addr, auth_token, path, server_rustls, quic, cancel)?;
         Ok(Box::new(listener))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_quic_endpoint_config_valid() {
+        let quic = QuicConfig {
+            mtu_upper_bound: Some(8192),
+            ..Default::default()
+        };
+        let cfg = quic_endpoint_config(&quic);
+        assert!(cfg.is_ok());
+    }
+
+    #[test]
+    fn test_quic_endpoint_config_invalid_returns_err() {
+        let quic = QuicConfig {
+            mtu_upper_bound: Some(100),
+            ..Default::default()
+        };
+        let cfg = quic_endpoint_config(&quic);
+        assert!(cfg.is_err());
     }
 }

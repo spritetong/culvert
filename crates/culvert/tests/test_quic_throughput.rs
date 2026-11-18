@@ -413,6 +413,11 @@ fn free_udp_port() -> u16 {
     socket.local_addr().unwrap().port()
 }
 
+fn free_tcp_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
 /// Backend that drains `connections` TCP connections concurrently, reporting
 /// the aggregated byte count. This is the iperf3 `-s` role plus iperf3's `-P`.
 fn spawn_sink(
@@ -456,7 +461,7 @@ async fn full_relay(label: &'static str, scheme: &str, pool_size: usize, streams
     let cancel = tokio_util::sync::CancellationToken::new();
     let (sink_handle, sink_port) = spawn_sink(cancel.clone(), streams);
     let server_port = free_udp_port();
-    let client_port = free_udp_port();
+    let client_port = free_tcp_port();
     let server_addr = format!("127.0.0.1:{server_port}");
     let client_addr = format!("127.0.0.1:{client_port}");
 

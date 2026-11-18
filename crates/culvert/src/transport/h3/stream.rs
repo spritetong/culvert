@@ -197,6 +197,13 @@ impl TunnelStream for QuinnTunnelStream {
     }
 
     fn poll_write_owned(&mut self, cx: &mut Context<'_>, chunk: Bytes) -> Poll<io::Result<usize>> {
+        if self.shutdown_done {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "QUIC stream write direction closed",
+            )));
+        }
+
         if chunk.is_empty() {
             return Poll::Ready(Ok(0));
         }
@@ -489,8 +496,42 @@ impl AsyncWrite for H3TunnelStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.get_mut()
-            .poll_write_bytes(cx, Bytes::copy_from_slice(buf))
+        let this = self.get_mut();
+        if this.fin_sent {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "HTTP/3 stream write direction closed",
+            )));
+        }
+
+        let tx = match this.tx_outbound.as_mut() {
+            Some(tx) => tx,
+            None => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "HTTP/3 stream write direction closed",
+                )));
+            }
+        };
+
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        match tx.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => {
+                let chunk = Bytes::copy_from_slice(buf);
+                let len = chunk.len();
+                let _ = tx.send_item(chunk);
+                this.touch_activity();
+                Poll::Ready(Ok(len))
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "HTTP/3 background pump closed",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -685,7 +726,14 @@ impl H3RecvStream for h3::server::RequestStream<h3_quinn::RecvStream, Bytes> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct MockRecvStream;
+    impl H3RecvStream for MockRecvStream {
+        async fn recv_chunk(&mut self) -> Result<Option<Bytes>, io::Error> {
+            Ok(None)
+        }
+    }
 
     struct MockSendStream {
         #[allow(dead_code)]
@@ -788,5 +836,33 @@ mod tests {
         drop(stream);
         tokio::task::yield_now().await;
         assert!(dropped_flag.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_h3_stream_poll_write_owned_and_post_shutdown_fails() {
+        use std::future::poll_fn;
+
+        let send = MockSendStream {
+            sent: vec![],
+            finished: false,
+        };
+        let recv = MockRecvStream;
+        let mut stream = H3TunnelStream::spawn_split_pump(send, recv);
+        assert!(stream.caps().owned_write);
+
+        let payload = Bytes::from_static(b"owned payload test");
+        let n = poll_fn(|cx| stream.poll_write_owned(cx, payload.clone()))
+            .await
+            .expect("owned write succeeds");
+        assert_eq!(n, payload.len());
+
+        // Shutdown stream
+        stream.shutdown().await.expect("shutdown succeeds");
+
+        // Subsequent poll_write_owned must fail with BrokenPipe
+        let err = poll_fn(|cx| stream.poll_write_owned(cx, payload.clone()))
+            .await
+            .expect_err("write after shutdown must fail");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
     }
 }

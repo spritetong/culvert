@@ -151,12 +151,11 @@ impl H3Connector {
         apply_quic_config(&mut transport_config, quic);
         client_config.transport_config(Arc::new(transport_config));
 
-        let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-        let socket = std::net::UdpSocket::bind(bind_addr).map_err(TunnelError::Io)?;
+        let socket = crate::platform::create_dual_stack_udp_socket(0).map_err(TunnelError::Io)?;
         let runtime = quinn::default_runtime()
             .ok_or_else(|| TunnelError::Io(std::io::Error::other("No quinn runtime available")))?;
         let mut quinn_endpoint =
-            quinn::Endpoint::new(quic_endpoint_config(quic), None, socket, runtime)
+            quinn::Endpoint::new(quic_endpoint_config(quic)?, None, socket, runtime)
                 .map_err(TunnelError::Io)?;
         quinn_endpoint.set_default_client_config(client_config);
 

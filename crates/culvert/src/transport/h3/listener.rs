@@ -206,12 +206,13 @@ impl H3Listener {
 
         let runtime = quinn::default_runtime()
             .ok_or_else(|| TunnelError::Io(std::io::Error::other("No quinn runtime available")))?;
+        let endpoint_config = quic_endpoint_config(quic)?;
         let quinn_endpoint = match parsed_listen {
             crate::io::addr::ListenAddr::DualStack(port) => {
                 let udp_socket =
                     crate::platform::create_dual_stack_udp_socket(port).map_err(TunnelError::Io)?;
                 quinn::Endpoint::new(
-                    quic_endpoint_config(quic),
+                    endpoint_config,
                     Some(server_config),
                     udp_socket,
                     Arc::clone(&runtime),
@@ -221,7 +222,7 @@ impl H3Listener {
             crate::io::addr::ListenAddr::Ip(addr) => {
                 let udp_socket = std::net::UdpSocket::bind(addr).map_err(TunnelError::Io)?;
                 quinn::Endpoint::new(
-                    quic_endpoint_config(quic),
+                    endpoint_config,
                     Some(server_config),
                     udp_socket,
                     Arc::clone(&runtime),
@@ -232,7 +233,7 @@ impl H3Listener {
                 let addr = resolve_listen_socket_addr(&format!("{}:{}", host, port), listen_addr)?;
                 let udp_socket = std::net::UdpSocket::bind(addr).map_err(TunnelError::Io)?;
                 quinn::Endpoint::new(
-                    quic_endpoint_config(quic),
+                    endpoint_config,
                     Some(server_config),
                     udp_socket,
                     Arc::clone(&runtime),

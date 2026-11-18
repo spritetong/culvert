@@ -445,7 +445,7 @@ quic:
   congestion: cubic       # cubic | bbr | new_reno
 ```
 
-`mtu_upper_bound` also sets the advertised UDP payload size; the initial MTU stays 1200 so ordinary paths still handshake. Set the same values on both peers. Initial RTT, loss thresholds, and congestion-controller internals are intentionally not configurable.
+`mtu_upper_bound` also sets the advertised UDP payload size; the initial MTU stays 1200 so ordinary paths still handshake. Set the same values on both peers. Initial RTT, loss thresholds, and congestion-controller internals are intentionally not configurable. `immediate_ack` defaults to `true` to eliminate delayed ACK timer overhead on quiet or high-bandwidth LAN paths; on asymmetric WAN connections with constrained upstream bandwidth, set `immediate_ack: false` to prevent upstream ACK saturation.
 
 ---
 
