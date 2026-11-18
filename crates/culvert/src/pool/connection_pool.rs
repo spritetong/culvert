@@ -143,8 +143,9 @@ impl ManagedStream {
 /// A stream with an in-flight probe write is healthy but busy, so it is skipped
 /// and *kept* in the queue. Only an over-age stream or one whose liveness probe
 /// reports `Dead` is evicted. The boolean reports whether any stream was
-/// actually evicted, so the caller can invalidate shared transport sessions
-/// once instead of once per eviction.
+/// actually evicted, so the caller can avoid handing out a sibling from the
+/// same sweep. The shared transport session itself is never closed here:
+/// other streams may still be carrying live traffic on it.
 fn take_live_idle_stream(
     idle_streams: &mut VecDeque<ManagedStream>,
     cx: &mut Context<'_>,
@@ -528,15 +529,12 @@ impl ReplenishingStreamPool {
                                 })
                                 .await;
 
-                                // Invalidate shared sessions once, and only after a
-                                // stream was actually proven dead. Closing the cached
-                                // QUIC/H3 connection invalidates all sibling streams
-                                // belonging to that session. Therefore, discard any
-                                // acquired sibling and remaining idle streams so the
-                                // caller is served by a fresh dial instead of a dead stream.
+                                // A dead or aged idle stream is retired on its own. Closing the
+                                // shared session here would reset every sibling that is still
+                                // relaying live traffic (e.g. the other iperf3 -P streams).
+                                // Genuine transport failures invalidate the cached session in
+                                // the connector's own dial path.
                                 if evicted_dead {
-                                    connector.invalidate_broken_sessions();
-                                    idle_streams.clear();
                                     acquired = None;
                                 }
 
@@ -623,9 +621,10 @@ impl ReplenishingStreamPool {
                         retry_timer = None;
                     }
                     PoolEvent::StreamsEvicted => {
-                        connector.invalidate_broken_sessions();
-                        idle_streams.clear();
-                        stats_clone.lock().idle_count = 0;
+                        // Dead idle streams were already removed by the sweep. The
+                        // shared session must stay open for active relays; stream-level
+                        // failures do not prove the whole connection is broken.
+                        stats_clone.lock().idle_count = idle_streams.len();
                     }
                     PoolEvent::HeartbeatTick => {
                         let now = Instant::now();
@@ -1382,46 +1381,11 @@ mod tests {
         }
     }
 
-    struct CountingInvalidationConnector {
-        invalidations: Arc<AtomicUsize>,
-    }
-
-    impl TransportConnector for CountingInvalidationConnector {
-        fn connect<'a>(
-            &'a self,
-            _target: &'a TargetAddr,
-            _session_id: Option<&'a str>,
-        ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
-            Box::pin(async {
-                let (client, _server) = tokio::io::duplex(1024);
-                Ok(IoChannel::from_boxed_stream(Box::new(client)))
-            })
-        }
-
-        fn connect_pooled<'a>(
-            &'a self,
-            _target: &'a TargetAddr,
-        ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
-            Box::pin(async {
-                let (client, _server) = tokio::io::duplex(1024);
-                Ok(IoChannel::from_boxed_stream(Box::new(client)))
-            })
-        }
-
-        fn invalidate_broken_sessions(&self) {
-            self.invalidations.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    /// Acquire evicts every dead idle stream, but invalidates the shared
-    /// transport session exactly once. Invalidating once per evicted stream
-    /// repeatedly closes the cached QUIC/H3 connection and its sibling streams.
+    /// Dead idle streams are discarded one by one; the shared session stays open
+    /// because sibling streams may still be carrying live relays.
     #[tokio::test]
-    async fn test_acquire_invalidates_shared_session_once_for_many_dead_streams() {
-        let invalidations = Arc::new(AtomicUsize::new(0));
-        let connector = Arc::new(CountingInvalidationConnector {
-            invalidations: Arc::clone(&invalidations),
-        });
+    async fn test_acquire_discards_dead_streams_without_closing_session() {
+        let connector = Arc::new(MockSuccessfulConnector);
         let cancel_token = CancellationToken::new();
         // target_size 0 keeps background replenishment out of the picture.
         let pool = ReplenishingStreamPool::new_shared(
@@ -1444,11 +1408,6 @@ mod tests {
             .expect("Acquire stalled after evicting dead streams")
             .expect("Acquire failed after evicting dead streams");
 
-        assert_eq!(
-            invalidations.load(Ordering::SeqCst),
-            1,
-            "shared sessions must be invalidated once per Acquire, not once per evicted stream"
-        );
         // The handed-out stream is a fresh healthy dial, never a dead one.
         assert_eq!(
             std::future::poll_fn(|cx| stream.poll_check_alive(cx)).await,
@@ -1460,8 +1419,6 @@ mod tests {
 
     /// A stream with an in-flight probe write is healthy but busy: Acquire must
     /// skip it and leave it pooled, handing out the next freshest idle stream.
-    /// `pop_back()` followed by a "dead" verdict destroyed these streams and
-    /// invalidated the shared QUIC/H3 session they belonged to.
     #[tokio::test]
     async fn test_acquire_skips_but_retains_busy_probe_stream() {
         let healthy_stream = || -> Box<dyn TunnelStream> {

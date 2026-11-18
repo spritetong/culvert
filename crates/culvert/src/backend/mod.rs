@@ -84,10 +84,6 @@ pub trait TransportConnector: Send + Sync {
         let _ = tunnel_id;
         self.connect_pooled_with_protocol(target, protocol)
     }
-
-    /// Hints to the connector that underlying streams have failed or become dead,
-    /// allowing multiplexed transports (such as HTTP/3) to invalidate broken cached sessions.
-    fn invalidate_broken_sessions(&self) {}
 }
 
 /// Dynamic trait object for accepting inbound relay channels from clients.

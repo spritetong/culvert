@@ -16,10 +16,10 @@ use culvert::transport::TargetAddr;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio_util::sync::CancellationToken;
 
 /// A mock stream belonging to a shared session.
@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 struct SessionBoundStream {
     session_closed: Arc<AtomicBool>,
     is_dead: Arc<AtomicBool>,
+    aged_at: Option<u64>,
 }
 
 impl AsyncRead for SessionBoundStream {
@@ -90,6 +91,10 @@ impl TunnelStream for SessionBoundStream {
             Poll::Ready(HeartbeatStatus::Alive)
         }
     }
+
+    fn last_activity_ms(&self) -> Option<u64> {
+        self.aged_at
+    }
 }
 
 struct MockSession {
@@ -100,7 +105,6 @@ struct MockSession {
 /// where multiple streams share an underlying cached session.
 struct MultiplexedMockConnector {
     current_session: parking_lot::RwLock<Arc<MockSession>>,
-    invalidations: Arc<AtomicUsize>,
 }
 
 impl TransportConnector for MultiplexedMockConnector {
@@ -114,6 +118,7 @@ impl TransportConnector for MultiplexedMockConnector {
             let stream = SessionBoundStream {
                 session_closed: Arc::clone(&session.closed),
                 is_dead: Arc::new(AtomicBool::new(false)),
+                aged_at: None,
             };
             Ok(IoChannel::from_boxed_stream(
                 Box::new(stream) as Box<dyn TunnelStream>
@@ -144,27 +149,15 @@ impl TransportConnector for MultiplexedMockConnector {
     ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
         self.connect(target, None)
     }
-
-    fn invalidate_broken_sessions(&self) {
-        self.invalidations.fetch_add(1, Ordering::SeqCst);
-        let mut guard = self.current_session.write();
-        guard.closed.store(true, Ordering::SeqCst);
-        *guard = Arc::new(MockSession {
-            closed: Arc::new(AtomicBool::new(false)),
-        });
-    }
 }
 
 #[tokio::test]
-async fn probe_pool_acquire_session_invalidation_kill_race() {
+async fn probe_pool_acquire_dead_stream_keeps_sibling_session_alive() {
     let session = Arc::new(MockSession {
         closed: Arc::new(AtomicBool::new(false)),
     });
-    let invalidations = Arc::new(AtomicUsize::new(0));
-
     let connector = Arc::new(MultiplexedMockConnector {
         current_session: parking_lot::RwLock::new(Arc::clone(&session)),
-        invalidations: Arc::clone(&invalidations),
     });
 
     let cancel_token = CancellationToken::new();
@@ -180,6 +173,7 @@ async fn probe_pool_acquire_session_invalidation_kill_race() {
     let stream0 = SessionBoundStream {
         session_closed: Arc::clone(&session.closed),
         is_dead: Arc::new(AtomicBool::new(false)),
+        aged_at: None,
     };
     pool.push_idle(Box::new(stream0));
 
@@ -187,6 +181,7 @@ async fn probe_pool_acquire_session_invalidation_kill_race() {
     let stream1 = SessionBoundStream {
         session_closed: Arc::clone(&session.closed),
         is_dead: Arc::new(AtomicBool::new(true)),
+        aged_at: None,
     };
     pool.push_idle(Box::new(stream1));
 
@@ -200,21 +195,70 @@ async fn probe_pool_acquire_session_invalidation_kill_race() {
     let write_res = acquired_stream.write_all(b"\xA5\x00\x00").await;
 
     println!("write_res: {:?}", write_res);
-    println!("invalidations: {}", invalidations.load(Ordering::SeqCst));
     println!("session_closed: {}", session.closed.load(Ordering::SeqCst));
 
-    // Now test: caller's write to acquired_stream must SUCCEED because
-    // the pool avoided handing out the killed sibling and dialed a fresh healthy session!
+    // A stream-level dead verdict must not close the shared session: sibling
+    // streams may still be carrying live relays. Only the dead idle stream is
+    // discarded; the acquired stream comes from a fresh dial.
     assert!(
         write_res.is_ok(),
-        "Expected write_res to SUCCEED with freshly dialed session: {:?}",
+        "Expected write_res to SUCCEED with a healthy stream: {:?}",
         write_res
     );
-    assert_eq!(
-        invalidations.load(Ordering::SeqCst),
-        1,
-        "invalidate_broken_sessions was called exactly once"
+    assert!(
+        !session.closed.load(Ordering::SeqCst),
+        "sibling streams must survive one stream's death"
     );
+
+    cancel_token.cancel();
+}
+
+/// An idle stream that only aged out (no RST, no connection failure) must be
+/// retired locally. Closing the shared session here would reset every active
+/// relay that still uses it, which is what an iperf3 `-P 4` run sees as
+/// "unable to write to stream socket: Connection reset by peer".
+#[tokio::test]
+async fn probe_pool_age_eviction_keeps_active_sibling_stream_alive() {
+    let session = Arc::new(MockSession {
+        closed: Arc::new(AtomicBool::new(false)),
+    });
+    let connector = Arc::new(MultiplexedMockConnector {
+        current_session: parking_lot::RwLock::new(Arc::clone(&session)),
+    });
+
+    let cancel_token = CancellationToken::new();
+    let pool = ReplenishingStreamPool::new_shared(
+        connector,
+        0,
+        cancel_token.clone(),
+        DEFAULT_HEARTBEAT_INTERVAL,
+        Duration::from_millis(200),
+    );
+
+    // This stream is live and carrying traffic outside the pool.
+    let mut active = SessionBoundStream {
+        session_closed: Arc::clone(&session.closed),
+        is_dead: Arc::new(AtomicBool::new(false)),
+        aged_at: None,
+    };
+    // This one is merely older than idle_timeout; its session is still healthy.
+    pool.push_idle(Box::new(SessionBoundStream {
+        session_closed: Arc::clone(&session.closed),
+        is_dead: Arc::new(AtomicBool::new(false)),
+        aged_at: Some(0), // created at the activity clock origin
+    }));
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    println!("age probe stats: {:?}", pool.stats());
+    assert!(
+        !session.closed.load(Ordering::SeqCst),
+        "shared session must stay open for active relays"
+    );
+    active
+        .write_all(b"still alive")
+        .await
+        .expect("active sibling stream was reset by idle age eviction");
 
     cancel_token.cancel();
 }
@@ -243,6 +287,96 @@ fn generate_test_quic_pki() -> (
         server_rustls,
         rustls::pki_types::CertificateDer::from(cert_der),
     )
+}
+
+/// Real QUIC version of the age-eviction probe: an idle pooled stream on the
+/// same connection ages out while an active relay is still exchanging bytes.
+#[tokio::test]
+async fn probe_pool_age_eviction_preserves_live_quic_connection() {
+    use culvert::backend::accept_one;
+    use culvert::config::model::{AppConfig, EndpointConfig, TlsConfig, TunnelMode};
+    use culvert::dialer::endpoint::EndpointContext;
+    use culvert::transport::h3::H3Connector;
+    use culvert::transport::h3::listener::H3Listener;
+
+    let port = {
+        let t = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        t.local_addr().unwrap().port()
+    };
+    let listen_addr = format!("127.0.0.1:{port}");
+    let token = "probe_quic_age_eviction";
+    let (server_rustls, _) = generate_test_quic_pki();
+    let mut listener = H3Listener::bind(&listen_addr, Some(token), None, server_rustls).unwrap();
+
+    let server_task = tokio::spawn(async move {
+        // First stream is the live relay; echo one payload back.
+        let (mut active, meta) = accept_one(&mut listener).await.unwrap();
+        assert!(!meta.pool_idle);
+        let mut buf = [0u8; 6];
+        active.read_exact(&mut buf).await.unwrap();
+        active.write_all(&buf).await.unwrap();
+        active.flush().await.unwrap();
+
+        // Second stream is the pre-warmed idle sibling.
+        let (idle, meta) = accept_one(&mut listener).await.unwrap();
+        assert!(meta.pool_idle);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        drop(idle);
+    });
+
+    let endpoint_cfg = EndpointConfig::Detailed {
+        url: format!("quic://{listen_addr}/raw"),
+        dns: None,
+        dialer: None,
+        tls: Some(TlsConfig {
+            insecure: Some(true),
+            server_name: Some("localhost".to_string()),
+            ..Default::default()
+        }),
+        http_headers: None,
+    };
+    let ctx = EndpointContext::build(&endpoint_cfg, &AppConfig::default()).unwrap();
+    let connector = Arc::new(H3Connector::new(&ctx, token, TunnelMode::Forward).unwrap());
+    let target = TargetAddr::Domain("127.0.0.1".to_string(), 5201);
+
+    let mut active = connector
+        .connect(&target, None)
+        .await
+        .unwrap()
+        .into_stream()
+        .unwrap();
+    let pooled = connector
+        .connect_pooled(&TargetAddr::Domain("pool.idle".to_string(), 0))
+        .await
+        .unwrap()
+        .into_stream()
+        .unwrap();
+
+    let cancel = CancellationToken::new();
+    let pool = ReplenishingStreamPool::new_shared(
+        Arc::clone(&connector) as Arc<dyn culvert::backend::TransportConnector>,
+        0,
+        cancel.clone(),
+        DEFAULT_HEARTBEAT_INTERVAL,
+        Duration::from_millis(100),
+    );
+    pool.push_idle(pooled);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    active
+        .write_all(b"active")
+        .await
+        .expect("idle stream eviction reset the live QUIC connection");
+    let mut reply = [0u8; 6];
+    active
+        .read_exact(&mut reply)
+        .await
+        .expect("live QUIC stream stopped receiving");
+    assert_eq!(&reply, b"active");
+
+    drop(active);
+    cancel.cancel();
+    server_task.await.unwrap();
 }
 
 #[tokio::test]

@@ -32,7 +32,9 @@ fn effective_mtu(quic: &QuicConfig) -> u16 {
 
 /// Endpoint-level QUIC socket configuration. `max_udp_payload_size` is also
 /// advertised to the peer, so it must be set on listeners and connectors alike.
-pub(crate) fn quic_endpoint_config(quic: &QuicConfig) -> Result<quinn::EndpointConfig, TunnelError> {
+pub(crate) fn quic_endpoint_config(
+    quic: &QuicConfig,
+) -> Result<quinn::EndpointConfig, TunnelError> {
     let mut config = quinn::EndpointConfig::default();
     let mtu = effective_mtu(quic);
     config

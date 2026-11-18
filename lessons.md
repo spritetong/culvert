@@ -22,20 +22,16 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
   - Implementation: [stream.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/h3/stream.rs#L536-L565)
   - Probe Test: [test_idle_probe.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/tests/test_idle_probe.rs#L121-L186)
 
-### 1.2 Session Invalidation Kill Race in Multiplexed Connection Pools
+### 1.2 Pooled Stream Eviction Must Not Close a Shared Transport Session
 
-- **Problem / Trap**: When multiple idle streams in a pool share a single multiplexed QUIC/H3 session, evicting an over-age or dead stream triggers session invalidation (`connector.invalidate_broken_sessions()`), which calls `conn.close(0x00, b"broken")`.
-- **Symptom**: If the pool reactor pops an idle stream for a caller and simultaneously detects that an adjacent stream is dead, calling `invalidate_broken_sessions()` aborts the underlying QUIC connection. The caller receives a stream whose underlying session was just killed, causing the activation handshake to fail immediately.
+- **Problem / Trap**: Idle streams in a pool share one multiplexed QUIC/H3 session. Retiring an over-age or stream-level-dead idle stream by closing that session (`conn.close(...)`) also resets every sibling stream still relaying live traffic.
+- **Symptom**: With `quic://` + `pool_size: 16` and `iperf3 -P 4`, idle streams pre-warmed at startup age out at `idle_timeout` (30s) while four iperf3 streams are active. The pool actor's `StreamsEvicted` sweep (or an `acquire` that scans aged streams) closes the shared QUIC connection; active relays fail immediately and the frontend TCP sockets are dropped with unread data, producing `iperf3: error - unable to write to stream socket: Connection reset by peer`.
 - **Solution**:
-  - In `take_live_idle_stream`: If any dead stream is encountered during LIFO scanning (`evicted_dead == true`), treat the entire cached session as compromised:
-    1. Call `connector.invalidate_broken_sessions()`.
-    2. Completely clear the remaining `idle_streams` queue.
-    3. Discard any candidate stream popped during that sweep (`acquired = None`).
-    4. Fall through to dial a brand-new connection rather than handing out a poisoned sibling.
-  - In background heartbeat sweep (`PoolEvent::StreamsEvicted`): If a background eviction invalidates the session, unconditionally clear `idle_streams` and reset `idle_count = 0`.
+  - `take_live_idle_stream` evicts dead/aged streams individually and discards a candidate only when that sweep actually evicted something; it never touches the connector's cached session.
+  - `PoolEvent::StreamsEvicted` keeps the already-pruned idle queue and leaves the session open. The connector invalidates its cached session only in its own dial path when a real handshake/open/write failure proves the transport broken; `TransportConnector` no longer exposes `invalidate_broken_sessions`.
 - **References**:
-  - Implementation: [connection_pool.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/pool/connection_pool.rs#L148-L200)
-  - Probe Test: [test_idle_probe.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/tests/test_idle_probe.rs#L40-L119)
+  - Implementation: [connection_pool.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/pool/connection_pool.rs#L148-L200), [connector.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/h3/connector.rs#L368-L382)
+  - Probe Tests: [test_idle_probe.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/tests/test_idle_probe.rs#L155-L275)
 
 ### 1.3 Stream-Level Activity Clock vs. NAT/Firewall UDP Pinholes
 

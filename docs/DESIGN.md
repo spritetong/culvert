@@ -325,7 +325,6 @@ pub trait TransportConnector: Send + Sync {
     fn connect_pooled_with_protocol<'a>(&'a self, target: &'a TargetAddr,
                                         protocol: L4Protocol)
         -> BoxFuture<'a, Result<IoChannel, TunnelError>>;
-    fn invalidate_broken_sessions(&self) {}
 }
 
 pub trait TransportListener: Send + Sync {
@@ -887,13 +886,13 @@ later.
 
 | Element | Behavior |
 | :--- | :--- |
-| `mpsc::Sender<PoolCommand>` | `Acquire`, `PushIdle`, `StreamClosed` / `ActiveReleased` on a 1024-slot channel. |
+| `mpsc::Sender<PoolCommand>` | `Acquire`, `PushIdle`, `ActiveReleased` wake hint on a 1024-slot channel. |
 | `idle_streams: VecDeque<ManagedStream>` | Idle streams with per-stream `HeartbeatState`. |
 | `pending_requests: VecDeque<AcquireRequest>` | Waiters with timestamps; each has a `oneshot` reply. |
 | `connecting_futures: FuturesUnordered` | At most 16 concurrent dials (`POOL_MAX_CONCURRENT_CONNECTS`). |
 | Reactor events | `Cancelled`, `ConnectionResult`, `Command`, `RetryTimerExpired`, `HeartbeatTick`, `StreamsEvicted`. |
 | Heartbeats | `poll_check_alive` sweeps on a 1-second tick with a 5-second probe interval and 5-second probe timeout. Non-destructive via zero-capacity read buffer. |
-| Acquire order | LIFO (freshest first) to avoid silently expired NAT/QUIC pinholes. A stream with an in-flight probe write (`HeartbeatState::SendingPing`) is skipped but kept in the pool; only over-age or `poll_check_alive == Dead` streams are evicted. Shared transport sessions are invalidated once per Acquire and only after a real eviction, so a healthy-but-busy stream cannot close the cached QUIC/H3 connection and its sibling multiplexed streams. |
+| Acquire order | LIFO (freshest first) to avoid silently expired NAT/QUIC pinholes. A stream with an in-flight probe write (`HeartbeatState::SendingPing`) is skipped but kept in the pool; only over-age or `poll_check_alive == Dead` streams are evicted. Evicting idle streams never closes the shared QUIC/H3 session: other streams may still be relaying on it. The connector invalidates a cached session only when its own dial path proves the transport broken. |
 | Replenishment | Parallel one-turn batch dialing up to `POOL_MAX_CONCURRENT_CONNECTS` (16); backoff from 200 ms up to 10 s, capped at 1 s when waiters are queued (`POOL_BACKOFF_ACTIVE_WAITERS_MAX`). |
 | Limits | Idle pre-warmed inventory bounded by `POOL_MAX_CAPACITY` = 64; `pool_size` acts as the 0-RTT minimum warm inventory floor. Active relay throughput is fully decoupled from replenishment gating; pending callers dial immediately in parallel batches up to 16. Acquire timeout 15 s. |
 | Statistics | `PoolStats { idle_count, active_count, total_created }`. Authoritative `active_count` is tracked atomically (`Arc<AtomicUsize>`). |

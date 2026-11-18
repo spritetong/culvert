@@ -235,8 +235,9 @@ behavior is configurable, the configuration key is given.
   throughput from replenishment gating, and supports up to 16 concurrent dials
   (`POOL_MAX_CONCURRENT_CONNECTS`). Acquire prefers the freshest idle stream
   (LIFO); a stream with a probe write in flight is skipped, not destroyed. Only
-  over-age or confirmed-dead streams are evicted, and shared transport sessions
-  are invalidated at most once per Acquire on a real eviction.
+  over-age or confirmed-dead streams are evicted without closing the shared
+  session; cached sessions are invalidated only by the connector's dial path
+  when a transport failure is proven.
 - **FR-4.6** An acquired stream is used once. Closing it decrements the pool's
   atomic active-stream counter through a guard; the actor replenishes idle streams in
   the background. Streams are not returned to the idle queue after use. Cancelled

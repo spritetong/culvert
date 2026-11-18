@@ -676,17 +676,6 @@ impl TransportConnector for H3Connector {
             Ok(IoChannel::from_boxed_stream(stream))
         })
     }
-
-    fn invalidate_broken_sessions(&self) {
-        if let Some(s) = self.cached_h3_session.write().take() {
-            s.conn
-                .close(quinn::VarInt::from_u32(0), b"pool evicted dead streams");
-        }
-        if let Some(s) = self.cached_quic_session.write().take() {
-            s.conn
-                .close(quinn::VarInt::from_u32(0), b"pool evicted dead streams");
-        }
-    }
 }
 
 #[cfg(test)]

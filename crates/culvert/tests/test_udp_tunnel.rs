@@ -755,10 +755,6 @@ impl TransportConnector for CountingConnector {
     ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
         self.inner.connect_pooled_with_protocol(target, protocol)
     }
-
-    fn invalidate_broken_sessions(&self) {
-        self.inner.invalidate_broken_sessions();
-    }
 }
 
 struct CountingWsDriver {
