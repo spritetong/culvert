@@ -35,7 +35,7 @@ pub struct AppConfig {
 }
 
 /// QUIC parameters that are safe to expose without changing connection semantics.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
 pub struct QuicConfig {
     /// PLPMTUD upper bound. The initial MTU remains 1200 for path safety.
@@ -46,29 +46,14 @@ pub struct QuicConfig {
     pub congestion: Option<QuicCongestion>,
 }
 
-impl Default for QuicConfig {
-    fn default() -> Self {
-        Self {
-            mtu_upper_bound: None,
-            immediate_ack: None,
-            congestion: None,
-        }
-    }
-}
-
 /// Supported QUIC congestion controllers.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum QuicCongestion {
+    #[default]
     Bbr,
     Cubic,
     NewReno,
-}
-
-impl Default for QuicCongestion {
-    fn default() -> Self {
-        Self::Bbr
-    }
 }
 
 /// Parses a UDS `chmod=` value. Socket modes are always octal: a plain `660`

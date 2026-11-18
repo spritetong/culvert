@@ -69,6 +69,7 @@ impl TransportRegistry {
     }
 
     /// Creates a dynamic `TransportListener` for the specified scheme.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_listener(
         &self,
         scheme: &str,
