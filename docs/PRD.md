@@ -379,9 +379,11 @@ behavior is configurable, the configuration key is given.
   (default 15 s), `idle_timeout` (default 30 s), `udp_idle_timeout` (default 30 s,
   also configurable on `server` and per mapping). `bind_interface` relies on
   `SO_BINDTODEVICE` and is rejected on platforms without it.
-- **FR-8.3** TLS client options: `server_name`, `insecure`, `alpn`,
-  `ca_certificate`, `client_certificate`, `client_key`, `certificate`, `key`,
-  `min_version`, `max_version`. mTLS requires certificate and key together.
+- **FR-8.3** TLS options: `server_name`, `insecure`, `alpn`, `ca_certificate`,
+  `client_certificate`, `client_key`, `certificate`, `key`, `client_ca_certificate`,
+  `client_auth` (`none`, `optional`, `required`), `min_version`, `max_version`.
+  Client mTLS requires certificate and key together; server mTLS requires a trusted
+  client CA certificate (`client_ca_certificate`) to verify client certificates.
   ALPN is set to `h3` for HTTP/3 endpoints and `culvert-quic` for raw QUIC
   endpoints.
 - **FR-8.4** Logging uses `tracing`. `log.level` accepts `trace`, `debug`,

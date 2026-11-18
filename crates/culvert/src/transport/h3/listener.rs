@@ -130,6 +130,7 @@ impl H3Listener {
     }
 
     /// Binds an `H3Listener` wired to the root shutdown token with custom keepalive and idle timeouts.
+    #[allow(clippy::too_many_arguments)]
     pub fn bind_with_options(
         listen_addr: &str,
         auth_token: Option<&str>,

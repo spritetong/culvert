@@ -202,8 +202,26 @@ impl ConfigLoader {
                 (None, None) => {}
             }
 
+            // Server client CA cert validation
+            if let Some(ref ca) = server.client_ca_certificate {
+                Self::validate_pem_certs(Path::new(ca), "server client CA certificate", "server")?;
+            }
+
             if let Some(ref tls) = server.tls {
                 Self::validate_tls_config(tls, "server.tls")?;
+            }
+
+            let effective_server_tls = server.effective_tls(config.tls.as_ref());
+            if let Some(ref eff) = effective_server_tls
+                && eff
+                    .client_auth
+                    .is_some_and(|m| m != crate::config::model::ClientAuthMode::None)
+                && eff.client_ca_certificate.is_none()
+                && eff.ca_certificate.is_none()
+            {
+                return Err(TunnelError::Config(
+                    "server: 'client_auth' is enabled, but no client CA certificate ('client_ca_certificate') was provided.".to_string(),
+                ));
             }
 
             let specs = server.parse_specs()?;
@@ -217,13 +235,20 @@ impl ConfigLoader {
             });
             let has_server_certs = server.certificate.is_some()
                 || server.key.is_some()
+                || server.client_ca_certificate.is_some()
                 || server
-                    .tls
-                    .as_ref()
-                    .is_some_and(|t| t.certificate.is_some() || t.key.is_some());
+                    .client_auth
+                    .is_some_and(|m| m != crate::config::model::ClientAuthMode::None)
+                || server.tls.as_ref().is_some_and(|t| {
+                    t.certificate.is_some()
+                        || t.key.is_some()
+                        || t.client_ca_certificate.is_some()
+                        || t.client_auth
+                            .is_some_and(|m| m != crate::config::model::ClientAuthMode::None)
+                });
             if !any_tls_listener && has_server_certs {
                 return Err(TunnelError::Config(
-                    "Server is configured with TLS certificates, but all server.listen URLs use plaintext schemes ('ws://' or 'ws+unix://'). Use a TLS scheme ('wss://', 'h3://', 'wss+unix://') or remove certificate settings.".to_string(),
+                    "Server is configured with TLS certificates or client authentication, but all server.listen URLs use plaintext schemes ('ws://' or 'ws+unix://'). Use a TLS scheme ('wss://', 'h3://', 'wss+unix://') or remove certificate settings.".to_string(),
                 ));
             }
         }
@@ -694,6 +719,23 @@ impl ConfigLoader {
         // CA cert existence and validity
         if let Some(ref ca) = tls.ca_certificate {
             Self::validate_pem_certs(ca, "CA certificate", context)?;
+        }
+
+        // Client CA certificate existence and validity (server mTLS)
+        if let Some(ref client_ca) = tls.client_ca_certificate {
+            Self::validate_pem_certs(client_ca, "client CA certificate", context)?;
+        }
+
+        // Validate client_auth requirement
+        if let Some(mode) = tls.client_auth
+            && mode != crate::config::model::ClientAuthMode::None
+            && tls.client_ca_certificate.is_none()
+            && tls.ca_certificate.is_none()
+        {
+            return Err(TunnelError::Config(format!(
+                "{}: 'client_auth' is set to '{}', but no client CA certificate ('client_ca_certificate') was provided.",
+                context, mode
+            )));
         }
 
         Ok(())
@@ -1654,5 +1696,68 @@ tunnels:
 "#;
         let err_quic = ConfigLoader::from_yaml_str(yaml_quic_proxy).unwrap_err();
         assert!(err_quic.to_string().contains("does not support proxy"));
+    }
+
+    #[test]
+    fn test_server_client_auth_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_params = rcgen::CertificateParams::default();
+        let ca = rcgen::CertifiedIssuer::self_signed(ca_params, &ca_key).unwrap();
+        let ca_path = dir.path().join("ca.crt");
+        std::fs::write(&ca_path, ca.as_ref().pem()).unwrap();
+
+        let server_key = rcgen::KeyPair::generate().unwrap();
+        let server_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let server_cert = server_params.signed_by(&server_key, &ca).unwrap();
+        let cert_path = dir.path().join("server.crt");
+        let key_path = dir.path().join("server.key");
+        std::fs::write(&cert_path, server_cert.pem()).unwrap();
+        std::fs::write(&key_path, server_key.serialize_pem()).unwrap();
+
+        let ca_str = ca_path.to_str().unwrap().replace('\\', "/");
+        let cert_str = cert_path.to_str().unwrap().replace('\\', "/");
+        let key_str = key_path.to_str().unwrap().replace('\\', "/");
+
+        // 1. Valid server mTLS config accepts
+        let valid_yaml = format!(
+            r#"
+server:
+  listen: "wss://0.0.0.0:8443/tunnel"
+  certificate: "{cert_str}"
+  key: "{key_str}"
+  client_ca_certificate: "{ca_str}"
+  client_auth: "required"
+"#
+        );
+        assert!(ConfigLoader::from_yaml_str(&valid_yaml).is_ok());
+
+        // 2. Reject client_auth: required without client_ca_certificate
+        let missing_ca_yaml = format!(
+            r#"
+server:
+  listen: "wss://0.0.0.0:8443/tunnel"
+  certificate: "{cert_str}"
+  key: "{key_str}"
+  client_auth: "required"
+"#
+        );
+        let err = ConfigLoader::from_yaml_str(&missing_ca_yaml).unwrap_err();
+        assert!(err.to_string().contains("client_ca_certificate"));
+
+        // 3. Reject client_ca_certificate on plaintext listener
+        let plaintext_ca_yaml = format!(
+            r#"
+server:
+  listen: "ws://0.0.0.0:8080/tunnel"
+  client_ca_certificate: "{ca_str}"
+"#
+        );
+        let err_plain = ConfigLoader::from_yaml_str(&plaintext_ca_yaml).unwrap_err();
+        assert!(
+            err_plain
+                .to_string()
+                .contains("all server.listen URLs use plaintext schemes")
+        );
     }
 }

@@ -405,3 +405,18 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
   - Constants: [consts.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/consts.rs) (`DEFAULT_QUIC_MTU_UPPER_BOUND`, `DEFAULT_QUIC_MAX_UDP_PAYLOAD_SIZE`)
   - Implementation: [mod.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/h3/mod.rs), [stream.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/h3/stream.rs)
   - Probe Test: [test_quic_throughput.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/tests/test_quic_throughput.rs)
+
+---
+
+## 10. Server-Side mTLS & Client Certificate Verification
+
+### 10.1 Isolated Client Root Store vs. Shared WebPKI Roots
+
+- **Problem / Trap**: When adding server-side client certificate verification (`WebPkiClientVerifier`), seeding the server's client root store with default public web PKI roots (`webpki_roots::TLS_SERVER_ROOTS`) allows any client presenting a certificate signed by any public CA to pass verification.
+- **Solution**:
+  - Maintain strict separation: client outbound connections use public roots plus optional custom CA, while server-side client verification builds an empty `RootCertStore` containing ONLY the certificates from `client_ca_certificate`.
+  - In `TlsConfigBuilder::build_server_config`, evaluate `client_ca_certificate` and `client_auth` mode (`Required`, `Optional`, `None`). Default to `Required` whenever `client_ca_certificate` is supplied.
+  - Fail fast during configuration validation if `client_auth` is configured on plaintext (`ws://`) listeners, or if `client_auth` is set to `Required` without a client CA certificate.
+- **References**:
+  - Implementation: [tls.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/dialer/tls.rs#L250-L315), [model.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/config/model.rs#L550-L650)
+  - Integration Tests: [test_wss_tls.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/tests/test_wss_tls.rs#L1000-L1150), [test_h3_quic.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/tests/test_h3_quic.rs#L1210-L1350)

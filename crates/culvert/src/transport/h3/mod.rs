@@ -138,6 +138,10 @@ impl TransportDriver for H3TransportDriver {
             .and_then(|t| t.certificate.as_ref())
             .and_then(|p| p.to_str());
         let key_str = tls.and_then(|t| t.key.as_ref()).and_then(|p| p.to_str());
+        let client_ca_str = tls
+            .and_then(|t| t.effective_client_ca_certificate())
+            .and_then(|p| p.to_str());
+        let client_auth = tls.map(|t| t.effective_client_auth());
         let (min_v, max_v) = match tls {
             Some(t) => (t.min_version.as_deref(), t.max_version.as_deref()),
             None => (None, None),
@@ -146,6 +150,8 @@ impl TransportDriver for H3TransportDriver {
         let server_rustls = crate::dialer::tls::TlsConfigBuilder::build_server_config(
             cert_str,
             key_str,
+            client_ca_str,
+            client_auth,
             Some(alpn),
             min_v,
             max_v,

@@ -22,8 +22,8 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
 use culvert::config::model::{
-    AppConfig, EndpointConfig, MappingRuleConfig, ServerConfig, TlsConfig, TunnelConfig,
-    TunnelMappingsConfig, TunnelMode,
+    AppConfig, ClientAuthMode, EndpointConfig, MappingRuleConfig, ServerConfig, TlsConfig,
+    TunnelConfig, TunnelMappingsConfig, TunnelMode,
 };
 use culvert::dialer::endpoint::EndpointContext;
 use culvert::server::ServerRunner;
@@ -1001,4 +1001,189 @@ async fn test_server_listen_dual_stack_wss_port() {
 
     cancel_token.cancel();
     let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_wss_server_native_mandatory_mtls() {
+    let cancel_token = CancellationToken::new();
+    let pki = generate_test_pki();
+
+    let server_port = get_available_port();
+    let echo_port = get_available_port();
+    let client_listen_port = get_available_port();
+    let auth_token = "native_mtls_test_token";
+
+    // 1. Spawn echo server on backend
+    let echo_listener = TcpListener::bind(format!("127.0.0.1:{}", echo_port))
+        .await
+        .unwrap();
+    let echo_cancel = cancel_token.clone();
+    let echo_handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = echo_cancel.cancelled() => break,
+                res = echo_listener.accept() => {
+                    if let Ok((mut socket, _)) = res {
+                        tokio::spawn(async move {
+                            let (mut rd, mut wr) = socket.split();
+                            let _ = tokio::io::copy(&mut rd, &mut wr).await;
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    // 2. Spawn Culvert Server with native mTLS required
+    let mut server_registry = TransportRegistry::new();
+    server_registry.register(WsTransportDriver);
+    let server_registry = Arc::new(server_registry);
+    let session_mgr = Arc::new(SessionManager::new());
+
+    let server_config = ServerConfig {
+        listen: vec![format!("wss://127.0.0.1:{}/tunnel", server_port)],
+        token: Some(auth_token.to_string()),
+        default_target: None,
+        certificate: Some(pki.server_cert_path.to_str().unwrap().to_string()),
+        key: Some(pki.server_key_path.to_str().unwrap().to_string()),
+        client_ca_certificate: Some(pki.ca_cert_path.to_str().unwrap().to_string()),
+        client_auth: Some(ClientAuthMode::Required),
+        ..Default::default()
+    };
+
+    let server_runner = ServerRunner::new(
+        server_config,
+        Arc::clone(&server_registry),
+        Arc::clone(&session_mgr),
+    );
+    let s_cancel = cancel_token.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = server_runner.run(s_cancel).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // 3. Test Client A: Valid client certificate -> MUST SUCCEED
+    let tunnel_config = TunnelConfig {
+        tag: "test-native-mtls".to_string(),
+        uuid: None,
+        token: Some(auth_token.to_string()),
+        failover: None,
+        multiplex: None,
+        mappings: TunnelMappingsConfig::forward(vec![MappingRuleConfig::tcp(
+            format!("127.0.0.1:{}", client_listen_port),
+            format!("127.0.0.1:{}", echo_port),
+        )]),
+        retry: None,
+        http_headers: None,
+        endpoint: EndpointConfig::Detailed {
+            url: format!("wss://127.0.0.1:{}/tunnel", server_port),
+            dns: None,
+            dialer: None,
+            tls: Some(TlsConfig {
+                server_name: Some("localhost".to_string()),
+                insecure: Some(false),
+                ca_certificate: Some(pki.ca_cert_path.clone()),
+                client_certificate: Some(pki.client_cert_path.clone()),
+                client_key: Some(pki.client_key_path.clone()),
+                ..Default::default()
+            }),
+            http_headers: None,
+        },
+    };
+
+    let app_config = AppConfig::default();
+    let endpoint_ctx = EndpointContext::build(&tunnel_config.endpoint, &app_config).unwrap();
+    let client_cancel = cancel_token.clone();
+    let client_registry = Arc::clone(&server_registry);
+    let client_handle = tokio::spawn(async move {
+        let _ =
+            run_forward_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
+    });
+
+    let mut stream = None;
+    for _ in 0..50 {
+        if let Ok(s) = TcpStream::connect(format!("127.0.0.1:{}", client_listen_port)).await {
+            stream = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut stream = stream.expect("Failed to connect client listen port after retries");
+
+    let payload = b"native server mTLS verification works perfectly!";
+    stream.write_all(payload).await.unwrap();
+
+    let mut buf = vec![0u8; payload.len()];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+        .await
+        .expect("Timeout reading echo response")
+        .unwrap();
+    assert_eq!(&buf, payload);
+
+    // 4. Test Client B: Connector with NO client cert -> MUST BE REJECTED by server
+    let unauth_ep = EndpointConfig::Detailed {
+        url: format!("wss://127.0.0.1:{}/tunnel", server_port),
+        dns: None,
+        dialer: None,
+        tls: Some(TlsConfig {
+            server_name: Some("localhost".to_string()),
+            insecure: Some(false),
+            ca_certificate: Some(pki.ca_cert_path.clone()),
+            ..Default::default()
+        }),
+        http_headers: None,
+    };
+    let unauth_ctx = EndpointContext::build(&unauth_ep, &app_config).unwrap();
+    let unauth_connector = server_registry
+        .create_connector(&unauth_ctx, Some(auth_token), TunnelMode::Forward)
+        .unwrap();
+    let target = culvert::transport::TargetAddr::Domain("127.0.0.1".into(), echo_port);
+    let unauth_res = unauth_connector.connect(&target, None).await;
+    assert!(
+        unauth_res.is_err(),
+        "Server must reject client connection when client certificate is omitted"
+    );
+
+    // 5. Test Client C: Connector with Untrusted client cert -> MUST BE REJECTED
+    let untrusted_ca_key = rcgen::KeyPair::generate().unwrap();
+    let untrusted_ca =
+        rcgen::CertifiedIssuer::self_signed(rcgen::CertificateParams::default(), &untrusted_ca_key)
+            .unwrap();
+    let untrusted_client_key = rcgen::KeyPair::generate().unwrap();
+    let untrusted_client_cert = rcgen::CertificateParams::default()
+        .signed_by(&untrusted_client_key, &untrusted_ca)
+        .unwrap();
+    let untrusted_cert_path = pki.ca_cert_path.parent().unwrap().join("untrusted.crt");
+    let untrusted_key_path = pki.ca_cert_path.parent().unwrap().join("untrusted.key");
+    std::fs::write(&untrusted_cert_path, untrusted_client_cert.pem()).unwrap();
+    std::fs::write(&untrusted_key_path, untrusted_client_key.serialize_pem()).unwrap();
+
+    let rogue_ep = EndpointConfig::Detailed {
+        url: format!("wss://127.0.0.1:{}/tunnel", server_port),
+        dns: None,
+        dialer: None,
+        tls: Some(TlsConfig {
+            server_name: Some("localhost".to_string()),
+            insecure: Some(false),
+            ca_certificate: Some(pki.ca_cert_path.clone()),
+            client_certificate: Some(untrusted_cert_path),
+            client_key: Some(untrusted_key_path),
+            ..Default::default()
+        }),
+        http_headers: None,
+    };
+    let rogue_ctx = EndpointContext::build(&rogue_ep, &app_config).unwrap();
+    let rogue_connector = server_registry
+        .create_connector(&rogue_ctx, Some(auth_token), TunnelMode::Forward)
+        .unwrap();
+    let rogue_res = rogue_connector.connect(&target, None).await;
+    assert!(
+        rogue_res.is_err(),
+        "Server must reject client connection when client certificate is signed by untrusted CA"
+    );
+
+    // Clean up
+    cancel_token.cancel();
+    let _ = tokio::join!(echo_handle, server_handle, client_handle);
 }

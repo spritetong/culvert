@@ -5,9 +5,10 @@
 //! Declarative YAML configuration data models.
 //! All comments and docstrings must be in English.
 
+use crate::core::error::TunnelError;
 use crate::io::addr::L4Protocol;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Top-level application configuration structure.
@@ -35,7 +36,7 @@ pub struct AppConfig {
 }
 
 /// QUIC parameters that are safe to expose without changing connection semantics.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct QuicConfig {
     /// PLPMTUD upper bound. The initial MTU remains 1200 for path safety.
@@ -46,29 +47,14 @@ pub struct QuicConfig {
     pub congestion: Option<QuicCongestion>,
 }
 
-impl Default for QuicConfig {
-    fn default() -> Self {
-        Self {
-            mtu_upper_bound: None,
-            immediate_ack: None,
-            congestion: None,
-        }
-    }
-}
-
 /// Supported QUIC congestion controllers.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum QuicCongestion {
+    #[default]
     Bbr,
     Cubic,
     NewReno,
-}
-
-impl Default for QuicCongestion {
-    fn default() -> Self {
-        Self::Bbr
-    }
 }
 
 /// Parses a UDS `chmod=` value. Socket modes are always octal: a plain `660`
@@ -254,6 +240,14 @@ pub struct ServerConfig {
     #[serde(default)]
     pub key: Option<String>,
 
+    /// Client CA certificate file path for mandatory client verification (mTLS, optional).
+    #[serde(default)]
+    pub client_ca_certificate: Option<String>,
+
+    /// Client certificate verification mode for server termination (none, optional, required).
+    #[serde(default)]
+    pub client_auth: Option<ClientAuthMode>,
+
     /// Advanced TLS options (version bounds, cert paths, ALPN) for server termination.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
@@ -283,6 +277,8 @@ impl ServerConfig {
             default_target,
             certificate: None,
             key: None,
+            client_ca_certificate: None,
+            client_auth: None,
             tls: None,
             heartbeat_interval: None,
             idle_timeout: None,
@@ -299,13 +295,23 @@ impl ServerConfig {
             (None, None) => None,
         };
 
-        if self.certificate.is_some() || self.key.is_some() {
+        if self.certificate.is_some()
+            || self.key.is_some()
+            || self.client_ca_certificate.is_some()
+            || self.client_auth.is_some()
+        {
             let mut cfg = merged.unwrap_or_default();
             if let Some(ref c) = self.certificate {
                 cfg.certificate = Some(PathBuf::from(c));
             }
             if let Some(ref k) = self.key {
                 cfg.key = Some(PathBuf::from(k));
+            }
+            if let Some(ref ca) = self.client_ca_certificate {
+                cfg.client_ca_certificate = Some(PathBuf::from(ca));
+            }
+            if let Some(mode) = self.client_auth {
+                cfg.client_auth = Some(mode);
             }
             Some(cfg)
         } else {
@@ -548,6 +554,71 @@ pub(crate) mod humantime_serde_opt {
     }
 }
 
+/// Client authentication mode for TLS server termination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClientAuthMode {
+    /// No client certificate requested or verified.
+    #[default]
+    None,
+    /// Client certificate requested; connection allowed even if none presented,
+    /// but verified against trusted client CA if presented.
+    Optional,
+    /// Client certificate mandatory and verified against trusted client CA.
+    /// Handshake fails if omitted or invalid.
+    Required,
+}
+
+impl ClientAuthMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Optional => "optional",
+            Self::Required => "required",
+        }
+    }
+}
+
+impl std::fmt::Display for ClientAuthMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ClientAuthMode {
+    type Err = TunnelError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" | "off" | "disabled" => Ok(Self::None),
+            "optional" | "want" => Ok(Self::Optional),
+            "required" | "require" | "mandatory" | "need" | "on" => Ok(Self::Required),
+            other => Err(TunnelError::Config(format!(
+                "Unsupported client_auth mode '{}'. Expected 'none', 'optional', or 'required'.",
+                other
+            ))),
+        }
+    }
+}
+
+impl Serialize for ClientAuthMode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientAuthMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse::<Self>().map_err(serde::de::Error::custom)
+    }
+}
+
 /// Advanced TLS connection and verification options.
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -579,6 +650,14 @@ pub struct TlsConfig {
     #[serde(default)]
     pub key: Option<PathBuf>,
 
+    /// Custom CA certificate path for validating client certificates (mTLS on server).
+    #[serde(default)]
+    pub client_ca_certificate: Option<PathBuf>,
+
+    /// Client certificate verification mode for server termination (none, optional, required).
+    #[serde(default)]
+    pub client_auth: Option<ClientAuthMode>,
+
     /// Minimum TLS version constraint (e.g. "1.2", "1.3").
     pub min_version: Option<String>,
 
@@ -590,6 +669,33 @@ impl TlsConfig {
     /// Determines whether certificate chain verification is skipped.
     pub fn is_insecure(&self) -> bool {
         self.insecure.unwrap_or(false)
+    }
+
+    /// Resolves the effective client authentication requirement.
+    /// Defaults to `Required` if a client CA is configured without an explicit mode.
+    pub fn effective_client_auth(&self) -> ClientAuthMode {
+        match self.client_auth {
+            Some(mode) => mode,
+            None => {
+                if self.effective_client_ca_certificate().is_some() {
+                    ClientAuthMode::Required
+                } else {
+                    ClientAuthMode::None
+                }
+            }
+        }
+    }
+
+    /// Resolves the effective CA path for validating client certificates.
+    /// Falls back to `ca_certificate` if `client_ca_certificate` is unset but client auth is explicitly enabled.
+    pub fn effective_client_ca_certificate(&self) -> Option<&Path> {
+        self.client_ca_certificate.as_deref().or_else(|| {
+            if self.client_auth.is_some_and(|m| m != ClientAuthMode::None) {
+                self.ca_certificate.as_deref()
+            } else {
+                None
+            }
+        })
     }
 
     /// Merges an override TLS configuration over this base configuration field-by-field.
@@ -618,6 +724,11 @@ impl TlsConfig {
                 .clone()
                 .or_else(|| self.certificate.clone()),
             key: over.key.clone().or_else(|| self.key.clone()),
+            client_ca_certificate: over
+                .client_ca_certificate
+                .clone()
+                .or_else(|| self.client_ca_certificate.clone()),
+            client_auth: over.client_auth.or(self.client_auth),
             min_version: over
                 .min_version
                 .clone()
@@ -1133,7 +1244,7 @@ pub struct FailoverConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_socket_mode;
+    use super::*;
 
     #[test]
     fn socket_modes_are_always_octal() {
@@ -1145,5 +1256,78 @@ mod tests {
         assert_eq!(parse_socket_mode("10000"), None, "mode above 0o7777");
         assert_eq!(parse_socket_mode("888"), None, "non-octal digit");
         assert_eq!(parse_socket_mode(""), None);
+    }
+
+    #[test]
+    fn test_client_auth_mode_parsing() {
+        assert_eq!(
+            "none".parse::<ClientAuthMode>().unwrap(),
+            ClientAuthMode::None
+        );
+        assert_eq!(
+            "off".parse::<ClientAuthMode>().unwrap(),
+            ClientAuthMode::None
+        );
+        assert_eq!(
+            "disabled".parse::<ClientAuthMode>().unwrap(),
+            ClientAuthMode::None
+        );
+
+        assert_eq!(
+            "optional".parse::<ClientAuthMode>().unwrap(),
+            ClientAuthMode::Optional
+        );
+        assert_eq!(
+            "want".parse::<ClientAuthMode>().unwrap(),
+            ClientAuthMode::Optional
+        );
+
+        assert_eq!(
+            "required".parse::<ClientAuthMode>().unwrap(),
+            ClientAuthMode::Required
+        );
+        assert_eq!(
+            "require".parse::<ClientAuthMode>().unwrap(),
+            ClientAuthMode::Required
+        );
+        assert_eq!(
+            "mandatory".parse::<ClientAuthMode>().unwrap(),
+            ClientAuthMode::Required
+        );
+        assert_eq!(
+            "need".parse::<ClientAuthMode>().unwrap(),
+            ClientAuthMode::Required
+        );
+        assert_eq!(
+            "on".parse::<ClientAuthMode>().unwrap(),
+            ClientAuthMode::Required
+        );
+
+        assert!("unknown".parse::<ClientAuthMode>().is_err());
+    }
+
+    #[test]
+    fn test_effective_client_auth() {
+        let tls_none = TlsConfig::default();
+        assert_eq!(tls_none.effective_client_auth(), ClientAuthMode::None);
+
+        let tls_with_ca = TlsConfig {
+            client_ca_certificate: Some(PathBuf::from("/etc/ssl/ca.crt")),
+            ..Default::default()
+        };
+        assert_eq!(
+            tls_with_ca.effective_client_auth(),
+            ClientAuthMode::Required
+        );
+
+        let tls_explicit_optional = TlsConfig {
+            client_ca_certificate: Some(PathBuf::from("/etc/ssl/ca.crt")),
+            client_auth: Some(ClientAuthMode::Optional),
+            ..Default::default()
+        };
+        assert_eq!(
+            tls_explicit_optional.effective_client_auth(),
+            ClientAuthMode::Optional
+        );
     }
 }

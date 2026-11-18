@@ -12,14 +12,18 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use culvert::backend::accept_one;
 use culvert::config::model::{
-    AppConfig, EndpointConfig, MappingRuleConfig, TlsConfig, TunnelMappingsConfig, TunnelMode,
+    AppConfig, ClientAuthMode, EndpointConfig, MappingRuleConfig, ServerConfig, TlsConfig,
+    TunnelMappingsConfig, TunnelMode,
 };
 use culvert::core::error::TunnelError;
 use culvert::core::stream::TunnelStream;
 use culvert::dialer::endpoint::EndpointContext;
+use culvert::server::ServerRunner;
+use culvert::session::SessionManager;
 use culvert::transport::h3::H3Connector;
+use culvert::transport::h3::H3TransportDriver;
 use culvert::transport::h3::listener::H3Listener;
-use culvert::transport::{TargetAddr, TransportConnector, TransportListener};
+use culvert::transport::{TargetAddr, TransportConnector, TransportListener, TransportRegistry};
 
 /// Helper to get an available ephemeral port from the OS that is free for both TCP and UDP.
 fn get_ephemeral_port() -> u16 {
@@ -1202,4 +1206,164 @@ async fn test_h3_listener_dual_stack_port() {
 
     let _ = tx_done.send(());
     server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_h3_server_native_mandatory_mtls() {
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let dir = tempfile::tempdir().unwrap();
+
+    // 1. Generate Root CA
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let ca_params = rcgen::CertificateParams::default();
+    let ca = rcgen::CertifiedIssuer::self_signed(ca_params, &ca_key).unwrap();
+    let ca_cert_path = dir.path().join("ca.crt");
+    std::fs::write(&ca_cert_path, ca.as_ref().pem()).unwrap();
+
+    // 2. Generate Server Certificate
+    let server_key = rcgen::KeyPair::generate().unwrap();
+    let server_params =
+        rcgen::CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .unwrap();
+    let server_cert = server_params.signed_by(&server_key, &ca).unwrap();
+    let server_cert_path = dir.path().join("server.crt");
+    let server_key_path = dir.path().join("server.key");
+    std::fs::write(&server_cert_path, server_cert.pem()).unwrap();
+    std::fs::write(&server_key_path, server_key.serialize_pem()).unwrap();
+
+    // 3. Generate Valid Client Certificate
+    let client_key = rcgen::KeyPair::generate().unwrap();
+    let client_params = rcgen::CertificateParams::default();
+    let client_cert = client_params.signed_by(&client_key, &ca).unwrap();
+    let client_cert_path = dir.path().join("client.crt");
+    let client_key_path = dir.path().join("client.key");
+    std::fs::write(&client_cert_path, client_cert.pem()).unwrap();
+    std::fs::write(&client_key_path, client_key.serialize_pem()).unwrap();
+
+    // 4. Generate Untrusted Client Certificate (different CA)
+    let untrusted_ca_key = rcgen::KeyPair::generate().unwrap();
+    let untrusted_ca =
+        rcgen::CertifiedIssuer::self_signed(rcgen::CertificateParams::default(), &untrusted_ca_key)
+            .unwrap();
+    let rogue_key = rcgen::KeyPair::generate().unwrap();
+    let rogue_cert = rcgen::CertificateParams::default()
+        .signed_by(&rogue_key, &untrusted_ca)
+        .unwrap();
+    let rogue_cert_path = dir.path().join("rogue.crt");
+    let rogue_key_path = dir.path().join("rogue.key");
+    std::fs::write(&rogue_cert_path, rogue_cert.pem()).unwrap();
+    std::fs::write(&rogue_key_path, rogue_key.serialize_pem()).unwrap();
+
+    let server_port = get_ephemeral_port();
+    let (echo_task, echo_port) = spawn_echo_server(cancel_token.clone());
+    let auth_token = "h3_native_mtls_token";
+
+    // 5. Spawn Culvert Server with native mTLS required on h3://
+    let mut server_registry = TransportRegistry::new();
+    server_registry.register(H3TransportDriver);
+    let server_registry = Arc::new(server_registry);
+    let session_mgr = Arc::new(SessionManager::new());
+
+    let server_config = ServerConfig {
+        listen: vec![format!("h3://127.0.0.1:{}/tunnel", server_port)],
+        token: Some(auth_token.to_string()),
+        default_target: Some(format!("127.0.0.1:{}", echo_port)),
+        certificate: Some(server_cert_path.to_str().unwrap().to_string()),
+        key: Some(server_key_path.to_str().unwrap().to_string()),
+        client_ca_certificate: Some(ca_cert_path.to_str().unwrap().to_string()),
+        client_auth: Some(ClientAuthMode::Required),
+        ..Default::default()
+    };
+
+    let server_runner = ServerRunner::new(
+        server_config,
+        Arc::clone(&server_registry),
+        Arc::clone(&session_mgr),
+    );
+    let s_cancel = cancel_token.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = server_runner.run(s_cancel).await;
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let app_cfg = AppConfig::default();
+    let target = TargetAddr::Domain("127.0.0.1".to_string(), echo_port);
+
+    // 6. Test Client A: Valid client cert -> MUST CONNECT & ECHO
+    let valid_ep = EndpointConfig::Detailed {
+        url: format!("h3://127.0.0.1:{}/tunnel", server_port),
+        dns: None,
+        dialer: None,
+        tls: Some(TlsConfig {
+            server_name: Some("localhost".to_string()),
+            insecure: Some(false),
+            ca_certificate: Some(ca_cert_path.clone()),
+            client_certificate: Some(client_cert_path.clone()),
+            client_key: Some(client_key_path.clone()),
+            ..Default::default()
+        }),
+        http_headers: None,
+    };
+    let valid_ctx = EndpointContext::build(&valid_ep, &app_cfg).unwrap();
+    let valid_connector = H3Connector::new(&valid_ctx, auth_token, TunnelMode::Forward).unwrap();
+    let mut client_stream = valid_connector.connect(&target, None).await.unwrap();
+
+    let payload = b"h3 mTLS authentication roundtrip success!";
+    client_stream.write_all(payload).await.unwrap();
+    client_stream.shutdown().await.unwrap();
+
+    let mut buf = vec![0u8; payload.len()];
+    read_exact_timed(&mut client_stream, &mut buf)
+        .await
+        .unwrap();
+    assert_eq!(&buf, payload);
+
+    // 7. Test Client B: No client cert -> MUST FAIL
+    let no_cert_ep = EndpointConfig::Detailed {
+        url: format!("h3://127.0.0.1:{}/tunnel", server_port),
+        dns: None,
+        dialer: None,
+        tls: Some(TlsConfig {
+            server_name: Some("localhost".to_string()),
+            insecure: Some(false),
+            ca_certificate: Some(ca_cert_path.clone()),
+            ..Default::default()
+        }),
+        http_headers: None,
+    };
+    let no_cert_ctx = EndpointContext::build(&no_cert_ep, &app_cfg).unwrap();
+    let no_cert_connector =
+        H3Connector::new(&no_cert_ctx, auth_token, TunnelMode::Forward).unwrap();
+    let no_cert_res = no_cert_connector.connect(&target, None).await;
+    assert!(
+        no_cert_res.is_err(),
+        "H3 Server must reject connection when client cert is missing"
+    );
+
+    // 8. Test Client C: Rogue/Untrusted client cert -> MUST FAIL
+    let rogue_ep = EndpointConfig::Detailed {
+        url: format!("h3://127.0.0.1:{}/tunnel", server_port),
+        dns: None,
+        dialer: None,
+        tls: Some(TlsConfig {
+            server_name: Some("localhost".to_string()),
+            insecure: Some(false),
+            ca_certificate: Some(ca_cert_path.clone()),
+            client_certificate: Some(rogue_cert_path),
+            client_key: Some(rogue_key_path),
+            ..Default::default()
+        }),
+        http_headers: None,
+    };
+    let rogue_ctx = EndpointContext::build(&rogue_ep, &app_cfg).unwrap();
+    let rogue_connector = H3Connector::new(&rogue_ctx, auth_token, TunnelMode::Forward).unwrap();
+    let rogue_res = rogue_connector.connect(&target, None).await;
+    assert!(
+        rogue_res.is_err(),
+        "H3 Server must reject connection when client cert is untrusted"
+    );
+
+    // Clean up
+    cancel_token.cancel();
+    let _ = tokio::join!(server_handle, echo_task);
 }

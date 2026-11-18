@@ -9,7 +9,7 @@
 //! a slow path can be attributed to one specific cause:
 //!
 //! - `raw borrowed`  : quinn `write_all(&[u8])`, which copies every write into an
-//!                     owned `Bytes` inside quinn-proto (`ByteSlice::pop_chunk`).
+//!   owned `Bytes` inside quinn-proto (`ByteSlice::pop_chunk`).
 //! - `raw owned`     : quinn `write_chunk(Bytes)`, the zero-copy `BytesArray` path.
 //! - `quinn adapter` : `QuinnTunnelStream`, whose `poll_write` is the borrowed path.
 //! - `h3 adapter`    : `H3TunnelStream`, adding two mpsc channels and two tasks.

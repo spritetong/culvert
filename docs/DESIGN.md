@@ -186,8 +186,8 @@ structs are too. `EndpointConfig` and `DnsResolverConfig` implement custom
 | `worker_threads` | `Option<usize>` | Tokio worker count; `0` rejected. |
 | `dns` | `Option<DnsConfig>` | `strategy`, `resolvers`, `cache_capacity`. |
 | `dialer` | `Option<DialerConfig>` | `connect_timeout`, `tcp_nodelay`, `bind_interface`, `proxy`, `heartbeat_interval`, `idle_timeout`, `udp_idle_timeout`. |
-| `tls` | `Option<TlsConfig>` | `server_name`, `insecure`, `alpn`, `ca_certificate`, `client_certificate`, `client_key`, `certificate`, `key`, `min_version`, `max_version`. |
-| `server` | `Option<ServerConfig>` | `listen`, `token`, `default_target`, `certificate`, `key`, `tls`, `heartbeat_interval`, `idle_timeout`, `udp_idle_timeout`. |
+| `tls` | `Option<TlsConfig>` | `server_name`, `insecure`, `alpn`, `ca_certificate`, `client_certificate`, `client_key`, `certificate`, `key`, `client_ca_certificate`, `client_auth`, `min_version`, `max_version`. |
+| `server` | `Option<ServerConfig>` | `listen`, `token`, `default_target`, `certificate`, `key`, `client_ca_certificate`, `client_auth`, `tls`, `heartbeat_interval`, `idle_timeout`, `udp_idle_timeout`. |
 | `tunnels` | `Vec<TunnelConfig>` (defaulted) | `tag`, `endpoint`, `token`, `uuid`, `http_headers`, `failover`, `multiplex`, `retry`, `mappings`. |
 
 `TunnelConfig` requires a `mappings` object (`TunnelMappingsConfig`) containing `forward` and/or `reverse` groups (`MappingGroupConfig`), each with an optional `pool_size` and a list of `MappingRuleConfig { protocol, listen, target, udp_idle_timeout }`. `protocol` is mandatory and must be explicitly set to `"TCP"` or `"UDP"` (case-insensitive, no default value). `TunnelRetryConfig { delay, max_retries }` uses a separate duration
@@ -495,10 +495,12 @@ The server caps `auth_len` at 1024 bytes and `meta_len` at 65536 bytes.
 ### 5.6 TLS, DNS, and dialing
 
 - `dialer::tls::TlsConfigBuilder` builds rustls client and server configs. It
-  loads a custom CA, mTLS client certificate/key, applies version bounds and
-  ALPN, installs a no-verification verifier when `insecure` is set, and
-  generates an ephemeral self-signed certificate (`rcgen`) when no server
-  certificate/key pair is provided.
+  loads custom CAs, mTLS client certificate/key, enforces server-side client
+  certificate verification (`WebPkiClientVerifier`) when `client_ca_certificate`
+  or `client_auth` (`required` / `optional`) is configured on server TLS,
+  applies version bounds and ALPN, installs a no-verification verifier when
+  `insecure` is set, and generates an ephemeral self-signed certificate (`rcgen`)
+  when no server certificate/key pair is provided.
 - ALPN defaults: `h3` for HTTP/3 endpoints, `culvert-quic` for raw QUIC. The
   H3 listener ensures `h3` is first in the server ALPN list and adds
   `culvert-quic` for `quic://` listeners.
