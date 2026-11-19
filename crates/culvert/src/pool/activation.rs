@@ -57,14 +57,20 @@ pub async fn decode_activation<S: AsyncReadExt + Unpin + Send>(
     timeout_duration: Duration,
 ) -> Result<Option<ActivationHeader>, TunnelError> {
     let mut magic = [0u8; 1];
-    let read_magic = stream
+    let read_magic = match stream
         .read_exact(&mut magic)
-        .cancel_with(cancel_token)
-        .await;
-    let Some(res) = read_magic else {
-        return Ok(None);
+        .timeout_or_cancel(timeout_duration, cancel_token)
+        .await
+    {
+        TimeoutOrCancel::Ok(r) => r,
+        TimeoutOrCancel::TimedOut => {
+            return Err(TunnelError::ControlProtocol(
+                "Timed out reading activation magic".into(),
+            ));
+        }
+        TimeoutOrCancel::Cancelled => return Ok(None),
     };
-    if res.is_err() {
+    if read_magic.is_err() {
         return Ok(None);
     }
 
@@ -155,6 +161,16 @@ pub async fn decode_activation<S: AsyncReadExt + Unpin + Send>(
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[tokio::test]
+    async fn test_decode_activation_magic_byte_is_bounded() {
+        let (mut reader, _writer) = tokio::io::duplex(64);
+        let cancel = CancellationToken::new();
+        let started = std::time::Instant::now();
+        let decoded = decode_activation(&mut reader, &cancel, Duration::from_millis(20)).await;
+        assert!(decoded.is_err());
+        assert!(started.elapsed() >= Duration::from_millis(20));
+    }
 
     #[tokio::test]
     async fn test_encode_decode_activation_tcp_with_target() {

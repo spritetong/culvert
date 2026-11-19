@@ -17,18 +17,16 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::PollSender;
 use tracing::debug;
 
-use crate::consts::{
-    DEFAULT_H3_FINISH_STREAM_TIMEOUT, DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD,
-    H3_STREAM_CHUNK_QUEUE_SIZE,
-};
+use crate::consts::{DEFAULT_H3_FINISH_STREAM_TIMEOUT, H3_STREAM_CHUNK_QUEUE_SIZE};
 use crate::core::stream::{HeartbeatStatus, StreamCaps, TunnelStream, activity_now_ms};
+
+use super::QuicSessionHandle;
 
 /// Raw QUIC bidirectional stream adapter directly polling `quinn::SendStream` and `quinn::RecvStream`.
 pub struct QuinnTunnelStream {
     send: quinn::SendStream,
     recv: quinn::RecvStream,
-    conn: Option<quinn::Connection>,
-    liveness: Option<QuicLivenessTracker>,
+    session: Option<QuicSessionHandle>,
     shutdown_done: bool,
     read_buf: Option<u8>,
     last_activity_ms: AtomicU64,
@@ -40,18 +38,16 @@ impl QuinnTunnelStream {
         Self {
             send,
             recv,
-            conn: None,
-            liveness: None,
+            session: None,
             shutdown_done: false,
             read_buf: None,
             last_activity_ms: AtomicU64::new(activity_now_ms()),
         }
     }
 
-    /// Associates the underlying Quinn connection for accurate liveness detection.
-    pub fn with_connection(mut self, conn: quinn::Connection) -> Self {
-        self.liveness = Some(QuicLivenessTracker::new(&conn));
-        self.conn = Some(conn);
+    /// Associates the shared QUIC session handle for accurate liveness detection.
+    pub(crate) fn with_session(mut self, session: QuicSessionHandle) -> Self {
+        self.session = Some(session);
         self
     }
 
@@ -142,60 +138,6 @@ impl AsyncWrite for QuinnTunnelStream {
     }
 }
 
-#[derive(Debug, Clone)]
-struct QuicLivenessTracker {
-    last_rx_dgrams: u64,
-    last_tx_dgrams: u64,
-    last_progress_at: std::time::Instant,
-}
-
-impl QuicLivenessTracker {
-    fn new(conn: &quinn::Connection) -> Self {
-        let stats = conn.stats();
-        Self {
-            last_rx_dgrams: stats.udp_rx.datagrams,
-            last_tx_dgrams: stats.udp_tx.datagrams,
-            last_progress_at: std::time::Instant::now(),
-        }
-    }
-
-    /// Evaluates connection responsiveness based on UDP datagram progression.
-    /// If UDP packets are being sent (e.g. keep-alive pings) but zero UDP packets are received
-    /// for longer than unresponsive_threshold, the connection is deemed dead.
-    fn check_liveness(
-        &mut self,
-        conn: &quinn::Connection,
-        unresponsive_threshold: std::time::Duration,
-    ) -> bool {
-        let stats = conn.stats();
-        let cur_rx = stats.udp_rx.datagrams;
-        let cur_tx = stats.udp_tx.datagrams;
-
-        if cur_rx > self.last_rx_dgrams {
-            self.last_rx_dgrams = cur_rx;
-            self.last_tx_dgrams = cur_tx;
-            self.last_progress_at = std::time::Instant::now();
-            return true;
-        }
-
-        // Transmitting packets while zero packets received for longer than threshold -> zombie!
-        if cur_tx > self.last_tx_dgrams && self.last_progress_at.elapsed() >= unresponsive_threshold
-        {
-            tracing::warn!(
-                cur_tx,
-                last_tx = self.last_tx_dgrams,
-                cur_rx,
-                last_rx = self.last_rx_dgrams,
-                elapsed = ?self.last_progress_at.elapsed(),
-                "QUIC connection deemed zombie: transmitting with zero RX for longer than threshold"
-            );
-            return false;
-        }
-
-        true
-    }
-}
-
 impl TunnelStream for QuinnTunnelStream {
     fn caps(&self) -> StreamCaps {
         StreamCaps {
@@ -239,17 +181,14 @@ impl TunnelStream for QuinnTunnelStream {
     }
 
     fn poll_send_ping(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if let Some(ref conn) = self.conn {
-            if let Some(reason) = conn.close_reason() {
+        if let Some(ref session) = self.session {
+            if let Some(reason) = session.conn().close_reason() {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::ConnectionReset,
                     format!("Underlying QUIC connection closed: {:?}", reason),
                 )));
             }
-            if let Some(ref mut tracker) = self.liveness
-                && !tracker.check_liveness(conn, DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD)
-            {
-                conn.close(quinn::VarInt::from_u32(0), b"liveness ping timeout");
+            if !session.check_liveness() {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "Underlying QUIC connection unresponsive to pings",
@@ -261,16 +200,10 @@ impl TunnelStream for QuinnTunnelStream {
     }
 
     fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
-        if let Some(ref conn) = self.conn {
-            if conn.close_reason().is_some() {
-                return Poll::Ready(HeartbeatStatus::Dead);
-            }
-            if let Some(ref mut tracker) = self.liveness
-                && !tracker.check_liveness(conn, DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD)
-            {
-                conn.close(quinn::VarInt::from_u32(0), b"liveness check timeout");
-                return Poll::Ready(HeartbeatStatus::Dead);
-            }
+        if let Some(ref session) = self.session
+            && !session.check_liveness()
+        {
+            return Poll::Ready(HeartbeatStatus::Dead);
         }
         if self.read_buf.is_some() {
             return Poll::Ready(HeartbeatStatus::Alive);
@@ -298,8 +231,7 @@ pub struct H3TunnelStream {
     rx_inbound: mpsc::Receiver<io::Result<Bytes>>,
     read_buf: Option<Bytes>,
     shutdown_rx: Option<oneshot::Receiver<io::Result<()>>>,
-    conn: Option<quinn::Connection>,
-    liveness: Option<QuicLivenessTracker>,
+    session: Option<QuicSessionHandle>,
     shutdown_done: bool,
     fin_sent: bool,
     last_activity_ms: AtomicU64,
@@ -324,10 +256,9 @@ impl H3TunnelStream {
         Self::spawn_split_pump(send, recv)
     }
 
-    /// Associates the underlying Quinn connection for accurate liveness detection.
-    pub fn with_connection(mut self, conn: quinn::Connection) -> Self {
-        self.liveness = Some(QuicLivenessTracker::new(&conn));
-        self.conn = Some(conn);
+    /// Associates the shared QUIC session handle for accurate liveness detection.
+    pub(crate) fn with_session(mut self, session: QuicSessionHandle) -> Self {
+        self.session = Some(session);
         self
     }
 
@@ -442,8 +373,7 @@ impl H3TunnelStream {
             rx_inbound,
             read_buf: None,
             shutdown_rx: Some(rx_shutdown),
-            conn: None,
-            liveness: None,
+            session: None,
             shutdown_done: false,
             fin_sent: false,
             last_activity_ms: AtomicU64::new(activity_now_ms()),
@@ -552,8 +482,8 @@ impl AsyncWrite for H3TunnelStream {
             return Poll::Ready(Ok(()));
         }
 
-        if let Some(ref conn) = self.conn
-            && let Some(reason) = conn.close_reason()
+        if let Some(ref session) = self.session
+            && let Some(reason) = session.conn().close_reason()
         {
             self.shutdown_done = true;
             self.shutdown_rx.take();
@@ -615,17 +545,14 @@ impl TunnelStream for H3TunnelStream {
     }
 
     fn poll_send_ping(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if let Some(ref conn) = self.conn {
-            if let Some(reason) = conn.close_reason() {
+        if let Some(ref session) = self.session {
+            if let Some(reason) = session.conn().close_reason() {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::ConnectionReset,
                     format!("Underlying QUIC connection closed: {:?}", reason),
                 )));
             }
-            if let Some(ref mut tracker) = self.liveness
-                && !tracker.check_liveness(conn, DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD)
-            {
-                conn.close(quinn::VarInt::from_u32(0), b"liveness ping timeout");
+            if !session.check_liveness() {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "Underlying QUIC connection unresponsive to pings",
@@ -643,16 +570,10 @@ impl TunnelStream for H3TunnelStream {
     }
 
     fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
-        if let Some(ref conn) = self.conn {
-            if conn.close_reason().is_some() {
-                return Poll::Ready(HeartbeatStatus::Dead);
-            }
-            if let Some(ref mut tracker) = self.liveness
-                && !tracker.check_liveness(conn, DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD)
-            {
-                conn.close(quinn::VarInt::from_u32(0), b"liveness check timeout");
-                return Poll::Ready(HeartbeatStatus::Dead);
-            }
+        if let Some(ref session) = self.session
+            && !session.check_liveness()
+        {
+            return Poll::Ready(HeartbeatStatus::Dead);
         }
         if self.read_buf.is_some() {
             return Poll::Ready(HeartbeatStatus::Alive);

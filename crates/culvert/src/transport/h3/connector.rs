@@ -10,12 +10,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use http::{Request, StatusCode};
 use parking_lot::RwLock;
 use tokio::sync::Mutex;
 use tracing::debug;
 
-use super::{apply_quic_config, quic_endpoint_config};
+use super::{QuicSessionHandle, apply_quic_config, quic_endpoint_config};
 use crate::config::model::TunnelMode;
 use crate::consts::{
     ALPN_H3, ALPN_QUIC, AUTH_BEARER_PREFIX, DEFAULT_HANDSHAKE_TIMEOUT,
@@ -40,25 +41,25 @@ use crate::transport::{TargetAddr, TransportConnector};
 struct H3Session {
     id: usize,
     sender: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
-    conn: quinn::Connection,
+    handle: QuicSessionHandle,
     driver_alive: Arc<AtomicBool>,
 }
 
 impl H3Session {
     fn is_alive(&self) -> bool {
-        self.driver_alive.load(Ordering::Acquire) && self.conn.close_reason().is_none()
+        self.driver_alive.load(Ordering::Acquire) && self.handle.is_alive()
     }
 }
 
 /// Active raw QUIC shared session holding the underlying QUIC connection.
 struct RawQuicSession {
     id: usize,
-    conn: quinn::Connection,
+    handle: QuicSessionHandle,
 }
 
 impl RawQuicSession {
     fn is_alive(&self) -> bool {
-        self.conn.close_reason().is_none()
+        self.handle.is_alive()
     }
 }
 
@@ -174,7 +175,26 @@ impl H3Connector {
         })
     }
 
-    /// Dials a fresh underlying QUIC connection to the target endpoint.
+    /// Dials one resolved address. Parallel attempts share the connect deadline.
+    async fn dial_quic_addr(
+        &self,
+        resolved_addr: SocketAddr,
+        sni: &str,
+        connect_timeout: std::time::Duration,
+    ) -> Result<quinn::Connection, TunnelError> {
+        debug!(server = %resolved_addr, sni = %sni, "Dialing QUIC transport endpoint");
+        let connecting = self
+            .quinn_endpoint
+            .connect(resolved_addr, sni)
+            .map_err(|e| TunnelError::TlsHandshake(format!("QUIC connect error: {:?}", e)))?;
+
+        tokio::time::timeout(connect_timeout, connecting)
+            .await
+            .map_err(|_| TunnelError::ConnectTimeout(connect_timeout))?
+            .map_err(|e| TunnelError::TlsHandshake(format!("QUIC handshake error: {:?}", e)))
+    }
+
+    /// Dials all resolved addresses concurrently and returns the first connection.
     async fn dial_quic_connection(&self) -> Result<quinn::Connection, TunnelError> {
         let connect_timeout = self.endpoint.connect_timeout();
         let ips = tokio::time::timeout(
@@ -185,29 +205,43 @@ impl H3Connector {
         )
         .await
         .map_err(|_| TunnelError::ConnectTimeout(connect_timeout))??;
-        let ip = ips.first().copied().ok_or_else(|| {
-            TunnelError::DnsNoAddresses(self.endpoint.endpoint.host.clone(), "any".to_string())
-        })?;
-        let resolved_addr = SocketAddr::new(ip, self.endpoint.endpoint.port);
+        if ips.is_empty() {
+            return Err(TunnelError::DnsNoAddresses(
+                self.endpoint.endpoint.host.clone(),
+                "any".to_string(),
+            ));
+        }
+        // `resolve` already applied the configured DnsStrategy (family filter +
+        // preference order). Do not reorder it here.
+
         let sni = self
             .endpoint
             .tls_config
             .as_ref()
             .and_then(|t| t.server_name.as_deref())
-            .unwrap_or(self.endpoint.endpoint.host.as_str());
+            .unwrap_or(self.endpoint.endpoint.host.as_str())
+            .to_string();
 
-        debug!(server = %resolved_addr, sni = %sni, "Dialing QUIC transport endpoint");
-        let connecting = self
-            .quinn_endpoint
-            .connect(resolved_addr, sni)
-            .map_err(|e| TunnelError::TlsHandshake(format!("QUIC connect error: {:?}", e)))?;
+        let mut attempts = FuturesUnordered::new();
+        for ip in ips {
+            attempts.push(Box::pin(self.dial_quic_addr(
+                SocketAddr::new(ip, self.endpoint.endpoint.port),
+                &sni,
+                connect_timeout,
+            )));
+        }
 
-        let conn = tokio::time::timeout(connect_timeout, connecting)
-            .await
-            .map_err(|_| TunnelError::ConnectTimeout(connect_timeout))?
-            .map_err(|e| TunnelError::TlsHandshake(format!("QUIC handshake error: {:?}", e)))?;
-
-        Ok(conn)
+        let mut last_err = None;
+        while let Some(res) = attempts.next().await {
+            match res {
+                Ok(conn) => {
+                    attempts.clear();
+                    return Ok(conn);
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or(TunnelError::ConnectTimeout(connect_timeout)))
     }
 
     /// Establishes and caches the H3 client session with single-flight gating and a persistent anchor SendRequest.
@@ -242,9 +276,7 @@ impl H3Connector {
 
         // If there is an existing dead session, close its QUIC connection explicitly
         if let Some(old_session) = self.cached_h3_session.write().take() {
-            old_session
-                .conn
-                .close(quinn::VarInt::from_u32(0), b"replacing dead H3 session");
+            old_session.handle.mark_dead(b"replacing dead H3 session");
         }
 
         // Always dial a fresh QUIC connection dedicated to this H3 session
@@ -256,6 +288,7 @@ impl H3Connector {
             }
         };
         let id = conn.stable_id();
+        let handle = QuicSessionHandle::new(conn.clone());
 
         let connect_timeout = self.endpoint.connect_timeout();
         let build_res = tokio::time::timeout(
@@ -269,13 +302,13 @@ impl H3Connector {
             Ok(Err(e)) => {
                 let err_str = format!("H3 handshake failed: {:?}", e);
                 *self.last_h3_failure.write() = Some((std::time::Instant::now(), err_str.clone()));
-                conn.close(quinn::VarInt::from_u32(0), b"H3 build failed");
+                handle.mark_dead(b"H3 build failed");
                 return Err(TunnelError::ControlProtocol(err_str));
             }
             Err(_) => {
                 *self.last_h3_failure.write() =
                     Some((std::time::Instant::now(), "H3 build timeout".to_string()));
-                conn.close(quinn::VarInt::from_u32(0), b"H3 build timeout");
+                handle.mark_dead(b"H3 build timeout");
                 return Err(TunnelError::ConnectTimeout(connect_timeout));
             }
         };
@@ -291,7 +324,7 @@ impl H3Connector {
         let new_session = Arc::new(H3Session {
             id,
             sender,
-            conn,
+            handle,
             driver_alive,
         });
 
@@ -304,11 +337,13 @@ impl H3Connector {
     /// preventing lost updates from wiping out newer healthy connections.
     fn invalidate_h3_session_if_same(&self, session_id: usize) {
         let mut guard = self.cached_h3_session.write();
-        if let Some(ref current) = *guard
-            && current.id == session_id
-        {
+        let matches = guard
+            .as_ref()
+            .map(|current| current.id == session_id)
+            .unwrap_or(false);
+        if matches && let Some(session) = guard.take() {
             debug!(session_id, "Invalidating broken H3 session cache");
-            *guard = None;
+            session.handle.mark_dead(b"invalidated H3 session");
         }
     }
 
@@ -339,10 +374,9 @@ impl H3Connector {
         }
 
         if let Some(old_session) = self.cached_quic_session.write().take() {
-            old_session.conn.close(
-                quinn::VarInt::from_u32(0),
-                b"replacing dead raw QUIC session",
-            );
+            old_session
+                .handle
+                .mark_dead(b"replacing dead raw QUIC session");
         }
 
         let conn = match self.dial_quic_connection().await {
@@ -354,7 +388,7 @@ impl H3Connector {
         };
         let session = Arc::new(RawQuicSession {
             id: conn.stable_id(),
-            conn,
+            handle: QuicSessionHandle::new(conn),
         });
 
         *self.last_quic_failure.write() = None;
@@ -365,11 +399,13 @@ impl H3Connector {
     /// Atomically clears the cached raw QUIC session only if it matches the specified session ID.
     fn invalidate_quic_session_if_same(&self, session_id: usize) {
         let mut guard = self.cached_quic_session.write();
-        if let Some(ref current) = *guard
-            && current.id == session_id
-        {
+        let matches = guard
+            .as_ref()
+            .map(|current| current.id == session_id)
+            .unwrap_or(false);
+        if matches && let Some(session) = guard.take() {
             debug!(session_id, "Invalidating broken raw QUIC session cache");
-            *guard = None;
+            session.handle.mark_dead(b"invalidated raw QUIC session");
         }
     }
 
@@ -385,7 +421,6 @@ impl H3Connector {
         let session = self.get_or_establish_h3_session().await?;
         let mut send_request = session.sender.clone();
         let session_id_val = session.id;
-        let conn_clone = session.conn.clone();
 
         let path = if self.endpoint.endpoint.path.is_empty() {
             DEFAULT_TUNNEL_PATH
@@ -475,7 +510,7 @@ impl H3Connector {
         {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                if !session.is_alive() || session.conn.close_reason().is_some() {
+                if !session.is_alive() {
                     self.invalidate_h3_session_if_same(session_id_val);
                 }
                 return Err(TunnelError::ControlProtocol(format!(
@@ -493,7 +528,7 @@ impl H3Connector {
             match tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, stream.recv_response()).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
-                    if !session.is_alive() || session.conn.close_reason().is_some() {
+                    if !session.is_alive() {
                         self.invalidate_h3_session_if_same(session_id_val);
                     }
                     return Err(TunnelError::ControlProtocol(format!(
@@ -521,7 +556,7 @@ impl H3Connector {
         }
 
         Ok(
-            Box::new(H3TunnelStream::from_client(stream).with_connection(conn_clone))
+            Box::new(H3TunnelStream::from_client(stream).with_session(session.handle.clone()))
                 as Box<dyn TunnelStream>,
         )
     }
@@ -536,24 +571,26 @@ impl H3Connector {
         tunnel_id: Option<&str>,
     ) -> Result<Box<dyn TunnelStream>, TunnelError> {
         let session = self.get_or_connect_quic_raw().await?;
-        let conn = session.conn.clone();
         let session_id_val = session.id;
 
         let connect_timeout = self.endpoint.connect_timeout();
-        let (mut send, recv) = match tokio::time::timeout(connect_timeout, conn.open_bi()).await {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(e)) => {
-                self.invalidate_quic_session_if_same(session_id_val);
-                return Err(TunnelError::Tls(format!(
-                    "Failed to open QUIC bi-stream: {:?}",
-                    e
-                )));
-            }
-            Err(_) => {
-                self.invalidate_quic_session_if_same(session_id_val);
-                return Err(TunnelError::ConnectTimeout(connect_timeout));
-            }
-        };
+        let (mut send, recv) =
+            match tokio::time::timeout(connect_timeout, session.handle.conn().open_bi()).await {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => {
+                    if !session.is_alive() {
+                        self.invalidate_quic_session_if_same(session_id_val);
+                    }
+                    return Err(TunnelError::Tls(format!(
+                        "Failed to open QUIC bi-stream: {:?}",
+                        e
+                    )));
+                }
+                Err(_) => {
+                    self.invalidate_quic_session_if_same(session_id_val);
+                    return Err(TunnelError::ConnectTimeout(connect_timeout));
+                }
+            };
 
         // Send handshake control header over the raw QUIC stream
         let handshake_meta = crate::transport::StreamMetadata {
@@ -585,7 +622,9 @@ impl H3Connector {
         match write_res {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                self.invalidate_quic_session_if_same(session_id_val);
+                if !session.is_alive() {
+                    self.invalidate_quic_session_if_same(session_id_val);
+                }
                 return Err(TunnelError::Io(e));
             }
             Err(_) => {
@@ -595,7 +634,7 @@ impl H3Connector {
         }
 
         Ok(
-            Box::new(QuinnTunnelStream::new(send, recv).with_connection(conn))
+            Box::new(QuinnTunnelStream::new(send, recv).with_session(session.handle.clone()))
                 as Box<dyn TunnelStream>,
         )
     }
@@ -763,7 +802,7 @@ mod tests {
         let (server_conn, client_conn) = create_test_quic_connection_pair().await;
         let dummy_quic_session = Arc::new(RawQuicSession {
             id: client_conn.stable_id(),
-            conn: client_conn,
+            handle: QuicSessionHandle::new(client_conn),
         });
 
         *connector.cached_quic_session.write() = Some(Arc::clone(&dummy_quic_session));
@@ -774,6 +813,7 @@ mod tests {
 
         // Cached session MUST NOT be cleared (lost update prevented!)
         assert!(connector.cached_quic_session.read().is_some());
+        assert!(dummy_quic_session.handle.is_alive());
         assert_eq!(
             connector.cached_quic_session.read().as_ref().unwrap().id,
             dummy_quic_session.id
@@ -783,8 +823,9 @@ mod tests {
         let matching_id = dummy_quic_session.id;
         connector.invalidate_quic_session_if_same(matching_id);
 
-        // Cached session is now cleared
+        // Cached session is now cleared and its shared handle is marked dead
         assert!(connector.cached_quic_session.read().is_none());
+        assert!(!dummy_quic_session.handle.is_alive());
         drop(server_conn);
     }
 }

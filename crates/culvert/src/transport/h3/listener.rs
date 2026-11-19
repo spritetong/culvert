@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use super::{apply_quic_config, quic_endpoint_config};
+use super::{QuicSessionHandle, apply_quic_config, quic_endpoint_config};
 use crate::common::{CancelFutureExt, TimeoutOrCancel};
 use crate::config::model::{QuicConfig, TunnelMode};
 use crate::consts::{
@@ -381,6 +381,7 @@ impl H3Listener {
         cancel_token: CancellationToken,
     ) {
         let is_raw_quic = is_quic_listener || alpn.as_deref() == Some(ALPN_QUIC.as_bytes());
+        let session = QuicSessionHandle::new(conn.clone());
         debug!(
             alpn = ?alpn.as_ref().map(|b| String::from_utf8_lossy(b)),
             is_quic_listener,
@@ -389,27 +390,28 @@ impl H3Listener {
         );
 
         if is_raw_quic {
-            Self::handle_raw_quic_streams(conn, auth_token, tx_streams, cancel_token).await;
+            Self::handle_raw_quic_streams(session, auth_token, tx_streams, cancel_token).await;
         } else {
-            Self::handle_h3_streams(conn, auth_token, path, tx_streams, cancel_token).await;
+            Self::handle_h3_streams(session, auth_token, path, tx_streams, cancel_token).await;
         }
     }
 
     /// Processes HTTP/3 request streams on the connection.
     async fn handle_h3_streams(
-        conn: quinn::Connection,
+        session: QuicSessionHandle,
         auth_token: Arc<Option<String>>,
         expected_path: Arc<Option<String>>,
         tx_streams: mpsc::Sender<(Box<dyn TunnelStream>, StreamMetadata)>,
         cancel_token: CancellationToken,
     ) {
         let mut h3_conn = match h3::server::builder()
-            .build::<_, Bytes>(h3_quinn::Connection::new(conn.clone()))
+            .build::<_, Bytes>(h3_quinn::Connection::new(session.conn().clone()))
             .await
         {
             Ok(server) => server,
             Err(e) => {
                 debug!("Failed to start H3 server session: {:?}", e);
+                session.mark_dead(b"h3 server build failed");
                 return;
             }
         };
@@ -426,7 +428,7 @@ impl H3Listener {
                             let auth_clone = Arc::clone(&auth_token);
                             let path_clone = Arc::clone(&expected_path);
                             let tx_clone = tx_streams.clone();
-                            let conn_clone = conn.clone();
+                            let session_clone = session.clone();
                             let cancel_task = cancel_token.clone();
 
                             request_tasks.spawn(async move {
@@ -601,7 +603,7 @@ impl H3Listener {
                                     TimeoutOrCancel::Ok(Ok((stream, metadata))) => {
                                         let tunnel_stream = Box::new(
                                             H3TunnelStream::from_server(stream)
-                                                .with_connection(conn_clone),
+                                                .with_session(session_clone),
                                         )
                                             as Box<dyn TunnelStream>;
 
@@ -621,6 +623,7 @@ impl H3Listener {
                         Ok(None) => break,
                         Err(e) => {
                             debug!("H3 accept error: {:?}", e);
+                            session.mark_dead(b"h3 accept error");
                             break;
                         }
                     }
@@ -641,12 +644,12 @@ impl H3Listener {
 
         // Keep h3_conn alive until connection is closed by peer or cancelled,
         // preventing premature QUIC teardown while accepted streams are still relaying.
-        let _ = conn.closed().cancel_with(&cancel_token).await;
+        let _ = session.conn().closed().cancel_with(&cancel_token).await;
     }
 
     /// Processes raw QUIC bidirectional streams on the connection.
     async fn handle_raw_quic_streams(
-        conn: quinn::Connection,
+        session: QuicSessionHandle,
         auth_token: Arc<Option<String>>,
         tx_streams: mpsc::Sender<(Box<dyn TunnelStream>, StreamMetadata)>,
         cancel_token: CancellationToken,
@@ -659,12 +662,12 @@ impl H3Listener {
             tokio::select! {
                 _ = cancel_token.cancelled() => break,
                 Some(_) = handshake_tasks.join_next(), if !handshake_tasks.is_empty() => continue,
-                res = conn.accept_bi() => {
+                res = session.conn().accept_bi() => {
                     match res {
                         Ok((send, mut recv)) => {
                             let auth_clone = Arc::clone(&auth_token);
                             let tx_clone = tx_streams.clone();
-                            let conn_clone = conn.clone();
+                            let session_clone = session.clone();
                             let cancel_stream = cancel_token.clone();
                             let cancel_handshake = cancel_token.clone();
 
@@ -706,7 +709,7 @@ impl H3Listener {
                                     .await;
                                 match res {
                                     TimeoutOrCancel::Ok(Ok((send, recv, metadata))) => {
-                                        let tunnel_stream = Box::new(QuinnTunnelStream::new(send, recv).with_connection(conn_clone)) as Box<dyn TunnelStream>;
+                                        let tunnel_stream = Box::new(QuinnTunnelStream::new(send, recv).with_session(session_clone)) as Box<dyn TunnelStream>;
                                         // The accepted-stream queue can be full during
                                         // shutdown; the owned handshake task must
                                         // never sit on an uncancellable send.
@@ -725,7 +728,10 @@ impl H3Listener {
                                 }
                             });
                         }
-                        Err(_) => break,
+                        Err(_) => {
+                            session.mark_dead(b"raw quic accept error");
+                            break;
+                        }
                     }
                 }
             }
@@ -736,7 +742,7 @@ impl H3Listener {
 
         // Keep conn alive until closed by peer or cancelled,
         // preventing premature QUIC teardown while accepted streams are still relaying.
-        let _ = conn.closed().cancel_with(&cancel_token).await;
+        let _ = session.conn().closed().cancel_with(&cancel_token).await;
     }
 }
 

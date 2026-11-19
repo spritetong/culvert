@@ -406,6 +406,17 @@ send fairness and an expanded 64 KiB crypto buffer for lossy handshakes.
 listeners. Initial RTT, loss thresholds, and congestion-controller internals are
 deliberately not config surface.
 
+Every QUIC connection carries one `QuicSessionHandle` shared by the connector
+cache, accepted relay streams and listener handlers. The handle owns the UDP
+datagram-progress check, the `dead` flag and the single `conn.close()` path, so
+forward and reverse paths agree on when a session is unusable. A stream that
+detects a stalled session reports `Dead` and retires the shared session; the
+next connector call replaces the cached connection. Dialing a QUIC endpoint races all addresses returned by the configured DNS
+strategy concurrently instead of committing to the first DNS record; the
+strategy's family filtering and preference order are preserved because the
+connector does not reorder the resolver output. This removes single-record
+bad-A/AAAA failures without adding a config knob.
+
 `BufferedTlsStream` (one-byte pushback) is still present: TLS drivers require
 it. `impl TunnelStream for Box<dyn TunnelStream>` was removed because no
 production path boxes a boxed stream; `IoChannel` is the only forwarding layer
@@ -683,18 +694,19 @@ Magic byte values:
 
 - In **Forward mode**: Produced by `ReplenishingStreamPool::encode_activation_with_proto`
   on the client, written before any application data. The server reads the magic
-  byte (`0xA5` or `0xA7`), then the length and payload with a 10-second timeout,
-  rejects lengths `>= 512`, parses the string with `parse_target_addr`, and only
-  then dials the target (TCP/UDS or `ConnectedUdpSocket`). An invalid magic byte
-  or a closed idle stream terminates that connection.
+  byte, length and payload under one bounded `decode_activation` call, rejects
+  lengths `>= 512`, parses the string with `parse_target_addr`, and only then
+  dials the target (TCP/UDS or `ConnectedUdpSocket`). An invalid magic byte or a
+  closed/timed-out idle stream terminates that connection.
 - In **Reverse mode**: The server writes `0xA5` (TCP) or `0xA7` (UDP) directly down
   the popped idle reverse stream, flushes, and reads back `0xAC` (`ACTIVATE_STREAM_ACK`)
   bounded by `reverse_frame_timeout(idle_timeout)` before pairing. The client worker
-  reads the magic byte (or `0xA6` to promote an idle stream to control signaling),
-  echoes `0xAC` within a 2-second timeout before dialing the local target, and begins
-  relaying. This round-trip acknowledgment prevents silently dead (half-open) idle
-  connections — where server writes succeed into the local socket send buffer — from
-  blackholing visitors.
+  reads the magic byte (or `0xA6` to promote an idle stream to control signaling)
+  under the same `reverse_frame_timeout(idle_timeout)` bound, echoes `0xAC` within
+  a 2-second timeout before dialing the local target, and begins relaying. This
+  round-trip acknowledgment prevents silently dead (half-open) idle connections —
+  where server writes succeed into the local socket send buffer — from blackholing
+  visitors.
 
 ### 6.2 Reverse control channel, SignalingChannel & Inbound Pool
 
@@ -836,14 +848,15 @@ The worker count is capped at `POOL_MAX_CAPACITY` = 64 (`clamp_reverse_pool_size
 an idle stream connected to the server via `connect_pooled_with_tunnel`
 (`mode = Reverse`, `pool_idle = true`, `tunnel_id = Some(tunnel_id)`).
 
-The worker waits cancellably for an activation packet using the unified `decode_activation_with_proto`
+The worker waits cancellably for an activation packet using the unified `decode_activation`
 codec (reading `0xA5` for TCP or `0xA7` for UDP, plus target length and the target string, or `0xA6`
-for signaling promotion) and reaps its own relay tasks while waiting. It has **no independent recycle timer**:
-the server is the sole owner of an idle stream's lifetime. Upon reading a valid activation packet,
-the worker echoes `ACTIVATE_STREAM_ACK` (`0xAC`) with a bounded 2-second timeout before opening the
-dynamically received local target channel via `platform::connect_target_channel_str(&target, protocol)`
-(TCP/UDS or `ConnectedUdpSocket`). It then hands `core::serve` to its own `TaskTracker`, and immediately
-dials a replacement idle stream to replenish the tunnel's shared server-side pool.
+for signaling promotion), bounded by `reverse_frame_timeout(idle_timeout)`, and reaps its own relay
+tasks while waiting. It has **no independent recycle timer**: the server is the sole owner of an idle
+stream's lifetime. Upon reading a valid activation packet, the worker echoes `ACTIVATE_STREAM_ACK`
+(`0xAC`) with a bounded 2-second timeout before opening the dynamically received local target channel
+via `platform::connect_target_channel(&target, protocol)` (TCP/UDS or `ConnectedUdpSocket`). It then
+hands `core::serve` to its own `TaskTracker`, and immediately dials a replacement idle stream to
+replenish the tunnel's shared server-side pool.
 
 Pre-warm dials are throttled to at most `POOL_MAX_CONCURRENT_CONNECTS` = 16 concurrent handshakes
 via a shared semaphore, protecting low-bandwidth links from connection storms.
@@ -894,7 +907,7 @@ later.
 | `connecting_futures: FuturesUnordered` | At most 16 concurrent dials (`POOL_MAX_CONCURRENT_CONNECTS`). |
 | Reactor events | `Cancelled`, `ConnectionResult`, `Command`, `RetryTimerExpired`, `HeartbeatTick`, `StreamsEvicted`. |
 | Heartbeats | `poll_check_alive` sweeps on a 1-second tick with a 5-second probe interval and 5-second probe timeout. Non-destructive via zero-capacity read buffer. |
-| Acquire order | LIFO (freshest first) to avoid silently expired NAT/QUIC pinholes. A stream with an in-flight probe write (`HeartbeatState::SendingPing`) is skipped but kept in the pool; only over-age or `poll_check_alive == Dead` streams are evicted. Evicting idle streams never closes the shared QUIC/H3 session: other streams may still be relaying on it. The connector invalidates a cached session only when its own dial path proves the transport broken. |
+| Acquire order | LIFO (freshest first) to avoid silently expired NAT/QUIC pinholes. A stream with an in-flight probe write (`HeartbeatState::SendingPing`) is skipped but kept in the pool; only over-age or `poll_check_alive == Dead` streams are evicted. Evicting one idle stream never closes the shared QUIC/H3 session: all streams share one `QuicSessionHandle`, and only a connection-level liveness failure or connector dial failure marks that handle dead and closes the session. |
 | Replenishment | Parallel one-turn batch dialing up to `POOL_MAX_CONCURRENT_CONNECTS` (16); backoff from 200 ms up to 10 s, capped at 1 s when waiters are queued (`POOL_BACKOFF_ACTIVE_WAITERS_MAX`). |
 | Limits | Idle pre-warmed inventory bounded by `POOL_MAX_CAPACITY` = 64; `pool_size` acts as the 0-RTT minimum warm inventory floor. Active relay throughput is fully decoupled from replenishment gating; pending callers dial immediately in parallel batches up to 16. Acquire timeout 15 s. |
 | Statistics | `PoolStats { idle_count, active_count, total_created }`. Authoritative `active_count` is tracked atomically (`Arc<AtomicUsize>`). |

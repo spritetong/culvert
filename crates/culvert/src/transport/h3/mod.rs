@@ -14,17 +14,106 @@ pub use listener::H3Listener;
 pub use stream::{H3TunnelStream, QuinnTunnelStream};
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+
+use parking_lot::Mutex;
 
 use crate::config::model::{QuicConfig, QuicCongestion, TunnelMode};
 use crate::consts::{
     ALPN_H3, ALPN_QUIC, DEFAULT_QUIC_ACK_ELICITING_THRESHOLD,
-    DEFAULT_QUIC_ACK_REORDERING_THRESHOLD, DEFAULT_QUIC_MTU_UPPER_BOUND, SCHEME_H3, SCHEME_HTTPS,
-    SCHEME_QUIC,
+    DEFAULT_QUIC_ACK_REORDERING_THRESHOLD, DEFAULT_QUIC_MTU_UPPER_BOUND,
+    DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD, SCHEME_H3, SCHEME_HTTPS, SCHEME_QUIC,
 };
 use crate::core::error::TunnelError;
 use crate::dialer::endpoint::EndpointContext;
 use crate::transport::{TransportConnector, TransportDriver, TransportListener};
 use tokio_util::sync::CancellationToken;
+
+/// Shared health state for all streams on one QUIC connection.
+///
+/// Connector caches, relay streams and listener handlers all consult this handle,
+/// so "dead" has one meaning and one close path regardless of tunnel direction.
+#[derive(Clone)]
+pub(crate) struct QuicSessionHandle {
+    conn: quinn::Connection,
+    dead: Arc<AtomicBool>,
+    liveness: Arc<Mutex<QuicLiveness>>,
+}
+
+struct QuicLiveness {
+    last_rx_dgrams: u64,
+    last_tx_dgrams: u64,
+    last_progress_at: Instant,
+}
+
+impl QuicSessionHandle {
+    pub(crate) fn new(conn: quinn::Connection) -> Self {
+        let stats = conn.stats();
+        Self {
+            conn,
+            dead: Arc::new(AtomicBool::new(false)),
+            liveness: Arc::new(Mutex::new(QuicLiveness {
+                last_rx_dgrams: stats.udp_rx.datagrams,
+                last_tx_dgrams: stats.udp_tx.datagrams,
+                last_progress_at: Instant::now(),
+            })),
+        }
+    }
+
+    pub(crate) fn conn(&self) -> &quinn::Connection {
+        &self.conn
+    }
+
+    pub(crate) fn is_alive(&self) -> bool {
+        !self.dead.load(Ordering::Acquire) && self.conn.close_reason().is_none()
+    }
+
+    pub(crate) fn mark_dead(&self, reason: &'static [u8]) {
+        if !self.dead.swap(true, Ordering::AcqRel) {
+            self.conn.close(quinn::VarInt::from_u32(0), reason);
+        }
+    }
+
+    /// Returns false only when the whole connection has stopped receiving QUIC
+    /// datagrams while still transmitting. The state is shared by every stream,
+    /// so one stream's observation applies to the session rather than a copy.
+    pub(crate) fn check_liveness(&self) -> bool {
+        if !self.is_alive() {
+            return false;
+        }
+
+        let stats = self.conn.stats();
+        let cur_rx = stats.udp_rx.datagrams;
+        let cur_tx = stats.udp_tx.datagrams;
+
+        let stalled = {
+            let mut liveness = self.liveness.lock();
+            if cur_rx > liveness.last_rx_dgrams {
+                liveness.last_rx_dgrams = cur_rx;
+                liveness.last_tx_dgrams = cur_tx;
+                liveness.last_progress_at = Instant::now();
+                false
+            } else {
+                cur_tx > liveness.last_tx_dgrams
+                    && liveness.last_progress_at.elapsed() >= DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD
+            }
+        };
+
+        if stalled {
+            tracing::warn!(
+                cur_tx,
+                cur_rx,
+                conn = ?self.conn,
+                "QUIC session unresponsive: transmitting without receiving datagrams"
+            );
+            self.mark_dead(b"quic session unresponsive");
+            false
+        } else {
+            true
+        }
+    }
+}
 
 fn effective_mtu(quic: &QuicConfig) -> u16 {
     quic.mtu_upper_bound.unwrap_or(DEFAULT_QUIC_MTU_UPPER_BOUND)
