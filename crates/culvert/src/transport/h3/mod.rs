@@ -44,20 +44,52 @@ pub(crate) struct QuicSessionHandle {
 struct QuicLiveness {
     last_rx_dgrams: u64,
     last_tx_dgrams: u64,
-    last_progress_at: Instant,
+    stalled_since: Option<Instant>,
+}
+
+impl QuicLiveness {
+    fn new(conn: &quinn::Connection) -> Self {
+        let stats = conn.stats();
+        Self {
+            last_rx_dgrams: stats.udp_rx.datagrams,
+            last_tx_dgrams: stats.udp_tx.datagrams,
+            stalled_since: None,
+        }
+    }
+
+    /// Returns true only when a later TX sample confirms an unbroken TX-only
+    /// window. The first TX without RX starts the clock; polls with no new TX
+    /// leave it running, so frequent liveness checks never mask a stalled
+    /// session. A single TX followed by silence never confirms and is harmless.
+    fn observe(&mut self, cur_rx: u64, cur_tx: u64, now: Instant) -> bool {
+        if cur_rx > self.last_rx_dgrams {
+            self.last_rx_dgrams = cur_rx;
+            self.last_tx_dgrams = cur_tx;
+            self.stalled_since = None;
+            return false;
+        }
+
+        let tx_progressed = cur_tx > self.last_tx_dgrams;
+        self.last_tx_dgrams = cur_tx;
+        if !tx_progressed {
+            return false;
+        }
+
+        let Some(since) = self.stalled_since else {
+            self.stalled_since = Some(now);
+            return false;
+        };
+        now.duration_since(since) >= DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD
+    }
 }
 
 impl QuicSessionHandle {
     pub(crate) fn new(conn: quinn::Connection) -> Self {
-        let stats = conn.stats();
+        let liveness = QuicLiveness::new(&conn);
         Self {
             conn,
             dead: Arc::new(AtomicBool::new(false)),
-            liveness: Arc::new(Mutex::new(QuicLiveness {
-                last_rx_dgrams: stats.udp_rx.datagrams,
-                last_tx_dgrams: stats.udp_tx.datagrams,
-                last_progress_at: Instant::now(),
-            })),
+            liveness: Arc::new(Mutex::new(liveness)),
         }
     }
 
@@ -75,9 +107,10 @@ impl QuicSessionHandle {
         }
     }
 
-    /// Returns false only when the whole connection has stopped receiving QUIC
-    /// datagrams while still transmitting. The state is shared by every stream,
-    /// so one stream's observation applies to the session rather than a copy.
+    /// Returns false only after two TX-without-RX samples confirm that the
+    /// whole connection is still transmitting while receiving nothing. The
+    /// state is shared by every stream, so one stream's observation applies to
+    /// the session rather than a copy.
     pub(crate) fn check_liveness(&self) -> bool {
         if !self.is_alive() {
             return false;
@@ -86,18 +119,9 @@ impl QuicSessionHandle {
         let stats = self.conn.stats();
         let cur_rx = stats.udp_rx.datagrams;
         let cur_tx = stats.udp_tx.datagrams;
-
         let stalled = {
             let mut liveness = self.liveness.lock();
-            if cur_rx > liveness.last_rx_dgrams {
-                liveness.last_rx_dgrams = cur_rx;
-                liveness.last_tx_dgrams = cur_tx;
-                liveness.last_progress_at = Instant::now();
-                false
-            } else {
-                cur_tx > liveness.last_tx_dgrams
-                    && liveness.last_progress_at.elapsed() >= DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD
-            }
+            liveness.observe(cur_rx, cur_tx, Instant::now())
         };
 
         if stalled {
@@ -105,7 +129,7 @@ impl QuicSessionHandle {
                 cur_tx,
                 cur_rx,
                 conn = ?self.conn,
-                "QUIC session unresponsive: transmitting without receiving datagrams"
+                "QUIC session unresponsive: confirmed transmitting without receiving datagrams"
             );
             self.mark_dead(b"quic session unresponsive");
             false
@@ -255,6 +279,15 @@ impl TransportDriver for H3TransportDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    fn stalled_tracker() -> QuicLiveness {
+        QuicLiveness {
+            last_rx_dgrams: 10,
+            last_tx_dgrams: 20,
+            stalled_since: None,
+        }
+    }
 
     #[test]
     fn test_quic_endpoint_config_valid() {
@@ -274,5 +307,54 @@ mod tests {
         };
         let cfg = quic_endpoint_config(&quic);
         assert!(cfg.is_err());
+    }
+
+    #[test]
+    fn test_quic_liveness_single_tx_then_idle_is_healthy() {
+        let now = Instant::now();
+        let mut liveness = stalled_tracker();
+
+        assert!(!liveness.observe(10, 21, now));
+        assert!(!liveness.observe(
+            10,
+            21,
+            now + DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn test_quic_liveness_continued_tx_without_rx_is_dead() {
+        let now = Instant::now();
+        let mut liveness = stalled_tracker();
+
+        assert!(!liveness.observe(10, 21, now));
+        assert!(!liveness.observe(10, 22, now + Duration::from_secs(5)));
+        assert!(liveness.observe(10, 23, now + DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD));
+    }
+
+    #[test]
+    fn test_quic_liveness_no_tx_polls_do_not_reset_stall_clock() {
+        let now = Instant::now();
+        let mut liveness = stalled_tracker();
+
+        assert!(!liveness.observe(10, 21, now));
+        for sec in 1..DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD.as_secs() {
+            assert!(!liveness.observe(10, 21, now + Duration::from_secs(sec)));
+        }
+        assert!(liveness.observe(10, 22, now + DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD));
+    }
+
+    #[test]
+    fn test_quic_liveness_rx_resets_stall_clock() {
+        let now = Instant::now();
+        let mut liveness = stalled_tracker();
+
+        assert!(!liveness.observe(10, 21, now));
+        assert!(!liveness.observe(11, 22, now + DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD));
+        assert!(!liveness.observe(
+            11,
+            23,
+            now + DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD + Duration::from_secs(1)
+        ));
     }
 }
