@@ -45,6 +45,7 @@ struct QuicLiveness {
     last_rx_dgrams: u64,
     last_tx_dgrams: u64,
     stalled_since: Option<Instant>,
+    stall_start_tx: u64,
 }
 
 impl QuicLiveness {
@@ -54,32 +55,46 @@ impl QuicLiveness {
             last_rx_dgrams: stats.udp_rx.datagrams,
             last_tx_dgrams: stats.udp_tx.datagrams,
             stalled_since: None,
+            stall_start_tx: 0,
         }
     }
 
-    /// Returns true only when a later TX sample confirms an unbroken TX-only
-    /// window. The first TX without RX starts the clock; polls with no new TX
-    /// leave it running, so frequent liveness checks never mask a stalled
-    /// session. A single TX followed by silence never confirms and is harmless.
+    /// Returns true only when subsequent TX attempts confirm an unbroken TX-without-RX
+    /// window beyond `DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD`.
+    ///
+    /// The first TX without RX starts the clock and anchors `stall_start_tx`.
+    /// Subsequent calls without RX remain healthy if no new TX was attempted
+    /// (`cur_tx == stall_start_tx`, e.g. a single non-ack-eliciting pure ACK frame
+    /// followed by routine idle).
+    /// Once subsequent transmissions are observed (`cur_tx > stall_start_tx`) and
+    /// silence persists beyond the threshold, the session is declared dead without
+    /// requiring a new TX right at the exact instant of the liveness check.
     fn observe(&mut self, cur_rx: u64, cur_tx: u64, now: Instant) -> bool {
         if cur_rx > self.last_rx_dgrams {
             self.last_rx_dgrams = cur_rx;
             self.last_tx_dgrams = cur_tx;
             self.stalled_since = None;
+            self.stall_start_tx = 0;
             return false;
         }
 
-        let tx_progressed = cur_tx > self.last_tx_dgrams;
-        self.last_tx_dgrams = cur_tx;
-        if !tx_progressed {
-            return false;
+        if cur_tx > self.last_tx_dgrams {
+            self.last_tx_dgrams = cur_tx;
+            if self.stalled_since.is_none() {
+                self.stalled_since = Some(now);
+                self.stall_start_tx = cur_tx;
+                return false;
+            }
         }
 
-        let Some(since) = self.stalled_since else {
-            self.stalled_since = Some(now);
-            return false;
-        };
-        now.duration_since(since) >= DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD
+        if let Some(since) = self.stalled_since
+            && cur_tx > self.stall_start_tx
+            && now.duration_since(since) >= DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD
+        {
+            return true;
+        }
+
+        false
     }
 }
 
@@ -286,6 +301,7 @@ mod tests {
             last_rx_dgrams: 10,
             last_tx_dgrams: 20,
             stalled_since: None,
+            stall_start_tx: 0,
         }
     }
 
@@ -356,5 +372,23 @@ mod tests {
             23,
             now + DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD + Duration::from_secs(1)
         ));
+    }
+
+    #[test]
+    fn test_quic_liveness_dead_session_detected_without_tx_on_eval_instant() {
+        let now = Instant::now();
+        let mut liveness = stalled_tracker();
+
+        // 1. Initial TX starts the stall clock with stall_start_tx = 21
+        assert!(!liveness.observe(10, 21, now));
+
+        // 2. Transmissions continue without RX at T = 5s and T = 9s
+        assert!(!liveness.observe(10, 22, now + Duration::from_secs(5)));
+        assert!(!liveness.observe(10, 23, now + Duration::from_secs(9)));
+
+        // 3. At T = 11s, a check occurs where cur_tx has NOT increased between 9s and 11s (still 23).
+        // Because cur_tx (23) > stall_start_tx (21) and elapsed (11s) >= threshold (10s),
+        // it must reliably detect the dead session instead of missing the stall.
+        assert!(liveness.observe(10, 23, now + Duration::from_secs(11)));
     }
 }

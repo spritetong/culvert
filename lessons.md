@@ -453,3 +453,19 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
 - **References**:
   - Implementation: [forward.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/tunnel/forward.rs), [runner.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/server/runner.rs), [manager.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/session/manager.rs), [reverse.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/tunnel/reverse.rs)
 
+### 11.4 QuicLiveness State Machine: Baseline Anchoring vs. Per-Poll TX Gating
+
+- **Problem / Trap (Sticky Latch vs. Per-Poll TX Gating)**:
+  1. *Sticky Latch*: In QUIC, non-ack-eliciting datagrams (e.g. pure ACK frames) increase `cur_tx` without eliciting an ACK. If liveness tracking latches `cur_tx > last_tx` without refreshing the TX baseline, routine idle periods $\ge 10s$ cause subsequent liveness checks to falsely declare healthy sessions dead and terminate shared connections.
+  2. *Per-Poll TX Gating Trap*: Conversely, requiring `cur_tx > last_tx` on the exact evaluation call that inspects `now - stalled_since >= threshold` causes missed detections. If a packet was transmitted at 9.8s and evaluated at 10.5s without an intervening packet (e.g. under 5s keepalive intervals), the check observes `!tx_progressed` and reports `Alive`, delaying failover or completely missing dead sessions when TX ceases.
+- **Solution (Anchor Baseline on Initial Stall)**:
+  - In `QuicLiveness`, record `stall_start_tx` when `stalled_since` is first initialized.
+  - Declare a session dead when `cur_tx > stall_start_tx` and `now.duration_since(since) >= DEFAULT_QUIC_UNRESPONSIVE_THRESHOLD`.
+  - Isolated single-TX events followed by silence never exceed `stall_start_tx` and remain healthy.
+  - Truly unresponsive sessions that attempt subsequent transmissions (keepalives or retransmissions) reliably trigger `Dead` on any check past the threshold without requiring a coincident TX on the evaluation instant.
+  - Clean RX progress clears `stalled_since` and resets `stall_start_tx` to 0.
+- **References**:
+  - Implementation: [mod.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/h3/mod.rs)
+  - Unit Tests: [mod.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/h3/mod.rs#L300-L395)
+
+
