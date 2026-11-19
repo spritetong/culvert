@@ -510,9 +510,7 @@ impl H3Connector {
         {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                if !session.is_alive() {
-                    self.invalidate_h3_session_if_same(session_id_val);
-                }
+                self.invalidate_h3_session_if_same(session_id_val);
                 return Err(TunnelError::ControlProtocol(format!(
                     "Failed to send H3 request: {:?}",
                     e
@@ -528,9 +526,7 @@ impl H3Connector {
             match tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, stream.recv_response()).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
-                    if !session.is_alive() {
-                        self.invalidate_h3_session_if_same(session_id_val);
-                    }
+                    self.invalidate_h3_session_if_same(session_id_val);
                     return Err(TunnelError::ControlProtocol(format!(
                         "Failed to receive H3 response: {:?}",
                         e
@@ -578,9 +574,7 @@ impl H3Connector {
             match tokio::time::timeout(connect_timeout, session.handle.conn().open_bi()).await {
                 Ok(Ok(pair)) => pair,
                 Ok(Err(e)) => {
-                    if !session.is_alive() {
-                        self.invalidate_quic_session_if_same(session_id_val);
-                    }
+                    self.invalidate_quic_session_if_same(session_id_val);
                     return Err(TunnelError::Tls(format!(
                         "Failed to open QUIC bi-stream: {:?}",
                         e
@@ -622,9 +616,7 @@ impl H3Connector {
         match write_res {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                if !session.is_alive() {
-                    self.invalidate_quic_session_if_same(session_id_val);
-                }
+                self.invalidate_quic_session_if_same(session_id_val);
                 return Err(TunnelError::Io(e));
             }
             Err(_) => {

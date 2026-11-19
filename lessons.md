@@ -420,3 +420,36 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
 - **References**:
   - Implementation: [tls.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/dialer/tls.rs#L250-L315), [model.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/config/model.rs#L550-L650)
   - Integration Tests: [test_wss_tls.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/tests/test_wss_tls.rs#L1000-L1150), [test_h3_quic.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/tests/test_h3_quic.rs#L1210-L1350)
+
+---
+
+## 11. Multiplexed QUIC Resiliency, Activation Handshakes & Generational Lifecycles
+
+### 11.1 Local Allocation Blindspot & Inline Session Liveness
+
+- **Problem / Trap**: In QUIC (`quinn`), `conn.open_bi()` allocates stream IDs locally and `write_all()` buffers frames into user-space queues without a network round-trip. When a sudden network failure drops the connection, stream creation and initial writes succeed locally in RAM while the remote peer never receives them.
+- **Symptom**: Pool workers and fallback dialers open streams into a zombie session; `decode_activation` or relay pumps hang until max idle timeout. The tunnel becomes completely unusable until process restart, while `wss://` (unshared TCP dial) works immediately.
+- **Solution**:
+  - Invalidate connector session caches unconditionally upon any stream open or initial write error/timeout without gating on `is_alive()`.
+  - Check `session.is_alive()` and `session.check_liveness()` directly inside `QuinnTunnelStream` and `H3TunnelStream`'s `poll_read`, `poll_write`, and `poll_write_owned`. Stalled UDP connections immediately abort pending readers and writers with `ConnectionReset` / `TimedOut`, waking all waiting pool workers.
+- **References**:
+  - Implementation: [connector.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/h3/connector.rs), [stream.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/transport/h3/stream.rs)
+  - Probe Test: [test_idle_probe.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/tests/test_idle_probe.rs)
+
+### 11.2 Control-Data Generational Decoupling in Reverse Tunnels
+
+- **Problem / Trap**: Retaining a single `data_connector` outside the reverse mapping reconnect loop causes reconnected control channels to pair with a stale `data_connector` whose cached QUIC connection and local UDP socket are dead or blocked by NAT.
+- **Solution**:
+  - Scope `data_connector` inside the reverse control reconnect loop. Each control generation creates a fresh data connector with a new local UDP socket, clean NAT 4-tuple, and fresh session cache matching the server's new pool generation.
+- **References**:
+  - Implementation: [reverse.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/tunnel/reverse.rs)
+
+### 11.3 Symmetric Round-Trip Activation ACK & Idle Boundary Grace
+
+- **Problem / Trap**: Forward mode previously lacked round-trip activation ACK, causing half-open pooled streams to fail immediately in `serve()` without triggering the visitor retry loop. Simultaneously, tight `decode_activation` timeouts caused client workers to drop streams right as the server popped and activated them near the 30s idle boundary.
+- **Solution**:
+  - Unify forward and reverse pooling: servers echo `ACTIVATE_STREAM_ACK` (`0xAC`) on forward pooled activation, allowing client retry loops (`attempts < max_attempts`) to cleanly recover from stale streams without dropping visitors.
+  - Server `pop_live` retires streams approaching expiration (`elapsed + margin >= max_age`), while reverse worker `decode_activation` adds a safety grace window (`idle_timeout + reverse_frame_timeout.max(5s)`), eliminating boundary race conditions on high-latency WANs.
+- **References**:
+  - Implementation: [forward.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/tunnel/forward.rs), [runner.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/server/runner.rs), [manager.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/session/manager.rs), [reverse.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/tunnel/reverse.rs)
+

@@ -20,7 +20,8 @@ use crate::common::{CancelFutureExt, TaskTracker};
 use crate::config::model::{QuicConfig, ServerConfig, TlsConfig, TunnelMode};
 use crate::consts::{
     ACTIVATE_STREAM_ACK, DEFAULT_ACTIVATION_READ_TIMEOUT, DEFAULT_SESSION_PAIR_TIMEOUT,
-    POOL_DUMMY_HOST, reverse_frame_timeout, reverse_grace_period, reverse_pool_soft_cap,
+    POOL_DUMMY_HOST, reverse_ack_timeout, reverse_frame_timeout, reverse_grace_period,
+    reverse_pool_soft_cap,
 };
 use crate::control::{
     ControlMessage, FramedControlStream, SignalingChannel, SignalingConfig, SignalingReceiver,
@@ -229,6 +230,23 @@ impl ServerRunner {
 
                                                     match decoded {
                                                         Ok(Some(header)) => {
+                                                            let ack_timeout = reverse_ack_timeout(idle_timeout);
+                                                            let echo_ack = async {
+                                                                tokio::io::AsyncWriteExt::write_all(
+                                                                    &mut stream,
+                                                                    &[ACTIVATE_STREAM_ACK],
+                                                                )
+                                                                .await?;
+                                                                tokio::io::AsyncWriteExt::flush(&mut stream).await
+                                                            };
+                                                            if tokio::time::timeout(ack_timeout, echo_ack)
+                                                                .cancel_with(&conn_token)
+                                                                .await
+                                                                .map(|r| r.is_ok())
+                                                                != Some(true)
+                                                            {
+                                                                return;
+                                                            }
                                                             activated_proto = Some(header.protocol);
                                                             if let Some(t) = header.target {
                                                                 dynamic_target = Some(t);

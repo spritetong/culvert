@@ -18,6 +18,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::common::CancelFutureExt;
+use crate::consts::{ACTIVATE_STREAM_PROMOTE, DEFAULT_REVERSE_PROMOTE_WAIT, reverse_pool_expiration_margin};
 use crate::control::FramedControlStream;
 use crate::core::error::TunnelError;
 use crate::core::stream::{HeartbeatStatus, TunnelStream};
@@ -107,7 +108,8 @@ impl ReverseInboundPool {
     pub async fn pop_live(&self, max_age: Duration) -> Option<Box<dyn TunnelStream>> {
         loop {
             let entry = self.idle.lock().pop_back()?;
-            if entry.enqueued_at.elapsed() >= max_age {
+            let safety_margin = reverse_pool_expiration_margin(max_age);
+            if entry.enqueued_at.elapsed() + safety_margin >= max_age {
                 drop(entry);
                 continue;
             }
@@ -131,12 +133,12 @@ impl ReverseInboundPool {
         let mut stream = self.pop_live(max_age).await?;
         let write_fut = async {
             stream
-                .write_all(&[crate::consts::ACTIVATE_STREAM_PROMOTE])
+                .write_all(&[ACTIVATE_STREAM_PROMOTE])
                 .await?;
             stream.flush().await
         };
         // Bounded write: an unread or dead stream buffer must never hang promote_idle indefinitely.
-        if tokio::time::timeout(Duration::from_secs(1), write_fut)
+        if tokio::time::timeout(DEFAULT_REVERSE_PROMOTE_WAIT, write_fut)
             .await
             .is_ok_and(|r| r.is_ok())
         {

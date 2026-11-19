@@ -64,6 +64,20 @@ impl AsyncRead for QuinnTunnelStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if let Some(ref session) = self.session {
+            if !session.is_alive() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "Underlying QUIC connection closed",
+                )));
+            }
+            if !session.check_liveness() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Underlying QUIC connection unresponsive",
+                )));
+            }
+        }
         let mut filled_any = false;
         if let Some(b) = self.read_buf.take() {
             buf.put_slice(&[b]);
@@ -105,6 +119,20 @@ impl AsyncWrite for QuinnTunnelStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if let Some(ref session) = self.session {
+            if !session.is_alive() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "Underlying QUIC connection closed",
+                )));
+            }
+            if !session.check_liveness() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Underlying QUIC connection unresponsive",
+                )));
+            }
+        }
         match tokio::io::AsyncWrite::poll_write(Pin::new(&mut self.send), cx, buf) {
             Poll::Ready(Ok(n)) => {
                 if n > 0 {
@@ -152,6 +180,21 @@ impl TunnelStream for QuinnTunnelStream {
                 io::ErrorKind::BrokenPipe,
                 "QUIC stream write direction closed",
             )));
+        }
+
+        if let Some(ref session) = self.session {
+            if !session.is_alive() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "Underlying QUIC connection closed",
+                )));
+            }
+            if !session.check_liveness() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Underlying QUIC connection unresponsive",
+                )));
+            }
         }
 
         if chunk.is_empty() {
@@ -274,6 +317,21 @@ impl H3TunnelStream {
                 io::ErrorKind::BrokenPipe,
                 "HTTP/3 stream write direction closed",
             )));
+        }
+
+        if let Some(ref session) = self.session {
+            if !session.is_alive() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "Underlying QUIC connection closed",
+                )));
+            }
+            if !session.check_liveness() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Underlying QUIC connection unresponsive",
+                )));
+            }
         }
 
         let tx = match self.tx_outbound.as_mut() {
@@ -400,6 +458,20 @@ impl AsyncRead for H3TunnelStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if let Some(ref session) = self.session {
+            if !session.is_alive() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "Underlying QUIC connection closed",
+                )));
+            }
+            if !session.check_liveness() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Underlying QUIC connection unresponsive",
+                )));
+            }
+        }
         if let Some(mut current) = self.read_buf.take() {
             let to_copy = std::cmp::min(buf.remaining(), current.len());
             buf.put_slice(&current[..to_copy]);

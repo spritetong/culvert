@@ -7,12 +7,13 @@
 
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::common::{CancelFutureExt, TaskTracker};
 use crate::config::model::{TunnelConfig, TunnelMode};
+use crate::consts::{ACTIVATE_STREAM_ACK, reverse_ack_timeout};
 use crate::core::error::TunnelError;
 use crate::core::serve::serve;
 use crate::dialer::endpoint::EndpointContext;
@@ -123,14 +124,26 @@ pub async fn run_forward_mapping(
                                     Ok(mut channel) => {
                                         if pool_clone.is_some() {
                                             let activation_pkt = ReplenishingStreamPool::encode_activation_with_proto(Some(&target), protocol);
-                                            let Some(write_act_res) = async {
+                                            let ack_timeout = reverse_ack_timeout(idle_timeout);
+                                            let write_act_res = async {
                                                 channel.write_all(&activation_pkt).await?;
                                                 channel.flush().await?;
-                                                Ok::<(), std::io::Error>(())
+                                                let mut ack = [0u8; 1];
+                                                tokio::time::timeout(ack_timeout, channel.read_exact(&mut ack))
+                                                    .await
+                                                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Timed out waiting for activation ACK"))??;
+                                                if ack[0] == ACTIVATE_STREAM_ACK {
+                                                    Ok::<(), std::io::Error>(())
+                                                } else {
+                                                    Err(std::io::Error::new(
+                                                        std::io::ErrorKind::InvalidData,
+                                                        "Invalid activation ACK byte",
+                                                    ))
+                                                }
                                             }
                                             .cancel_with(&conn_token)
-                                            .await
-                                            else {
+                                            .await;
+                                            let Some(write_act_res) = write_act_res else {
                                                 return;
                                             };
 

@@ -232,6 +232,46 @@ pub fn reverse_grace_period(idle_timeout: Duration) -> Duration {
     DEFAULT_REVERSE_GRACE_PERIOD.min(idle_timeout)
 }
 
+/// Minimum timeout floor for acknowledging or verifying stream activation (0xAC ACK).
+///
+/// Under high-RTT cross-border links, cellular jitter, or lossy wireless networks, an ACK
+/// round-trip can take several hundred milliseconds to seconds when packets drop and require
+/// TCP/QUIC retransmission. Clamping the activation ACK timeout to at least 5 seconds prevents
+/// false-positive stream teardown while keeping failover bounded.
+pub const DEFAULT_MIN_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum safety margin subtracted from idle `max_age` when popping pooled streams on the server.
+///
+/// Pre-emptively retires idle streams before `max_age` (up to 10% of `max_age` capped at 3s)
+/// so the server never pops and dispatches a stream that the client is about to expire at the idle boundary.
+pub const DEFAULT_MAX_POOL_EXPIRATION_MARGIN: Duration = Duration::from_secs(3);
+
+/// Effective timeout for sending or awaiting an activation ACK (`0xAC`) frame.
+///
+/// Scales adaptively with `reverse_frame_timeout(idle_timeout)` while enforcing a floor of
+/// `DEFAULT_MIN_ACK_TIMEOUT` (5 seconds) to ensure resilience against high WAN latency.
+pub fn reverse_ack_timeout(idle_timeout: Duration) -> Duration {
+    reverse_frame_timeout(idle_timeout).max(DEFAULT_MIN_ACK_TIMEOUT)
+}
+
+/// Total wait timeout for a client worker awaiting server activation on an idle pooled stream.
+///
+/// Because the server is the sole authority for idle stream lifecycle up to `idle_timeout`,
+/// the client worker holds the stream open for the configured `idle_timeout` plus an extra
+/// `reverse_ack_timeout(idle_timeout)` grace window. This eliminates boundary race conditions
+/// where the client closes a stream right as the server pops and activates it across WAN.
+pub fn reverse_activation_wait_timeout(idle_timeout: Duration) -> Duration {
+    idle_timeout + reverse_ack_timeout(idle_timeout)
+}
+
+/// Pre-emptive expiration safety margin subtracted from `max_age` in `ReverseInboundPool::pop_live`.
+///
+/// Retires streams within 10% of `max_age` (bounded by `DEFAULT_MAX_POOL_EXPIRATION_MARGIN`),
+/// ensuring popped streams have sufficient lifespan to complete the activation round-trip.
+pub fn reverse_pool_expiration_margin(max_age: Duration) -> Duration {
+    (max_age / 10).min(DEFAULT_MAX_POOL_EXPIRATION_MARGIN)
+}
+
 // =============================================================================
 // 5. QUIC & HTTP/3 Transport Parameters & Flow Control Windows
 // =============================================================================
@@ -495,6 +535,47 @@ mod tests {
         assert_eq!(
             reverse_frame_timeout(Duration::from_secs(3)),
             Duration::from_secs(3)
+        );
+    }
+
+    #[test]
+    fn test_reverse_ack_timeout_enforces_floor() {
+        // Short idle window (e.g. 3s): reverse_frame_timeout is 3s, floor is 5s
+        assert_eq!(
+            reverse_ack_timeout(Duration::from_secs(3)),
+            DEFAULT_MIN_ACK_TIMEOUT
+        );
+        // Default idle window (30s): reverse_frame_timeout is 10s, exceeds floor 5s
+        assert_eq!(
+            reverse_ack_timeout(DEFAULT_IDLE_TIMEOUT),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn test_reverse_activation_wait_timeout_adds_grace() {
+        assert_eq!(
+            reverse_activation_wait_timeout(DEFAULT_IDLE_TIMEOUT),
+            DEFAULT_IDLE_TIMEOUT + Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn test_reverse_pool_expiration_margin_scales_and_caps() {
+        // 30s max_age: 10% is 3s, exactly hits the 3s cap
+        assert_eq!(
+            reverse_pool_expiration_margin(Duration::from_secs(30)),
+            Duration::from_secs(3)
+        );
+        // 60s max_age: 10% is 6s, capped at 3s
+        assert_eq!(
+            reverse_pool_expiration_margin(Duration::from_secs(60)),
+            DEFAULT_MAX_POOL_EXPIRATION_MARGIN
+        );
+        // 10s max_age: 10% is 1s, below cap
+        assert_eq!(
+            reverse_pool_expiration_margin(Duration::from_secs(10)),
+            Duration::from_secs(1)
         );
     }
 }

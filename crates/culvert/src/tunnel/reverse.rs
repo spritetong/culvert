@@ -17,7 +17,7 @@ use crate::consts::{
     ACTIVATE_STREAM_ACK, DEFAULT_REVERSE_BACKOFF_INITIAL, DEFAULT_REVERSE_BACKOFF_MAX,
     DEFAULT_REVERSE_PROMOTE_WAIT, POOL_BACKOFF_ACTIVE_WAITERS_MAX, POOL_BACKOFF_BASE,
     POOL_MAX_CONCURRENT_CONNECTS, REVERSE_BACKOFF_RESET_THRESHOLD, REVERSE_CONTROL_TARGET_HOST,
-    clamp_reverse_pool_size,
+    clamp_reverse_pool_size, reverse_ack_timeout, reverse_activation_wait_timeout,
 };
 use crate::control::{ControlMessage, SignalingChannel, SignalingConfig, SignalingRouter};
 use crate::core::error::TunnelError;
@@ -103,14 +103,6 @@ pub async fn run_reverse_mapping(
     }
     let mut conn_tracker = TaskTracker::<()>::new(cancel_token.clone());
 
-    // Share data connector across all incoming visitor sessions to maximize connection/0-RTT reuse
-    let data_connector: Arc<dyn TransportConnector> =
-        Arc::from(transport_registry.create_connector(
-            &endpoint_ctx,
-            token.as_deref(),
-            TunnelMode::Reverse,
-        )?);
-
     let mut backoff = DEFAULT_REVERSE_BACKOFF_INITIAL;
 
     while !cancel_token.is_cancelled() {
@@ -119,6 +111,15 @@ pub async fn run_reverse_mapping(
             token.as_deref(),
             TunnelMode::Reverse,
         )?;
+
+        // Share a fresh data connector across all incoming visitor sessions for this
+        // control-channel generation, preventing zombie session carry-over across reconnects.
+        let data_connector: Arc<dyn TransportConnector> =
+            Arc::from(transport_registry.create_connector(
+                &endpoint_ctx,
+                token.as_deref(),
+                TunnelMode::Reverse,
+            )?);
 
         debug!(tag = %tag, "Connecting reverse control channel to remote server");
         let Some(conn_res) = connector
@@ -326,7 +327,8 @@ pub async fn run_reverse_mapping(
                             retry = initial_retry;
 
                             let activation_hdr = {
-                                let activation = decode_activation(&mut stream, &token, idle);
+                                let wait_timeout = reverse_activation_wait_timeout(idle);
+                                let activation = decode_activation(&mut stream, &token, wait_timeout);
                                 tokio::pin!(activation);
 
                                 loop {
@@ -376,7 +378,8 @@ pub async fn run_reverse_mapping(
                                 .await?;
                                 tokio::io::AsyncWriteExt::flush(&mut stream).await
                             };
-                            let ack_res = tokio::time::timeout(Duration::from_secs(2), ack_sent)
+                            let ack_timeout = reverse_ack_timeout(idle);
+                            let ack_res = tokio::time::timeout(ack_timeout, ack_sent)
                                 .cancel_with(&token)
                                 .await;
                             if !matches!(ack_res, Some(Ok(Ok(())))) {
@@ -664,7 +667,8 @@ pub async fn run_shared_reverse_pool(
 
                 // Server is sole owner of idle stream lifetime; await activation from server.
                 let activation_hdr = {
-                    let activation = decode_activation(&mut stream, &worker_token, idle_timeout);
+                    let wait_timeout = reverse_activation_wait_timeout(idle_timeout);
+                    let activation = decode_activation(&mut stream, &worker_token, wait_timeout);
                     tokio::pin!(activation);
 
                     loop {
@@ -706,7 +710,8 @@ pub async fn run_shared_reverse_pool(
                         .await?;
                     tokio::io::AsyncWriteExt::flush(&mut stream).await
                 };
-                let ack_res = tokio::time::timeout(Duration::from_secs(2), ack_sent)
+                let ack_timeout = reverse_ack_timeout(idle_timeout);
+                let ack_res = tokio::time::timeout(ack_timeout, ack_sent)
                     .cancel_with(&worker_token)
                     .await;
                 if !matches!(ack_res, Some(Ok(Ok(())))) {
