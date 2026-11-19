@@ -18,7 +18,9 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::common::CancelFutureExt;
-use crate::consts::{ACTIVATE_STREAM_PROMOTE, DEFAULT_REVERSE_PROMOTE_WAIT, reverse_pool_expiration_margin};
+use crate::consts::{
+    ACTIVATE_STREAM_PROMOTE, DEFAULT_REVERSE_PROMOTE_WAIT, reverse_pool_expiration_margin,
+};
 use crate::control::FramedControlStream;
 use crate::core::error::TunnelError;
 use crate::core::stream::{HeartbeatStatus, TunnelStream};
@@ -132,9 +134,7 @@ impl ReverseInboundPool {
         use tokio::io::AsyncWriteExt;
         let mut stream = self.pop_live(max_age).await?;
         let write_fut = async {
-            stream
-                .write_all(&[ACTIVATE_STREAM_PROMOTE])
-                .await?;
+            stream.write_all(&[ACTIVATE_STREAM_PROMOTE]).await?;
             stream.flush().await
         };
         // Bounded write: an unread or dead stream buffer must never hang promote_idle indefinitely.
@@ -712,6 +712,23 @@ mod tests {
         assert!(
             pool.pop_live(Duration::from_millis(60)).await.is_none(),
             "an over-age stream must be closed, never paired"
+        );
+        assert!(pool.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_pop_live_applies_expiration_margin() {
+        let pool = ReverseInboundPool::new(4);
+        let (client, _server) = duplex(64);
+        pool.push(Box::new(client));
+
+        // max_age=1s -> margin=100ms. At ~950ms the stream is younger than
+        // max_age, but 950ms + 100ms >= 1s, so it must be retired instead of
+        // paired. This proves pop_live applies the margin, not just its helper.
+        tokio::time::sleep(Duration::from_millis(950)).await;
+        assert!(
+            pool.pop_live(Duration::from_secs(1)).await.is_none(),
+            "stream within the expiration margin must be retired, not paired"
         );
         assert!(pool.is_empty());
     }
