@@ -16,7 +16,7 @@ use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
 use tokio_util::sync::CancellationToken;
 
 use culvert::config::model::{
-    AppConfig, EndpointConfig, ServerConfig, TlsConfig, TunnelMode,
+    AppConfig, ClientAuthMode, EndpointConfig, ServerConfig, TlsConfig, TunnelMode,
 };
 use culvert::dialer::endpoint::EndpointContext;
 use culvert::server::ServerRunner;
@@ -371,6 +371,66 @@ async fn test_server_dynamic_client_ca_hot_reload() {
     // 5. Client A connects again -> Must still succeed!
     let conn_a2 = connector_a.connect(&target, None).await;
     assert!(conn_a2.is_ok(), "Client A must still succeed after CA list update");
+
+    cancel_token.cancel();
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_optional_client_auth_allows_anonymous_client() {
+    let cancel_token = CancellationToken::new();
+    let pki = generate_pki();
+    let server_port = get_available_port();
+    let auth_token = "optional_mtls_token";
+
+    let mut server_registry = TransportRegistry::new();
+    server_registry.register(WsTransportDriver);
+    let server_registry = Arc::new(server_registry);
+
+    let server_config = ServerConfig {
+        listen: vec![format!("wss://127.0.0.1:{}/tunnel", server_port)],
+        token: Some(auth_token.to_string()),
+        certificate: Some(pki.server_cert_path.to_str().unwrap().to_string()),
+        key: Some(pki.server_key_path.to_str().unwrap().to_string()),
+        client_ca_certificate: Some(pki.ca_cert_path.to_str().unwrap().to_string()),
+        client_auth: Some(ClientAuthMode::Optional),
+        ..Default::default()
+    };
+
+    let server_runner = ServerRunner::new(
+        server_config,
+        Arc::clone(&server_registry),
+        Arc::new(SessionManager::new()),
+    );
+    let cancel_server = cancel_token.child_token();
+    let server_handle = tokio::spawn(async move {
+        server_runner.run(cancel_server).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Anonymous client: trusts the server CA but presents no client certificate.
+    let tls = TlsConfig {
+        server_name: Some("localhost".to_string()),
+        ca_certificate: Some(pki.ca_cert_path.clone()),
+        ..Default::default()
+    };
+    let ep = EndpointConfig::Detailed {
+        url: format!("wss://127.0.0.1:{}/tunnel", server_port),
+        dns: None,
+        dialer: None,
+        tls: Some(tls),
+        http_headers: None,
+    };
+    let ep_ctx = EndpointContext::build(&ep, &AppConfig::default()).unwrap();
+    let anonymous = server_registry
+        .create_connector(&ep_ctx, Some(auth_token), TunnelMode::Forward)
+        .unwrap();
+    let target = culvert::transport::TargetAddr::Domain("127.0.0.1".into(), 80);
+
+    assert!(
+        anonymous.connect(&target, None).await.is_ok(),
+        "Optional mTLS must accept a client that presents no certificate"
+    );
 
     cancel_token.cancel();
     let _ = server_handle.await;

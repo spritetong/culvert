@@ -106,7 +106,7 @@ impl TlsConfigBuilder {
         if let Some(ref ca_path) = config.ca_certificate {
             let custom_roots = crate::cert::CertReader::read_root_store(ca_path)?;
             for root in custom_roots.roots {
-                let _ = root_store.roots.push(root);
+                root_store.roots.push(root);
             }
         }
 

@@ -99,10 +99,20 @@ impl std::fmt::Debug for DynamicClientCertVerifier {
 }
 
 impl ClientCertVerifier for DynamicClientCertVerifier {
+    fn offer_client_auth(&self) -> bool {
+        self.current().offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        // Must delegate: the trait default derives this from `offer_client_auth()`
+        // and would force `ClientAuthMode::Optional` into mandatory mTLS.
+        self.current().client_auth_mandatory()
+    }
+
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        // Rustls expects a slice. Returning empty or from the current verifier.
-        // Since &self cannot easily return a slice into a read guard,
-        // we can return empty slice or delegate if possible.
+        // An empty CA hint list is valid: rustls clients still present their
+        // configured client certificate. The hot-swappable inner verifier lives
+        // behind a read guard, so a borrow into it cannot be returned here.
         &[]
     }
 
@@ -142,6 +152,8 @@ impl ClientCertVerifier for DynamicClientCertVerifier {
 mod tests {
     use super::*;
     use crate::cert::CertManager;
+    use crate::config::model::ClientAuthMode;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn test_dynamic_resolver_quic_compatibility() {
@@ -159,5 +171,38 @@ mod tests {
         let new_key = CertManager::generate_self_signed().unwrap();
         resolver.update(new_key.clone());
         assert_eq!(resolver.current().cert, new_key.cert);
+    }
+
+    #[test]
+    fn test_dynamic_client_verifier_preserves_auth_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca = rcgen::CertifiedIssuer::self_signed(rcgen::CertificateParams::default(), &ca_key)
+            .unwrap();
+        let ca_path = dir.path().join("ca.crt");
+        std::fs::write(&ca_path, ca.as_ref().pem()).unwrap();
+
+        let manager = CertManager::new();
+        let optional = manager
+            .register_client_ca(
+                ca_path.clone(),
+                ClientAuthMode::Optional,
+                CancellationToken::new(),
+            )
+            .unwrap();
+        let required = manager
+            .register_client_ca(ca_path, ClientAuthMode::Required, CancellationToken::new())
+            .unwrap();
+
+        assert!(optional.offer_client_auth());
+        assert!(
+            !optional.client_auth_mandatory(),
+            "Optional must not require a client cert"
+        );
+        assert!(required.offer_client_auth());
+        assert!(
+            required.client_auth_mandatory(),
+            "Required must require a client cert"
+        );
     }
 }
