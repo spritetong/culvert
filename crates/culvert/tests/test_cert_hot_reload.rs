@@ -21,8 +21,8 @@ use culvert::config::model::{
 use culvert::dialer::endpoint::EndpointContext;
 use culvert::server::ServerRunner;
 use culvert::session::SessionManager;
-use culvert::transport::ws::WsTransportDriver;
 use culvert::transport::TransportRegistry;
+use culvert::transport::ws::WsTransportDriver;
 
 fn get_available_port() -> u16 {
     let listener =
@@ -348,11 +348,17 @@ async fn test_server_dynamic_client_ca_hot_reload() {
     if let Err(ref e) = conn_a {
         eprintln!("[DEBUG client A error] {:?}", e);
     }
-    assert!(conn_a.is_ok(), "Client A (signed by CA 1) must succeed initially");
+    assert!(
+        conn_a.is_ok(),
+        "Client A (signed by CA 1) must succeed initially"
+    );
 
     // 2. Client B connects -> Must fail (CA 2 not trusted yet)
     let conn_b = connector_b.connect(&target, None).await;
-    assert!(conn_b.is_err(), "Client B (signed by CA 2) must fail initially");
+    assert!(
+        conn_b.is_err(),
+        "Client B (signed by CA 2) must fail initially"
+    );
 
     // 3. Update client_ca_path to include both CA 1 and CA 2
     let combined_ca = format!("{}\n{}", ca1_cert_pem, ca2_cert);
@@ -366,11 +372,17 @@ async fn test_server_dynamic_client_ca_hot_reload() {
     if let Err(ref e) = conn_b2 {
         eprintln!("[DEBUG client B2 error] {:?}", e);
     }
-    assert!(conn_b2.is_ok(), "Client B must succeed after CA 2 is added to trusted CAs");
+    assert!(
+        conn_b2.is_ok(),
+        "Client B must succeed after CA 2 is added to trusted CAs"
+    );
 
     // 5. Client A connects again -> Must still succeed!
     let conn_a2 = connector_a.connect(&target, None).await;
-    assert!(conn_a2.is_ok(), "Client A must still succeed after CA list update");
+    assert!(
+        conn_a2.is_ok(),
+        "Client A must still succeed after CA list update"
+    );
 
     cancel_token.cancel();
     let _ = server_handle.await;

@@ -76,9 +76,9 @@ impl CertFileWatcher {
                         let can_ep = ep.canonicalize().unwrap_or_else(|_| ep.clone());
                         let match_direct = watched_set_clone.contains(ep);
                         let match_can = watched_set_clone.contains(&can_ep);
-                        let match_name = watched_set_clone.iter().any(|wp| {
-                            wp.file_name().is_some() && wp.file_name() == ep.file_name()
-                        });
+                        let match_name = watched_set_clone
+                            .iter()
+                            .any(|wp| wp.file_name().is_some() && wp.file_name() == ep.file_name());
                         match_direct || match_can || match_name
                     });
 

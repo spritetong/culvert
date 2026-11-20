@@ -122,7 +122,8 @@ impl ClientCertVerifier for DynamicClientCertVerifier {
         intermediates: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
-        self.current().verify_client_cert(end_entity, intermediates, now)
+        self.current()
+            .verify_client_cert(end_entity, intermediates, now)
     }
 
     fn verify_tls12_signature(
@@ -165,7 +166,10 @@ mod tests {
             .with_cert_resolver(resolver.clone());
 
         let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(server_config);
-        assert!(quic_crypto.is_ok(), "QuicServerConfig must support ResolvesServerCert");
+        assert!(
+            quic_crypto.is_ok(),
+            "QuicServerConfig must support ResolvesServerCert"
+        );
 
         // Verify resolver update works
         let new_key = CertManager::generate_self_signed().unwrap();

@@ -189,7 +189,12 @@ impl ConfigLoader {
                     Self::validate_pem_certs(Path::new(c), "server certificate", "server")?;
                     Self::validate_pem_private_key(Path::new(k), "server private key", "server")?;
                     crate::cert::CertReader::read_server_credentials(Path::new(c), Path::new(k))
-                        .map_err(|e| TunnelError::Config(format!("server: certificate and key pairing error: {}", e)))?;
+                        .map_err(|e| {
+                            TunnelError::Config(format!(
+                                "server: certificate and key pairing error: {}",
+                                e
+                            ))
+                        })?;
                 }
                 (Some(_), None) => {
                     return Err(TunnelError::Config(
@@ -605,9 +610,10 @@ impl ConfigLoader {
 
     fn validate_pem_certs(path: &Path, file_role: &str, context: &str) -> Result<(), TunnelError> {
         crate::cert::CertReader::read_cert_chain(path).map_err(|e| match e {
-            TunnelError::Config(msg) => {
-                TunnelError::Config(format!("{}: {} validation failed: {}", context, file_role, msg))
-            }
+            TunnelError::Config(msg) => TunnelError::Config(format!(
+                "{}: {} validation failed: {}",
+                context, file_role, msg
+            )),
             other => TunnelError::Config(format!(
                 "{}: {} validation failed: {}",
                 context, file_role, other
@@ -622,9 +628,10 @@ impl ConfigLoader {
         context: &str,
     ) -> Result<(), TunnelError> {
         crate::cert::CertReader::read_private_key(path).map_err(|e| match e {
-            TunnelError::Config(msg) => {
-                TunnelError::Config(format!("{}: {} validation failed: {}", context, file_role, msg))
-            }
+            TunnelError::Config(msg) => TunnelError::Config(format!(
+                "{}: {} validation failed: {}",
+                context, file_role, msg
+            )),
             other => TunnelError::Config(format!(
                 "{}: {} validation failed: {}",
                 context, file_role, other

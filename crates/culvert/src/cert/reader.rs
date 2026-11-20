@@ -10,9 +10,9 @@ use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
+use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::sign::CertifiedKey;
-use rustls::RootCertStore;
 
 use crate::core::error::TunnelError;
 
@@ -21,7 +21,9 @@ pub struct CertReader;
 
 impl CertReader {
     /// Reads and parses an X.509 certificate chain from a PEM file.
-    pub fn read_cert_chain<P: AsRef<Path>>(path: P) -> Result<Vec<CertificateDer<'static>>, TunnelError> {
+    pub fn read_cert_chain<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Vec<CertificateDer<'static>>, TunnelError> {
         let p = path.as_ref();
         if !p.exists() {
             return Err(TunnelError::Config(format!(
@@ -51,7 +53,9 @@ impl CertReader {
     }
 
     /// Reads and parses a private key from a PEM file (PKCS#1, PKCS#8, or SEC1).
-    pub fn read_private_key<P: AsRef<Path>>(path: P) -> Result<PrivateKeyDer<'static>, TunnelError> {
+    pub fn read_private_key<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<PrivateKeyDer<'static>, TunnelError> {
         let p = path.as_ref();
         if !p.exists() {
             return Err(TunnelError::Config(format!(
@@ -90,9 +94,8 @@ impl CertReader {
         let mut root_store = RootCertStore::empty();
         let mut count = 0;
         for cert in rustls_pemfile::certs(&mut reader) {
-            let cert = cert.map_err(|e| {
-                TunnelError::Tls(format!("Invalid CA cert in {:?}: {}", p, e))
-            })?;
+            let cert =
+                cert.map_err(|e| TunnelError::Tls(format!("Invalid CA cert in {:?}: {}", p, e)))?;
             root_store.add(cert).map_err(|e| {
                 TunnelError::Tls(format!("Failed to add CA cert to root store: {}", e))
             })?;

@@ -23,14 +23,9 @@ pub enum CertEvent {
         error: String,
     },
     /// Client CA root store reloaded successfully.
-    ClientCaReloaded {
-        ca_path: PathBuf,
-    },
+    ClientCaReloaded { ca_path: PathBuf },
     /// Client CA root store reload failed (previous root store retained).
-    ClientCaReloadFailed {
-        ca_path: PathBuf,
-        error: String,
-    },
+    ClientCaReloadFailed { ca_path: PathBuf, error: String },
 }
 
 /// Decoupled event bus for certificate lifecycle events.

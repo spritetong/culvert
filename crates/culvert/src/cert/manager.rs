@@ -216,7 +216,10 @@ impl CertManager {
                 TunnelError::Tls(format!("Failed to build client cert verifier: {}", e))
             })?,
             ClientAuthMode::Optional => builder.allow_unauthenticated().build().map_err(|e| {
-                TunnelError::Tls(format!("Failed to build optional client cert verifier: {}", e))
+                TunnelError::Tls(format!(
+                    "Failed to build optional client cert verifier: {}",
+                    e
+                ))
             })?,
         };
         Ok(verifier)
@@ -225,9 +228,8 @@ impl CertManager {
     /// Generates an ephemeral self-signed `CertifiedKey` for zero-configuration fallback.
     pub fn generate_self_signed() -> Result<Arc<CertifiedKey>, TunnelError> {
         let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-        let cert_key = rcgen::generate_simple_self_signed(subject_alt_names).map_err(|e| {
-            TunnelError::Tls(format!("Failed to generate self-signed cert: {}", e))
-        })?;
+        let cert_key = rcgen::generate_simple_self_signed(subject_alt_names)
+            .map_err(|e| TunnelError::Tls(format!("Failed to generate self-signed cert: {}", e)))?;
 
         let cert_der = cert_key.cert.der().to_vec();
         let key_der = cert_key.signing_key.serialize_der();
@@ -305,9 +307,15 @@ mod tests {
         })
         .await;
 
-        assert!(event.is_ok(), "Expected ServerCertReloaded event within timeout");
+        assert!(
+            event.is_ok(),
+            "Expected ServerCertReloaded event within timeout"
+        );
         let updated_der = resolver.current().cert[0].to_vec();
-        assert_ne!(initial_der, updated_der, "Certificate must be updated after reload");
+        assert_ne!(
+            initial_der, updated_der,
+            "Certificate must be updated after reload"
+        );
 
         cancel.cancel();
     }
@@ -346,9 +354,15 @@ mod tests {
         })
         .await;
 
-        assert!(event.is_ok(), "Expected ServerCertReloadFailed event within timeout");
+        assert!(
+            event.is_ok(),
+            "Expected ServerCertReloadFailed event within timeout"
+        );
         let current_der = resolver.current().cert[0].to_vec();
-        assert_eq!(initial_der, current_der, "Original certificate must be preserved on reload failure");
+        assert_eq!(
+            initial_der, current_der,
+            "Original certificate must be preserved on reload failure"
+        );
 
         cancel.cancel();
     }
