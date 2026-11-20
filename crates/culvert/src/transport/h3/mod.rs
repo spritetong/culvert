@@ -275,7 +275,8 @@ impl TransportDriver for H3TransportDriver {
             None => (None, None),
         };
 
-        let server_rustls = crate::dialer::tls::TlsConfigBuilder::build_server_config(
+        let server_rustls = crate::dialer::tls::TlsConfigBuilder::build_dynamic_server_config(
+            &crate::cert::CertManager::new(),
             cert_str,
             key_str,
             client_ca_str,
@@ -283,6 +284,7 @@ impl TransportDriver for H3TransportDriver {
             Some(alpn),
             min_v,
             max_v,
+            cancel.clone(),
         )?;
 
         let listener =

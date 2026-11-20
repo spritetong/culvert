@@ -7,10 +7,7 @@
 
 use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
-use std::fs::File;
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 use tokio_rustls::TlsConnector;
@@ -107,18 +104,9 @@ impl TlsConfigBuilder {
 
         // Load custom CA certificate if configured
         if let Some(ref ca_path) = config.ca_certificate {
-            let file = File::open(ca_path).map_err(|e| {
-                TunnelError::Tls(format!(
-                    "Failed to open CA certificate {:?}: {}",
-                    ca_path, e
-                ))
-            })?;
-            let mut reader = BufReader::new(file);
-            for cert in rustls_pemfile::certs(&mut reader) {
-                let cert = cert.map_err(|e| TunnelError::Tls(format!("Invalid CA cert: {}", e)))?;
-                root_store
-                    .add(cert)
-                    .map_err(|e| TunnelError::Tls(format!("Failed to add CA cert: {}", e)))?;
+            let custom_roots = crate::cert::CertReader::read_root_store(ca_path)?;
+            for root in custom_roots.roots {
+                let _ = root_store.roots.push(root);
             }
         }
 
@@ -140,25 +128,8 @@ impl TlsConfigBuilder {
         // Configure client authentication (mTLS) if client certificate & key are provided
         let mut client_config = match (&config.client_certificate, &config.client_key) {
             (Some(cert_path), Some(key_path)) => {
-                let cert_file = File::open(cert_path).map_err(|e| {
-                    TunnelError::Tls(format!("Failed to open client cert {:?}: {}", cert_path, e))
-                })?;
-                let mut cert_reader = BufReader::new(cert_file);
-                let client_certs: Vec<CertificateDer<'static>> =
-                    rustls_pemfile::certs(&mut cert_reader)
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|e| TunnelError::Tls(format!("Invalid client cert: {}", e)))?;
-
-                let key_file = File::open(key_path).map_err(|e| {
-                    TunnelError::Tls(format!("Failed to open client key {:?}: {}", key_path, e))
-                })?;
-                let mut key_reader = BufReader::new(key_file);
-                let key = rustls_pemfile::private_key(&mut key_reader)
-                    .map_err(|e| TunnelError::Tls(format!("Failed to read client key: {}", e)))?
-                    .ok_or_else(|| {
-                        TunnelError::Tls("No private key found in client key file".to_string())
-                    })?;
-
+                let client_certs = crate::cert::CertReader::read_cert_chain(cert_path)?;
+                let key = crate::cert::CertReader::read_private_key(key_path)?;
                 builder
                     .with_client_auth_cert(client_certs, key)
                     .map_err(|e| TunnelError::Tls(format!("Failed to configure mTLS: {}", e)))?
@@ -204,31 +175,8 @@ impl TlsConfigBuilder {
         TunnelError,
     > {
         if let (Some(cp), Some(kp)) = (cert_path, key_path) {
-            let cert_file = File::open(cp).map_err(|e| {
-                TunnelError::Tls(format!("Failed to open server cert {:?}: {}", cp, e))
-            })?;
-            let mut cert_reader = BufReader::new(cert_file);
-            let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| TunnelError::Tls(format!("Invalid server cert: {}", e)))?;
-
-            if certs.is_empty() {
-                return Err(TunnelError::Tls(format!(
-                    "No certificates found in {:?}",
-                    cp
-                )));
-            }
-
-            let key_file = File::open(kp).map_err(|e| {
-                TunnelError::Tls(format!("Failed to open server key {:?}: {}", kp, e))
-            })?;
-            let mut key_reader = BufReader::new(key_file);
-            let key = rustls_pemfile::private_key(&mut key_reader)
-                .map_err(|e| TunnelError::Tls(format!("Failed to read server key: {}", e)))?
-                .ok_or_else(|| {
-                    TunnelError::Tls(format!("No private key found in server key file {:?}", kp))
-                })?;
-
+            let certs = crate::cert::CertReader::read_cert_chain(cp)?;
+            let key = crate::cert::CertReader::read_private_key(kp)?;
             Ok((certs, key))
         } else if cert_path.is_some() || key_path.is_some() {
             Err(TunnelError::Tls(
@@ -255,28 +203,58 @@ impl TlsConfigBuilder {
 
     /// Loads trusted CA certificates from a file into a `RootCertStore`.
     pub fn load_root_certs<P: AsRef<Path>>(ca_path: P) -> Result<RootCertStore, TunnelError> {
-        let path = ca_path.as_ref();
-        let file = File::open(path).map_err(|e| {
-            TunnelError::Tls(format!("Failed to open CA certificate {:?}: {}", path, e))
-        })?;
-        let mut reader = BufReader::new(file);
-        let mut root_store = RootCertStore::empty();
-        let mut count = 0;
-        for cert in rustls_pemfile::certs(&mut reader) {
-            let cert = cert
-                .map_err(|e| TunnelError::Tls(format!("Invalid CA cert in {:?}: {}", path, e)))?;
-            root_store.add(cert).map_err(|e| {
-                TunnelError::Tls(format!("Failed to add CA cert to root store: {}", e))
-            })?;
-            count += 1;
+        crate::cert::CertReader::read_root_store(ca_path)
+    }
+
+    /// Builds a `rustls::ServerConfig` with dynamic certificate resolution and hot-reloading support.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_dynamic_server_config(
+        cert_manager: &crate::cert::CertManager,
+        cert_path: Option<&str>,
+        key_path: Option<&str>,
+        client_ca_path: Option<&str>,
+        client_auth: Option<ClientAuthMode>,
+        alpn: Option<Vec<Vec<u8>>>,
+        min_version: Option<&str>,
+        max_version: Option<&str>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<rustls::ServerConfig, TunnelError> {
+        let versions = Self::parse_protocol_versions(min_version, max_version)?;
+        let resolver = cert_manager.resolve_server_cert(cert_path, key_path, cancel.clone())?;
+
+        let effective_auth = match (client_auth, client_ca_path) {
+            (Some(mode), _) => mode,
+            (None, Some(_)) => ClientAuthMode::Required,
+            (None, None) => ClientAuthMode::None,
+        };
+
+        let builder = rustls::ServerConfig::builder_with_protocol_versions(versions);
+
+        let builder_with_client_auth = match effective_auth {
+            ClientAuthMode::None => builder.with_no_client_auth(),
+            ClientAuthMode::Required | ClientAuthMode::Optional => {
+                let ca_path = client_ca_path.ok_or_else(|| {
+                    TunnelError::Tls(
+                        "Client certificate authentication requires a client CA certificate"
+                            .to_string(),
+                    )
+                })?;
+                let client_verifier = cert_manager.register_client_ca(
+                    std::path::PathBuf::from(ca_path),
+                    effective_auth,
+                    cancel,
+                )?;
+                builder.with_client_cert_verifier(client_verifier)
+            }
+        };
+
+        let mut server_config = builder_with_client_auth.with_cert_resolver(resolver);
+
+        if let Some(alpn_protocols) = alpn {
+            server_config.alpn_protocols = alpn_protocols;
         }
-        if count == 0 {
-            return Err(TunnelError::Tls(format!(
-                "No certificates found in CA file {:?}",
-                path
-            )));
-        }
-        Ok(root_store)
+
+        Ok(server_config)
     }
 
     /// Builds a `rustls::ServerConfig` from certificate and private key paths or self-signed fallback,
@@ -290,61 +268,17 @@ impl TlsConfigBuilder {
         min_version: Option<&str>,
         max_version: Option<&str>,
     ) -> Result<rustls::ServerConfig, TunnelError> {
-        let versions = Self::parse_protocol_versions(min_version, max_version)?;
-        let (cert_chain, private_key) = Self::resolve_server_cert_and_key(cert_path, key_path)?;
-
-        let effective_auth = match (client_auth, client_ca_path) {
-            (Some(mode), _) => mode,
-            (None, Some(_)) => ClientAuthMode::Required,
-            (None, None) => ClientAuthMode::None,
-        };
-
-        let builder = rustls::ServerConfig::builder_with_protocol_versions(versions);
-
-        let builder_with_client_auth = match effective_auth {
-            ClientAuthMode::None => builder.with_no_client_auth(),
-            ClientAuthMode::Required => {
-                let ca_path = client_ca_path.ok_or_else(|| {
-                    TunnelError::Tls(
-                        "Client certificate authentication requires a client CA certificate"
-                            .to_string(),
-                    )
-                })?;
-                let client_roots = Self::load_root_certs(ca_path)?;
-                let client_verifier = WebPkiClientVerifier::builder(Arc::new(client_roots))
-                    .build()
-                    .map_err(|e| {
-                        TunnelError::Tls(format!("Failed to build client cert verifier: {}", e))
-                    })?;
-                builder.with_client_cert_verifier(client_verifier)
-            }
-            ClientAuthMode::Optional => {
-                let ca_path = client_ca_path.ok_or_else(|| {
-                    TunnelError::Tls("Optional client certificate authentication requires a client CA certificate".to_string())
-                })?;
-                let client_roots = Self::load_root_certs(ca_path)?;
-                let client_verifier = WebPkiClientVerifier::builder(Arc::new(client_roots))
-                    .allow_unauthenticated()
-                    .build()
-                    .map_err(|e| {
-                        TunnelError::Tls(format!(
-                            "Failed to build optional client cert verifier: {}",
-                            e
-                        ))
-                    })?;
-                builder.with_client_cert_verifier(client_verifier)
-            }
-        };
-
-        let mut server_config = builder_with_client_auth
-            .with_single_cert(cert_chain, private_key)
-            .map_err(|e| TunnelError::Tls(format!("Failed to build server TLS config: {}", e)))?;
-
-        if let Some(alpn_protocols) = alpn {
-            server_config.alpn_protocols = alpn_protocols;
-        }
-
-        Ok(server_config)
+        Self::build_dynamic_server_config(
+            &crate::cert::CertManager::new(),
+            cert_path,
+            key_path,
+            client_ca_path,
+            client_auth,
+            alpn,
+            min_version,
+            max_version,
+            tokio_util::sync::CancellationToken::new(),
+        )
     }
 }
 

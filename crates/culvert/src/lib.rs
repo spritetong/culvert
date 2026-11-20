@@ -6,6 +6,7 @@
 //! All comments and docstrings must be in English.
 
 pub mod backend;
+pub mod cert;
 pub mod client;
 pub mod common;
 pub mod config;

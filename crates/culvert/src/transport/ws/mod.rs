@@ -80,7 +80,8 @@ impl TransportDriver for WsTransportDriver {
         });
 
         let tls_acceptor = if is_wss {
-            let server_rustls = crate::dialer::tls::TlsConfigBuilder::build_server_config(
+            let server_rustls = crate::dialer::tls::TlsConfigBuilder::build_dynamic_server_config(
+                &crate::cert::CertManager::new(),
                 cert_str,
                 key_str,
                 client_ca_str,
@@ -88,6 +89,7 @@ impl TransportDriver for WsTransportDriver {
                 alpn,
                 min_v,
                 max_v,
+                cancel.clone(),
             )?;
             Some(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(
                 server_rustls,

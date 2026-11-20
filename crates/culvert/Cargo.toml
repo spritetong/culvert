@@ -37,6 +37,7 @@ thiserror = "2"
 
 # Synchronization & Utilities
 scopeguard = "1.2"
+notify = "8"
 
 # TLS
 ring = "0.17"

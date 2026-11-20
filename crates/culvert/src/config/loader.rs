@@ -188,6 +188,8 @@ impl ConfigLoader {
                 (Some(c), Some(k)) => {
                     Self::validate_pem_certs(Path::new(c), "server certificate", "server")?;
                     Self::validate_pem_private_key(Path::new(k), "server private key", "server")?;
+                    crate::cert::CertReader::read_server_credentials(Path::new(c), Path::new(k))
+                        .map_err(|e| TunnelError::Config(format!("server: certificate and key pairing error: {}", e)))?;
                 }
                 (Some(_), None) => {
                     return Err(TunnelError::Config(
@@ -602,33 +604,15 @@ impl ConfigLoader {
     }
 
     fn validate_pem_certs(path: &Path, file_role: &str, context: &str) -> Result<(), TunnelError> {
-        if !path.exists() {
-            return Err(TunnelError::Config(format!(
-                "{}: {} file not found: {:?}",
-                context, file_role, path
-            )));
-        }
-        let file = std::fs::File::open(path).map_err(|e| {
-            TunnelError::Config(format!(
-                "{}: failed to open {} file {:?}: {}",
-                context, file_role, path, e
-            ))
+        crate::cert::CertReader::read_cert_chain(path).map_err(|e| match e {
+            TunnelError::Config(msg) => {
+                TunnelError::Config(format!("{}: {} validation failed: {}", context, file_role, msg))
+            }
+            other => TunnelError::Config(format!(
+                "{}: {} validation failed: {}",
+                context, file_role, other
+            )),
         })?;
-        let mut reader = std::io::BufReader::new(file);
-        let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                TunnelError::Config(format!(
-                    "{}: {} file {:?} contains invalid PEM: {}",
-                    context, file_role, path, e
-                ))
-            })?;
-        if certs.is_empty() {
-            return Err(TunnelError::Config(format!(
-                "{}: {} file {:?} contains no certificates",
-                context, file_role, path
-            )));
-        }
         Ok(())
     }
 
@@ -637,31 +621,15 @@ impl ConfigLoader {
         file_role: &str,
         context: &str,
     ) -> Result<(), TunnelError> {
-        if !path.exists() {
-            return Err(TunnelError::Config(format!(
-                "{}: {} file not found: {:?}",
-                context, file_role, path
-            )));
-        }
-        let file = std::fs::File::open(path).map_err(|e| {
-            TunnelError::Config(format!(
-                "{}: failed to open {} file {:?}: {}",
-                context, file_role, path, e
-            ))
+        crate::cert::CertReader::read_private_key(path).map_err(|e| match e {
+            TunnelError::Config(msg) => {
+                TunnelError::Config(format!("{}: {} validation failed: {}", context, file_role, msg))
+            }
+            other => TunnelError::Config(format!(
+                "{}: {} validation failed: {}",
+                context, file_role, other
+            )),
         })?;
-        let mut reader = std::io::BufReader::new(file);
-        let key = rustls_pemfile::private_key(&mut reader).map_err(|e| {
-            TunnelError::Config(format!(
-                "{}: {} file {:?} contains invalid private key: {}",
-                context, file_role, path, e
-            ))
-        })?;
-        if key.is_none() {
-            return Err(TunnelError::Config(format!(
-                "{}: {} file {:?} contains no private key",
-                context, file_role, path
-            )));
-        }
         Ok(())
     }
 
@@ -700,6 +668,12 @@ impl ConfigLoader {
             (Some(c), Some(k)) => {
                 Self::validate_pem_certs(c, "client certificate", context)?;
                 Self::validate_pem_private_key(k, "client private key", context)?;
+                crate::cert::CertReader::read_server_credentials(c, k).map_err(|e| {
+                    TunnelError::Config(format!(
+                        "{}: client certificate and key pairing error: {}",
+                        context, e
+                    ))
+                })?;
             }
             (Some(_), None) => {
                 return Err(TunnelError::Config(format!(

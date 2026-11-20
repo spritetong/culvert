@@ -148,6 +148,21 @@ behavior is configurable, the configuration key is given.
 + **FR-1.7** `server.default_target` supplies the target for a forward stream
   that arrives without a target in its handshake and without an activation
   packet.
++ **FR-1.8 Dynamic Certificate Management & Hot-Reloading**
+  All reading, parsing, and lifecycle management of certificate and private key
+  files are unified through a dedicated certificate management module. When server
+  certificates (`certificate`, `key`) or client CA certificates (`client_ca_certificate`)
+  are supplied as file paths, the certificate manager automatically monitors them for
+  changes on disk. To prevent race conditions during certificate renewal (e.g. Caddy or
+  external scripts copying or writing key and cert files asynchronously), updates are
+  processed through an asynchronous debouncing pipeline (default 1 s quiet window). The
+  reloader executes two-phase in-memory validation (PEM syntax parsing, private key
+  and certificate public key pairing verification, and validity bounds) before committing
+  changes atomically. Invalid or incomplete files never displace the currently active
+  certificate. Dynamic certificate resolution integrates natively with Rustls
+  (`ResolvesServerCert`), ensuring zero downtime: active sessions are uninterrupted,
+  new handshakes immediately use updated certificates, and listeners require no restarts
+  or socket rebinds. A decoupled event bus broadcasts certificate reload outcomes.
 
 ### FR-2 Authentication
 
@@ -461,7 +476,7 @@ configuration data model; none are part of the runtime data path.
 | P2P, STUN/ICE, NAT hole punching | Not implemented. |
 | TOML configuration files | Not implemented. Configuration is YAML only. |
 | Inbound SOCKS5 / HTTP proxy server for local traffic | Not implemented (culvert is not an inbound proxy server for local applications; client tunnels can dial through outbound HTTP/SOCKS5 proxies via `dialer.proxy`). |
-| ACME certificate issuance and renewal | Not implemented. Certificates come from files, an ephemeral self-signed fallback, or an external reverse proxy. |
+| ACME certificate issuance and renewal | Not implemented. Certificates come from files, an ephemeral self-signed fallback, or an external reverse proxy (dynamic certificate file hot-reloading is supported). |
 | Protocol-level `CMD_TUNNEL_RESET` / `CMD_RESET_ACK` draining and returning streams to the idle pool | Not implemented. Pooled streams are one-shot. |
 | WebSocket SIMD masking claims, hardware acceleration claims | No such implementation is exposed by the product. |
 

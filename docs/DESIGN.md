@@ -536,6 +536,48 @@ The server caps `auth_len` at 1024 bytes and `meta_len` at 65536 bytes.
   never performed for the destination endpoint, preventing DNS leaks and
   poisoning. Transports (`ws://`, `wss://`) run transparently over the returned
   stream without modification.
+
+### 5.7 Unified Certificate Management and Dynamic Hot-Reloading (`cert` module)
+
+- **Centralized Reading & Pairing Validation (`cert::reader`)**:
+  All reading, parsing, and syntax validation of PEM certificate chains, private keys,
+  and root CA stores are unified in `cert::reader`. Ad-hoc `rustls_pemfile` calls in
+  `config::loader` and `dialer::tls` delegate directly to `cert::reader`. In addition to
+  PEM syntax validation, `cert::reader` validates that private keys strictly match the
+  public key in the certificate's `SubjectPublicKeyInfo`, preventing mismatched key/cert
+  misconfigurations at load and reload time.
+- **Asynchronous File Watching & Debouncing Strategy (`cert::watcher`)**:
+  Filesystem change events for watched certificate and private key files (e.g. copied by
+  Caddy event hooks or external ACME tools) are captured via cross-platform `notify`.
+  To prevent race conditions during multi-file updates (e.g. `cert.pem` and `key.pem`
+  being written sequentially), events feed into an asynchronous Tokio debouncing loop:
+  - Any write/create/modify event resets a quiet-period timer (default 1 s).
+  - Only when the quiet window elapses without new events does the reload pipeline trigger.
+  - Basic file monitoring tracks target files or their parent directories without complex
+    platform-specific symlink hacks, keeping logic maintainable, portable, and reliable.
+- **Two-Phase Safe Reload Pipeline (`cert::manager`)**:
+  - *Phase 1 (Staging & Validation)*: The reloader reads the updated files from disk into
+    an ephemeral staging object. It verifies PEM syntax, checks certificate validity
+    dates (`not_before` / `not_after`), and validates private key / certificate public key
+    pairing. If any step fails (e.g. truncated file or temporary disk lock), the reload
+    aborts, logs an actionable `warn!`, keeps the currently active valid certificate
+    untouched, and schedules a retry. Invalid files never disrupt live traffic.
+  - *Phase 2 (Atomic In-Memory Commit)*: Upon successful validation, the new `Arc<CertifiedKey>`
+    or `Arc<RootCertStore>` is committed atomically to the dynamic resolver's read-mostly
+    lock (`parking_lot::RwLock`).
+- **Decoupled Dynamic Resolution & Zero Downtime (`cert::resolver`)**:
+  - `DynamicCertResolver` implements `rustls::server::ResolvesServerCert`.
+  - `DynamicClientCertVerifier` implements `rustls::server::danger::ClientCertVerifier`.
+  - Transports (`ws`, `h3`, `quic`, `uds`) build their `rustls::ServerConfig` with
+    `DynamicCertResolver`. Handshakes dynamically acquire the latest certificate in
+    memory with zero lock contention and zero disk I/O.
+  - Existing open connections and active tunnel streams continue uninterrupted. Network
+    listeners require no restarts, rebinds, or connection drops.
+- **Decoupled Event Notification Bus (`cert::events`)**:
+  An internal broadcast channel (`tokio::sync::broadcast`) emits `CertEvent::ReloadSuccess`
+  and `CertEvent::ReloadFailed`. External consumers (such as logging, metrics, audit, or
+  testing harnesses) subscribe to events without coupling to transport or reloader internals.
+  All background tasks respect `CancellationToken` for graceful shutdown.
 - `platform::GenericListener` is either `Tcp(Arc<TcpListener>)` or
   `Uds(Arc<Mutex<PlatformUdsListener>>)`, exposed via `frontend::tcp::TcpFrontend`.
 - `frontend::udp::UdpFrontend` binds a single `tokio::net::UdpSocket`, runs a

@@ -114,7 +114,8 @@ impl TransportDriver for UdsTransportDriver {
         });
 
         let tls_acceptor = if is_wss {
-            let server_rustls = TlsConfigBuilder::build_server_config(
+            let server_rustls = TlsConfigBuilder::build_dynamic_server_config(
+                &crate::cert::CertManager::new(),
                 cert_str,
                 key_str,
                 client_ca_str,
@@ -122,6 +123,7 @@ impl TransportDriver for UdsTransportDriver {
                 alpn,
                 min_v,
                 max_v,
+                cancel.clone(),
             )?;
             Some(TlsAcceptor::from(Arc::new(server_rustls)))
         } else {
