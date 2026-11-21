@@ -366,4 +366,116 @@ mod tests {
 
         cancel.cancel();
     }
+
+    #[tokio::test]
+    async fn test_cert_manager_hot_reload_move_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert1, key1) = generate_cert_and_key();
+
+        let cert_path = dir.path().join("server.crt");
+        let key_path = dir.path().join("server.key");
+        std::fs::write(&cert_path, &cert1).unwrap();
+        std::fs::write(&key_path, &key1).unwrap();
+
+        let manager = CertManager::with_debounce_interval(Duration::from_millis(100));
+        let mut rx = manager.subscribe_events();
+        let cancel = CancellationToken::new();
+
+        let resolver = manager
+            .register_server_cert(cert_path.clone(), key_path.clone(), cancel.clone())
+            .unwrap();
+
+        let initial_der = resolver.current().cert[0].to_vec();
+
+        // Prepare new cert and key in temporary files
+        let (cert2, key2) = generate_cert_and_key();
+        let tmp_cert = dir.path().join("server.crt.tmp");
+        let tmp_key = dir.path().join("server.key.tmp");
+        std::fs::write(&tmp_cert, &cert2).unwrap();
+        std::fs::write(&tmp_key, &key2).unwrap();
+
+        // Atomic move/replace
+        std::fs::rename(&tmp_cert, &cert_path).unwrap();
+        std::fs::rename(&tmp_key, &key_path).unwrap();
+
+        // Wait for debounce and event
+        let event = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(CertEvent::ServerCertReloaded { .. }) = rx.recv().await {
+                    break;
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            event.is_ok(),
+            "Expected ServerCertReloaded event after move replace within timeout"
+        );
+        let updated_der = resolver.current().cert[0].to_vec();
+        assert_ne!(
+            initial_der, updated_der,
+            "Certificate must be updated after atomic move replace"
+        );
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_cert_manager_hot_reload_delete_and_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert1, key1) = generate_cert_and_key();
+
+        let cert_path = dir.path().join("server.crt");
+        let key_path = dir.path().join("server.key");
+        std::fs::write(&cert_path, &cert1).unwrap();
+        std::fs::write(&key_path, &key1).unwrap();
+
+        let manager = CertManager::with_debounce_interval(Duration::from_millis(100));
+        let mut rx = manager.subscribe_events();
+        let cancel = CancellationToken::new();
+
+        let resolver = manager
+            .register_server_cert(cert_path.clone(), key_path.clone(), cancel.clone())
+            .unwrap();
+
+        let initial_der = resolver.current().cert[0].to_vec();
+
+        // Prepare new cert and key in staging paths
+        let (cert2, key2) = generate_cert_and_key();
+        let stage_cert = dir.path().join("new_server.crt");
+        let stage_key = dir.path().join("new_server.key");
+        std::fs::write(&stage_cert, &cert2).unwrap();
+        std::fs::write(&stage_key, &key2).unwrap();
+
+        // Delete existing files
+        std::fs::remove_file(&cert_path).unwrap();
+        std::fs::remove_file(&key_path).unwrap();
+
+        // Then rename staged files to target paths
+        std::fs::rename(&stage_cert, &cert_path).unwrap();
+        std::fs::rename(&stage_key, &key_path).unwrap();
+
+        // Wait for debounce and event
+        let event = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(CertEvent::ServerCertReloaded { .. }) = rx.recv().await {
+                    break;
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            event.is_ok(),
+            "Expected ServerCertReloaded event after delete and rename within timeout"
+        );
+        let updated_der = resolver.current().cert[0].to_vec();
+        assert_ne!(
+            initial_der, updated_der,
+            "Certificate must be updated after delete and rename"
+        );
+
+        cancel.cancel();
+    }
 }
