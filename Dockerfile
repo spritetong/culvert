@@ -55,8 +55,8 @@ RUN addgroup -g 1000 culvert && \
     adduser -u 1000 -G culvert -s /bin/sh -D culvert && \
     apk add --no-cache ca-certificates dumb-init tzdata libcap && \
     touch /etc/timezone /etc/localtime && \
-    mkdir -p /etc/culvert /home/culvert && \
-    chown -R culvert:culvert /etc/culvert /home/culvert
+    mkdir -p /etc/culvert /home/culvert /shared && \
+    chown -R culvert:culvert /etc/culvert /home/culvert /shared
 
 WORKDIR /home/culvert
 
