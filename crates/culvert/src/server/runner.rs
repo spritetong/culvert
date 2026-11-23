@@ -20,8 +20,7 @@ use crate::common::{CancelFutureExt, TaskTracker};
 use crate::config::model::{QuicConfig, ServerConfig, TlsConfig, TunnelMode};
 use crate::consts::{
     ACTIVATE_STREAM_ACK, DEFAULT_SESSION_PAIR_TIMEOUT, POOL_DUMMY_HOST, reverse_ack_timeout,
-    reverse_activation_wait_timeout, reverse_frame_timeout, reverse_grace_period,
-    reverse_pool_soft_cap,
+    reverse_frame_timeout, reverse_grace_period, reverse_pool_soft_cap,
 };
 use crate::control::{
     ControlMessage, FramedControlStream, SignalingChannel, SignalingConfig, SignalingReceiver,
@@ -221,13 +220,16 @@ impl ServerRunner {
                                                 // If this stream was pre-warmed as an idle connection in client pool,
                                                 // wait for the client activation signal before touching the target service.
                                                 if metadata.pool_idle {
-                                                    let act_wait_timeout = reverse_activation_wait_timeout(idle_timeout);
-                                                    let decoded = crate::pool::activation::decode_activation(
-                                                        &mut stream,
-                                                        &conn_token,
-                                                        act_wait_timeout,
-                                                    )
-                                                    .await;
+                                                    // The client owns the idle stream's lifetime and retires it
+                                                    // on its own idle_timeout. Waiting without a local deadline
+                                                    // keeps a healthy stream alive regardless of how the two
+                                                    // ends configure that window; EOF or cancellation ends it.
+                                                    let decoded =
+                                                        crate::pool::activation::decode_activation_until_cancel(
+                                                            &mut stream,
+                                                            &conn_token,
+                                                        )
+                                                        .await;
 
                                                     match decoded {
                                                         Ok(Some(header)) => {

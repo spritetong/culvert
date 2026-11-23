@@ -100,9 +100,6 @@ pub const DEFAULT_SESSION_PAIR_TIMEOUT: Duration = Duration::from_secs(15);
 /// do not abort prematurely under jittery or high-RTT weak network conditions.
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Timeout for reading the activation packet and dynamic target payload on the server.
-pub const DEFAULT_ACTIVATION_READ_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Bounded drain period to flush in-flight relay tails on cancellation.
 ///
 /// 500 milliseconds covers 1-2 cross-border round-trip times (RTT) to ensure trailing

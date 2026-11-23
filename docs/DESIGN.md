@@ -736,16 +736,18 @@ Magic byte values:
 
 - In **Forward mode**: Produced by `ReplenishingStreamPool::encode_activation_with_proto`
   on the client, written before any application data. The server reads the magic
-  byte, length and payload under one bounded `decode_activation` call, rejects
-  lengths `>= 512`, parses the string with `parse_target_addr`, and only then
-  dials the target (TCP/UDS or `ConnectedUdpSocket`). An invalid magic byte or a
-  closed/timed-out idle stream terminates that connection.
+  byte, length and payload with `decode_activation_until_cancel` — no local
+  timeout, only peer EOF or cancellation — because the client owns the idle
+  stream's lifetime. It rejects lengths `>= 512`, parses the string with
+  `parse_target_addr`, and only then dials the target (TCP/UDS or
+  `ConnectedUdpSocket`). An invalid magic byte or a closed idle stream terminates
+  that connection.
 - In **Reverse mode**: The server writes `0xA5` (TCP) or `0xA7` (UDP) directly down
   the popped idle reverse stream, flushes, and reads back `0xAC` (`ACTIVATE_STREAM_ACK`)
   bounded by `reverse_frame_timeout(idle_timeout)` before pairing. The client worker
   reads the magic byte (or `0xA6` to promote an idle stream to control signaling)
-  under the same `reverse_frame_timeout(idle_timeout)` bound, echoes `0xAC` within
-  a 2-second timeout before dialing the local target, and begins relaying. This
+  under `reverse_activation_wait_timeout(idle_timeout)`, echoes `0xAC` within
+  `reverse_ack_timeout(idle_timeout)`, and begins relaying. This
   round-trip acknowledgment prevents silently dead (half-open) idle connections —
   where server writes succeed into the local socket send buffer — from blackholing
   visitors.
@@ -944,12 +946,12 @@ later.
 | Element | Behavior |
 | :--- | :--- |
 | `mpsc::Sender<PoolCommand>` | `Acquire`, `PushIdle`, `ActiveReleased` wake hint on a 1024-slot channel. |
-| `idle_streams: VecDeque<ManagedStream>` | Idle streams with per-stream `HeartbeatState`. |
+| `idle_streams: VecDeque<ManagedStream>` | Idle streams with per-stream `HeartbeatState` and an `enqueued_at` lifetime stamp. |
 | `pending_requests: VecDeque<AcquireRequest>` | Waiters with timestamps; each has a `oneshot` reply. |
 | `connecting_futures: FuturesUnordered` | At most 16 concurrent dials (`POOL_MAX_CONCURRENT_CONNECTS`). |
 | Reactor events | `Cancelled`, `ConnectionResult`, `Command`, `RetryTimerExpired`, `HeartbeatTick`, `StreamsEvicted`. |
 | Heartbeats | `poll_check_alive` sweeps on a 1-second tick with a 5-second probe interval and 5-second probe timeout. Non-destructive via zero-capacity read buffer. |
-| Acquire order | LIFO (freshest first) to avoid silently expired NAT/QUIC pinholes. A stream with an in-flight probe write (`HeartbeatState::SendingPing`) is skipped but kept in the pool; only over-age or `poll_check_alive == Dead` streams are evicted. Evicting one idle stream never closes the shared QUIC/H3 session: all streams share one `QuicSessionHandle`, and only a connection-level liveness failure or connector dial failure marks that handle dead and closes the session. |
+| Acquire order | LIFO (freshest first) to avoid silently expired NAT/QUIC pinholes. A stream with an in-flight probe write (`HeartbeatState::SendingPing`) is skipped but kept in the pool; only over-age or `poll_check_alive == Dead` streams are evicted. Over-age is measured from `enqueued_at`, not from the transport activity clock: heartbeat probes keep the transport healthy but never extend the idle lifetime, so the client retires the stream before the server's activation wait expires. Evicting one idle stream never closes the shared QUIC/H3 session: all streams share one `QuicSessionHandle`, and only a connection-level liveness failure or connector dial failure marks that handle dead and closes the session. |
 | Replenishment | Parallel one-turn batch dialing up to `POOL_MAX_CONCURRENT_CONNECTS` (16); backoff from 200 ms up to 10 s, capped at 1 s when waiters are queued (`POOL_BACKOFF_ACTIVE_WAITERS_MAX`). |
 | Limits | Idle pre-warmed inventory bounded by `POOL_MAX_CAPACITY` = 64; `pool_size` acts as the 0-RTT minimum warm inventory floor. Active relay throughput is fully decoupled from replenishment gating; pending callers dial immediately in parallel batches up to 16. Acquire timeout 15 s. |
 | Statistics | `PoolStats { idle_count, active_count, total_created }`. Authoritative `active_count` is tracked atomically (`Arc<AtomicUsize>`). |
@@ -1095,7 +1097,6 @@ effective configuration values.
 | `DEFAULT_UDP_IDLE_TIMEOUT` | 30 s |
 | `DEFAULT_RETRY_DELAY` | 3 s |
 | `DEFAULT_SESSION_PAIR_TIMEOUT` | 15 s |
-| `DEFAULT_ACTIVATION_READ_TIMEOUT` | 10 s |
 | `DEFAULT_RELAY_DRAIN_TIMEOUT` | 500 ms |
 | `DEFAULT_GRACE_PERIOD` | 5 s (shared absolute deadline) |
 | `DEFAULT_SHUTDOWN_HARD_DEADLINE` | 10 s |

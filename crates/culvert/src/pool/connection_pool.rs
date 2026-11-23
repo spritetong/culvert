@@ -126,15 +126,27 @@ enum HeartbeatState {
 struct ManagedStream {
     stream: Box<dyn TunnelStream>,
     state: HeartbeatState,
+    /// Pool lifetime starts when the stream enters the idle queue. Heartbeat
+    /// probes keep the transport healthy but must not extend this deadline:
+    /// the server waits for activation for the same idle window, so a heartbeat-
+    /// refreshed clock would make the server close the stream first and the
+    /// client misreport it as dead instead of expired.
+    enqueued_at: Instant,
 }
 
 impl ManagedStream {
     fn new(stream: Box<dyn TunnelStream>) -> Self {
+        let now = Instant::now();
         Self {
             stream,
-            state: HeartbeatState::Idle(Instant::now()),
+            state: HeartbeatState::Idle(now),
+            enqueued_at: now,
         }
     }
+}
+
+fn idle_expired(enqueued_at: Instant, idle_timeout: Duration) -> bool {
+    enqueued_at.elapsed() >= idle_timeout
 }
 
 /// Inspects idle streams in LIFO order (freshest first, to avoid silently
@@ -148,7 +160,6 @@ impl ManagedStream {
 fn take_live_idle_stream(
     idle_streams: &mut VecDeque<ManagedStream>,
     cx: &mut Context<'_>,
-    heartbeat_interval: Duration,
     idle_timeout: Duration,
 ) -> (Option<Box<dyn TunnelStream>>, bool) {
     let mut evicted_dead_count = 0usize;
@@ -162,12 +173,7 @@ fn take_live_idle_stream(
             continue;
         }
 
-        let (_, expired) = heartbeat_timing(
-            idle_streams[idx].stream.last_activity_ms(),
-            activity_now_ms(),
-            heartbeat_interval,
-            idle_timeout,
-        );
+        let expired = idle_expired(idle_streams[idx].enqueued_at, idle_timeout);
         if expired {
             idle_streams.remove(idx);
             evicted_expired_count += 1;
@@ -387,12 +393,13 @@ impl ReplenishingStreamPool {
                     let mut evicted_expired_count = 0usize;
                     while i < idle_streams.len() {
                         let managed = &mut idle_streams[i];
-                        let (probe, expired) = heartbeat_timing(
+                        let (probe, _) = heartbeat_timing(
                             managed.stream.last_activity_ms(),
                             now_ms,
                             heartbeat_interval,
                             idle_timeout,
                         );
+                        let expired = idle_expired(managed.enqueued_at, idle_timeout);
 
                         if expired {
                             idle_streams.swap_remove_back(i);
@@ -550,7 +557,6 @@ impl ReplenishingStreamPool {
                                     Poll::Ready(take_live_idle_stream(
                                         &mut idle_streams,
                                         cx,
-                                        heartbeat_interval,
                                         idle_timeout,
                                     ))
                                 })
@@ -1460,12 +1466,7 @@ mod tests {
         idle.push_back(busy);
 
         let (acquired, evicted) = std::future::poll_fn(|cx| {
-            Poll::Ready(take_live_idle_stream(
-                &mut idle,
-                cx,
-                DEFAULT_HEARTBEAT_INTERVAL,
-                DEFAULT_IDLE_TIMEOUT,
-            ))
+            Poll::Ready(take_live_idle_stream(&mut idle, cx, DEFAULT_IDLE_TIMEOUT))
         })
         .await;
 
@@ -1483,5 +1484,32 @@ mod tests {
             matches!(idle[0].state, HeartbeatState::SendingPing(_)),
             "the retained stream must be the one with the in-flight probe"
         );
+    }
+
+    /// Pool lifetime is counted from enqueue time: a heartbeat that refreshed
+    /// the transport activity clock must not keep an idle stream pooled past
+    /// `idle_timeout`, or the server would close it first on activation timeout.
+    #[tokio::test]
+    async fn test_idle_expiry_ignores_refreshed_transport_activity() {
+        let mut idle = VecDeque::new();
+        let mut managed = ManagedStream::new(Box::new(tokio::io::duplex(64).0));
+        managed.enqueued_at = Instant::now() - Duration::from_millis(20);
+        idle.push_back(managed);
+
+        let (acquired, evicted_dead) = std::future::poll_fn(|cx| {
+            Poll::Ready(take_live_idle_stream(
+                &mut idle,
+                cx,
+                Duration::from_millis(10),
+            ))
+        })
+        .await;
+
+        assert!(
+            acquired.is_none(),
+            "an over-age idle stream must be retired"
+        );
+        assert!(!evicted_dead, "expiry is not a transport death");
+        assert!(idle.is_empty());
     }
 }

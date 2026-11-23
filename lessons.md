@@ -58,15 +58,13 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
 - **References**:
   - Implementation: [pump.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/io/pump.rs#L200-L260)
 
-### 1.5 Pre-Warmed Idle Stream Activation Timeout Symmetry & Reactor Sweep Eviction Storm
+### 1.5 Idle Pool Lifetime Must Not Be Extended by Transport Heartbeats
 
-- **Problem / Trap**: In forward tunnel pools (`pool_size > 0`), the client pre-warms idle streams and retains them in `idle_streams` for the configured `idle_timeout` (default 30s). However, the server side previously awaited activation using a hardcoded 10-second `DEFAULT_ACTIVATION_READ_TIMEOUT`.
-- **Symptom**: In idle or low-traffic environments (e.g. during a single large file download where 31 pooled streams sit idle), at exactly the 10-second mark, the server unilaterally timed out on all idle streams and dropped them. The client's reactor sweep detected EOF / RST on all 32 streams simultaneously, emitting a burst of `Evicted dead/hanging stream during reactor sweep` logs within sub-milliseconds (simulating dozens/hundreds of evictions/sec) while active traffic streams remained completely unaffected.
-- **Solution**:
-  - Align server-side activation timeout with the tunnel's idle lifecycle: use `reverse_activation_wait_timeout(idle_timeout)` (idle_timeout + grace window) so the server never drops healthy pre-warmed streams before the client pool's authoritative `idle_timeout` expires.
-  - At the 30s mark, the client reactor cleanly evicts streams as `expired = true` (`Evicted expired idle stream`) rather than transport `Dead`.
+- **Problem / Trap**: In forward tunnel pools (`pool_size > 0`), the server waits a bounded interval for the client's activation signal. Aligning that wait to `reverse_activation_wait_timeout(idle_timeout)` is not enough if the client's idle clock keeps moving: QUIC/H3 `poll_send_ping` calls `touch_activity()`, and WS Ping/Pong frames call `liveness.record_rx()`. A 45 s probe with default settings showed `dead=0 expired=0` until t=35 s, then `dead=4` at t=40 s: the server closed the waiting streams at its timeout and the client reported them as dead instead of expired.
+- **Solution**: `ManagedStream` records `enqueued_at` when it enters the idle queue. Both the reactor sweep and `take_live_idle_stream` use `enqueued_at.elapsed() >= idle_timeout` for expiry; `last_activity_ms` is used only to decide when to send a liveness probe. Heartbeats keep the transport healthy without extending the pool lifetime, so the client retires idle streams before the server's activation wait expires.
+- **Server side**: the forward server calls `decode_activation_until_cancel`: it waits for activation, peer EOF, or cancellation, with no local timeout derived from its own `idle_timeout`. Unequal server/client idle windows can no longer make the server close a healthy waiting stream first.
 - **References**:
-  - Implementation: [runner.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/server/runner.rs#L220-L230)
+  - Implementation: [runner.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/server/runner.rs#L220-L230), [connection_pool.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/pool/connection_pool.rs#L125-L175)
   - Regression Test: [test_forward_pool_32.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/tests/test_forward_pool_32.rs)
 
 ---
@@ -244,6 +242,11 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
 
 - **Problem / Trap**: `unregister_tunnel_pool()` dropped its `DashMap` read guard before an unconditional `remove(tunnel_id)`. A reconnect could register another listener in that window; the stale teardown then deleted and drained the live pool.
 - **Solution**: Decrement under the write guard, and only `remove_if` when the slot is still the same pool generation and `listener_count == 0`. Identity checks alone are not enough; the count must be rechecked in the same lock.
+
+### 4.7 Server Reverse Pool Has No Equivalent False-Dead Eviction
+
+- **Conclusion**: `ReverseInboundPool::pop_live` treats `Poll::Pending` as healthy and uses `enqueued_at + margin >= max_age` as the half-open guard; it never runs a periodic sweep that labels a quiet stream `Dead`. Activation is followed by a round-trip `0xAC` ACK, so a stream popped after the client vanished fails over to signaling instead of blackholing the visitor. No client-forward-pool-style false-dead storm exists here.
+- **Configuration boundary**: `max_age` and the ACK timeout come from the server's `idle_timeout`, while the client worker's activation wait comes from its own `idle_timeout`; `RegisterReverse` carries `pool_size` but not the timing. Operators must keep them aligned. The promotion-byte write uses `reverse_frame_timeout(max_age)` rather than a LAN-scale constant.
 
 ---
 

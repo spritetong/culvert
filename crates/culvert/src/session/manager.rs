@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::common::CancelFutureExt;
 use crate::consts::{
-    ACTIVATE_STREAM_PROMOTE, DEFAULT_REVERSE_PROMOTE_WAIT, reverse_pool_expiration_margin,
+    ACTIVATE_STREAM_PROMOTE, reverse_frame_timeout, reverse_pool_expiration_margin,
 };
 use crate::control::FramedControlStream;
 use crate::core::error::TunnelError;
@@ -138,7 +138,8 @@ impl ReverseInboundPool {
             stream.flush().await
         };
         // Bounded write: an unread or dead stream buffer must never hang promote_idle indefinitely.
-        if tokio::time::timeout(DEFAULT_REVERSE_PROMOTE_WAIT, write_fut)
+        // Derive the window from the same idle budget that governs the reverse pool.
+        if tokio::time::timeout(reverse_frame_timeout(max_age), write_fut)
             .await
             .is_ok_and(|r| r.is_ok())
         {
