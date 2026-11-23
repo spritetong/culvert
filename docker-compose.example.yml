@@ -29,12 +29,17 @@ services:
     volumes:
       # Mount your configuration file into the container (read-only)
       - ./config.yaml:/etc/culvert/config.yaml:ro
+      # Optional: synchronize host timezone (supported via pre-created files & tzdata)
+      # - /etc/localtime:/etc/localtime:ro
+      # - /etc/timezone:/etc/timezone:ro
       # If using custom TLS certificates, mount them into /etc/culvert/certs:
       # - ./certs:/etc/culvert/certs:ro
 
     environment:
       # Optional: override logging level (trace, debug, info, warn, error)
       - RUST_LOG=info
+      # Optional: configure container timezone (e.g. Asia/Shanghai, America/New_York)
+      # - TZ=UTC
 
     # Security enhancements
     cap_add:

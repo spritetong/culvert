@@ -1,12 +1,12 @@
 # syntax=docker/dockerfile:1
 
 # ==============================================================================
-# Culvert Multi-Arch Dockerfile
+# Culvert Multi-Arch Dockerfile (Alpine-based, ultra-lightweight)
 #
 # Supported build modes:
-#   1. 'source'   - Compiles binary from source code using official Rust image.
+#   1. 'source'   - Compiles binary from source code using official rust:alpine.
 #                   (Default for local `docker build -t culvert .`)
-#   2. 'prebuilt' - Ingests pre-compiled cross-target binaries from bin/${TARGETARCH}.
+#   2. 'prebuilt' - Ingests pre-compiled cross-target musl binaries from bin/${TARGETARCH}.
 #                   (Used in CI for blazing-fast multi-arch manifests without QEMU)
 # ==============================================================================
 
@@ -15,25 +15,26 @@ ARG BUILD_MODE=source
 ################################################################################
 # Stage 1a: Compile binary from source (Local Build)
 ################################################################################
-FROM rust:bookworm AS builder-source
+FROM rust:alpine AS builder-source
 
 WORKDIR /build
 COPY . .
 
-# Build culvert-cli in release mode
-RUN cargo build --release -p culvert-cli && \
+# Install build dependencies for C-binding crates (ring, mimalloc)
+RUN apk add --no-cache build-base && \
+    cargo build --release -p culvert-cli && \
     mkdir -p /out && \
     cp target/release/culvert /out/culvert
 
 ################################################################################
 # Stage 1b: Ingest pre-compiled binary (CI Build)
 ################################################################################
-FROM debian:bookworm-slim AS builder-prebuilt
+FROM alpine:latest AS builder-prebuilt
 
 ARG TARGETARCH
 WORKDIR /out
 
-# Prebuilt binaries are placed in bin/amd64/culvert or bin/arm64/culvert
+# Prebuilt musl binaries are placed in bin/amd64/culvert or bin/arm64/culvert
 COPY bin/${TARGETARCH}/culvert /out/culvert
 
 ################################################################################
@@ -42,18 +43,20 @@ COPY bin/${TARGETARCH}/culvert /out/culvert
 FROM builder-${BUILD_MODE} AS binary-provider
 
 ################################################################################
-# Stage 3: Minimal Production Runtime Image
+# Stage 3: Minimal Production Runtime Image (Alpine Linux)
 ################################################################################
-FROM debian:bookworm-slim AS final
+FROM alpine:latest AS final
 
-# Install dumb-init for clean PID 1 signal forwarding and zombie process reaping,
-# ca-certificates for TLS verification, and libcap2-bin for privileged port binding.
-RUN groupadd -g 1000 culvert && \
-    useradd -u 1000 -g culvert -m -s /bin/bash culvert && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates dumb-init libcap2-bin && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+# 1. Create unprivileged culvert user (UID/GID 1000)
+# 2. Install dumb-init, ca-certificates, tzdata, and libcap
+# 3. Pre-create /etc/timezone and /etc/localtime as regular files so that host
+#    bind-mounts (-v /etc/timezone:/etc/timezone) never create directories
+RUN addgroup -g 1000 culvert && \
+    adduser -u 1000 -G culvert -s /bin/sh -D culvert && \
+    apk add --no-cache ca-certificates dumb-init tzdata libcap && \
+    touch /etc/timezone /etc/localtime && \
+    mkdir -p /etc/culvert /home/culvert && \
+    chown -R culvert:culvert /etc/culvert /home/culvert
 
 WORKDIR /home/culvert
 
@@ -63,9 +66,6 @@ COPY --from=binary-provider /out/culvert /usr/local/bin/culvert
 # Grant CAP_NET_BIND_SERVICE to allow binding low ports (<1024) as unprivileged user
 RUN chmod +x /usr/local/bin/culvert && \
     (setcap 'cap_net_bind_service=+ep' /usr/local/bin/culvert || true)
-
-# Prepare config directory with culvert user ownership
-RUN mkdir -p /etc/culvert && chown -R culvert:culvert /etc/culvert /home/culvert
 
 ENV RUST_LOG="info"
 VOLUME ["/etc/culvert"]

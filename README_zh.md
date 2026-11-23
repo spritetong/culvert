@@ -201,7 +201,7 @@ cargo build --release
 
 ### 2. 使用 Docker 运行
 
-官方多架构镜像（支持 `linux/amd64` 与 `linux/arm64`）自动发布在 GitHub Packages (`ghcr.io`)：
+官方多架构轻量镜像（基于 Alpine Linux，原生适配静态 Musl 二进制，支持 `linux/amd64` 与 `linux/arm64`）自动发布在 GitHub Packages (`ghcr.io`)：
 
 ```bash
 # 拉取最新镜像

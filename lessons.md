@@ -543,5 +543,18 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
 - **References**:
   - Implementation: [Dockerfile](file:///d:/githome/spritetong/@github/culvert/Dockerfile), [release.yml](file:///d:/githome/spritetong/@github/culvert/.github/workflows/release.yml)
 
+### 13.2 Container Rootfs Timezone Bind-Mount ENOTDIR Trap
+
+- **Problem / Trap (Missing File Destination Mount Failure)**:
+  - When deployment tools (e.g. docker-compose, Watchtower, or system scripts) bind-mount host timezone files (`-v /etc/timezone:/etc/timezone:ro` or `-v /etc/localtime:/etc/localtime:ro`), if the target path does not exist in a minimal container image (like `debian-slim` or bare `alpine`), Docker daemon automatically creates the destination path as a directory via `os.MkdirAll(dst, 0755)`.
+  - When runc subsequently executes `mount(src, dst, MS_BIND)`, mounting a host regular file onto a container directory fails at the Linux kernel level with `ENOTDIR` (`mount ... not a directory: Are you trying to mount a directory onto a file (or vice-versa)?`).
+- **Solution**:
+  - Base the minimal runtime on `alpine:latest` (~5 MB) which natively pairs with the statically compiled Musl binaries.
+  - Install `tzdata` to provide complete IANA timezone support and `TZ` environment variable resolution.
+  - Explicitly pre-create both `/etc/timezone` and `/etc/localtime` as regular files (`touch /etc/timezone /etc/localtime`) during image build.
+  - When Docker mounts host files, it identifies the pre-existing regular file targets and mounts file-to-file cleanly without creating directories.
+- **References**:
+  - Implementation: [Dockerfile](file:///d:/githome/spritetong/@github/culvert/Dockerfile), [docker-compose.example.yml](file:///d:/githome/spritetong/@github/culvert/docker-compose.example.yml)
+
 
 

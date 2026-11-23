@@ -206,7 +206,7 @@ cargo build --release
 
 ### 2. Run with Docker
 
-Pre-built multi-architecture container images (`linux/amd64`, `linux/arm64`) are automatically published to the GitHub Container Registry (`ghcr.io`):
+Pre-built lightweight multi-architecture container images (`linux/amd64`, `linux/arm64`) based on Alpine Linux are automatically published to the GitHub Container Registry (`ghcr.io`):
 
 ```bash
 # Pull the latest image
