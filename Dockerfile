@@ -55,8 +55,8 @@ RUN addgroup -g 1000 culvert && \
     adduser -u 1000 -G culvert -s /bin/sh -D culvert && \
     apk add --no-cache ca-certificates dumb-init tzdata libcap && \
     touch /etc/timezone /etc/localtime && \
-    mkdir -p /etc/culvert /home/culvert /shared && \
-    chown -R culvert:culvert /etc/culvert /home/culvert /shared
+    mkdir -p /etc/culvert /home/culvert && \
+    chown -R culvert:culvert /etc/culvert /home/culvert
 
 WORKDIR /etc/culvert
 
@@ -67,7 +67,6 @@ COPY --from=binary-provider /out/culvert /usr/local/bin/culvert
 RUN chmod +x /usr/local/bin/culvert && \
     (setcap 'cap_net_bind_service=+ep' /usr/local/bin/culvert || true)
 
-ENV RUST_LOG="info"
 VOLUME ["/etc/culvert"]
 
 USER culvert
