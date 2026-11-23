@@ -58,7 +58,7 @@ RUN addgroup -g 1000 culvert && \
     mkdir -p /etc/culvert /home/culvert /shared && \
     chown -R culvert:culvert /etc/culvert /home/culvert /shared
 
-WORKDIR /home/culvert
+WORKDIR /etc/culvert
 
 # Copy compiled binary from provider stage
 COPY --from=binary-provider /out/culvert /usr/local/bin/culvert
@@ -73,4 +73,4 @@ VOLUME ["/etc/culvert"]
 USER culvert
 
 ENTRYPOINT ["/usr/bin/dumb-init", "--", "/usr/local/bin/culvert"]
-CMD ["--config", "/etc/culvert/config.yaml"]
+CMD ["--config", "config.yaml"]
