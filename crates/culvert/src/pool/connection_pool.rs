@@ -126,40 +126,29 @@ enum HeartbeatState {
 struct ManagedStream {
     stream: Box<dyn TunnelStream>,
     state: HeartbeatState,
-    /// Pool lifetime starts when the stream enters the idle queue. Heartbeat
-    /// probes keep the transport healthy but must not extend this deadline:
-    /// the server waits for activation for the same idle window, so a heartbeat-
-    /// refreshed clock would make the server close the stream first and the
-    /// client misreport it as dead instead of expired.
-    enqueued_at: Instant,
 }
 
 impl ManagedStream {
     fn new(stream: Box<dyn TunnelStream>) -> Self {
-        let now = Instant::now();
         Self {
             stream,
-            state: HeartbeatState::Idle(now),
-            enqueued_at: now,
+            state: HeartbeatState::Idle(Instant::now()),
         }
     }
-}
-
-fn idle_expired(enqueued_at: Instant, idle_timeout: Duration) -> bool {
-    enqueued_at.elapsed() >= idle_timeout
 }
 
 /// Inspects idle streams in LIFO order (freshest first, to avoid silently
 /// expired NAT/QUIC pinholes) and removes the first one that can be handed out.
 ///
 /// A stream with an in-flight probe write is healthy but busy, so it is skipped
-/// and *kept* in the queue. An over-age stream is dropped as routine turnover;
-/// a stream whose probe reports `Dead` is dropped and sets the returned flag.
-/// The shared transport session is never closed here: other streams may still
-/// be carrying live traffic on it.
+/// and *kept* in the queue. A stream whose activity clock has gone quiet for
+/// `idle_timeout` is dropped as routine turnover; a stream whose probe reports
+/// `Dead` is dropped and sets the returned flag. The shared transport session
+/// is never closed here: other streams may still be carrying live traffic.
 fn take_live_idle_stream(
     idle_streams: &mut VecDeque<ManagedStream>,
     cx: &mut Context<'_>,
+    heartbeat_interval: Duration,
     idle_timeout: Duration,
 ) -> (Option<Box<dyn TunnelStream>>, bool) {
     let mut evicted_dead_count = 0usize;
@@ -173,7 +162,12 @@ fn take_live_idle_stream(
             continue;
         }
 
-        let expired = idle_expired(idle_streams[idx].enqueued_at, idle_timeout);
+        let (_, expired) = heartbeat_timing(
+            idle_streams[idx].stream.last_activity_ms(),
+            activity_now_ms(),
+            heartbeat_interval,
+            idle_timeout,
+        );
         if expired {
             idle_streams.remove(idx);
             evicted_expired_count += 1;
@@ -393,13 +387,12 @@ impl ReplenishingStreamPool {
                     let mut evicted_expired_count = 0usize;
                     while i < idle_streams.len() {
                         let managed = &mut idle_streams[i];
-                        let (probe, _) = heartbeat_timing(
+                        let (probe, expired) = heartbeat_timing(
                             managed.stream.last_activity_ms(),
                             now_ms,
                             heartbeat_interval,
                             idle_timeout,
                         );
-                        let expired = idle_expired(managed.enqueued_at, idle_timeout);
 
                         if expired {
                             idle_streams.swap_remove_back(i);
@@ -557,6 +550,7 @@ impl ReplenishingStreamPool {
                                     Poll::Ready(take_live_idle_stream(
                                         &mut idle_streams,
                                         cx,
+                                        heartbeat_interval,
                                         idle_timeout,
                                     ))
                                 })
@@ -1466,7 +1460,12 @@ mod tests {
         idle.push_back(busy);
 
         let (acquired, evicted) = std::future::poll_fn(|cx| {
-            Poll::Ready(take_live_idle_stream(&mut idle, cx, DEFAULT_IDLE_TIMEOUT))
+            Poll::Ready(take_live_idle_stream(
+                &mut idle,
+                cx,
+                DEFAULT_HEARTBEAT_INTERVAL,
+                DEFAULT_IDLE_TIMEOUT,
+            ))
         })
         .await;
 
@@ -1486,29 +1485,93 @@ mod tests {
         );
     }
 
-    /// Pool lifetime is counted from enqueue time: a heartbeat that refreshed
-    /// the transport activity clock must not keep an idle stream pooled past
-    /// `idle_timeout`, or the server would close it first on activation timeout.
+    /// Idle stream with a controllable activity clock. `None` means the clock
+    /// is refreshed on every query, like a healthy stream answering probes.
+    struct ActivityStream {
+        inner: tokio::io::DuplexStream,
+        activity: Option<u64>,
+    }
+
+    impl tokio::io::AsyncRead for ActivityStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for ActivityStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl TunnelStream for ActivityStream {
+        fn last_activity_ms(&self) -> Option<u64> {
+            Some(self.activity.unwrap_or_else(activity_now_ms))
+        }
+
+        fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+            Pin::new(&mut self.inner).poll_check_alive(cx)
+        }
+    }
+
+    /// A probing stream stays pooled past any wall-clock window while a quiet
+    /// stream retires. Enqueue-time expiry made a whole prewarm batch expire
+    /// together and forced a synchronized redial wave.
     #[tokio::test]
-    async fn test_idle_expiry_ignores_refreshed_transport_activity() {
+    async fn test_idle_expiry_tracks_activity_not_enqueue_time() {
+        let idle_timeout = Duration::from_millis(20);
+        let stale_activity = activity_now_ms();
         let mut idle = VecDeque::new();
-        let mut managed = ManagedStream::new(Box::new(tokio::io::duplex(64).0));
-        managed.enqueued_at = Instant::now() - Duration::from_millis(20);
-        idle.push_back(managed);
+        idle.push_back(ManagedStream::new(Box::new(ActivityStream {
+            inner: tokio::io::duplex(64).0,
+            activity: Some(stale_activity),
+        })));
+        idle.push_back(ManagedStream::new(Box::new(ActivityStream {
+            inner: tokio::io::duplex(64).0,
+            activity: None,
+        })));
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
 
         let (acquired, evicted_dead) = std::future::poll_fn(|cx| {
             Poll::Ready(take_live_idle_stream(
                 &mut idle,
                 cx,
-                Duration::from_millis(10),
+                DEFAULT_HEARTBEAT_INTERVAL,
+                idle_timeout,
             ))
         })
         .await;
+        assert!(acquired.is_some(), "the probing stream must stay pooled");
+        assert!(!evicted_dead, "expiry is not a transport death");
+        assert_eq!(idle.len(), 1, "only the stale stream should remain");
 
-        assert!(
-            acquired.is_none(),
-            "an over-age idle stream must be retired"
-        );
+        let (acquired, evicted_dead) = std::future::poll_fn(|cx| {
+            Poll::Ready(take_live_idle_stream(
+                &mut idle,
+                cx,
+                DEFAULT_HEARTBEAT_INTERVAL,
+                idle_timeout,
+            ))
+        })
+        .await;
+        assert!(acquired.is_none(), "the quiet stream must retire");
         assert!(!evicted_dead, "expiry is not a transport death");
         assert!(idle.is_empty());
     }

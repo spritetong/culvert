@@ -102,7 +102,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EvictionCounter {
 }
 
 #[tokio::test]
-async fn test_forward_pool_idle_streams_expire_before_activation_wait() {
+async fn test_forward_pool_idle_streams_survive_asymmetric_timeout() {
     let dead = Arc::new(AtomicUsize::new(0));
     let expired = Arc::new(AtomicUsize::new(0));
     let _ = tracing_subscriber::registry()
@@ -203,11 +203,11 @@ async fn test_forward_pool_idle_streams_expire_before_activation_wait() {
     let expired_count = expired.load(Ordering::SeqCst);
     assert_eq!(
         dead_count, 0,
-        "heartbeats must not keep idle streams alive until the server times out"
+        "healthy idle streams must never be classified dead"
     );
-    assert!(
-        expired_count >= 31,
-        "all unused pooled streams must retire by enqueue-time expiry, got {expired_count}"
+    assert_eq!(
+        expired_count, 0,
+        "heartbeat-refreshed streams must not expire in a synchronized wave; got {expired_count}"
     );
 
     cancel.cancel();

@@ -446,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "culvert"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "bytes",
  "criterion",
@@ -492,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "culvert-cli"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "clap",
  "culvert",
