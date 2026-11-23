@@ -378,7 +378,7 @@ server:
 ```yaml
 tunnels:
   - tag: "corp-internal"              # Unique identifier for this tunnel
-    # uuid: "550e8400-e29b-41d4-a716-446655440000" # Optional: explicit Tunnel UUID (defaults to deterministic UUID v5 from tag)
+    # uuid: "550e8400-e29b-41d4-a716-446655440000" # Optional: explicit Tunnel UUID (defaults to UUID v5 from per-client UUID + tag)
     endpoint: "wss://tunnel.example.com/tunnel" # Ingress URL or endpoint object
     token: "SECURE_AUTH_TOKEN"        # Must match server.token
     http_headers:                     # Optional: custom HTTP headers sent during handshake
@@ -413,7 +413,7 @@ Each tunnel entry accepts:
 | Key | Type | Required | Default | Notes |
 | :--- | :--- | :--- | :--- | :--- |
 | `tag` | string | Yes | — | Unique identifier tag for the tunnel. |
-| `uuid` | string | No | UUID v5 from `tag` | Optional explicit Tunnel UUID. Mappings under the same tunnel share connection pools. |
+| `uuid` | string | No | UUID v5 from per-client UUID + `tag` | Optional explicit Tunnel UUID. Mappings under the same tunnel share connection pools. |
 | `endpoint` | string / object | Yes | — | Server ingress URL (e.g. `wss://...`, `h3://...`, `ws+unix://...`) or detailed object with `url` and per-endpoint `dns`, `dialer` (including `proxy`), and `tls` overrides. |
 | `token` | string | No | `null` | Pre-shared authentication token matching `server.token`. |
 | `http_headers` | map | No | — | Custom HTTP headers sent during transport handshake. |
@@ -650,7 +650,7 @@ A single tunnel endpoint can aggregate multiple forward and reverse mappings acr
 ```yaml
 tunnels:
   - tag: "dev-cluster"
-    # uuid: "550e8400-e29b-41d4-a716-446655440000"  # Optional explicit UUID (defaults to deterministic UUID v5 from tag)
+    # uuid: "550e8400-e29b-41d4-a716-446655440000"  # Optional explicit UUID (defaults to UUID v5 from per-client UUID + tag)
     endpoint: "wss://tunnel.example.com/tunnel"
     token: "CHANGE_ME"
     mappings:

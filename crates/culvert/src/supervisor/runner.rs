@@ -8,6 +8,7 @@
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
+use uuid::Uuid;
 
 use crate::common::TaskTracker;
 use crate::config::model::{AppConfig, TunnelConfig};
@@ -23,6 +24,7 @@ pub struct TunnelSupervisor {
     cancel_token: CancellationToken,
     transport_registry: Arc<TransportRegistry>,
     session_manager: Arc<SessionManager>,
+    client_uuid: String,
 }
 
 impl TunnelSupervisor {
@@ -33,6 +35,7 @@ impl TunnelSupervisor {
             cancel_token,
             transport_registry: Arc::new(TransportRegistry::default()),
             session_manager: Arc::new(SessionManager::new()),
+            client_uuid: Uuid::new_v4().to_string(),
         }
     }
 
@@ -71,9 +74,10 @@ impl TunnelSupervisor {
             let cfg = tunnel_cfg.clone();
             let registry = Arc::clone(&self.transport_registry);
             let endpoint_ctx = EndpointContext::build_for_tunnel(&cfg, &self.config)?;
+            let client_uuid = self.client_uuid.clone();
 
             tracker.spawn_with_cancel(move |token| async move {
-                Self::run_tunnel_with_retry(cfg, endpoint_ctx, registry, token).await
+                Self::run_tunnel_with_retry(cfg, endpoint_ctx, registry, token, &client_uuid).await
             });
         }
 
@@ -152,8 +156,15 @@ impl TunnelSupervisor {
         endpoint_ctx: EndpointContext,
         registry: Arc<TransportRegistry>,
         token: CancellationToken,
+        client_uuid: &str,
     ) -> Result<(), TunnelError> {
-        crate::client::ClientRunner::run_tunnel_with_retry(config, endpoint_ctx, registry, token)
-            .await
+        crate::client::ClientRunner::run_tunnel_with_retry(
+            config,
+            endpoint_ctx,
+            registry,
+            token,
+            client_uuid,
+        )
+        .await
     }
 }

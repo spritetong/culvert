@@ -223,6 +223,12 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
 - **References**:
   - Implementation: [reverse.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/tunnel/reverse.rs), [cluster.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/tunnel/cluster.rs)
 
+### 4.5 Reverse Pool Identity Must Be Per-Client, Not Per-Tag
+
+- **Problem / Trap**: The server routes pre-warmed reverse streams by `tunnel_id` only. Deriving that id from `tag` alone makes separately deployed clients with the same tag silently join one `TunnelPoolSlot`; the visitor target travels in the activation header, so any worker in the pool may be asked to dial a target only reachable from another client.
+- **Solution**: `ClientRunner` and `TunnelSupervisor` generate a per-instance `client_uuid`; `effective_tunnel_id(client_uuid)` derives the default id from that UUID plus `tag`. Explicit `uuid` still pins a shared cluster identity. Grace reattachment is keyed by `(protocol, listen_addr)`, so it carries the incoming `tunnel_id` and replaces the pool generation under the new id.
+- **References**: [model.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/config/model.rs) (`effective_tunnel_id`), [manager.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/session/manager.rs) (`ReverseGraceReattach`), [runner.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/server/runner.rs) (`attach_reconnected_control`), [test_multiple_reverse_clients.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/tests/test_multiple_reverse_clients.rs)
+
 ---
 
 ## 5. Async Concurrency & Probe-Driven Verification

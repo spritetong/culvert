@@ -8,6 +8,7 @@
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 use crate::common::{CancellationTokenExt, TaskTracker};
 use crate::config::model::{AppConfig, TunnelConfig};
@@ -21,6 +22,7 @@ use crate::tunnel::run_tunnel_cluster;
 pub struct ClientRunner {
     tunnels: Vec<(TunnelConfig, EndpointContext)>,
     transport_registry: Arc<TransportRegistry>,
+    client_uuid: String,
 }
 
 impl ClientRunner {
@@ -63,6 +65,7 @@ impl ClientRunner {
         Ok(Self {
             tunnels,
             transport_registry,
+            client_uuid: Uuid::new_v4().to_string(),
         })
     }
 
@@ -75,9 +78,10 @@ impl ClientRunner {
             let config = cfg.clone();
             let ctx = endpoint_ctx.clone();
             let registry = Arc::clone(&self.transport_registry);
+            let client_uuid = self.client_uuid.clone();
 
             tracker.spawn_with_cancel(move |token| async move {
-                Self::run_tunnel_with_retry(config, ctx, registry, token).await
+                Self::run_tunnel_with_retry(config, ctx, registry, token, &client_uuid).await
             });
         }
 
@@ -154,6 +158,7 @@ impl ClientRunner {
         endpoint_ctx: EndpointContext,
         registry: Arc<TransportRegistry>,
         token: CancellationToken,
+        client_uuid: &str,
     ) -> Result<(), TunnelError> {
         let retry_cfg = config.retry.clone().unwrap_or_default();
         let retry_delay = retry_cfg.delay.unwrap_or(DEFAULT_RETRY_DELAY);
@@ -170,6 +175,7 @@ impl ClientRunner {
                 endpoint_ctx.clone(),
                 Arc::clone(&registry),
                 token.clone(),
+                client_uuid,
             )
             .await
             {

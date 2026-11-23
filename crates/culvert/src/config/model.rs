@@ -1081,13 +1081,14 @@ impl TunnelConfig {
         self.mappings.reverse.as_ref().and_then(|g| g.pool_size)
     }
 
-    /// Effective tunnel UUID: prefers configured `uuid`, falls back to deterministic UUID v5 from `tag`.
-    pub fn effective_tunnel_id(&self) -> String {
+    /// Effective tunnel UUID: prefers configured `uuid`; otherwise derives a
+    /// deterministic v5 UUID from the per-client UUID and `tag`.
+    pub fn effective_tunnel_id(&self, client_uuid: &str) -> String {
         if let Some(ref id) = self.uuid {
-            id.clone()
-        } else {
-            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, self.tag.as_bytes()).to_string()
+            return id.clone();
         }
+        let seed = format!("{}:{}", client_uuid, self.tag);
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, seed.as_bytes()).to_string()
     }
 }
 
@@ -1329,5 +1330,37 @@ mod tests {
             tls_explicit_optional.effective_client_auth(),
             ClientAuthMode::Optional
         );
+    }
+
+    #[test]
+    fn test_effective_tunnel_id_is_scoped_to_client_and_tag() {
+        let base = TunnelConfig {
+            tag: "web".to_string(),
+            uuid: None,
+            endpoint: EndpointConfig::Simple("ws://127.0.0.1:1".to_string()),
+            token: None,
+            failover: None,
+            multiplex: None,
+            retry: None,
+            http_headers: None,
+            mappings: TunnelMappingsConfig::default(),
+        };
+
+        let client_a = base.effective_tunnel_id("client-a");
+        assert_eq!(client_a, base.effective_tunnel_id("client-a"));
+        assert_ne!(client_a, base.effective_tunnel_id("client-b"));
+
+        let other_tag = TunnelConfig {
+            tag: "db".to_string(),
+            ..base.clone()
+        };
+        assert_ne!(client_a, other_tag.effective_tunnel_id("client-a"));
+
+        let explicit = TunnelConfig {
+            uuid: Some("fixed-tunnel".to_string()),
+            ..base
+        };
+        assert_eq!(explicit.effective_tunnel_id("client-a"), "fixed-tunnel");
+        assert_eq!(explicit.effective_tunnel_id("client-b"), "fixed-tunnel");
     }
 }

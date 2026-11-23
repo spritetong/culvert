@@ -168,6 +168,7 @@ impl ReverseInboundPool {
 pub struct ReverseGraceReattach {
     pub ctrl_stream: FramedControlStream<Box<dyn TunnelStream>>,
     pub pool_size: Option<usize>,
+    pub tunnel_id: Option<String>,
 }
 
 struct GraceSlot {
@@ -871,6 +872,7 @@ mod tests {
         let reattach = ReverseGraceReattach {
             ctrl_stream: FramedControlStream::new(Box::new(c1) as Box<dyn TunnelStream>),
             pool_size: Some(4),
+            tunnel_id: None,
         };
         assert!(
             manager
@@ -897,6 +899,7 @@ mod tests {
             let req = ReverseGraceReattach {
                 ctrl_stream: FramedControlStream::new(Box::new(c2) as Box<dyn TunnelStream>),
                 pool_size: None,
+                tunnel_id: None,
             };
             mgr_clone
                 .try_reattach_grace_listener(L4Protocol::Udp, "127.0.0.1:5354", req, &cancel_clone)

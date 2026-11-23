@@ -677,7 +677,9 @@ impl ServerRunner {
 
         // Register the new pool generation BEFORE sending RegisterAck so the
         // client's freshly spawned pre-warm workers never race ahead of registration.
-        let tid_opt = pool_guard.tunnel_id.clone();
+        // The reattached client may present a different tunnel_id (e.g. after a
+        // restart), so follow the incoming identity instead of the old listener's.
+        let tid_opt = reattach.tunnel_id.clone();
         if let Some(ref tid) = tid_opt {
             pool_guard.replace_pool(
                 session_mgr.register_tunnel_pool(tid, reverse_pool_soft_cap(reattach.pool_size)),
@@ -689,6 +691,7 @@ impl ServerRunner {
                 reverse_pool_soft_cap(reattach.pool_size),
             ));
         }
+        pool_guard.tunnel_id = tid_opt;
 
         if let Some(sink) = sig_rx.event_sink() {
             let new_handle = SignalingChannel::spawn_framed_with_event_sink(
@@ -969,6 +972,7 @@ impl ServerRunner {
         let reattach = ReverseGraceReattach {
             ctrl_stream,
             pool_size,
+            tunnel_id: tunnel_id.clone(),
         };
         let mut ctrl_stream = match session_mgr
             .try_reattach_grace_listener(protocol, &listen_addr, reattach, &cancel_token)

@@ -70,7 +70,7 @@ server:
 tunnels:
   # Tunnel 1: Cluster with forward and reverse mappings sharing 0-RTT connection pools
   - tag: "corp-cluster"
-    # uuid: "550e8400-e29b-41d4-a716-446655440000"  # Optional: explicit Tunnel UUID (defaults to deterministic UUID v5 from tag)
+    # uuid: "550e8400-e29b-41d4-a716-446655440000"  # Optional: explicit Tunnel UUID (defaults to UUID v5 from per-client UUID + tag)
     endpoint: "ws://127.0.0.1:8080/tunnel"
     token: "SECURE_PRESHARED_TOKEN"
     retry:

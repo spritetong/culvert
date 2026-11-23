@@ -372,7 +372,7 @@ server:
 ```yaml
 tunnels:
   - tag: "corp-internal"              # 隧道唯一标签
-    # uuid: "550e8400-e29b-41d4-a716-446655440000" # 可选: 显式 Tunnel UUID (默认由 tag 派生确定性 UUID v5)
+    # uuid: "550e8400-e29b-41d4-a716-446655440000" # 可选: 显式 Tunnel UUID (默认由每客户端 UUID + tag 派生 UUID v5)
     endpoint: "wss://tunnel.example.com/tunnel" # 服务端 URL 或包含独立 dns/tls 的对象
     token: "SECURE_AUTH_TOKEN"        # 与服务端一致的验证令牌
     http_headers:                     # 可选：连接服务端时携带的自定义 HTTP 头
@@ -407,7 +407,7 @@ tunnels:
 | 字段 | 类型 | 是否必填 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- | :--- |
 | `tag` | 字符串 | 是 | — | 隧道唯一标识标签。 |
-| `uuid` | 字符串 | 否 | 由 `tag` 派生 UUID v5 | 显式 Tunnel UUID。同一 Tunnel 下的所有映射共享连接池。 |
+| `uuid` | 字符串 | 否 | 由每客户端 UUID + `tag` 派生 UUID v5 | 显式 Tunnel UUID。同一 Tunnel 下的所有映射共享连接池。 |
 | `endpoint` | 字符串/对象 | 是 | — | 服务端接入点 URL（如 `wss://...`、`h3://...`、`ws+unix://...`）或包含 `url` 及专用 `dns`、`dialer`（包含 `proxy`）、`tls` 覆盖的对象。 |
 | `token` | 字符串 | 否 | `null` | 预共享认证令牌，须与服务端的 `server.token` 保持一致。 |
 | `http_headers` | 映射 | 否 | — | 传输层握手时携带的自定义 HTTP 标头。 |

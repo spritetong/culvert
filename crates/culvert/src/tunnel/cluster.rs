@@ -24,6 +24,7 @@ pub async fn run_tunnel_cluster(
     endpoint_ctx: EndpointContext,
     transport_registry: Arc<TransportRegistry>,
     cancel_token: CancellationToken,
+    client_uuid: &str,
 ) -> Result<(), TunnelError> {
     let mappings = config.canonical_mappings()?;
     info!(
@@ -53,7 +54,7 @@ pub async fn run_tunnel_cluster(
             None
         };
 
-    let tunnel_id = config.effective_tunnel_id();
+    let tunnel_id = config.effective_tunnel_id(client_uuid);
     let has_reverse_mappings = mappings.iter().any(|m| m.mode == TunnelMode::Reverse);
     let reverse_pool_size = config.reverse_pool_size();
     let reverse_ready = if has_reverse_mappings && reverse_pool_size.is_some_and(|s| s > 0) {
