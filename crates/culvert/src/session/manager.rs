@@ -408,22 +408,37 @@ impl SessionManager {
                     listener_count: std::sync::atomic::AtomicUsize::new(0),
                 })
             });
-        slot.listener_count.fetch_add(1, Ordering::Relaxed);
+        slot.listener_count.fetch_add(1, Ordering::AcqRel);
         Arc::clone(&slot.pool)
     }
 
     /// Unregisters one listener from the shared tunnel pool, draining and removing it when count reaches zero.
     pub fn unregister_tunnel_pool(&self, tunnel_id: &str, pool: &Arc<ReverseInboundPool>) {
-        if let Some(slot) = self.tunnel_pools.get(tunnel_id)
-            && Arc::ptr_eq(&slot.pool, pool)
-        {
-            let prev = slot.listener_count.fetch_sub(1, Ordering::Relaxed);
-            if prev <= 1 {
-                drop(slot);
-                if let Some((_, removed)) = self.tunnel_pools.remove(tunnel_id) {
-                    removed.pool.drain();
-                }
-            }
+        let Some(slot) = self.tunnel_pools.get_mut(tunnel_id) else {
+            return;
+        };
+        if !Arc::ptr_eq(&slot.pool, pool) {
+            return;
+        }
+        let prev = slot.listener_count.load(Ordering::Acquire);
+        if prev == 0 {
+            return;
+        }
+        slot.listener_count.store(prev - 1, Ordering::Release);
+        if prev > 1 {
+            return;
+        }
+
+        // A reconnect can register another listener between releasing the write
+        // guard and the removal below. Only remove a slot that is still this
+        // generation and still has no listeners.
+        let candidate = Arc::clone(&slot.pool);
+        drop(slot);
+        if let Some((_, removed)) = self.tunnel_pools.remove_if(tunnel_id, |_, current| {
+            Arc::ptr_eq(&current.pool, &candidate)
+                && current.listener_count.load(Ordering::Acquire) == 0
+        }) {
+            removed.pool.drain();
         }
     }
 
@@ -589,6 +604,13 @@ impl SessionManager {
     /// Returns the number of reverse listeners currently in their grace period.
     pub fn grace_listener_count(&self) -> usize {
         self.grace_listeners.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tunnel_pool_for_test(&self, tunnel_id: &str) -> Option<Arc<ReverseInboundPool>> {
+        self.tunnel_pools
+            .get(tunnel_id)
+            .map(|slot| Arc::clone(&slot.pool))
     }
 }
 
@@ -987,6 +1009,79 @@ mod tests {
         guard.replace_pool(new_pool);
         assert_eq!(manager.pool_count(), 1);
         assert_eq!(guard.len(), 0);
+
+        drop(guard);
+        assert_eq!(manager.pool_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_tunnel_pool_keeps_idle_streams_until_last_listener_leaves() {
+        let manager = SessionManager::new();
+        let first = manager.register_tunnel_pool("shared", 4);
+        let second = manager.register_tunnel_pool("shared", 4);
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let (stream, _peer) = duplex(64);
+        assert!(first.push(Box::new(stream)));
+        assert_eq!(second.len(), 1);
+
+        manager.unregister_tunnel_pool("shared", &first);
+        assert_eq!(manager.pool_count(), 1);
+        assert_eq!(second.len(), 1);
+
+        manager.unregister_tunnel_pool("shared", &second);
+        assert_eq!(manager.pool_count(), 0);
+        assert_eq!(second.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_tunnel_pool_unregister_is_generation_aware() {
+        let manager = SessionManager::new();
+        let pool = manager.register_tunnel_pool("tid", 4);
+        let stale = Arc::new(ReverseInboundPool::new(4));
+        let (stream, _peer) = duplex(64);
+        assert!(pool.push(Box::new(stream)));
+
+        manager.unregister_tunnel_pool("tid", &stale);
+        assert_eq!(manager.pool_count(), 1);
+        assert_eq!(pool.len(), 1);
+        assert_eq!(
+            manager
+                .tunnel_pools
+                .get("tid")
+                .unwrap()
+                .listener_count
+                .load(Ordering::Acquire),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tunnel_pool_swap_on_new_tunnel_id_drains_old_generation() {
+        let manager = Arc::new(SessionManager::new());
+        let old_pool = manager.register_tunnel_pool("old-tid", 4);
+        let mut guard: ReversePoolGuard = scopeguard::guard(
+            ReversePoolEntry {
+                manager: Arc::clone(&manager),
+                protocol: L4Protocol::Tcp,
+                listen_addr: "127.0.0.1:9997".to_string(),
+                pool: Arc::clone(&old_pool),
+                tunnel_id: Some("old-tid".to_string()),
+            },
+            unregister_pool_entry as fn(_),
+        );
+        let (stream, _peer) = duplex(64);
+        assert!(guard.push(Box::new(stream)));
+        assert_eq!(old_pool.len(), 1);
+
+        let new_pool = manager.register_tunnel_pool("new-tid", 4);
+        guard.replace_pool(new_pool);
+        guard.tunnel_id = Some("new-tid".to_string());
+
+        assert!(old_pool.is_empty(), "stale generation must be drained");
+        assert!(manager.tunnel_pools.get("old-tid").is_none());
+        assert!(manager.tunnel_pools.get("new-tid").is_some());
+        assert_eq!(manager.pool_count(), 1);
 
         drop(guard);
         assert_eq!(manager.pool_count(), 0);

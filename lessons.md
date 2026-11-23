@@ -229,6 +229,11 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
 - **Solution**: `ClientRunner` and `TunnelSupervisor` generate a per-instance `client_uuid`; `effective_tunnel_id(client_uuid)` derives the default id from that UUID plus `tag`. Explicit `uuid` still pins a shared cluster identity. Grace reattachment is keyed by `(protocol, listen_addr)`, so it carries the incoming `tunnel_id` and replaces the pool generation under the new id.
 - **References**: [model.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/config/model.rs) (`effective_tunnel_id`), [manager.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/session/manager.rs) (`ReverseGraceReattach`), [runner.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/server/runner.rs) (`attach_reconnected_control`), [test_multiple_reverse_clients.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/tests/test_multiple_reverse_clients.rs)
 
+### 4.6 Shared-Slot Removal Must Be Identity-and-Count Guarded
+
+- **Problem / Trap**: `unregister_tunnel_pool()` dropped its `DashMap` read guard before an unconditional `remove(tunnel_id)`. A reconnect could register another listener in that window; the stale teardown then deleted and drained the live pool.
+- **Solution**: Decrement under the write guard, and only `remove_if` when the slot is still the same pool generation and `listener_count == 0`. Identity checks alone are not enough; the count must be rechecked in the same lock.
+
 ---
 
 ## 5. Async Concurrency & Probe-Driven Verification

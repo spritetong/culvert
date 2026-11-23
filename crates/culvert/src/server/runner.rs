@@ -1588,6 +1588,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_server_reverse_reattach_swaps_pool_to_new_tunnel_id() {
+        use futures_util::{SinkExt, StreamExt};
+
+        let (client1, server1) = tokio::io::duplex(4096);
+        let mut ctrl1 = FramedControlStream::new(client1);
+        let session_mgr = Arc::new(SessionManager::new());
+        let cancel_token = CancellationToken::new();
+        let listen_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let listen_addr = format!("127.0.0.1:{}", listen_port);
+
+        let s_mgr1 = Arc::clone(&session_mgr);
+        let c_token1 = cancel_token.clone();
+        let handle1 = tokio::spawn(async move {
+            ServerRunner::handle_reverse_control(
+                Box::new(server1),
+                s_mgr1,
+                c_token1,
+                Duration::from_secs(30),
+                crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
+                crate::consts::DEFAULT_UDP_IDLE_TIMEOUT,
+            )
+            .await;
+        });
+
+        ctrl1
+            .send(ControlMessage::RegisterReverse {
+                listen_addr: listen_addr.clone(),
+                target_addr: "127.0.0.1:9099".to_string(),
+                pool_size: Some(2),
+                protocol: L4Protocol::Tcp,
+                tunnel_id: Some("old-tid".to_string()),
+            })
+            .await
+            .unwrap();
+        let ack1 = ctrl1.next().await.unwrap().unwrap();
+        assert!(matches!(
+            ack1,
+            ControlMessage::RegisterAck { success: true, .. }
+        ));
+
+        let old_pool = session_mgr
+            .tunnel_pool_for_test("old-tid")
+            .expect("old tunnel pool must be registered");
+        let (idle, _peer) = tokio::io::duplex(64);
+        assert!(old_pool.push(Box::new(idle)));
+
+        drop(ctrl1);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(session_mgr.grace_listener_count(), 1);
+        assert!(!handle1.is_finished());
+
+        let (client2, server2) = tokio::io::duplex(4096);
+        let mut ctrl2 = FramedControlStream::new(client2);
+        let s_mgr2 = Arc::clone(&session_mgr);
+        let c_token2 = cancel_token.clone();
+        let handle2 = tokio::spawn(async move {
+            ServerRunner::handle_reverse_control(
+                Box::new(server2),
+                s_mgr2,
+                c_token2,
+                Duration::from_secs(30),
+                crate::consts::DEFAULT_HEARTBEAT_INTERVAL,
+                crate::consts::DEFAULT_UDP_IDLE_TIMEOUT,
+            )
+            .await;
+        });
+
+        ctrl2
+            .send(ControlMessage::RegisterReverse {
+                listen_addr: listen_addr.clone(),
+                target_addr: "127.0.0.1:9099".to_string(),
+                pool_size: Some(2),
+                protocol: L4Protocol::Tcp,
+                tunnel_id: Some("new-tid".to_string()),
+            })
+            .await
+            .unwrap();
+        let ack2 = ctrl2.next().await.unwrap().unwrap();
+        assert!(matches!(
+            ack2,
+            ControlMessage::RegisterAck { success: true, .. }
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), handle2)
+            .await
+            .expect("reattach handler must hand off and exit")
+            .expect("reattach handler panicked");
+        assert!(!handle1.is_finished());
+        assert!(
+            old_pool.is_empty(),
+            "stale pool must be drained on reattach"
+        );
+        assert!(session_mgr.tunnel_pool_for_test("old-tid").is_none());
+        assert!(session_mgr.tunnel_pool_for_test("new-tid").is_some());
+        assert_eq!(session_mgr.pool_count(), 1);
+
+        cancel_token.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle1).await;
+    }
+
+    #[tokio::test]
     async fn test_server_reverse_control_grace_period_udp_retains_socket_and_reattaches() {
         use futures_util::{SinkExt, StreamExt};
 
