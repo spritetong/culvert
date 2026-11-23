@@ -151,7 +151,9 @@ fn take_live_idle_stream(
     heartbeat_interval: Duration,
     idle_timeout: Duration,
 ) -> (Option<Box<dyn TunnelStream>>, bool) {
-    let mut evicted_dead = false;
+    let mut evicted_dead_count = 0usize;
+    let mut evicted_expired_count = 0usize;
+    let mut acquired = None;
     let mut idx = idle_streams.len();
     while idx > 0 {
         idx -= 1;
@@ -168,7 +170,7 @@ fn take_live_idle_stream(
         );
         if expired {
             idle_streams.remove(idx);
-            tracing::debug!("Evicted expired idle stream during acquire inspection");
+            evicted_expired_count += 1;
             continue;
         }
 
@@ -177,18 +179,30 @@ fn take_live_idle_stream(
             Poll::Ready(HeartbeatStatus::Dead)
         ) {
             idle_streams.remove(idx);
-            evicted_dead = true;
-            tracing::debug!("Evicted dead stream during acquire inspection");
+            evicted_dead_count += 1;
             continue;
         }
 
         if let Some(managed) = idle_streams.remove(idx) {
-            return (Some(managed.stream), evicted_dead);
+            acquired = Some(managed.stream);
         }
         break;
     }
 
-    (None, evicted_dead)
+    if evicted_expired_count > 0 {
+        tracing::debug!(
+            count = evicted_expired_count,
+            "Evicted expired idle stream(s) during acquire inspection"
+        );
+    }
+    if evicted_dead_count > 0 {
+        tracing::debug!(
+            count = evicted_dead_count,
+            "Evicted dead stream(s) during acquire inspection"
+        );
+    }
+
+    (acquired, evicted_dead_count > 0)
 }
 
 /// Request sent to the pool actor to acquire a stream.
@@ -369,7 +383,8 @@ impl ReplenishingStreamPool {
                     let sweep_now = Instant::now();
                     let now_ms = activity_now_ms();
                     let mut i = 0;
-                    let mut evicted_dead = false;
+                    let mut evicted_dead_count = 0usize;
+                    let mut evicted_expired_count = 0usize;
                     while i < idle_streams.len() {
                         let managed = &mut idle_streams[i];
                         let (probe, expired) = heartbeat_timing(
@@ -380,8 +395,8 @@ impl ReplenishingStreamPool {
                         );
 
                         if expired {
-                            tracing::debug!("Evicted expired idle stream during reactor sweep");
                             idle_streams.swap_remove_back(i);
+                            evicted_expired_count += 1;
                             continue;
                         }
 
@@ -434,15 +449,25 @@ impl ReplenishingStreamPool {
                         }
 
                         if is_dead {
-                            tracing::debug!("Evicted dead/hanging stream during reactor sweep");
                             idle_streams.swap_remove_back(i);
-                            evicted_dead = true;
+                            evicted_dead_count += 1;
                         } else {
                             i += 1;
                         }
                     }
 
-                    if evicted_dead {
+                    if evicted_expired_count > 0 {
+                        tracing::debug!(
+                            count = evicted_expired_count,
+                            "Evicted expired idle stream(s) during reactor sweep"
+                        );
+                    }
+
+                    if evicted_dead_count > 0 {
+                        tracing::debug!(
+                            count = evicted_dead_count,
+                            "Evicted dead/hanging stream(s) during reactor sweep"
+                        );
                         return Poll::Ready(PoolEvent::StreamsEvicted);
                     }
 

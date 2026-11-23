@@ -19,8 +19,8 @@ use tracing::{debug, error, info, warn};
 use crate::common::{CancelFutureExt, TaskTracker};
 use crate::config::model::{QuicConfig, ServerConfig, TlsConfig, TunnelMode};
 use crate::consts::{
-    ACTIVATE_STREAM_ACK, DEFAULT_ACTIVATION_READ_TIMEOUT, DEFAULT_SESSION_PAIR_TIMEOUT,
-    POOL_DUMMY_HOST, reverse_ack_timeout, reverse_frame_timeout, reverse_grace_period,
+    ACTIVATE_STREAM_ACK, DEFAULT_SESSION_PAIR_TIMEOUT, POOL_DUMMY_HOST, reverse_ack_timeout,
+    reverse_activation_wait_timeout, reverse_frame_timeout, reverse_grace_period,
     reverse_pool_soft_cap,
 };
 use crate::control::{
@@ -221,10 +221,11 @@ impl ServerRunner {
                                                 // If this stream was pre-warmed as an idle connection in client pool,
                                                 // wait for the client activation signal before touching the target service.
                                                 if metadata.pool_idle {
+                                                    let act_wait_timeout = reverse_activation_wait_timeout(idle_timeout);
                                                     let decoded = crate::pool::activation::decode_activation(
                                                         &mut stream,
                                                         &conn_token,
-                                                        DEFAULT_ACTIVATION_READ_TIMEOUT,
+                                                        act_wait_timeout,
                                                     )
                                                     .await;
 

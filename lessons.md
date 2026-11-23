@@ -58,6 +58,17 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
 - **References**:
   - Implementation: [pump.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/io/pump.rs#L200-L260)
 
+### 1.5 Pre-Warmed Idle Stream Activation Timeout Symmetry & Reactor Sweep Eviction Storm
+
+- **Problem / Trap**: In forward tunnel pools (`pool_size > 0`), the client pre-warms idle streams and retains them in `idle_streams` for the configured `idle_timeout` (default 30s). However, the server side previously awaited activation using a hardcoded 10-second `DEFAULT_ACTIVATION_READ_TIMEOUT`.
+- **Symptom**: In idle or low-traffic environments (e.g. during a single large file download where 31 pooled streams sit idle), at exactly the 10-second mark, the server unilaterally timed out on all idle streams and dropped them. The client's reactor sweep detected EOF / RST on all 32 streams simultaneously, emitting a burst of `Evicted dead/hanging stream during reactor sweep` logs within sub-milliseconds (simulating dozens/hundreds of evictions/sec) while active traffic streams remained completely unaffected.
+- **Solution**:
+  - Align server-side activation timeout with the tunnel's idle lifecycle: use `reverse_activation_wait_timeout(idle_timeout)` (idle_timeout + grace window) so the server never drops healthy pre-warmed streams before the client pool's authoritative `idle_timeout` expires.
+  - At the 30s mark, the client reactor cleanly evicts streams as `expired = true` (`Evicted expired idle stream`) rather than transport `Dead`.
+- **References**:
+  - Implementation: [runner.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/server/runner.rs#L220-L230)
+  - Regression Test: [test_forward_pool_32.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/tests/test_forward_pool_32.rs)
+
 ---
 
 ## 2. Flow Control & Multiplexing Head-of-Line Blocking
