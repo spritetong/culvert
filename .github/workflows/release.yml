@@ -172,6 +172,7 @@ jobs:
           name: packages-${{ matrix.target }}
           path: |
             culvert-*.*
+          retention-days: 3
           if-no-files-found: error
 
   release:
