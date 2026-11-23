@@ -199,7 +199,37 @@ cargo build --release
 # 编译产物位于: target/release/culvert
 ```
 
-### 2. 静态配置检查
+### 2. 使用 Docker 运行
+
+官方多架构镜像（支持 `linux/amd64` 与 `linux/arm64`）自动发布在 GitHub Packages (`ghcr.io`)：
+
+```bash
+# 拉取最新镜像
+docker pull ghcr.io/spritetong/culvert:latest
+
+# 挂载配置文件并启动（推荐使用 host 网络模式以获得极致吞吐与最低延迟）
+docker run -d \
+  --name culvert \
+  --restart unless-stopped \
+  --network host \
+  -v $(pwd)/config.yaml:/etc/culvert/config.yaml:ro \
+  ghcr.io/spritetong/culvert:latest
+```
+
+或使用 Docker Compose 运行（参考根目录的 [`docker-compose.example.yml`](docker-compose.example.yml)）：
+
+```yaml
+services:
+  culvert:
+    image: ghcr.io/spritetong/culvert:latest
+    container_name: culvert
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./config.yaml:/etc/culvert/config.yaml:ro
+```
+
+### 3. 静态配置检查
 
 在启动前，建议使用 `--check` 选项静态验证配置文件格式是否规范：
 
@@ -207,7 +237,7 @@ cargo build --release
 target/release/culvert --check -c config.yaml
 ```
 
-### 3. 最简正向穿透示例
+### 4. 最简正向穿透示例
 
 **服务端配置 (`server.yaml`)** — 在中继服务器上运行：
 

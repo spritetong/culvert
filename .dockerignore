@@ -1,0 +1,23 @@
+# Git & Version Control
+.git/
+.gitignore
+
+# Rust / Cargo build outputs
+target/
+**/*.rs.bk
+
+# CI/CD and Documentation
+.github/
+docs/
+*.md
+LICENSE
+
+# Python / Scripts cache
+scripts/__pycache__/
+*.pyc
+
+# Local configuration files, keys, and logs
+*.log
+*.pem
+*.key
+*.crt

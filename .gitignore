@@ -30,3 +30,7 @@ __pycache__
 /docs/config-*
 /benchmarks
 /Makefile
+
+# Prebuilt binaries for multi-arch docker staging
+/bin/*/*
+!/bin/*/.gitkeep

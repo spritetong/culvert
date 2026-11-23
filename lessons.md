@@ -58,13 +58,13 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
 - **References**:
   - Implementation: [pump.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/io/pump.rs#L200-L260)
 
-### 1.5 Idle Pool Lifetime Must Not Be Extended by Transport Heartbeats
+### 1.5 Idle Pool Expiry Must Follow the Activity Clock, Not Enqueue Time
 
-- **Problem / Trap**: In forward tunnel pools (`pool_size > 0`), the server waits a bounded interval for the client's activation signal. Aligning that wait to `reverse_activation_wait_timeout(idle_timeout)` is not enough if the client's idle clock keeps moving: QUIC/H3 `poll_send_ping` calls `touch_activity()`, and WS Ping/Pong frames call `liveness.record_rx()`. A 45 s probe with default settings showed `dead=0 expired=0` until t=35 s, then `dead=4` at t=40 s: the server closed the waiting streams at its timeout and the client reported them as dead instead of expired.
-- **Solution**: `ManagedStream` records `enqueued_at` when it enters the idle queue. Both the reactor sweep and `take_live_idle_stream` use `enqueued_at.elapsed() >= idle_timeout` for expiry; `last_activity_ms` is used only to decide when to send a liveness probe. Heartbeats keep the transport healthy without extending the pool lifetime, so the client retires idle streams before the server's activation wait expires.
-- **Server side**: the forward server calls `decode_activation_until_cancel`: it waits for activation, peer EOF, or cancellation, with no local timeout derived from its own `idle_timeout`. Unequal server/client idle windows can no longer make the server close a healthy waiting stream first.
+- **Problem / Trap**: Giving `ManagedStream` an `enqueued_at` deadline to work around a server-side activation timeout made every stream from the same prewarm batch expire at exactly `idle_timeout`. With `pool_size=32` and two tunnels this produced a batch `Evicted expired idle stream(s) during reactor sweep` storm, followed by a synchronized redial wave, on both WSS and QUIC. The server-side deadline was the actual bug; the wall-clock expiry only renamed the storm from `dead` to `expired`.
+- **Solution**: expiry comes from `heartbeat_timing(last_activity_ms, ...)`: a stream retires only when its transport activity clock has been quiet for `idle_timeout`. Healthy probe traffic refreshes that clock, so the full pool stays warm indefinitely; a genuinely unresponsive stream retires on its own schedule. Keepalive probes never count as TX, so a dead peer cannot keep the clock fresh.
+- **Server side**: the forward server calls `decode_activation_until_cancel`: it waits for activation, peer EOF, or cancellation, with no local timeout derived from its own `idle_timeout`. Unequal server/client idle windows can no longer make the server close a healthy waiting stream first, so no client-side wall-clock deadline is needed.
 - **References**:
-  - Implementation: [runner.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/server/runner.rs#L220-L230), [connection_pool.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/pool/connection_pool.rs#L125-L175)
+  - Implementation: [runner.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/server/runner.rs#L220-L230), [connection_pool.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/pool/connection_pool.rs#L116-L165)
   - Regression Test: [test_forward_pool_32.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/tests/test_forward_pool_32.rs)
 
 ---
@@ -521,6 +521,27 @@ A concise, actionable knowledge base of non-obvious bugs, architectural traps, a
 - **References**:
   - Implementation: [watcher.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/cert/watcher.rs), [reader.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/cert/reader.rs), [manager.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/src/cert/manager.rs)
   - Integration Tests: [test_cert_hot_reload.rs](file:///d:/githome/spritetong/@github/culvert/crates/culvert/tests/test_cert_hot_reload.rs)
+
+---
+
+## 13. Multi-Architecture Container Distribution & CI/CD Pipelines
+
+### 13.1 Decoupling Native Cross-Compilation from Multi-Arch Docker Manifest Assembly
+
+- **Problem / Trap (QEMU Emulation Compilation Bottleneck)**:
+  - In Rust projects with heavy cryptographic and asynchronous dependencies (`quinn`, `rustls`, `h3`, `fastwebsockets`, `ring`), compiling directly inside multi-arch Docker Buildx using QEMU emulation (e.g. emulating `linux/arm64` on standard `ubuntu-latest` x86_64 runners) is 10x-15x slower than native compilation.
+  - A build that takes 2-3 minutes natively often balloons to 40-50+ minutes under QEMU, leading to GitHub Actions runner timeouts or out-of-memory aborts.
+- **Problem / Trap (Broken Local Developer Experience)**:
+  - Replacing the standard Dockerfile with an image that only accepts prebuilt binaries breaks local developer workflows (`docker build -t culvert .` fails because no prebuilt binaries exist in the developer workspace).
+- **Solution (Dual-Mode Dockerfile + Staged CI Assembly)**:
+  1. **Dual-Mode Dockerfile**: Structure `Dockerfile` with multi-stage selector:
+     - `builder-source` (default `BUILD_MODE=source`): standard `rust:bookworm` compilation for local builds.
+     - `builder-prebuilt` (`BUILD_MODE=prebuilt`): copies pre-compiled binaries from `bin/${TARGETARCH}/culvert` without running cargo.
+     - `final`: unprivileged `culvert` user, `dumb-init` (PID 1 signal forwarding), and `ca-certificates`.
+  2. **CI Pipeline Staging**: In `release.yml`, reuse cross-compiled static musl binaries (`packages-x86_64-unknown-linux-musl` and `packages-aarch64-unknown-linux-musl`) already produced by the matrix `build` job.
+  3. **Fast Manifest Assembly**: In the `docker` job, set up QEMU (for lightweight `apt-get` on base images only) and Buildx, then invoke `docker/build-push-action` with `BUILD_MODE=prebuilt` across `linux/amd64,linux/arm64`. Assembly and upload complete in under 30 seconds.
+- **References**:
+  - Implementation: [Dockerfile](file:///d:/githome/spritetong/@github/culvert/Dockerfile), [release.yml](file:///d:/githome/spritetong/@github/culvert/.github/workflows/release.yml)
 
 
 

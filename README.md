@@ -204,7 +204,37 @@ cargo build --release
 # Output binary: target/release/culvert
 ```
 
-### 2. Static Configuration Validation
+### 2. Run with Docker
+
+Pre-built multi-architecture container images (`linux/amd64`, `linux/arm64`) are automatically published to the GitHub Container Registry (`ghcr.io`):
+
+```bash
+# Pull the latest image
+docker pull ghcr.io/spritetong/culvert:latest
+
+# Run with host networking (recommended for maximum throughput and minimal overhead)
+docker run -d \
+  --name culvert \
+  --restart unless-stopped \
+  --network host \
+  -v $(pwd)/config.yaml:/etc/culvert/config.yaml:ro \
+  ghcr.io/spritetong/culvert:latest
+```
+
+Or use Docker Compose (see [`docker-compose.example.yml`](docker-compose.example.yml)):
+
+```yaml
+services:
+  culvert:
+    image: ghcr.io/spritetong/culvert:latest
+    container_name: culvert
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./config.yaml:/etc/culvert/config.yaml:ro
+```
+
+### 3. Static Configuration Validation
 
 Before running in production, validate your configuration file syntax and constraints with `--check`:
 
@@ -212,7 +242,7 @@ Before running in production, validate your configuration file syntax and constr
 target/release/culvert --check -c config.yaml
 ```
 
-### 3. Basic Forward Tunnel Example
+### 4. Basic Forward Tunnel Example
 
 **`server.yaml`** — Runs on the public relay server:
 
