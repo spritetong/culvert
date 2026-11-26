@@ -1438,6 +1438,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_datagram_stream_pump_keeps_udp_to_stream_after_stream_read_eof() {
+        let (udp_tx, udp_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stream_to_udp_tx, _stream_to_udp_rx) = tokio::sync::mpsc::unbounded_channel();
+        let dgram_io = ChannelDatagramIo {
+            rx: udp_rx,
+            tx: stream_to_udp_tx,
+        };
+        let (stream_a, mut stream_b) = duplex(4096);
+
+        let pump = tokio::spawn(async move {
+            DatagramStreamPump::relay_datagram_stream(
+                Box::new(dgram_io),
+                Box::new(stream_a),
+                CancellationToken::new(),
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+            )
+            .await
+        });
+
+        // Half-close only the stream read direction. UDP->stream must remain live.
+        stream_b.shutdown().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        udp_tx.send(Datagram {
+            flow: Default::default(),
+            payload: Bytes::from_static(b"still-alive"),
+        }).unwrap();
+
+        let mut header = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(1), stream_b.read_exact(&mut header))
+            .await
+            .expect("pump stopped after stream read-side EOF")
+            .unwrap();
+        assert_eq!(u16::from_be_bytes(header), 11);
+        let mut payload = [0u8; 11];
+        stream_b.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"still-alive");
+
+        drop(udp_tx);
+        tokio::time::timeout(Duration::from_secs(1), pump)
+            .await
+            .expect("pump did not finish after both directions closed")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn test_datagram_stream_pump_rejects_truncated_frame_at_eof() {
         let (_to_dgram_tx, _from_pump_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_to_pump_tx, to_dgram_rx) = tokio::sync::mpsc::unbounded_channel();
