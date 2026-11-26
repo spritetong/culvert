@@ -242,7 +242,7 @@ impl UdpFrontend {
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             let mut guard = task_sessions.lock();
-                            if let Some((cur_id, _)) = guard.get(&peer_addr)
+                            if let Some((cur_id, _, _)) = guard.get(&peer_addr)
                                 && *cur_id == flow_id
                             {
                                 guard.remove(&peer_addr);
