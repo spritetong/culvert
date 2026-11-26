@@ -992,11 +992,23 @@ impl DatagramStreamPump {
                 }
             }
 
-            if stream_read_done && pending_dgrams.is_empty() && !rx_buf.is_empty() {
-                return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "truncated UDP datagram frame at end of stream",
-                ))));
+            if stream_read_done && pending_dgrams.is_empty() {
+                // There may be complete frames left in rx_buf because the byte
+                // budget prevented decoding them while the previous batch was queued.
+                if let Err(e) = decode_pending_datagrams(
+                    &mut rx_buf,
+                    &mut pending_dgrams,
+                    &mut stream_to_dgram_bytes,
+                    &mut pending_dgram_bytes,
+                ) {
+                    return Poll::Ready(Err(TunnelError::Io(e)));
+                }
+                if pending_dgrams.is_empty() && !rx_buf.is_empty() {
+                    return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "truncated UDP datagram frame at end of stream",
+                    ))));
+                }
             }
 
             // A stream read-side EOF is only a half-close: keep forwarding UDP
