@@ -65,6 +65,9 @@ pub const MAX_UDP_DATAGRAM_SIZE: usize = 65507;
 /// Default capacity for the command deduplication sliding window across dual channels.
 pub const DEFAULT_DEDUPLICATION_WINDOW_CAPACITY: usize = 256;
 
+/// Maximum number of active peer flows retained by one UDP frontend listener.
+pub const MAX_UDP_SESSIONS: usize = 4096;
+
 /// Channel queue capacity per active UDP client NAT flow session.
 pub const UDP_SESSION_CHANNEL_SIZE: usize = 256;
 
