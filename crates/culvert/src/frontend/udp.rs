@@ -385,6 +385,18 @@ mod tests {
     use crate::io::pump::{PumpCtx, PumpRequest};
     use std::time::Duration;
 
+    #[test]
+    fn session_queue_byte_budget_is_strict_and_releasable() {
+        let queued = AtomicUsize::new(0);
+        assert!(try_reserve_session_bytes(&queued, UDP_SESSION_QUEUE_MAX_BYTES - 1));
+        assert!(!try_reserve_session_bytes(&queued, 2));
+        release_session_bytes(&queued, UDP_SESSION_QUEUE_MAX_BYTES - 1);
+        assert_eq!(queued.load(Ordering::Acquire), 0);
+        assert!(try_reserve_session_bytes(&queued, UDP_SESSION_QUEUE_MAX_BYTES));
+        release_session_bytes(&queued, UDP_SESSION_QUEUE_MAX_BYTES);
+        assert_eq!(queued.load(Ordering::Acquire), 0);
+    }
+
     fn get_ephemeral_udp_addr() -> String {
         let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let port = probe.local_addr().unwrap().port();
