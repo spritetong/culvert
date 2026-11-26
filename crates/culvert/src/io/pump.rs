@@ -878,17 +878,16 @@ impl DatagramStreamPump {
                     Poll::Ready(Ok(())) => {
                         need_flush = false;
                     }
-                    Poll::Ready(Err(e)) => {
-                        tracing::debug!("Datagram pump stream flush error on shutdown: {}", e);
-                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(TunnelError::Io(e))),
                     Poll::Pending => return Poll::Pending,
                 }
                 if caps.half_close {
                     match Pin::new(&mut *stream).poll_shutdown(cx) {
-                        Poll::Ready(Ok(())) | Poll::Ready(Err(_)) => {
+                        Poll::Ready(Ok(())) => {
                             stream_write_shutdown = true;
                             progress = true;
                         }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(TunnelError::Io(e))),
                         Poll::Pending => {}
                     }
                 } else {
@@ -1432,6 +1431,79 @@ mod tests {
         let (d2s, s2d) = pump_handle.await.unwrap().unwrap();
         assert_eq!(d2s, 9);
         assert_eq!(s2d, 17);
+    }
+
+    #[tokio::test]
+    async fn test_datagram_stream_pump_rejects_truncated_frame_at_eof() {
+        let (_to_dgram_tx, _from_pump_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_to_pump_tx, to_dgram_rx) = tokio::sync::mpsc::unbounded_channel();
+        let dgram_io = ChannelDatagramIo {
+            rx: to_dgram_rx,
+            tx: _to_dgram_tx,
+        };
+        let (stream_a, mut stream_b) = duplex(4096);
+
+        let pump = tokio::spawn(async move {
+            DatagramStreamPump::relay_datagram_stream(
+                Box::new(dgram_io),
+                Box::new(stream_a),
+                CancellationToken::new(),
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+            )
+            .await
+        });
+
+        // A length of 3 followed by only one payload byte is a truncated frame.
+        stream_b.write_all(&[0, 3, b'x']).await.unwrap();
+        stream_b.shutdown().await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), pump)
+            .await
+            .expect("pump did not observe stream EOF")
+            .unwrap();
+        match result {
+            Err(TunnelError::Io(e)) => assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof),
+            other => panic!("expected UnexpectedEof, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_datagram_stream_pump_rejects_oversized_outbound_datagram() {
+        let (to_dgram_tx, _from_pump_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_to_pump_tx, to_dgram_rx) = tokio::sync::mpsc::unbounded_channel();
+        let dgram_io = ChannelDatagramIo {
+            rx: to_dgram_rx,
+            tx: to_dgram_tx,
+        };
+        let (stream_a, _stream_b) = duplex(4096);
+        let mut oversized = vec![0u8; crate::consts::MAX_UDP_DATAGRAM_SIZE + 1];
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<Datagram>();
+        drop(rx);
+        // The pump's DatagramIo receiver is fed through the outbound channel.
+        // Replace the empty receiver with a channel carrying one oversized packet.
+        let (packet_tx, packet_rx) = tokio::sync::mpsc::unbounded_channel();
+        packet_tx.send(Datagram {
+            flow: Default::default(),
+            payload: Bytes::from(std::mem::take(&mut oversized)),
+        }).unwrap();
+        drop(packet_tx);
+        let dgram_io = ChannelDatagramIo {
+            rx: packet_rx,
+            tx: _from_pump_rx,
+        };
+
+        let result = DatagramStreamPump::relay_datagram_stream(
+            Box::new(dgram_io),
+            Box::new(stream_a),
+            CancellationToken::new(),
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+        ).await;
+        match result {
+            Err(TunnelError::Io(e)) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput),
+            other => panic!("expected InvalidInput, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
