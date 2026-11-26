@@ -995,6 +995,7 @@ impl DatagramStreamPump {
             if stream_read_done && pending_dgrams.is_empty() {
                 // There may be complete frames left in rx_buf because the byte
                 // budget prevented decoding them while the previous batch was queued.
+                let queued_before_decode = pending_dgrams.len();
                 if let Err(e) = decode_pending_datagrams(
                     &mut rx_buf,
                     &mut pending_dgrams,
@@ -1002,6 +1003,9 @@ impl DatagramStreamPump {
                     &mut pending_dgram_bytes,
                 ) {
                     return Poll::Ready(Err(TunnelError::Io(e)));
+                }
+                if pending_dgrams.len() > queued_before_decode {
+                    progress = true;
                 }
                 if pending_dgrams.is_empty() && !rx_buf.is_empty() {
                     return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
