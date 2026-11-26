@@ -932,7 +932,12 @@ impl DatagramStreamPump {
                 return Poll::Ready(Err(TunnelError::Io(e)));
             }
 
-            if !stream_read_done && !is_cancelled && pending_dgrams.len() < MAX_PENDING_DATAGRAMS {
+            if !stream_read_done
+                && !is_cancelled
+                && pending_dgrams.len() < MAX_PENDING_DATAGRAMS
+                && pending_dgram_bytes + crate::consts::MAX_UDP_DATAGRAM_SIZE
+                    <= MAX_PENDING_DATAGRAM_BYTES
+            {
                 let mut read_buf = ReadBuf::new(&mut read_scratch);
                 match Pin::new(&mut *stream).poll_read(cx, &mut read_buf) {
                     Poll::Ready(Ok(())) => {
@@ -1640,6 +1645,29 @@ mod udp_frame_tests {
         assert_eq!(pending.len(), 7);
         assert!(rx.is_empty());
         assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn decoder_respects_pending_byte_budget_and_retains_frame() {
+        let payload = vec![0x5a; crate::consts::MAX_UDP_DATAGRAM_SIZE];
+        let mut rx = BytesMut::new();
+        for _ in 0..5 {
+            rx.extend_from_slice(&frame(&payload));
+        }
+        let mut pending = VecDeque::new();
+        let mut total = 0;
+        let mut pending_bytes = 0;
+
+        decode_pending_datagrams(&mut rx, &mut pending, &mut total, &mut pending_bytes).unwrap();
+        assert_eq!(pending.len(), 4);
+        assert_eq!(pending_bytes, 4 * crate::consts::MAX_UDP_DATAGRAM_SIZE);
+        assert_eq!(rx.len(), crate::consts::MAX_UDP_DATAGRAM_SIZE + 2);
+
+        pending.clear();
+        pending_bytes = 0;
+        decode_pending_datagrams(&mut rx, &mut pending, &mut total, &mut pending_bytes).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(rx.is_empty());
     }
 
     #[test]
