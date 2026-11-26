@@ -650,7 +650,8 @@ impl Pump for DatagramDatagramPump {
                 // Receive from A
                 if !a_done && !is_cancelled && queue_a_to_b.len() < MAX_PENDING_DATAGRAMS {
                     let remaining = MAX_PENDING_DATAGRAMS - queue_a_to_b.len();
-                    match a.poll_recv(cx, &mut batch_a[..remaining.min(batch_a.len())]) {
+                    let batch_len = remaining.min(batch_a.len());
+                    match a.poll_recv(cx, &mut batch_a[..batch_len]) {
                         Poll::Ready(Ok(0)) => {
                             a_done = true;
                             progress = true;
@@ -671,7 +672,8 @@ impl Pump for DatagramDatagramPump {
                 // Receive from B
                 if !b_done && !is_cancelled && queue_b_to_a.len() < MAX_PENDING_DATAGRAMS {
                     let remaining = MAX_PENDING_DATAGRAMS - queue_b_to_a.len();
-                    match b.poll_recv(cx, &mut batch_b[..remaining.min(batch_b.len())]) {
+                    let batch_len = remaining.min(batch_b.len());
+                    match b.poll_recv(cx, &mut batch_b[..batch_len]) {
                         Poll::Ready(Ok(0)) => {
                             b_done = true;
                             progress = true;
