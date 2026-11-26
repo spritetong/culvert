@@ -11,14 +11,18 @@ use reusable_future::ReusableFutureRef;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::common::CancelFutureExt;
-use crate::consts::{ACCEPTED_STREAM_QUEUE_SIZE, UDP_SESSION_CHANNEL_SIZE};
+use crate::consts::{
+    ACCEPTED_STREAM_QUEUE_SIZE, MAX_UDP_DATAGRAM_SIZE, MAX_UDP_SESSIONS,
+    UDP_SESSION_CHANNEL_SIZE, UDP_SESSION_QUEUE_MAX_BYTES,
+};
 use crate::frontend::{Frontend, FrontendAccept, FrontendFactory, FrontendOutput};
 use crate::io::addr::{L4Protocol, ListenAddr, MappingSpec, PeerAddr, parse_listen_addr};
 use crate::io::channel::{Datagram, DatagramIo, FlowKey, IoChannel};
@@ -26,7 +30,27 @@ use crate::io::error::TunnelError;
 use crate::io::stream::BoxFuture;
 
 /// Session table mapping client `SocketAddr` -> `(flow_id, inbound_sender)`.
-type UdpSessionMap = HashMap<SocketAddr, (u64, mpsc::Sender<Datagram>)>;
+type UdpSessionMap = HashMap<SocketAddr, (u64, mpsc::Sender<Datagram>, Arc<AtomicUsize>)>;
+
+fn try_reserve_session_bytes(queued: &AtomicUsize, amount: usize) -> bool {
+    queued.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        current.checked_add(amount).filter(|next| *next <= UDP_SESSION_QUEUE_MAX_BYTES)
+    }).is_ok()
+}
+
+fn release_session_bytes(queued: &AtomicUsize, amount: usize) {
+    let result = queued.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        current.checked_sub(amount)
+    });
+    debug_assert!(result.is_ok(), "UDP session byte accounting underflow");
+}
+
+/// Process-wide semaphore bounding active UDP peer flows across all listeners.
+fn udp_session_semaphore() -> &'static Arc<tokio::sync::Semaphore> {
+    static LIMIT: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    LIMIT.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_UDP_SESSIONS)))
+}
+
 
 /// Registered frontend factory for UDP port mappings.
 pub struct UdpFrontendFactory;
@@ -117,6 +141,11 @@ impl UdpFrontend {
                     }
                 };
 
+                if n > MAX_UDP_DATAGRAM_SIZE {
+                    tracing::debug!(size = n, "dropping oversized UDP datagram");
+                    continue;
+                }
+
                 let peer_addr = match raw_peer_addr {
                     SocketAddr::V6(v6) => SocketAddr::new(v6.ip().to_canonical(), v6.port()),
                     v4 => v4,
@@ -133,43 +162,71 @@ impl UdpFrontend {
                 };
 
                 // Look up existing session sender without holding the mutex across awaits.
-                let existing_tx = {
+                let existing_session = {
                     let guard = task_sessions.lock();
-                    guard.get(&peer_addr).map(|(_, tx)| tx.clone())
+                    guard.get(&peer_addr).map(|(_, tx, queued)| {
+                        (tx.clone(), Arc::clone(queued))
+                    })
                 };
 
-                let pending_first = if let Some(tx) = existing_tx {
+                let pending_first = if let Some((tx, queued_bytes)) = existing_session {
+                    let payload_len = dgram.payload.len();
+                    if !try_reserve_session_bytes(&queued_bytes, payload_len) {
+                        continue;
+                    }
                     match tx.try_send(dgram) {
                         Ok(()) => continue,
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            // Backpressure drop-tail when session queue is saturated.
+                        Err(mpsc::error::TrySendError::Full(returned)) => {
+                            release_session_bytes(&queued_bytes, returned.payload.len());
+                            // Backpressure drop-tail when the session queue is saturated.
                             continue;
                         }
-                        Err(mpsc::error::TrySendError::Closed(returned)) => Some(returned),
+                        Err(mpsc::error::TrySendError::Closed(returned)) => {
+                            release_session_bytes(&queued_bytes, returned.payload.len());
+                            Some(returned)
+                        }
                     }
                 } else {
                     Some(dgram)
                 };
 
                 if let Some(first_dgram) = pending_first {
+                    // One process-wide permit bounds sessions across all UDP listeners.
+                    let flow_permit = match udp_session_semaphore().clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => continue,
+                    };
+
                     let flow_id = next_flow_id;
                     next_flow_id = next_flow_id.wrapping_add(1).max(1);
 
                     let (flow_tx, flow_rx) = mpsc::channel(UDP_SESSION_CHANNEL_SIZE);
+                    let queued_bytes = Arc::new(AtomicUsize::new(first_dgram.payload.len()));
+                    if first_dgram.payload.len() > UDP_SESSION_QUEUE_MAX_BYTES {
+                        continue;
+                    }
                     if flow_tx.try_send(first_dgram).is_err() {
                         continue;
                     }
 
                     {
                         let mut guard = task_sessions.lock();
-                        guard.insert(peer_addr, (flow_id, flow_tx));
+                        let stale = guard
+                            .get(&peer_addr)
+                            .is_some_and(|(_, sender, _)| sender.is_closed());
+                        if stale {
+                            guard.remove(&peer_addr);
+                        }
+                        guard.insert(peer_addr, (flow_id, flow_tx, Arc::clone(&queued_bytes)));
                     }
 
                     let channel = UdpFlowChannel {
                         socket: Arc::clone(&task_socket),
                         peer_addr,
                         flow_id,
+                        _flow_permit: flow_permit,
                         rx: flow_rx,
+                        queued_bytes,
                         sessions: Arc::clone(&task_sessions),
                     };
 
@@ -178,19 +235,18 @@ impl UdpFrontend {
                         peer: PeerAddr::Socket(peer_addr),
                     };
 
-                    if accept_tx
-                        .send(accepted)
-                        .cancel_with(&task_cancel)
-                        .await
-                        .is_none_or(|r| r.is_err())
-                    {
-                        let mut guard = task_sessions.lock();
-                        if let Some((cur_id, _)) = guard.get(&peer_addr)
-                            && *cur_id == flow_id
-                        {
-                            guard.remove(&peer_addr);
+                    match accept_tx.try_send(accepted) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(rejected)) => {
+                            // Dropping the rejected flow removes its session and releases
+                            // the global permit; never stall the socket receive loop.
+                            drop(rejected);
+                            continue;
                         }
-                        break;
+                        Err(mpsc::error::TrySendError::Closed(rejected)) => {
+                            drop(rejected);
+                            break;
+                        }
                     }
                 }
             }
@@ -246,14 +302,16 @@ pub struct UdpFlowChannel {
     socket: Arc<UdpSocket>,
     peer_addr: SocketAddr,
     flow_id: u64,
+    _flow_permit: tokio::sync::OwnedSemaphorePermit,
     rx: mpsc::Receiver<Datagram>,
+    queued_bytes: Arc<AtomicUsize>,
     sessions: Arc<Mutex<UdpSessionMap>>,
 }
 
 impl Drop for UdpFlowChannel {
     fn drop(&mut self) {
         let mut guard = self.sessions.lock();
-        if let Some((current_id, _)) = guard.get(&self.peer_addr)
+        if let Some((current_id, _, _)) = guard.get(&self.peer_addr)
             && *current_id == self.flow_id
         {
             guard.remove(&self.peer_addr);
@@ -273,11 +331,13 @@ impl DatagramIo for UdpFlowChannel {
 
         match self.rx.poll_recv(cx) {
             Poll::Ready(Some(first)) => {
+                release_session_bytes(&self.queued_bytes, first.payload.len());
                 batch[0] = first;
                 let mut count = 1;
                 while count < batch.len() {
                     match self.rx.try_recv() {
                         Ok(next) => {
+                            release_session_bytes(&self.queued_bytes, next.payload.len());
                             batch[count] = next;
                             count += 1;
                         }
@@ -322,6 +382,18 @@ mod tests {
     use crate::core::serve::serve;
     use crate::io::pump::{PumpCtx, PumpRequest};
     use std::time::Duration;
+
+    #[test]
+    fn session_queue_byte_budget_is_strict_and_releasable() {
+        let queued = AtomicUsize::new(0);
+        assert!(try_reserve_session_bytes(&queued, UDP_SESSION_QUEUE_MAX_BYTES - 1));
+        assert!(!try_reserve_session_bytes(&queued, 2));
+        release_session_bytes(&queued, UDP_SESSION_QUEUE_MAX_BYTES - 1);
+        assert_eq!(queued.load(Ordering::Acquire), 0);
+        assert!(try_reserve_session_bytes(&queued, UDP_SESSION_QUEUE_MAX_BYTES));
+        release_session_bytes(&queued, UDP_SESSION_QUEUE_MAX_BYTES);
+        assert_eq!(queued.load(Ordering::Acquire), 0);
+    }
 
     fn get_ephemeral_udp_addr() -> String {
         let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
