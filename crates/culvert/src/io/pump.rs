@@ -1470,28 +1470,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_datagram_stream_pump_rejects_oversized_outbound_datagram() {
-        let (to_dgram_tx, _from_pump_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (_to_pump_tx, to_dgram_rx) = tokio::sync::mpsc::unbounded_channel();
-        let dgram_io = ChannelDatagramIo {
-            rx: to_dgram_rx,
-            tx: to_dgram_tx,
-        };
-        let (stream_a, _stream_b) = duplex(4096);
-        let mut oversized = vec![0u8; crate::consts::MAX_UDP_DATAGRAM_SIZE + 1];
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<Datagram>();
-        drop(rx);
-        // The pump's DatagramIo receiver is fed through the outbound channel.
-        // Replace the empty receiver with a channel carrying one oversized packet.
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
         let (packet_tx, packet_rx) = tokio::sync::mpsc::unbounded_channel();
         packet_tx.send(Datagram {
             flow: Default::default(),
-            payload: Bytes::from(std::mem::take(&mut oversized)),
+            payload: Bytes::from(vec![0u8; crate::consts::MAX_UDP_DATAGRAM_SIZE + 1]),
         }).unwrap();
         drop(packet_tx);
+
         let dgram_io = ChannelDatagramIo {
             rx: packet_rx,
-            tx: _from_pump_rx,
+            tx: out_tx,
         };
+        let (stream_a, _stream_b) = duplex(4096);
 
         let result = DatagramStreamPump::relay_datagram_stream(
             Box::new(dgram_io),
