@@ -486,6 +486,7 @@ impl StreamStreamPump {
 
 const DATAGRAM_BATCH_SIZE: usize = 16;
 const MAX_PENDING_DATAGRAMS: usize = 64;
+const MAX_PENDING_DATAGRAM_BYTES: usize = 256 * 1024;
 
 
 /// Decodes complete length-prefixed datagrams without exceeding the pending queue bound.
@@ -493,6 +494,7 @@ fn decode_pending_datagrams(
     rx_buf: &mut BytesMut,
     pending: &mut VecDeque<Datagram>,
     byte_counter: &mut u64,
+    pending_bytes: &mut usize,
 ) -> std::io::Result<()> {
     while pending.len() < MAX_PENDING_DATAGRAMS && rx_buf.len() >= 2 {
         let frame_len = u16::from_be_bytes([rx_buf[0], rx_buf[1]]) as usize;
@@ -502,6 +504,9 @@ fn decode_pending_datagrams(
                 "UDP datagram exceeds maximum payload size",
             ));
         }
+        if *pending_bytes + frame_len > MAX_PENDING_DATAGRAM_BYTES {
+            break;
+        }
         if rx_buf.len() < 2 + frame_len {
             break;
         }
@@ -509,6 +514,7 @@ fn decode_pending_datagrams(
         rx_buf.advance(2);
         let payload = rx_buf.split_to(frame_len).freeze();
         *byte_counter += frame_len as u64;
+        *pending_bytes += frame_len;
         pending.push_back(Datagram {
             flow: Default::default(),
             payload,
@@ -584,6 +590,8 @@ impl Pump for DatagramDatagramPump {
             let mut batch_b = vec![Datagram::default(); DATAGRAM_BATCH_SIZE];
             let mut queue_a_to_b: VecDeque<Datagram> = VecDeque::with_capacity(DATAGRAM_BATCH_SIZE);
             let mut queue_b_to_a: VecDeque<Datagram> = VecDeque::with_capacity(DATAGRAM_BATCH_SIZE);
+            let mut queue_a_to_b_bytes = 0usize;
+            let mut queue_b_to_a_bytes = 0usize;
             let mut bytes_a_to_b = 0u64;
             let mut bytes_b_to_a = 0u64;
             let mut a_done = false;
@@ -627,7 +635,9 @@ impl Pump for DatagramDatagramPump {
                 if !queue_a_to_b.is_empty() {
                     match b.poll_send(cx, queue_a_to_b.make_contiguous()) {
                         Poll::Ready(Ok(n)) if n > 0 => {
+                            let sent_bytes: usize = queue_a_to_b.iter().take(n).map(|d| d.payload.len()).sum();
                             queue_a_to_b.drain(..n);
+                            queue_a_to_b_bytes -= sent_bytes;
                             last_activity = Instant::now();
                             progress = true;
                         }
@@ -638,7 +648,9 @@ impl Pump for DatagramDatagramPump {
                 if !queue_b_to_a.is_empty() {
                     match a.poll_send(cx, queue_b_to_a.make_contiguous()) {
                         Poll::Ready(Ok(n)) if n > 0 => {
+                            let sent_bytes: usize = queue_b_to_a.iter().take(n).map(|d| d.payload.len()).sum();
                             queue_b_to_a.drain(..n);
+                            queue_b_to_a_bytes -= sent_bytes;
                             last_activity = Instant::now();
                             progress = true;
                         }
@@ -658,7 +670,12 @@ impl Pump for DatagramDatagramPump {
                         }
                         Poll::Ready(Ok(n)) => {
                             for d in batch_a.iter().take(n) {
-                                bytes_a_to_b += d.payload.len() as u64;
+                                let payload_len = d.payload.len();
+                                if queue_a_to_b_bytes + payload_len > MAX_PENDING_DATAGRAM_BYTES {
+                                    continue;
+                                }
+                                bytes_a_to_b += payload_len as u64;
+                                queue_a_to_b_bytes += payload_len;
                                 queue_a_to_b.push_back(d.clone());
                             }
                             last_activity = Instant::now();
@@ -680,7 +697,12 @@ impl Pump for DatagramDatagramPump {
                         }
                         Poll::Ready(Ok(n)) => {
                             for d in batch_b.iter().take(n) {
-                                bytes_b_to_a += d.payload.len() as u64;
+                                let payload_len = d.payload.len();
+                                if queue_b_to_a_bytes + payload_len > MAX_PENDING_DATAGRAM_BYTES {
+                                    continue;
+                                }
+                                bytes_b_to_a += payload_len as u64;
+                                queue_b_to_a_bytes += payload_len;
                                 queue_b_to_a.push_back(d.clone());
                             }
                             last_activity = Instant::now();
@@ -728,6 +750,7 @@ impl DatagramStreamPump {
         let mut rx_buf = BytesMut::with_capacity(RELAY_BUFFER_SIZE);
         let mut read_scratch = vec![0u8; RELAY_BUFFER_SIZE];
         let mut pending_dgrams: VecDeque<Datagram> = VecDeque::with_capacity(DATAGRAM_BATCH_SIZE);
+        let mut pending_dgram_bytes = 0usize;
         let mut stream_read_done = false;
 
         let mut dgram_to_stream_bytes: u64 = 0;
@@ -842,6 +865,9 @@ impl DatagramStreamPump {
                                     "UDP datagram exceeds maximum payload size",
                                 ))));
                             }
+                            if tx_scratch.len() + 2 + plen > MAX_PENDING_DATAGRAM_BYTES {
+                                continue;
+                            }
                             tx_scratch.put_u16(plen as u16);
                             tx_scratch.extend_from_slice(&d.payload);
                             dgram_to_stream_bytes += plen as u64;
@@ -901,6 +927,7 @@ impl DatagramStreamPump {
                 &mut rx_buf,
                 &mut pending_dgrams,
                 &mut stream_to_dgram_bytes,
+                &mut pending_dgram_bytes,
             ) {
                 return Poll::Ready(Err(TunnelError::Io(e)));
             }
@@ -918,6 +945,7 @@ impl DatagramStreamPump {
                                 &mut rx_buf,
                                 &mut pending_dgrams,
                                 &mut stream_to_dgram_bytes,
+                                &mut pending_dgram_bytes,
                             ) {
                                 return Poll::Ready(Err(TunnelError::Io(e)));
                             }
@@ -938,7 +966,9 @@ impl DatagramStreamPump {
                         ))));
                     }
                     Poll::Ready(Ok(sent)) => {
+                        let sent_bytes: usize = pending_dgrams.iter().take(sent).map(|d| d.payload.len()).sum();
                         pending_dgrams.drain(..sent);
+                        pending_dgram_bytes -= sent_bytes;
                         last_dgram_activity = Instant::now();
                         progress = true;
                     }
@@ -1599,13 +1629,14 @@ mod udp_frame_tests {
         }
         let mut pending = VecDeque::new();
         let mut total = 0;
+        let mut pending_bytes = 0;
 
-        decode_pending_datagrams(&mut rx, &mut pending, &mut total).unwrap();
+        decode_pending_datagrams(&mut rx, &mut pending, &mut total, &mut pending_bytes).unwrap();
         assert_eq!(pending.len(), MAX_PENDING_DATAGRAMS);
         assert_eq!(rx.len(), 14);
 
         pending.clear();
-        decode_pending_datagrams(&mut rx, &mut pending, &mut total).unwrap();
+        decode_pending_datagrams(&mut rx, &mut pending, &mut total, &mut pending_bytes).unwrap();
         assert_eq!(pending.len(), 7);
         assert!(rx.is_empty());
         assert_eq!(total, 0);
@@ -1617,7 +1648,8 @@ mod udp_frame_tests {
         rx.resize(2 + crate::consts::MAX_UDP_DATAGRAM_SIZE + 1, 0);
         let mut pending = VecDeque::new();
         let mut total = 0;
-        let err = decode_pending_datagrams(&mut rx, &mut pending, &mut total).unwrap_err();
+        let mut pending_bytes = 0;
+        let err = decode_pending_datagrams(&mut rx, &mut pending, &mut total, &mut pending_bytes).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }
