@@ -20,8 +20,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::common::CancelFutureExt;
 use crate::consts::{
-    ACCEPTED_STREAM_QUEUE_SIZE, MAX_UDP_SESSIONS, UDP_SESSION_CHANNEL_SIZE,
-    UDP_SESSION_QUEUE_MAX_BYTES,
+    ACCEPTED_STREAM_QUEUE_SIZE, MAX_UDP_DATAGRAM_SIZE, MAX_UDP_SESSIONS,
+    UDP_SESSION_CHANNEL_SIZE, UDP_SESSION_QUEUE_MAX_BYTES,
 };
 use crate::frontend::{Frontend, FrontendAccept, FrontendFactory, FrontendOutput};
 use crate::io::addr::{L4Protocol, ListenAddr, MappingSpec, PeerAddr, parse_listen_addr};
@@ -138,6 +138,11 @@ impl UdpFrontend {
                         continue;
                     }
                 };
+
+                if n > MAX_UDP_DATAGRAM_SIZE {
+                    tracing::debug!(size = n, "dropping oversized UDP datagram");
+                    continue;
+                }
 
                 let peer_addr = match raw_peer_addr {
                     SocketAddr::V6(v6) => SocketAddr::new(v6.ip().to_canonical(), v6.port()),
