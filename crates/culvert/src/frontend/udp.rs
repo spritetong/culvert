@@ -230,23 +230,14 @@ impl UdpFrontend {
 
                     match accept_tx.try_send(accepted) {
                         Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            // Drop the new flow rather than stalling the socket receive loop.
-                            let mut guard = task_sessions.lock();
-                            if let Some((cur_id, _, _)) = guard.get(&peer_addr)
-                                && *cur_id == flow_id
-                            {
-                                guard.remove(&peer_addr);
-                            }
+                        Err(mpsc::error::TrySendError::Full(rejected)) => {
+                            // Dropping the rejected flow removes its session and releases
+                            // the global permit; never stall the socket receive loop.
+                            drop(rejected);
                             continue;
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            let mut guard = task_sessions.lock();
-                            if let Some((cur_id, _, _)) = guard.get(&peer_addr)
-                                && *cur_id == flow_id
-                            {
-                                guard.remove(&peer_addr);
-                            }
+                        Err(mpsc::error::TrySendError::Closed(rejected)) => {
+                            drop(rejected);
                             break;
                         }
                     }
