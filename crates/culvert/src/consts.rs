@@ -66,7 +66,10 @@ pub const MAX_UDP_DATAGRAM_SIZE: usize = 65507;
 pub const DEFAULT_DEDUPLICATION_WINDOW_CAPACITY: usize = 256;
 
 /// Maximum number of active peer flows retained by one UDP frontend listener.
-pub const MAX_UDP_SESSIONS: usize = 4096;
+pub const MAX_UDP_SESSIONS: usize = 1024;
+
+/// Maximum queued UDP payload bytes retained by one peer session.
+pub const UDP_SESSION_QUEUE_MAX_BYTES: usize = 256 * 1024;
 
 /// Channel queue capacity per active UDP client NAT flow session.
 pub const UDP_SESSION_CHANNEL_SIZE: usize = 256;
