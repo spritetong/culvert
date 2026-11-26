@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::common::CancelFutureExt;
-use crate::consts::{ACCEPTED_STREAM_QUEUE_SIZE, UDP_SESSION_CHANNEL_SIZE};
+use crate::consts::{ACCEPTED_STREAM_QUEUE_SIZE, MAX_UDP_SESSIONS, UDP_SESSION_CHANNEL_SIZE};
 use crate::frontend::{Frontend, FrontendAccept, FrontendFactory, FrontendOutput};
 use crate::io::addr::{L4Protocol, ListenAddr, MappingSpec, PeerAddr, parse_listen_addr};
 use crate::io::channel::{Datagram, DatagramIo, FlowKey, IoChannel};
@@ -162,6 +162,17 @@ impl UdpFrontend {
 
                     {
                         let mut guard = task_sessions.lock();
+                        let stale = guard
+                            .get(&peer_addr)
+                            .is_some_and(|(_, sender)| sender.is_closed());
+                        if stale {
+                            guard.remove(&peer_addr);
+                        }
+                        // Enforce the per-listener flow cap while holding the same lock
+                        // used for insertion, so the limit cannot be exceeded.
+                        if guard.len() >= MAX_UDP_SESSIONS {
+                            continue;
+                        }
                         guard.insert(peer_addr, (flow_id, flow_tx));
                     }
 
@@ -178,19 +189,27 @@ impl UdpFrontend {
                         peer: PeerAddr::Socket(peer_addr),
                     };
 
-                    if accept_tx
-                        .send(accepted)
-                        .cancel_with(&task_cancel)
-                        .await
-                        .is_none_or(|r| r.is_err())
-                    {
-                        let mut guard = task_sessions.lock();
-                        if let Some((cur_id, _)) = guard.get(&peer_addr)
-                            && *cur_id == flow_id
-                        {
-                            guard.remove(&peer_addr);
+                    match accept_tx.try_send(accepted) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            // Drop the new flow rather than stalling the socket receive loop.
+                            let mut guard = task_sessions.lock();
+                            if let Some((cur_id, _)) = guard.get(&peer_addr)
+                                && *cur_id == flow_id
+                            {
+                                guard.remove(&peer_addr);
+                            }
+                            continue;
                         }
-                        break;
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            let mut guard = task_sessions.lock();
+                            if let Some((cur_id, _)) = guard.get(&peer_addr)
+                                && *cur_id == flow_id
+                            {
+                                guard.remove(&peer_addr);
+                            }
+                            break;
+                        }
                     }
                 }
             }
