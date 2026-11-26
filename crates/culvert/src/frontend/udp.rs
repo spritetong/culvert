@@ -33,13 +33,17 @@ use crate::io::stream::BoxFuture;
 type UdpSessionMap = HashMap<SocketAddr, (u64, mpsc::Sender<Datagram>, Arc<AtomicUsize>)>;
 
 fn try_reserve_session_bytes(queued: &AtomicUsize, amount: usize) -> bool {
-    queued.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-        current.checked_add(amount).filter(|next| *next <= UDP_SESSION_QUEUE_MAX_BYTES)
-    }).is_ok()
+    queued
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current
+                .checked_add(amount)
+                .filter(|next| *next <= UDP_SESSION_QUEUE_MAX_BYTES)
+        })
+        .is_ok()
 }
 
 fn release_session_bytes(queued: &AtomicUsize, amount: usize) {
-    let result = queued.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+    let result = queued.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
         current.checked_sub(amount)
     });
     debug_assert!(result.is_ok(), "UDP session byte accounting underflow");
@@ -191,6 +195,18 @@ impl UdpFrontend {
                 };
 
                 if let Some(first_dgram) = pending_first {
+                    if first_dgram.payload.len() > UDP_SESSION_QUEUE_MAX_BYTES {
+                        continue;
+                    }
+
+                    // Reserve an accept-queue slot before acquiring a global permit or mutating
+                    // the session table so a full accept queue never churns allocations or locks.
+                    let accept_permit = match accept_tx.try_reserve() {
+                        Ok(permit) => permit,
+                        Err(mpsc::error::TrySendError::Full(())) => continue,
+                        Err(mpsc::error::TrySendError::Closed(())) => break,
+                    };
+
                     // One process-wide permit bounds sessions across all UDP listeners.
                     let flow_permit = match udp_session_semaphore().clone().try_acquire_owned() {
                         Ok(permit) => permit,
@@ -202,9 +218,6 @@ impl UdpFrontend {
 
                     let (flow_tx, flow_rx) = mpsc::channel(UDP_SESSION_CHANNEL_SIZE);
                     let queued_bytes = Arc::new(AtomicUsize::new(first_dgram.payload.len()));
-                    if first_dgram.payload.len() > UDP_SESSION_QUEUE_MAX_BYTES {
-                        continue;
-                    }
                     if flow_tx.try_send(first_dgram).is_err() {
                         continue;
                     }
@@ -235,19 +248,7 @@ impl UdpFrontend {
                         peer: PeerAddr::Socket(peer_addr),
                     };
 
-                    match accept_tx.try_send(accepted) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(rejected)) => {
-                            // Dropping the rejected flow removes its session and releases
-                            // the global permit; never stall the socket receive loop.
-                            drop(rejected);
-                            continue;
-                        }
-                        Err(mpsc::error::TrySendError::Closed(rejected)) => {
-                            drop(rejected);
-                            break;
-                        }
-                    }
+                    accept_permit.send(accepted);
                 }
             }
         });
@@ -293,6 +294,9 @@ impl Frontend for UdpFrontend {
             if let Some(task) = self.recv_task.take() {
                 let _ = task.await;
             }
+            let mut rx = self.accept_rx.lock().await;
+            rx.close();
+            while rx.try_recv().is_ok() {}
         })
     }
 }
@@ -519,6 +523,111 @@ mod tests {
 
         cancel.cancel();
         let _ = serve_task.await;
+        fe.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_udp_frontend_enforces_session_byte_budget() {
+        let mut fe = UdpFrontend::bind(&get_ephemeral_udp_addr()).await.unwrap();
+        let listen_addr = fe.local_addr().unwrap();
+
+        let client_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // First establish client_a's flow and accept it without polling dgram_a yet.
+        let big_payload = vec![0x42u8; 60_000];
+        client_a.send_to(&big_payload, listen_addr).await.unwrap();
+
+        let mut slot = ReusableFutureRef::default();
+        fe.accept(&mut slot);
+        let acc_a = tokio::time::timeout(Duration::from_secs(2), &mut slot)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Send 5 more 60_000-byte packets with brief yields so the OS socket buffer drains into
+        // the session's mpsc queue (total 360_000 > UDP_SESSION_QUEUE_MAX_BYTES = 262_144).
+        for _ in 0..5 {
+            client_a.send_to(&big_payload, listen_addr).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        client_b.send_to(b"peer-b-ok", listen_addr).await.unwrap();
+        fe.accept(&mut slot);
+        let acc_b = tokio::time::timeout(Duration::from_secs(2), &mut slot)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut dgram_a = acc_a.channel.into_datagram().unwrap();
+        let mut total_a = 0usize;
+        let mut batch = vec![Datagram::default(); 8];
+        while let Ok(Ok(n)) = tokio::time::timeout(
+            Duration::from_millis(50),
+            std::future::poll_fn(|cx| dgram_a.poll_recv(cx, &mut batch)),
+        )
+        .await
+        {
+            if n == 0 {
+                break;
+            }
+            for d in &batch[..n] {
+                total_a += d.payload.len();
+            }
+        }
+        assert!(
+            total_a <= UDP_SESSION_QUEUE_MAX_BYTES,
+            "queued bytes {total_a} exceeded budget {UDP_SESSION_QUEUE_MAX_BYTES}"
+        );
+        assert!(total_a >= 60_000, "expected at least first packet");
+
+        let mut dgram_b = acc_b.channel.into_datagram().unwrap();
+        let n_b = tokio::time::timeout(
+            Duration::from_secs(1),
+            std::future::poll_fn(|cx| dgram_b.poll_recv(cx, &mut batch)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(n_b, 1);
+        assert_eq!(batch[0].payload.as_ref(), b"peer-b-ok");
+
+        drop(dgram_a);
+        drop(dgram_b);
+        fe.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_udp_frontend_full_accept_queue_does_not_stall_or_leak_permits() {
+        let mut fe = UdpFrontend::bind(&get_ephemeral_udp_addr()).await.unwrap();
+        let listen_addr = fe.local_addr().unwrap();
+
+        let mut clients = Vec::new();
+        for i in 0..(ACCEPTED_STREAM_QUEUE_SIZE + 8) {
+            let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            sock.send_to(format!("pkt-{i}").as_bytes(), listen_addr)
+                .await
+                .unwrap();
+            clients.push(sock);
+        }
+
+        // Wait briefly so recv_task processes all packets without stalling when accept_tx fills.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut slot = ReusableFutureRef::default();
+        let mut accepted = Vec::new();
+        for _ in 0..ACCEPTED_STREAM_QUEUE_SIZE {
+            fe.accept(&mut slot);
+            let acc = tokio::time::timeout(Duration::from_secs(1), &mut slot)
+                .await
+                .expect("accept stalled")
+                .unwrap();
+            accepted.push(acc);
+        }
+        assert_eq!(accepted.len(), ACCEPTED_STREAM_QUEUE_SIZE);
+
+        drop(accepted);
         fe.shutdown().await;
     }
 }

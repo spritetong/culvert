@@ -586,6 +586,37 @@ impl Pump for StreamDatagramPump {
     }
 }
 
+/// Flushes queued datagrams to `dst`, updating byte accounting and activity timestamp.
+fn flush_datagram_queue(
+    cx: &mut Context<'_>,
+    dst: &mut Box<dyn DatagramIo>,
+    queue: &mut VecDeque<Datagram>,
+    queue_bytes: &mut usize,
+    last_activity: &mut Instant,
+    progress: &mut bool,
+) -> Result<(), TunnelError> {
+    if queue.is_empty() {
+        return Ok(());
+    }
+    match dst.poll_send(cx, queue.make_contiguous()) {
+        Poll::Ready(Ok(0)) => Err(TunnelError::Io(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "datagram sender returned zero sent",
+        ))),
+        Poll::Ready(Ok(n)) => {
+            let count = n.min(queue.len());
+            let sent_bytes: usize = queue.iter().take(count).map(|d| d.payload.len()).sum();
+            queue.drain(..count);
+            *queue_bytes -= sent_bytes;
+            *last_activity = Instant::now();
+            *progress = true;
+            Ok(())
+        }
+        Poll::Ready(Err(e)) => Err(TunnelError::Io(e)),
+        Poll::Pending => Ok(()),
+    }
+}
+
 /// The `(Datagram, Datagram)` pump forwarding batched datagrams between two datagram channels.
 pub struct DatagramDatagramPump;
 
@@ -644,31 +675,25 @@ impl Pump for DatagramDatagramPump {
                 let mut progress = false;
 
                 // Flush queues
-                if !queue_a_to_b.is_empty() {
-                    match b.poll_send(cx, queue_a_to_b.make_contiguous()) {
-                        Poll::Ready(Ok(n)) if n > 0 => {
-                            let sent_bytes: usize = queue_a_to_b.iter().take(n).map(|d| d.payload.len()).sum();
-                            queue_a_to_b.drain(..n);
-                            queue_a_to_b_bytes -= sent_bytes;
-                            last_activity = Instant::now();
-                            progress = true;
-                        }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(TunnelError::Io(e))),
-                        _ => {}
-                    }
+                if let Err(e) = flush_datagram_queue(
+                    cx,
+                    &mut b,
+                    &mut queue_a_to_b,
+                    &mut queue_a_to_b_bytes,
+                    &mut last_activity,
+                    &mut progress,
+                ) {
+                    return Poll::Ready(Err(e));
                 }
-                if !queue_b_to_a.is_empty() {
-                    match a.poll_send(cx, queue_b_to_a.make_contiguous()) {
-                        Poll::Ready(Ok(n)) if n > 0 => {
-                            let sent_bytes: usize = queue_b_to_a.iter().take(n).map(|d| d.payload.len()).sum();
-                            queue_b_to_a.drain(..n);
-                            queue_b_to_a_bytes -= sent_bytes;
-                            last_activity = Instant::now();
-                            progress = true;
-                        }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(TunnelError::Io(e))),
-                        _ => {}
-                    }
+                if let Err(e) = flush_datagram_queue(
+                    cx,
+                    &mut a,
+                    &mut queue_b_to_a,
+                    &mut queue_b_to_a_bytes,
+                    &mut last_activity,
+                    &mut progress,
+                ) {
+                    return Poll::Ready(Err(e));
                 }
 
                 // Receive from A
@@ -684,7 +709,7 @@ impl Pump for DatagramDatagramPump {
                             progress = true;
                         }
                         Poll::Ready(Ok(n)) => {
-                            for d in batch_a.iter().take(n) {
+                            for d in batch_a[..batch_len_a].iter().take(n) {
                                 let payload_len = d.payload.len();
                                 if payload_len > crate::consts::MAX_UDP_DATAGRAM_SIZE {
                                     return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
@@ -723,7 +748,7 @@ impl Pump for DatagramDatagramPump {
                             progress = true;
                         }
                         Poll::Ready(Ok(n)) => {
-                            for d in batch_b.iter().take(n) {
+                            for d in batch_b[..batch_len_b].iter().take(n) {
                                 let payload_len = d.payload.len();
                                 if payload_len > crate::consts::MAX_UDP_DATAGRAM_SIZE {
                                     return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
@@ -824,28 +849,31 @@ impl DatagramStreamPump {
                     return Poll::Ready(Ok((dgram_to_stream_bytes, stream_to_dgram_bytes)));
                 }
 
-                let now_ms = activity_now_ms();
-                let effective_activity = stream.last_activity_ms().map(|ts| ts.max(pump_start_ms));
-                let (probe, expired) = heartbeat_timing(
-                    effective_activity,
-                    now_ms,
-                    heartbeat_interval,
-                    idle_timeout.saturating_add(tick_interval),
-                );
-                if expired {
-                    return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "Datagram relay tunnel stream idle timeout",
-                    ))));
-                }
-                if probe && let Poll::Ready(Err(e)) = stream.poll_send_ping(cx) {
-                    return Poll::Ready(Err(TunnelError::Io(e)));
-                }
-                if let Poll::Ready(HeartbeatStatus::Dead) = stream.poll_check_alive(cx) {
-                    return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "Datagram relay tunnel stream unresponsive to heartbeats",
-                    ))));
+                if !stream_read_done {
+                    let now_ms = activity_now_ms();
+                    let effective_activity =
+                        stream.last_activity_ms().map(|ts| ts.max(pump_start_ms));
+                    let (probe, expired) = heartbeat_timing(
+                        effective_activity,
+                        now_ms,
+                        heartbeat_interval,
+                        idle_timeout.saturating_add(tick_interval),
+                    );
+                    if expired {
+                        return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "Datagram relay tunnel stream idle timeout",
+                        ))));
+                    }
+                    if probe && let Poll::Ready(Err(e)) = stream.poll_send_ping(cx) {
+                        return Poll::Ready(Err(TunnelError::Io(e)));
+                    }
+                    if let Poll::Ready(HeartbeatStatus::Dead) = stream.poll_check_alive(cx) {
+                        return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "Datagram relay tunnel stream unresponsive to heartbeats",
+                        ))));
+                    }
                 }
             }
 
@@ -902,7 +930,10 @@ impl DatagramStreamPump {
                                 ))));
                             }
                             if tx_scratch.len() + 2 + plen > MAX_PENDING_DATAGRAM_BYTES {
-                                continue;
+                                return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "UDP datagram batch exceeded pending byte budget",
+                                ))));
                             }
                             tx_scratch.put_u16(plen as u16);
                             tx_scratch.extend_from_slice(&d.payload);
@@ -939,22 +970,22 @@ impl DatagramStreamPump {
                 match Pin::new(&mut *stream).poll_flush(cx) {
                     Poll::Ready(Ok(())) => {
                         need_flush = false;
-                    }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(TunnelError::Io(e))),
-                    Poll::Pending => return Poll::Pending,
-                }
-                if caps.half_close {
-                    match Pin::new(&mut *stream).poll_shutdown(cx) {
-                        Poll::Ready(Ok(())) => {
+                        if caps.half_close {
+                            match Pin::new(&mut *stream).poll_shutdown(cx) {
+                                Poll::Ready(Ok(())) => {
+                                    stream_write_shutdown = true;
+                                    progress = true;
+                                }
+                                Poll::Ready(Err(e)) => return Poll::Ready(Err(TunnelError::Io(e))),
+                                Poll::Pending => {}
+                            }
+                        } else {
                             stream_write_shutdown = true;
                             progress = true;
                         }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(TunnelError::Io(e))),
-                        Poll::Pending => {}
                     }
-                } else {
-                    stream_write_shutdown = true;
-                    progress = true;
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(TunnelError::Io(e))),
+                    Poll::Pending => {}
                 }
             }
 
@@ -1647,6 +1678,281 @@ mod tests {
         match result {
             Err(TunnelError::Io(e)) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput),
             other => panic!("expected InvalidInput, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_datagram_stream_pump_half_close_survives_heartbeat_on_eof_dead_stream() {
+        use crate::io::stream::BufferedTlsStream;
+
+        let (udp_tx, udp_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stream_to_udp_tx, _stream_to_udp_rx) = tokio::sync::mpsc::unbounded_channel();
+        let dgram_io = ChannelDatagramIo {
+            rx: udp_rx,
+            tx: stream_to_udp_tx,
+        };
+        let (stream_a, mut stream_b) = duplex(4096);
+        let stream_a = BufferedTlsStream::new(stream_a);
+
+        let pump = tokio::spawn(async move {
+            DatagramStreamPump::relay_datagram_stream(
+                Box::new(dgram_io),
+                Box::new(stream_a),
+                CancellationToken::new(),
+                Duration::from_millis(20),
+                Duration::from_secs(2),
+            )
+            .await
+        });
+
+        // Half-close stream_b and wait past multiple heartbeat ticks: BufferedTlsStream::poll_check_alive
+        // returns Dead on EOF, so the pump must gate liveness checks on !stream_read_done.
+        stream_b.shutdown().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let msg = b"still-alive-after-heartbeat";
+        udp_tx
+            .send(Datagram {
+                flow: Default::default(),
+                payload: Bytes::from_static(msg),
+            })
+            .unwrap();
+
+        let mut header = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(1), stream_b.read_exact(&mut header))
+            .await
+            .expect("pump aborted on heartbeat after stream read EOF")
+            .unwrap();
+        assert_eq!(u16::from_be_bytes(header) as usize, msg.len());
+        let mut payload = vec![0u8; msg.len()];
+        stream_b.read_exact(&mut payload).await.unwrap();
+        assert_eq!(payload.as_slice(), msg);
+
+        drop(udp_tx);
+        let (d2s, s2d) = tokio::time::timeout(Duration::from_secs(1), pump)
+            .await
+            .expect("pump did not finish after both sides closed")
+            .unwrap()
+            .unwrap();
+        assert_eq!(d2s, msg.len() as u64);
+        assert_eq!(s2d, 0);
+    }
+
+    #[tokio::test]
+    async fn test_datagram_stream_pump_pending_flush_does_not_starve_stream_to_dgram() {
+        use std::sync::atomic::AtomicBool;
+
+        struct PendingFlushStream {
+            inner: tokio::io::DuplexStream,
+            allow_flush: Arc<AtomicBool>,
+            flush_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+        }
+
+        impl tokio::io::AsyncRead for PendingFlushStream {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.inner).poll_read(cx, buf)
+            }
+        }
+
+        impl tokio::io::AsyncWrite for PendingFlushStream {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Pin::new(&mut self.inner).poll_write(cx, buf)
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                if self.allow_flush.load(Ordering::Acquire) {
+                    Poll::Ready(Ok(()))
+                } else {
+                    *self.flush_waker.lock().unwrap() = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+            }
+
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.inner).poll_shutdown(cx)
+            }
+        }
+
+        impl TunnelStream for PendingFlushStream {
+            fn caps(&self) -> StreamCaps {
+                StreamCaps {
+                    owned_write: false,
+                    half_close: true,
+                }
+            }
+
+            fn poll_check_alive(&mut self, _cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+                Poll::Ready(HeartbeatStatus::Alive)
+            }
+        }
+
+        let (to_dgram_tx, mut from_pump_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (to_pump_tx, to_dgram_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Close the datagram inbound side immediately so the pump enters the flush+shutdown path.
+        drop(to_pump_tx);
+
+        let dgram_io = ChannelDatagramIo {
+            rx: to_dgram_rx,
+            tx: to_dgram_tx,
+        };
+        let (stream_a, mut stream_b) = duplex(4096);
+        let allow_flush = Arc::new(AtomicBool::new(false));
+        let flush_waker = Arc::new(std::sync::Mutex::new(None::<std::task::Waker>));
+        let wrapped = PendingFlushStream {
+            inner: stream_a,
+            allow_flush: Arc::clone(&allow_flush),
+            flush_waker: Arc::clone(&flush_waker),
+        };
+
+        let pump = tokio::spawn(async move {
+            DatagramStreamPump::relay_datagram_stream(
+                Box::new(dgram_io),
+                Box::new(wrapped),
+                CancellationToken::new(),
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+            )
+            .await
+        });
+
+        let reply = b"tail-reply";
+        stream_b
+            .write_all(&(reply.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        stream_b.write_all(reply).await.unwrap();
+        stream_b.flush().await.unwrap();
+        stream_b.shutdown().await.unwrap();
+
+        let recvd = tokio::time::timeout(Duration::from_secs(1), from_pump_rx.recv())
+            .await
+            .expect("stream->dgram starved while stream poll_flush was Pending")
+            .unwrap();
+        assert_eq!(recvd.payload.as_ref(), reply);
+
+        allow_flush.store(true, Ordering::Release);
+        if let Some(w) = flush_waker.lock().unwrap().take() {
+            w.wake();
+        }
+        let (d2s, s2d) = tokio::time::timeout(Duration::from_secs(1), pump)
+            .await
+            .expect("pump did not exit after flush unblocked")
+            .unwrap()
+            .unwrap();
+        assert_eq!(d2s, 0);
+        assert_eq!(s2d, reply.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_datagram_datagram_pump_rejects_oversized_datagram() {
+        let (a_out_tx, _a_out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (a_in_tx, a_in_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (b_out_tx, _b_out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_b_in_tx, b_in_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        a_in_tx
+            .send(Datagram {
+                flow: Default::default(),
+                payload: Bytes::from(vec![0u8; crate::consts::MAX_UDP_DATAGRAM_SIZE + 1]),
+            })
+            .unwrap();
+
+        let req = PumpRequest::new(
+            IoChannel::from_datagram(ChannelDatagramIo {
+                rx: a_in_rx,
+                tx: a_out_tx,
+            }),
+            IoChannel::from_datagram(ChannelDatagramIo {
+                rx: b_in_rx,
+                tx: b_out_tx,
+            }),
+        );
+        let ctx = PumpCtx {
+            cancel: CancellationToken::new(),
+            heartbeat_interval: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(10),
+        };
+
+        let result = DatagramDatagramPump.run(req, ctx).await;
+        match result {
+            Err(TunnelError::Io(e)) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            other => panic!("expected InvalidData, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_datagram_datagram_pump_rejects_zero_send_progress() {
+        struct ZeroSendDatagramIo {
+            rx: tokio::sync::mpsc::UnboundedReceiver<Datagram>,
+        }
+
+        impl DatagramIo for ZeroSendDatagramIo {
+            fn poll_recv(
+                &mut self,
+                cx: &mut Context<'_>,
+                batch: &mut [Datagram],
+            ) -> Poll<io::Result<usize>> {
+                if batch.is_empty() {
+                    return Poll::Ready(Ok(0));
+                }
+                match self.rx.poll_recv(cx) {
+                    Poll::Ready(Some(d)) => {
+                        batch[0] = d;
+                        Poll::Ready(Ok(1))
+                    }
+                    Poll::Ready(None) => Poll::Ready(Ok(0)),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+
+            fn poll_send(
+                &mut self,
+                _cx: &mut Context<'_>,
+                _batch: &[Datagram],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(0))
+            }
+        }
+
+        let (a_out_tx, _a_out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (a_in_tx, a_in_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_b_in_tx, b_in_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        a_in_tx
+            .send(Datagram {
+                flow: Default::default(),
+                payload: Bytes::from_static(b"hello"),
+            })
+            .unwrap();
+
+        let req = PumpRequest::new(
+            IoChannel::from_datagram(ChannelDatagramIo {
+                rx: a_in_rx,
+                tx: a_out_tx,
+            }),
+            IoChannel::from_datagram(ZeroSendDatagramIo { rx: b_in_rx }),
+        );
+        let ctx = PumpCtx {
+            cancel: CancellationToken::new(),
+            heartbeat_interval: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(10),
+        };
+
+        let result = DatagramDatagramPump.run(req, ctx).await;
+        match result {
+            Err(TunnelError::Io(e)) => assert_eq!(e.kind(), io::ErrorKind::WriteZero),
+            other => panic!("expected WriteZero, got: {other:?}"),
         }
     }
 
