@@ -488,6 +488,18 @@ const DATAGRAM_BATCH_SIZE: usize = 4;
 const MAX_PENDING_DATAGRAMS: usize = 64;
 const MAX_PENDING_DATAGRAM_BYTES: usize = 256 * 1024;
 
+/// Returns a receive batch size that cannot exceed either pending queue budget.
+fn bounded_datagram_batch_len(
+    pending_datagrams: usize,
+    pending_bytes: usize,
+    batch_capacity: usize,
+) -> usize {
+    let packet_slots = MAX_PENDING_DATAGRAMS.saturating_sub(pending_datagrams);
+    let byte_slots = MAX_PENDING_DATAGRAM_BYTES
+        .saturating_sub(pending_bytes)
+        / crate::consts::MAX_UDP_DATAGRAM_SIZE;
+    packet_slots.min(byte_slots).min(batch_capacity)
+}
 
 /// Decodes complete length-prefixed datagrams without exceeding the pending queue bound.
 fn decode_pending_datagrams(
@@ -660,15 +672,13 @@ impl Pump for DatagramDatagramPump {
                 }
 
                 // Receive from A
-                if !a_done
-                    && !is_cancelled
-                    && queue_a_to_b.len() < MAX_PENDING_DATAGRAMS
-                    && queue_a_to_b_bytes + crate::consts::MAX_UDP_DATAGRAM_SIZE
-                        <= MAX_PENDING_DATAGRAM_BYTES
-                {
-                    let remaining = MAX_PENDING_DATAGRAMS - queue_a_to_b.len();
-                    let batch_len = remaining.min(batch_a.len());
-                    match a.poll_recv(cx, &mut batch_a[..batch_len]) {
+                let batch_len_a = bounded_datagram_batch_len(
+                    queue_a_to_b.len(),
+                    queue_a_to_b_bytes,
+                    batch_a.len(),
+                );
+                if !a_done && !is_cancelled && batch_len_a > 0 {
+                    match a.poll_recv(cx, &mut batch_a[..batch_len_a]) {
                         Poll::Ready(Ok(0)) => {
                             a_done = true;
                             progress = true;
@@ -692,15 +702,13 @@ impl Pump for DatagramDatagramPump {
                 }
 
                 // Receive from B
-                if !b_done
-                    && !is_cancelled
-                    && queue_b_to_a.len() < MAX_PENDING_DATAGRAMS
-                    && queue_b_to_a_bytes + crate::consts::MAX_UDP_DATAGRAM_SIZE
-                        <= MAX_PENDING_DATAGRAM_BYTES
-                {
-                    let remaining = MAX_PENDING_DATAGRAMS - queue_b_to_a.len();
-                    let batch_len = remaining.min(batch_b.len());
-                    match b.poll_recv(cx, &mut batch_b[..batch_len]) {
+                let batch_len_b = bounded_datagram_batch_len(
+                    queue_b_to_a.len(),
+                    queue_b_to_a_bytes,
+                    batch_b.len(),
+                );
+                if !b_done && !is_cancelled && batch_len_b > 0 {
+                    match b.poll_recv(cx, &mut batch_b[..batch_len_b]) {
                         Poll::Ready(Ok(0)) => {
                             b_done = true;
                             progress = true;
@@ -1039,6 +1047,21 @@ impl DatagramStreamPump {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn datagram_receive_batch_respects_remaining_byte_budget() {
+        assert_eq!(bounded_datagram_batch_len(0, 0, 4), 4);
+        assert_eq!(
+            bounded_datagram_batch_len(0, MAX_PENDING_DATAGRAM_BYTES - 80_000, 4),
+            1
+        );
+        assert_eq!(
+            bounded_datagram_batch_len(0, MAX_PENDING_DATAGRAM_BYTES - 60_000, 4),
+            0
+        );
+        assert_eq!(bounded_datagram_batch_len(63, 0, 4), 1);
+        assert_eq!(bounded_datagram_batch_len(64, 0, 4), 0);
+    }
     use crate::consts::{DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_IDLE_TIMEOUT};
     use std::io;
     use std::sync::Arc;
