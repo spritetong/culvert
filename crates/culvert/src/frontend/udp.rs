@@ -11,7 +11,7 @@ use reusable_future::ReusableFutureRef;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -27,6 +27,13 @@ use crate::io::stream::BoxFuture;
 
 /// Session table mapping client `SocketAddr` -> `(flow_id, inbound_sender)`.
 type UdpSessionMap = HashMap<SocketAddr, (u64, mpsc::Sender<Datagram>)>;
+
+/// Process-wide semaphore bounding active UDP peer flows across all listeners.
+fn udp_session_semaphore() -> &'static Arc<tokio::sync::Semaphore> {
+    static LIMIT: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    LIMIT.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_UDP_SESSIONS)))
+}
+
 
 /// Registered frontend factory for UDP port mappings.
 pub struct UdpFrontendFactory;
@@ -152,6 +159,12 @@ impl UdpFrontend {
                 };
 
                 if let Some(first_dgram) = pending_first {
+                    // One process-wide permit bounds sessions across all UDP listeners.
+                    let flow_permit = match udp_session_semaphore().clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => continue,
+                    };
+
                     let flow_id = next_flow_id;
                     next_flow_id = next_flow_id.wrapping_add(1).max(1);
 
@@ -168,11 +181,6 @@ impl UdpFrontend {
                         if stale {
                             guard.remove(&peer_addr);
                         }
-                        // Enforce the per-listener flow cap while holding the same lock
-                        // used for insertion, so the limit cannot be exceeded.
-                        if guard.len() >= MAX_UDP_SESSIONS {
-                            continue;
-                        }
                         guard.insert(peer_addr, (flow_id, flow_tx));
                     }
 
@@ -180,6 +188,7 @@ impl UdpFrontend {
                         socket: Arc::clone(&task_socket),
                         peer_addr,
                         flow_id,
+                        _flow_permit: flow_permit,
                         rx: flow_rx,
                         sessions: Arc::clone(&task_sessions),
                     };
@@ -265,6 +274,7 @@ pub struct UdpFlowChannel {
     socket: Arc<UdpSocket>,
     peer_addr: SocketAddr,
     flow_id: u64,
+    _flow_permit: tokio::sync::OwnedSemaphorePermit,
     rx: mpsc::Receiver<Datagram>,
     sessions: Arc<Mutex<UdpSessionMap>>,
 }
