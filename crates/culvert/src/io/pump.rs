@@ -487,6 +487,36 @@ impl StreamStreamPump {
 const DATAGRAM_BATCH_SIZE: usize = 16;
 const MAX_PENDING_DATAGRAMS: usize = 64;
 
+
+/// Decodes complete length-prefixed datagrams without exceeding the pending queue bound.
+fn decode_pending_datagrams(
+    rx_buf: &mut BytesMut,
+    pending: &mut VecDeque<Datagram>,
+    byte_counter: &mut u64,
+) -> std::io::Result<()> {
+    while pending.len() < MAX_PENDING_DATAGRAMS && rx_buf.len() >= 2 {
+        let frame_len = u16::from_be_bytes([rx_buf[0], rx_buf[1]]) as usize;
+        if frame_len > crate::consts::MAX_UDP_DATAGRAM_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "UDP datagram exceeds maximum payload size",
+            ));
+        }
+        if rx_buf.len() < 2 + frame_len {
+            break;
+        }
+
+        rx_buf.advance(2);
+        let payload = rx_buf.split_to(frame_len).freeze();
+        *byte_counter += frame_len as u64;
+        pending.push_back(Datagram {
+            flow: Default::default(),
+            payload,
+        });
+    }
+    Ok(())
+}
+
 /// The `(Datagram, Stream)` pump framing datagrams over a length-prefixed byte stream.
 ///
 /// Each datagram is encoded on the wire as `[u16 payload_len (big-endian) | payload bytes]`.
@@ -619,7 +649,8 @@ impl Pump for DatagramDatagramPump {
 
                 // Receive from A
                 if !a_done && !is_cancelled && queue_a_to_b.len() < MAX_PENDING_DATAGRAMS {
-                    match a.poll_recv(cx, &mut batch_a) {
+                    let remaining = MAX_PENDING_DATAGRAMS - queue_a_to_b.len();
+                    match a.poll_recv(cx, &mut batch_a[..remaining.min(batch_a.len())]) {
                         Poll::Ready(Ok(0)) => {
                             a_done = true;
                             progress = true;
@@ -639,7 +670,8 @@ impl Pump for DatagramDatagramPump {
 
                 // Receive from B
                 if !b_done && !is_cancelled && queue_b_to_a.len() < MAX_PENDING_DATAGRAMS {
-                    match b.poll_recv(cx, &mut batch_b) {
+                    let remaining = MAX_PENDING_DATAGRAMS - queue_b_to_a.len();
+                    match b.poll_recv(cx, &mut batch_b[..remaining.min(batch_b.len())]) {
                         Poll::Ready(Ok(0)) => {
                             b_done = true;
                             progress = true;
@@ -802,10 +834,10 @@ impl DatagramStreamPump {
                         tx_scratch.clear();
                         for d in recv_batch.iter().take(n) {
                             let plen = d.payload.len();
-                            if plen > u16::MAX as usize {
+                            if plen > crate::consts::MAX_UDP_DATAGRAM_SIZE {
                                 return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
                                     std::io::ErrorKind::InvalidInput,
-                                    "UDP datagram exceeds maximum u16 frame length",
+                                    "UDP datagram exceeds maximum payload size",
                                 ))));
                             }
                             tx_scratch.put_u16(plen as u16);
@@ -864,6 +896,14 @@ impl DatagramStreamPump {
             }
 
             // --- Direction 2: Stream -> Datagram (read & decode frames) ---
+            if let Err(e) = decode_pending_datagrams(
+                &mut rx_buf,
+                &mut pending_dgrams,
+                &mut stream_to_dgram_bytes,
+            ) {
+                return Poll::Ready(Err(TunnelError::Io(e)));
+            }
+
             if !stream_read_done && !is_cancelled && pending_dgrams.len() < MAX_PENDING_DATAGRAMS {
                 let mut read_buf = ReadBuf::new(&mut read_scratch);
                 match Pin::new(&mut *stream).poll_read(cx, &mut read_buf) {
@@ -873,19 +913,12 @@ impl DatagramStreamPump {
                             stream_read_done = true;
                         } else {
                             rx_buf.extend_from_slice(filled);
-                            while rx_buf.len() >= 2 {
-                                let frame_len = u16::from_be_bytes([rx_buf[0], rx_buf[1]]) as usize;
-                                if rx_buf.len() >= 2 + frame_len {
-                                    rx_buf.advance(2);
-                                    let payload = rx_buf.split_to(frame_len).freeze();
-                                    stream_to_dgram_bytes += frame_len as u64;
-                                    pending_dgrams.push_back(Datagram {
-                                        flow: Default::default(),
-                                        payload,
-                                    });
-                                } else {
-                                    break;
-                                }
+                            if let Err(e) = decode_pending_datagrams(
+                                &mut rx_buf,
+                                &mut pending_dgrams,
+                                &mut stream_to_dgram_bytes,
+                            ) {
+                                return Poll::Ready(Err(TunnelError::Io(e)));
                             }
                         }
                         progress = true;
@@ -913,9 +946,17 @@ impl DatagramStreamPump {
                 }
             }
 
-            if (stream_read_done && pending_dgrams.is_empty())
-                || (dgram_read_done && stream_write_shutdown && pending_dgrams.is_empty())
-            {
+            if stream_read_done && pending_dgrams.is_empty() {
+                if !rx_buf.is_empty() {
+                    return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "truncated UDP datagram frame at end of stream",
+                    ))));
+                }
+                return Poll::Ready(Ok((dgram_to_stream_bytes, stream_to_dgram_bytes)));
+            }
+
+            if dgram_read_done && stream_write_shutdown && pending_dgrams.is_empty() {
                 return Poll::Ready(Ok((dgram_to_stream_bytes, stream_to_dgram_bytes)));
             }
 
@@ -1419,5 +1460,48 @@ mod tests {
             "Pump must terminate promptly on UDP idle timeout"
         );
         assert!(res.unwrap().is_ok(), "UDP idle expiration is clean Ok exit");
+    }
+}
+
+
+#[cfg(test)]
+mod udp_frame_tests {
+    use super::*;
+
+    fn frame(payload: &[u8]) -> BytesMut {
+        let mut out = BytesMut::new();
+        out.put_u16(payload.len() as u16);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn decoder_never_exceeds_pending_limit_and_retains_remaining_frames() {
+        let mut rx = BytesMut::new();
+        for _ in 0..(MAX_PENDING_DATAGRAMS + 7) {
+            rx.extend_from_slice(&frame(&[]));
+        }
+        let mut pending = VecDeque::new();
+        let mut total = 0;
+
+        decode_pending_datagrams(&mut rx, &mut pending, &mut total).unwrap();
+        assert_eq!(pending.len(), MAX_PENDING_DATAGRAMS);
+        assert_eq!(rx.len(), 14);
+
+        pending.clear();
+        decode_pending_datagrams(&mut rx, &mut pending, &mut total).unwrap();
+        assert_eq!(pending.len(), 7);
+        assert!(rx.is_empty());
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn decoder_rejects_payload_length_above_udp_limit() {
+        let mut rx = BytesMut::from(&((crate::consts::MAX_UDP_DATAGRAM_SIZE + 1) as u16).to_be_bytes()[..]);
+        rx.resize(2 + crate::consts::MAX_UDP_DATAGRAM_SIZE + 1, 0);
+        let mut pending = VecDeque::new();
+        let mut total = 0;
+        let err = decode_pending_datagrams(&mut rx, &mut pending, &mut total).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }
