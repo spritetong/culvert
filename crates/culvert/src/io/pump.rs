@@ -686,8 +686,17 @@ impl Pump for DatagramDatagramPump {
                         Poll::Ready(Ok(n)) => {
                             for d in batch_a.iter().take(n) {
                                 let payload_len = d.payload.len();
+                                if payload_len > crate::consts::MAX_UDP_DATAGRAM_SIZE {
+                                    return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        "received UDP datagram exceeds maximum payload size",
+                                    ))));
+                                }
                                 if queue_a_to_b_bytes + payload_len > MAX_PENDING_DATAGRAM_BYTES {
-                                    continue;
+                                    return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        "UDP datagram batch exceeded pending byte budget",
+                                    ))));
                                 }
                                 bytes_a_to_b += payload_len as u64;
                                 queue_a_to_b_bytes += payload_len;
@@ -716,8 +725,17 @@ impl Pump for DatagramDatagramPump {
                         Poll::Ready(Ok(n)) => {
                             for d in batch_b.iter().take(n) {
                                 let payload_len = d.payload.len();
+                                if payload_len > crate::consts::MAX_UDP_DATAGRAM_SIZE {
+                                    return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        "received UDP datagram exceeds maximum payload size",
+                                    ))));
+                                }
                                 if queue_b_to_a_bytes + payload_len > MAX_PENDING_DATAGRAM_BYTES {
-                                    continue;
+                                    return Poll::Ready(Err(TunnelError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        "UDP datagram batch exceeded pending byte budget",
+                                    ))));
                                 }
                                 bytes_b_to_a += payload_len as u64;
                                 queue_b_to_a_bytes += payload_len;
