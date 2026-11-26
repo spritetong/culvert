@@ -11,6 +11,7 @@ use reusable_future::ReusableFutureRef;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use tokio::net::UdpSocket;
@@ -18,7 +19,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::common::CancelFutureExt;
-use crate::consts::{ACCEPTED_STREAM_QUEUE_SIZE, MAX_UDP_SESSIONS, UDP_SESSION_CHANNEL_SIZE};
+use crate::consts::{
+    ACCEPTED_STREAM_QUEUE_SIZE, MAX_UDP_SESSIONS, UDP_SESSION_CHANNEL_SIZE,
+    UDP_SESSION_QUEUE_MAX_BYTES,
+};
 use crate::frontend::{Frontend, FrontendAccept, FrontendFactory, FrontendOutput};
 use crate::io::addr::{L4Protocol, ListenAddr, MappingSpec, PeerAddr, parse_listen_addr};
 use crate::io::channel::{Datagram, DatagramIo, FlowKey, IoChannel};
@@ -26,7 +30,18 @@ use crate::io::error::TunnelError;
 use crate::io::stream::BoxFuture;
 
 /// Session table mapping client `SocketAddr` -> `(flow_id, inbound_sender)`.
-type UdpSessionMap = HashMap<SocketAddr, (u64, mpsc::Sender<Datagram>)>;
+type UdpSessionMap = HashMap<SocketAddr, (u64, mpsc::Sender<Datagram>, Arc<AtomicUsize>)>;
+
+fn try_reserve_session_bytes(queued: &AtomicUsize, amount: usize) -> bool {
+    queued.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        current.checked_add(amount).filter(|next| *next <= UDP_SESSION_QUEUE_MAX_BYTES)
+    }).is_ok()
+}
+
+fn release_session_bytes(queued: &AtomicUsize, amount: usize) {
+    let previous = queued.fetch_sub(amount, Ordering::AcqRel);
+    debug_assert!(previous >= amount, "UDP session byte accounting underflow");
+}
 
 /// Process-wide semaphore bounding active UDP peer flows across all listeners.
 fn udp_session_semaphore() -> &'static Arc<tokio::sync::Semaphore> {
@@ -140,19 +155,29 @@ impl UdpFrontend {
                 };
 
                 // Look up existing session sender without holding the mutex across awaits.
-                let existing_tx = {
+                let existing_session = {
                     let guard = task_sessions.lock();
-                    guard.get(&peer_addr).map(|(_, tx)| tx.clone())
+                    guard.get(&peer_addr).map(|(_, tx, queued)| {
+                        (tx.clone(), Arc::clone(queued))
+                    })
                 };
 
-                let pending_first = if let Some(tx) = existing_tx {
+                let pending_first = if let Some((tx, queued_bytes)) = existing_session {
+                    let payload_len = dgram.payload.len();
+                    if !try_reserve_session_bytes(&queued_bytes, payload_len) {
+                        continue;
+                    }
                     match tx.try_send(dgram) {
                         Ok(()) => continue,
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            // Backpressure drop-tail when session queue is saturated.
+                        Err(mpsc::error::TrySendError::Full(returned)) => {
+                            release_session_bytes(&queued_bytes, returned.payload.len());
+                            // Backpressure drop-tail when the session queue is saturated.
                             continue;
                         }
-                        Err(mpsc::error::TrySendError::Closed(returned)) => Some(returned),
+                        Err(mpsc::error::TrySendError::Closed(returned)) => {
+                            release_session_bytes(&queued_bytes, returned.payload.len());
+                            Some(returned)
+                        }
                     }
                 } else {
                     Some(dgram)
@@ -169,6 +194,10 @@ impl UdpFrontend {
                     next_flow_id = next_flow_id.wrapping_add(1).max(1);
 
                     let (flow_tx, flow_rx) = mpsc::channel(UDP_SESSION_CHANNEL_SIZE);
+                    let queued_bytes = Arc::new(AtomicUsize::new(first_dgram.payload.len()));
+                    if first_dgram.payload.len() > UDP_SESSION_QUEUE_MAX_BYTES {
+                        continue;
+                    }
                     if flow_tx.try_send(first_dgram).is_err() {
                         continue;
                     }
@@ -177,11 +206,11 @@ impl UdpFrontend {
                         let mut guard = task_sessions.lock();
                         let stale = guard
                             .get(&peer_addr)
-                            .is_some_and(|(_, sender)| sender.is_closed());
+                            .is_some_and(|(_, sender, _)| sender.is_closed());
                         if stale {
                             guard.remove(&peer_addr);
                         }
-                        guard.insert(peer_addr, (flow_id, flow_tx));
+                        guard.insert(peer_addr, (flow_id, flow_tx, Arc::clone(&queued_bytes)));
                     }
 
                     let channel = UdpFlowChannel {
@@ -190,6 +219,7 @@ impl UdpFrontend {
                         flow_id,
                         _flow_permit: flow_permit,
                         rx: flow_rx,
+                        queued_bytes,
                         sessions: Arc::clone(&task_sessions),
                     };
 
@@ -203,7 +233,7 @@ impl UdpFrontend {
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             // Drop the new flow rather than stalling the socket receive loop.
                             let mut guard = task_sessions.lock();
-                            if let Some((cur_id, _)) = guard.get(&peer_addr)
+                            if let Some((cur_id, _, _)) = guard.get(&peer_addr)
                                 && *cur_id == flow_id
                             {
                                 guard.remove(&peer_addr);
@@ -276,13 +306,14 @@ pub struct UdpFlowChannel {
     flow_id: u64,
     _flow_permit: tokio::sync::OwnedSemaphorePermit,
     rx: mpsc::Receiver<Datagram>,
+    queued_bytes: Arc<AtomicUsize>,
     sessions: Arc<Mutex<UdpSessionMap>>,
 }
 
 impl Drop for UdpFlowChannel {
     fn drop(&mut self) {
         let mut guard = self.sessions.lock();
-        if let Some((current_id, _)) = guard.get(&self.peer_addr)
+        if let Some((current_id, _, _)) = guard.get(&self.peer_addr)
             && *current_id == self.flow_id
         {
             guard.remove(&self.peer_addr);
@@ -302,11 +333,13 @@ impl DatagramIo for UdpFlowChannel {
 
         match self.rx.poll_recv(cx) {
             Poll::Ready(Some(first)) => {
+                release_session_bytes(&self.queued_bytes, first.payload.len());
                 batch[0] = first;
                 let mut count = 1;
                 while count < batch.len() {
                     match self.rx.try_recv() {
                         Ok(next) => {
+                            release_session_bytes(&self.queued_bytes, next.payload.len());
                             batch[count] = next;
                             count += 1;
                         }
