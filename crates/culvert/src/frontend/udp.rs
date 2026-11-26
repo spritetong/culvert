@@ -39,8 +39,10 @@ fn try_reserve_session_bytes(queued: &AtomicUsize, amount: usize) -> bool {
 }
 
 fn release_session_bytes(queued: &AtomicUsize, amount: usize) {
-    let previous = queued.fetch_sub(amount, Ordering::AcqRel);
-    debug_assert!(previous >= amount, "UDP session byte accounting underflow");
+    let result = queued.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        current.checked_sub(amount)
+    });
+    debug_assert!(result.is_ok(), "UDP session byte accounting underflow");
 }
 
 /// Process-wide semaphore bounding active UDP peer flows across all listeners.
