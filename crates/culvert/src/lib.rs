@@ -25,6 +25,7 @@ pub mod session;
 pub mod supervisor;
 pub mod transport;
 pub mod tunnel;
+pub mod v2;
 
 pub use client::ClientRunner;
 pub use daemon::run_daemon;
