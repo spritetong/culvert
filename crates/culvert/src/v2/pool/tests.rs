@@ -311,3 +311,49 @@ async fn reverse_inbound_pool_supports_push_try_acquire_wait_and_clear() {
         .expect("pool actor must exit on shutdown")
         .unwrap();
 }
+
+#[tokio::test]
+async fn cancelled_acquire_waiter_is_purged_and_stop_replenishing_halts_dials() {
+    let dial_count = Arc::new(AtomicUsize::new(0));
+    let conn = Arc::new(MockDialConnector {
+        dial_count: Arc::clone(&dial_count),
+        fail_dials: Arc::new(AtomicBool::new(false)),
+        last_tunnel_id: Arc::new(parking_lot::Mutex::new(None)),
+    });
+
+    // Reverse inbound pool starts empty; cancelling acquire() leaves zero pending waiters.
+    let (rev_pool, rev_join) = TransportPool::start(
+        PoolConfig::reverse_inbound(2, Duration::from_secs(30)),
+        CancellationToken::new(),
+    );
+    let waiter = {
+        let p = rev_pool.clone();
+        tokio::spawn(async move { p.acquire().await })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(rev_pool.stats().await.unwrap().pending_waiters, 1);
+    waiter.abort();
+    let _ = waiter.await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(rev_pool.stats().await.unwrap().pending_waiters, 0);
+    assert_eq!(rev_pool.stats().await.unwrap().active_count, 0);
+    rev_pool.shutdown();
+    rev_join.await.unwrap();
+
+    // Forward pool: stop_replenishing() halts new dials while existing leases stay valid until dropped.
+    let cfg = PoolConfig::forward(conn, 1, DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_IDLE_TIMEOUT);
+    let (fwd_pool, fwd_join) = TransportPool::start(cfg, CancellationToken::new());
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let lease = fwd_pool.acquire().await.unwrap();
+    let dials_before_drain = dial_count.load(Ordering::Acquire);
+
+    fwd_pool.stop_replenishing().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(dial_count.load(Ordering::Acquire), dials_before_drain);
+    assert_eq!(fwd_pool.stats().await.unwrap().active_count, 1);
+
+    drop(lease);
+    fwd_pool.shutdown();
+    let summary = fwd_join.await.unwrap();
+    assert_eq!(summary.final_stats.active_count, 0);
+}

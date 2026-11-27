@@ -24,14 +24,14 @@ pub enum PoolReleaseSignal {
 /// RAII drop guard maintaining the pool's authoritative active stream count.
 pub struct LeaseGuard {
     active_count: Arc<AtomicUsize>,
-    release_tx: mpsc::UnboundedSender<PoolReleaseSignal>,
+    release_tx: mpsc::Sender<PoolReleaseSignal>,
     disarmed: bool,
 }
 
 impl LeaseGuard {
     pub(crate) fn new(
         active_count: Arc<AtomicUsize>,
-        release_tx: mpsc::UnboundedSender<PoolReleaseSignal>,
+        release_tx: mpsc::Sender<PoolReleaseSignal>,
     ) -> Self {
         active_count.fetch_add(1, Ordering::AcqRel);
         Self {
@@ -62,7 +62,9 @@ impl Drop for LeaseGuard {
             .try_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
                 Some(n.saturating_sub(1))
             });
-        let _ = self.release_tx.send(PoolReleaseSignal::Released);
+        // Non-blocking try_send into a 1-slot coalescing channel guarantees bounded memory
+        // and clean no-op behavior if a lease drops after the Pool Actor exits.
+        let _ = self.release_tx.try_send(PoolReleaseSignal::Released);
     }
 }
 
@@ -79,7 +81,7 @@ impl StreamLease {
     pub(crate) fn new(
         stream: Box<dyn TunnelStream>,
         active_count: Arc<AtomicUsize>,
-        release_tx: mpsc::UnboundedSender<PoolReleaseSignal>,
+        release_tx: mpsc::Sender<PoolReleaseSignal>,
     ) -> Self {
         Self {
             stream: Some(stream),

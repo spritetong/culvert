@@ -6,9 +6,9 @@
 //! All comments and docstrings must be in English.
 
 use crate::v2::{
-    ActiveStage, CloseReason, ClosingStage, ConnectingContext, Coordinator, ExternalState,
-    StateEngine, TaskDirective, TaskError, TaskId, TaskOutcome, TaskWorkflow, TunnelPhase,
-    WaitResult,
+    ActiveStage, CloseReason, ClosingStage, CompletedJob, ConnectingContext, Coordinator,
+    ExternalState, JobId, StateEngine, TaskDirective, TaskError, TaskId, TaskOutcome, TaskWorkflow,
+    TunnelPhase, WaitResult,
 };
 use std::future::Future;
 use std::sync::Arc;
@@ -25,26 +25,39 @@ use tokio_util::sync::CancellationToken;
 #[test]
 fn state_engine_recycle_and_draining_shutdown() {
     let mut engine = StateEngine::<()>::new();
-    let (id, mut rx) = engine.register_task(ExternalState::Empty).unwrap();
+    let reg = engine.register_task(ExternalState::Empty).unwrap();
+    let id = reg.id;
+    let mut rx = reg.directive_rx;
+    assert_eq!(reg.job_id, None);
     assert_eq!(engine.task_state(id), Some(ExternalState::Empty));
     assert_eq!(engine.idle_task_count(), 1);
 
-    // Pop idle for connect: Empty -> Connecting
-    assert_eq!(engine.pop_idle_for_connect().unwrap(), Some(id));
+    // Pop idle for connect: Empty -> Connecting with fresh JobId
+    let (popped_id, job_1) = engine.pop_idle_for_connect().unwrap().unwrap();
+    assert_eq!(popped_id, id);
+    assert_eq!(engine.task_job(id), Some(job_1));
     assert_eq!(engine.idle_task_count(), 0);
     assert_eq!(engine.task_state(id), Some(ExternalState::Connecting));
-    engine.dispatch_to_task(id, ());
-    assert!(matches!(rx.try_recv(), Ok(TaskDirective::Assign(()))));
+    engine.dispatch_to_task(id, job_1, ());
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(TaskDirective::Assign { job_id, .. }) if job_id == job_1
+    ));
 
     // Connecting -> Active -> Closing -> Recycled back to Empty
-    engine.apply_task_state(id, ExternalState::Active);
+    engine.apply_task_state(id, job_1, ExternalState::Active);
     assert_eq!(engine.task_state(id), Some(ExternalState::Active));
-    engine.apply_task_state(id, ExternalState::Closing);
+    engine.apply_task_state(id, job_1, ExternalState::Closing);
     assert_eq!(engine.task_state(id), Some(ExternalState::Closing));
 
-    assert!(engine.on_task_recycled(id));
+    assert!(engine.on_task_recycled(id, job_1));
     assert_eq!(engine.task_state(id), Some(ExternalState::Empty));
+    assert_eq!(engine.task_job(id), None);
     assert_eq!(engine.idle_task_count(), 1);
+
+    // Stale job notification after recycle must be ignored
+    engine.apply_task_state(id, job_1, ExternalState::Active);
+    assert_eq!(engine.task_state(id), Some(ExternalState::Empty));
 
     // Graceful stop sends Shutdown to Empty task
     assert_eq!(engine.begin_graceful_stop(), TunnelPhase::Draining);
@@ -58,8 +71,11 @@ fn state_engine_recycle_and_draining_shutdown() {
 #[test]
 fn state_engine_detects_wait_cycles_and_resolves_dependencies() {
     let mut engine = StateEngine::<()>::new();
-    let (a, _rx_a) = engine.register_task(ExternalState::Connecting).unwrap();
-    let (b, _rx_b) = engine.register_task(ExternalState::Connecting).unwrap();
+    let reg_a = engine.register_task(ExternalState::Connecting).unwrap();
+    let reg_b = engine.register_task(ExternalState::Connecting).unwrap();
+    let a = reg_a.id;
+    let job_a = reg_a.job_id.unwrap();
+    let b = reg_b.id;
 
     // Self-wait is an immediate cycle
     let (tx_self, mut rx_self) = oneshot::channel();
@@ -77,8 +93,45 @@ fn state_engine_detects_wait_cycles_and_resolves_dependencies() {
     assert_eq!(rx_ab.try_recv().unwrap(), WaitResult::CycleDetected);
 
     // Transition A -> Active wakes B
-    engine.apply_task_state(a, ExternalState::Active);
+    engine.apply_task_state(a, job_a, ExternalState::Active);
     assert_eq!(rx_ba.try_recv().unwrap(), WaitResult::Reached);
+}
+
+#[test]
+fn state_engine_waiter_recycle_semantics_distinguishes_empty_and_closed() {
+    let mut engine = StateEngine::<()>::new();
+    let reg_t = engine.register_task(ExternalState::Connecting).unwrap();
+    let reg_e = engine.register_task(ExternalState::Connecting).unwrap();
+    let reg_c = engine.register_task(ExternalState::Connecting).unwrap();
+    let reg_a = engine.register_task(ExternalState::Connecting).unwrap();
+    let target = reg_t.id;
+    let job_1 = reg_t.job_id.unwrap();
+    let waiter_empty = reg_e.id;
+    let waiter_closed = reg_c.id;
+    let waiter_active = reg_a.id;
+
+    let (tx_empty, mut rx_empty) = oneshot::channel();
+    let (tx_closed, mut rx_closed) = oneshot::channel();
+    let (tx_active, mut rx_active) = oneshot::channel();
+    engine.register_waiter(waiter_empty, target, ExternalState::Empty, tx_empty);
+    engine.register_waiter(waiter_closed, target, ExternalState::Closed, tx_closed);
+    engine.register_waiter(waiter_active, target, ExternalState::Active, tx_active);
+
+    // Target recycles back to Empty after failing Connecting (without reaching Active or Closed):
+    // - Waiter for Empty -> Reached
+    // - Waiter for Closed -> Still pending until complete_task
+    // - Waiter for Active -> TargetClosed(Empty), never leaks into Job 2
+    assert!(engine.on_task_recycled(target, job_1));
+    assert_eq!(rx_empty.try_recv().unwrap(), WaitResult::Reached);
+    assert!(rx_closed.try_recv().is_err());
+    assert_eq!(
+        rx_active.try_recv().unwrap(),
+        WaitResult::TargetClosed(ExternalState::Empty)
+    );
+
+    // Only when target actually completes to Closed does waiter_closed receive Reached
+    engine.complete_task(target);
+    assert_eq!(rx_closed.try_recv().unwrap(), WaitResult::Reached);
 }
 
 // =============================================================================
@@ -98,6 +151,7 @@ enum MockInput {
     ForeverPending {
         on_active: Option<Arc<Notify>>,
     },
+    PanicInConnect,
 }
 
 struct MockActive {
@@ -144,6 +198,7 @@ impl TaskWorkflow for MockWorkflow {
                     on_active,
                     closed_jobs,
                 }),
+                MockInput::PanicInConnect => panic!("intentional test panic inside IoTask"),
             }
         }
     }
@@ -251,8 +306,16 @@ async fn task_recycles_to_empty_and_reuses_same_id() {
     assert_eq!(
         summary.completed_jobs,
         vec![
-            (task_id, TaskOutcome::Completed),
-            (task_id, TaskOutcome::Completed),
+            CompletedJob {
+                task_id,
+                job_id: JobId::new(1),
+                outcome: TaskOutcome::Completed,
+            },
+            CompletedJob {
+                task_id,
+                job_id: JobId::new(2),
+                outcome: TaskOutcome::Completed,
+            },
         ]
     );
 }
@@ -314,12 +377,14 @@ async fn inter_task_coordination_and_proactive_recycle() {
     assert!(
         summary
             .completed_jobs
-            .contains(&(task_a, TaskOutcome::GracefullyDrained))
+            .iter()
+            .any(|c| { c.task_id == task_a && c.outcome == TaskOutcome::GracefullyDrained })
     );
     assert!(
         summary
             .completed_jobs
-            .contains(&(task_b, TaskOutcome::Completed))
+            .iter()
+            .any(|c| c.task_id == task_b && c.outcome == TaskOutcome::Completed)
     );
 }
 
@@ -354,7 +419,45 @@ async fn dropping_all_handles_triggers_force_stop_immediately() {
     assert_eq!(summary.final_phase, TunnelPhase::Stopped);
     assert_eq!(
         summary.completed_jobs,
-        vec![(task_id, TaskOutcome::ForceStopped)]
+        vec![CompletedJob {
+            task_id,
+            job_id: JobId::new(1),
+            outcome: TaskOutcome::ForceStopped,
+        }]
     );
     assert_eq!(closed_jobs.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test]
+async fn coordinator_cleans_up_panicked_task_and_exits_gracefully() {
+    let cancel = CancellationToken::new();
+    let (handle, join) = Coordinator::start(
+        MockWorkflow {
+            closed_jobs: Arc::new(AtomicUsize::new(0)),
+        },
+        Duration::from_millis(500),
+        cancel,
+    );
+
+    let panicked_task = handle.assign(MockInput::PanicInConnect).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    // Task entry must have been removed upon JoinError so query returns None.
+    assert_eq!(handle.query_task_state(panicked_task).await.unwrap(), None);
+
+    // Coordinator must reach Stopped immediately instead of hanging in Draining.
+    let phase = handle.graceful_stop().await.unwrap();
+    assert_eq!(phase, TunnelPhase::Stopped);
+
+    let summary = tokio::time::timeout(Duration::from_secs(1), join)
+        .await
+        .expect("coordinator must not stall after a task panic")
+        .unwrap();
+    assert_eq!(summary.final_phase, TunnelPhase::Stopped);
+    assert_eq!(summary.completed_jobs.len(), 1);
+    assert_eq!(summary.completed_jobs[0].task_id, panicked_task);
+    assert!(matches!(
+        summary.completed_jobs[0].outcome,
+        TaskOutcome::Failed(_)
+    ));
 }

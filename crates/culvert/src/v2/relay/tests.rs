@@ -161,10 +161,8 @@ async fn duplex_relay_transfers_half_closes_and_recycles() {
         .unwrap()
         .unwrap();
     assert_eq!(summary.completed_tasks_len(), 1);
-    assert_eq!(
-        summary.completed_jobs,
-        vec![(task_id, TaskOutcome::Completed)]
-    );
+    assert_eq!(summary.completed_jobs[0].task_id, task_id);
+    assert_eq!(summary.completed_jobs[0].outcome, TaskOutcome::Completed);
 }
 
 #[tokio::test]
@@ -198,10 +196,9 @@ async fn duplex_relay_force_stop_exits_immediately_while_idle_forever() {
         .expect("force stop must not wait for 30s drain or idle timeout")
         .unwrap();
     assert!(started.elapsed() < Duration::from_millis(250));
-    assert_eq!(
-        summary.completed_jobs,
-        vec![(task_id, TaskOutcome::ForceStopped)]
-    );
+    assert_eq!(summary.completed_jobs.len(), 1);
+    assert_eq!(summary.completed_jobs[0].task_id, task_id);
+    assert_eq!(summary.completed_jobs[0].outcome, TaskOutcome::ForceStopped);
 }
 
 #[tokio::test]
@@ -239,9 +236,9 @@ async fn duplex_relay_idle_timeout_reports_failure_and_recycles() {
         .unwrap()
         .unwrap();
     assert_eq!(summary.completed_jobs.len(), 1);
-    assert_eq!(summary.completed_jobs[0].0, task_id);
+    assert_eq!(summary.completed_jobs[0].task_id, task_id);
     assert!(matches!(
-        summary.completed_jobs[0].1,
+        summary.completed_jobs[0].outcome,
         TaskOutcome::Failed(_)
     ));
 }
@@ -403,10 +400,9 @@ async fn channel_relay_datagram_stream_frames_and_half_closes() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        summary.completed_jobs,
-        vec![(task_id, TaskOutcome::Completed)]
-    );
+    assert_eq!(summary.completed_jobs.len(), 1);
+    assert_eq!(summary.completed_jobs[0].task_id, task_id);
+    assert_eq!(summary.completed_jobs[0].outcome, TaskOutcome::Completed);
 }
 
 #[tokio::test]
@@ -473,8 +469,7 @@ async fn channel_relay_datagram_datagram_forwards_batches() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        summary.completed_jobs,
-        vec![(task_id, TaskOutcome::Completed)]
-    );
+    assert_eq!(summary.completed_jobs.len(), 1);
+    assert_eq!(summary.completed_jobs[0].task_id, task_id);
+    assert_eq!(summary.completed_jobs[0].outcome, TaskOutcome::Completed);
 }

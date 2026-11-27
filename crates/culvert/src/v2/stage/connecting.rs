@@ -7,7 +7,7 @@
 
 use crate::v2::coordinator::Microtask;
 use crate::v2::error::TaskError;
-use crate::v2::state::{ExternalState, TaskId, WaitResult};
+use crate::v2::state::{ExternalState, JobId, TaskId, WaitResult};
 use tokio::sync::{mpsc, oneshot};
 
 /// Narrow capability object passed into `TaskWorkflow::connect`.
@@ -16,20 +16,35 @@ use tokio::sync::{mpsc, oneshot};
 /// high-priority microtask channel without exposing Coordinator internals.
 pub struct ConnectingContext<'a> {
     task_id: TaskId,
+    job_id: JobId,
     micro_tx: &'a mpsc::UnboundedSender<Microtask>,
 }
 
 impl<'a> ConnectingContext<'a> {
-    /// Creates a new `ConnectingContext` bound to `task_id` and `micro_tx`.
+    /// Creates a new `ConnectingContext` bound to `task_id`, `job_id`, and `micro_tx`.
     #[inline]
-    pub fn new(task_id: TaskId, micro_tx: &'a mpsc::UnboundedSender<Microtask>) -> Self {
-        Self { task_id, micro_tx }
+    pub fn new(
+        task_id: TaskId,
+        job_id: JobId,
+        micro_tx: &'a mpsc::UnboundedSender<Microtask>,
+    ) -> Self {
+        Self {
+            task_id,
+            job_id,
+            micro_tx,
+        }
     }
 
-    /// Returns the ID of the running task.
+    /// Returns the ID of the worker task executing this job.
     #[inline]
     pub fn task_id(&self) -> TaskId {
         self.task_id
+    }
+
+    /// Returns the ID of the current job cycle on this worker task.
+    #[inline]
+    pub fn job_id(&self) -> JobId {
+        self.job_id
     }
 
     /// Waits for `target` to reach `desired` external state via the Coordinator.

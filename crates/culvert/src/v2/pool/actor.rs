@@ -48,6 +48,9 @@ enum PoolCommand {
     Stats {
         reply: oneshot::Sender<PoolStats>,
     },
+    StopReplenishing {
+        reply: oneshot::Sender<()>,
+    },
 }
 
 struct PoolHandleInner {
@@ -130,6 +133,18 @@ impl PoolHandle {
         reply_rx.await.map_err(|_| TunnelError::PoolExhausted)
     }
 
+    /// Halts background replenishment dialing while allowing existing leases to release during
+    /// Coordinator graceful drain.
+    pub async fn stop_replenishing(&self) -> Result<(), TunnelError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.inner
+            .cmd_tx
+            .send(PoolCommand::StopReplenishing { reply: reply_tx })
+            .await
+            .map_err(|_| TunnelError::PoolExhausted)?;
+        reply_rx.await.map_err(|_| TunnelError::PoolExhausted)
+    }
+
     /// Immediately stops the pool actor via its `CancellationToken`.
     #[inline]
     pub fn shutdown(&self) {
@@ -148,6 +163,7 @@ impl PoolHandle {
 pub struct TransportPool {
     role: PoolRole,
     acquire_timeout: Duration,
+    draining: bool,
     inventory: PoolInventory,
     pending: VecDeque<PendingAcquire>,
     connecting: FuturesUnordered<BoxFuture<'static, Result<Box<dyn TunnelStream>, TunnelError>>>,
@@ -155,8 +171,8 @@ pub struct TransportPool {
     backoff: Duration,
     retry_sleep: Option<Pin<Box<Sleep>>>,
     cancel_token: CancellationToken,
-    release_tx: mpsc::UnboundedSender<PoolReleaseSignal>,
-    release_rx: mpsc::UnboundedReceiver<PoolReleaseSignal>,
+    release_tx: mpsc::Sender<PoolReleaseSignal>,
+    release_rx: mpsc::Receiver<PoolReleaseSignal>,
     _keep_cmd_tx: mpsc::Sender<PoolCommand>,
     cmd_rx: mpsc::Receiver<PoolCommand>,
 }
@@ -168,7 +184,7 @@ impl TransportPool {
         cancel_token: CancellationToken,
     ) -> (PoolHandle, JoinHandle<PoolSummary>) {
         let (cmd_tx, cmd_rx) = mpsc::channel(POOL_CMD_QUEUE_CAPACITY);
-        let (release_tx, release_rx) = mpsc::unbounded_channel();
+        let (release_tx, release_rx) = mpsc::channel(1);
 
         let handle = PoolHandle {
             inner: Arc::new(PoolHandleInner {
@@ -192,6 +208,7 @@ impl TransportPool {
         let actor = Self {
             role: config.role,
             acquire_timeout: config.acquire_timeout,
+            draining: false,
             inventory,
             pending: VecDeque::new(),
             connecting: FuturesUnordered::new(),
@@ -218,6 +235,7 @@ impl TransportPool {
 
         loop {
             self.drain_release_signals();
+            self.purge_closed_waiters();
             self.replenish_if_needed();
 
             tokio::select! {
@@ -267,7 +285,15 @@ impl TransportPool {
         while self.release_rx.try_recv().is_ok() {}
     }
 
+    fn purge_closed_waiters(&mut self) {
+        self.pending.retain(|req| !req.reply.is_closed());
+    }
+
     fn replenish_if_needed(&mut self) {
+        if self.draining {
+            self.retry_sleep = None;
+            return;
+        }
         let PoolRole::ActiveDial { connector, dial } = &self.role else {
             return;
         };
@@ -348,6 +374,9 @@ impl TransportPool {
     async fn handle_command(&mut self, cmd: PoolCommand) {
         match cmd {
             PoolCommand::Acquire { reply } => {
+                if reply.is_closed() {
+                    return;
+                }
                 let acquired = poll_fn(|cx| Poll::Ready(self.inventory.take_live_idle(cx))).await;
                 if let Some(stream) = acquired {
                     self.send_lease_or_reclaim(reply, stream);
@@ -367,6 +396,9 @@ impl TransportPool {
                 }
             }
             PoolCommand::TryAcquire { reply } => {
+                if reply.is_closed() {
+                    return;
+                }
                 let acquired = poll_fn(|cx| Poll::Ready(self.inventory.take_live_idle(cx))).await;
                 let lease = acquired.map(|stream| self.new_lease(stream));
                 if let Err(Some(returned)) = reply.send(lease)
@@ -388,10 +420,16 @@ impl TransportPool {
                 let _ = reply.send(cleared);
             }
             PoolCommand::Stats { reply } => {
+                self.purge_closed_waiters();
                 let _ = reply.send(
                     self.inventory
                         .stats(self.pending.len(), self.connecting.len()),
                 );
+            }
+            PoolCommand::StopReplenishing { reply } => {
+                self.draining = true;
+                self.retry_sleep = None;
+                let _ = reply.send(());
             }
         }
     }

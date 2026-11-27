@@ -106,6 +106,10 @@ impl ForwardRunner {
         accept_slot.reset();
         self.frontend.shutdown().await;
 
+        if let Some((ref pool_handle, _)) = self.pool {
+            let _ = pool_handle.stop_replenishing().await;
+        }
+
         let _ = coord.graceful_stop().await;
         let summary = coord_join
             .await

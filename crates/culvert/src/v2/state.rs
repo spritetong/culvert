@@ -8,7 +8,10 @@
 use crate::v2::error::TaskError;
 use std::fmt;
 
-/// Unique task identifier assigned by the Coordinator.
+/// Persistent identifier of a supervised, recyclable `IoTask` worker slot.
+///
+/// A `TaskId` remains constant across multiple work cycles (`Empty -> ... -> Empty`)
+/// until the worker task exits to `Closed`. Individual work cycles are identified by [`JobId`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TaskId(u64);
 
@@ -32,6 +35,33 @@ impl fmt::Display for TaskId {
     }
 }
 
+/// Monotonically increasing identifier of one job cycle executed on an `IoTask`.
+///
+/// Allocated once per `Assign` and cleared when the worker recycles back to `Empty` or exits,
+/// preventing late microtask updates from a previous job cycle from affecting a recycled worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct JobId(u64);
+
+impl JobId {
+    /// Creates a `JobId` from a raw sequence number.
+    #[inline]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the underlying integer value.
+    #[inline]
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for JobId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "job#{}", self.0)
+    }
+}
+
 /// External lifecycle states of an `IoTask` as tracked by the Coordinator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExternalState {
@@ -48,10 +78,17 @@ pub enum ExternalState {
 }
 
 impl ExternalState {
-    /// Returns `true` if `self` can progress forward to `target` within a single cycle.
+    /// Returns `true` if `self` can advance monotonically forward to `target` within one job.
+    #[inline]
+    pub const fn can_advance_to(self, target: Self) -> bool {
+        self.rank() <= target.rank()
+    }
+
+    /// Returns `true` if a live task in `self` can eventually reach `target`, accounting for
+    /// forward progress within the current job as well as recycling back to `Empty`.
     #[inline]
     pub const fn can_reach(self, target: Self) -> bool {
-        self.rank() <= target.rank()
+        self.can_advance_to(target) || (!self.is_terminal() && matches!(target, Self::Empty))
     }
 
     /// Returns `true` if this state is terminal.
@@ -119,8 +156,8 @@ impl fmt::Display for TunnelPhase {
 /// Asynchronous directive sent from Coordinator to a Task over its unbounded channel.
 #[derive(Debug)]
 pub enum TaskDirective<I> {
-    /// Delivers input payload (such as `(tunnel_id, stream)`) to transition `Empty -> Connecting`.
-    Assign(I),
+    /// Delivers input payload and `job_id` to transition `Empty -> Connecting`.
+    Assign { job_id: JobId, input: I },
     /// Requests bounded graceful drain/recycle; ignored when the task is already `Empty`.
     Drain,
     /// Requests the task loop to terminate cleanly and exit to `Closed`.

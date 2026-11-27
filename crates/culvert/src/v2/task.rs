@@ -6,39 +6,47 @@
 //! All comments and docstrings must be in English.
 
 use crate::v2::coordinator::Microtask;
+use crate::v2::error::TaskError;
 use crate::v2::stage::{ActiveStage, ClosingStage, ConnectingContext, TaskWorkflow};
-use crate::v2::state::{CloseReason, ExternalState, TaskDirective, TaskId, TaskOutcome};
+use crate::v2::state::{CloseReason, ExternalState, JobId, TaskDirective, TaskId, TaskOutcome};
 use std::future::poll_fn;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// Internal state payload owned by the task, matched 1-to-1 with `ExternalState`.
-enum TaskSlot<W: TaskWorkflow> {
+/// Single source of truth binding external lifecycle phase to its exact resource payload.
+///
+/// Illegal combinations such as `(state = Active, payload = Empty)` are unrepresentable.
+enum TaskPhase<W: TaskWorkflow> {
     Empty,
-    Connecting(W::Input),
-    Active(W::Active),
-    Closing(<W::Active as ActiveStage>::Closing),
+    Connecting {
+        job_id: JobId,
+        input: W::Input,
+    },
+    Active {
+        job_id: JobId,
+        stage: W::Active,
+    },
+    Closing {
+        job_id: JobId,
+        stage: <W::Active as ActiveStage>::Closing,
+        outcome: TaskOutcome,
+        shutdown_after_close: bool,
+    },
+    Closed {
+        outcome: TaskOutcome,
+    },
 }
 
-impl<W: TaskWorkflow> TaskSlot<W> {
-    fn take_input(&mut self) -> Option<W::Input> {
-        match std::mem::replace(self, Self::Empty) {
-            Self::Connecting(input) => Some(input),
-            other => {
-                *self = other;
-                None
-            }
-        }
-    }
-
-    fn take_active(&mut self) -> Option<W::Active> {
-        match std::mem::replace(self, Self::Empty) {
-            Self::Active(active) => Some(active),
-            other => {
-                *self = other;
-                None
-            }
+impl<W: TaskWorkflow> TaskPhase<W> {
+    #[inline]
+    fn external_state(&self) -> ExternalState {
+        match self {
+            Self::Empty => ExternalState::Empty,
+            Self::Connecting { .. } => ExternalState::Connecting,
+            Self::Active { .. } => ExternalState::Active,
+            Self::Closing { .. } => ExternalState::Closing,
+            Self::Closed { .. } => ExternalState::Closed,
         }
     }
 }
@@ -49,34 +57,35 @@ impl<W: TaskWorkflow> TaskSlot<W> {
 /// eliminating scattered force-stop checks across internal state branches.
 pub struct IoTask<W: TaskWorkflow> {
     id: TaskId,
-    state: ExternalState,
     workflow: Arc<W>,
     micro_tx: mpsc::UnboundedSender<Microtask>,
     directive_rx: mpsc::UnboundedReceiver<TaskDirective<W::Input>>,
     cancel: CancellationToken,
-    slot: TaskSlot<W>,
-    shutdown_after_close: bool,
+    initial_phase: Option<TaskPhase<W>>,
 }
 
 impl<W: TaskWorkflow> IoTask<W> {
-    /// Constructs a new `IoTask` in either `Empty` or `Connecting` initial state.
+    /// Constructs a new `IoTask` starting either in `Empty` (`None`) or directly in
+    /// `Connecting` (`Some((job_id, input))`).
     pub fn new(
         id: TaskId,
-        initial_state: ExternalState,
+        initial_job: Option<(JobId, W::Input)>,
         workflow: Arc<W>,
         micro_tx: mpsc::UnboundedSender<Microtask>,
         directive_rx: mpsc::UnboundedReceiver<TaskDirective<W::Input>>,
         cancel: CancellationToken,
     ) -> Self {
+        let initial_phase = match initial_job {
+            Some((job_id, input)) => TaskPhase::Connecting { job_id, input },
+            None => TaskPhase::Empty,
+        };
         Self {
             id,
-            state: initial_state,
             workflow,
             micro_tx,
             directive_rx,
             cancel,
-            slot: TaskSlot::Empty,
-            shutdown_after_close: false,
+            initial_phase: Some(initial_phase),
         }
     }
 
@@ -91,46 +100,24 @@ impl<W: TaskWorkflow> IoTask<W> {
     }
 
     async fn run_loop(&mut self) -> TaskOutcome {
-        let mut last_outcome = TaskOutcome::Shutdown;
+        let mut phase = self.initial_phase.take().unwrap_or(TaskPhase::Empty);
 
         loop {
-            match self.state {
-                ExternalState::Empty => match self.directive_rx.recv().await {
-                    Some(TaskDirective::Assign(input)) => {
-                        self.shutdown_after_close = false;
-                        last_outcome = TaskOutcome::Completed;
-                        self.slot = TaskSlot::Connecting(input);
-                        self.state = ExternalState::Connecting;
+            phase = match phase {
+                TaskPhase::Empty => match self.directive_rx.recv().await {
+                    Some(TaskDirective::Assign { job_id, input }) => {
+                        TaskPhase::Connecting { job_id, input }
                     }
                     // Ignore late Drain directives when already idle in Empty.
-                    Some(TaskDirective::Drain) => {}
-                    Some(TaskDirective::Shutdown) | None => {
-                        self.state = ExternalState::Closed;
-                        last_outcome = TaskOutcome::Shutdown;
-                    }
+                    Some(TaskDirective::Drain) => TaskPhase::Empty,
+                    Some(TaskDirective::Shutdown) | None => TaskPhase::Closed {
+                        outcome: TaskOutcome::Shutdown,
+                    },
                 },
-                ExternalState::Connecting => {
-                    let Some(input) = self.slot.take_input() else {
-                        match self.directive_rx.recv().await {
-                            Some(TaskDirective::Assign(input)) => {
-                                self.slot = TaskSlot::Connecting(input);
-                            }
-                            Some(TaskDirective::Drain) => {
-                                last_outcome = TaskOutcome::GracefullyDrained;
-                                self.recycle_or_exit(&last_outcome);
-                            }
-                            Some(TaskDirective::Shutdown) | None => {
-                                self.shutdown_after_close = true;
-                                last_outcome = TaskOutcome::Shutdown;
-                                self.recycle_or_exit(&last_outcome);
-                            }
-                        }
-                        continue;
-                    };
-
-                    let mut ctx = ConnectingContext::new(self.id, &self.micro_tx);
+                TaskPhase::Connecting { job_id, input } => {
+                    let mut ctx = ConnectingContext::new(self.id, job_id, &self.micro_tx);
                     enum ConnectBreak<A, I> {
-                        Done(Result<A, crate::v2::error::TaskError>),
+                        Done(Result<A, TaskError>),
                         Directive(Option<TaskDirective<I>>),
                     }
 
@@ -142,117 +129,126 @@ impl<W: TaskWorkflow> IoTask<W> {
 
                     match res {
                         ConnectBreak::Directive(Some(TaskDirective::Shutdown) | None) => {
-                            self.shutdown_after_close = true;
-                            last_outcome = TaskOutcome::Shutdown;
-                            self.recycle_or_exit(&last_outcome);
+                            self.recycle_or_exit(job_id, TaskOutcome::Shutdown, true)
                         }
                         ConnectBreak::Directive(Some(TaskDirective::Drain)) => {
-                            last_outcome = TaskOutcome::GracefullyDrained;
-                            self.recycle_or_exit(&last_outcome);
+                            self.recycle_or_exit(job_id, TaskOutcome::GracefullyDrained, false)
                         }
-                        ConnectBreak::Directive(Some(TaskDirective::Assign(next_input))) => {
-                            self.slot = TaskSlot::Connecting(next_input);
+                        ConnectBreak::Directive(Some(TaskDirective::Assign {
+                            job_id: next_job,
+                            input: next_input,
+                        })) => {
+                            let _ =
+                                self.recycle_or_exit(job_id, TaskOutcome::GracefullyDrained, false);
+                            TaskPhase::Connecting {
+                                job_id: next_job,
+                                input: next_input,
+                            }
                         }
-                        ConnectBreak::Done(Ok(active)) => {
-                            self.report_state(ExternalState::Active);
-                            self.slot = TaskSlot::Active(active);
-                            self.state = ExternalState::Active;
+                        ConnectBreak::Done(Ok(stage)) => {
+                            let next = TaskPhase::Active { job_id, stage };
+                            self.report_state(job_id, next.external_state());
+                            next
                         }
                         ConnectBreak::Done(Err(err)) => {
-                            last_outcome = TaskOutcome::Failed(err);
-                            self.recycle_or_exit(&last_outcome);
+                            self.recycle_or_exit(job_id, TaskOutcome::Failed(err), false)
                         }
                     }
                 }
-                ExternalState::Active => {
-                    let Some(mut active) = self.slot.take_active() else {
-                        self.state = ExternalState::Closed;
-                        continue;
-                    };
-
+                TaskPhase::Active { job_id, mut stage } => {
                     enum ActiveBreak<I> {
-                        Finished(Result<(), crate::v2::error::TaskError>),
+                        Finished(Result<(), TaskError>),
                         Directive(Option<TaskDirective<I>>),
                     }
 
                     let brk = tokio::select! {
                         biased;
                         dir = self.directive_rx.recv() => ActiveBreak::Directive(dir),
-                        res = poll_fn(|cx| active.poll_drive(cx)) => ActiveBreak::Finished(res),
+                        res = poll_fn(|cx| stage.poll_drive(cx)) => ActiveBreak::Finished(res),
                     };
 
-                    let reason = match brk {
-                        ActiveBreak::Directive(Some(TaskDirective::Shutdown) | None) => {
-                            self.shutdown_after_close = true;
-                            last_outcome = TaskOutcome::GracefullyDrained;
-                            CloseReason::GracefulDrain
-                        }
-                        ActiveBreak::Directive(Some(TaskDirective::Drain)) => {
-                            last_outcome = TaskOutcome::GracefullyDrained;
-                            CloseReason::GracefulDrain
-                        }
-                        ActiveBreak::Directive(Some(TaskDirective::Assign(_))) => {
-                            self.slot = TaskSlot::Active(active);
+                    let (reason, outcome, shutdown_after_close) = match brk {
+                        ActiveBreak::Directive(Some(TaskDirective::Shutdown) | None) => (
+                            CloseReason::GracefulDrain,
+                            TaskOutcome::GracefullyDrained,
+                            true,
+                        ),
+                        ActiveBreak::Directive(Some(TaskDirective::Drain)) => (
+                            CloseReason::GracefulDrain,
+                            TaskOutcome::GracefullyDrained,
+                            false,
+                        ),
+                        ActiveBreak::Directive(Some(TaskDirective::Assign { .. })) => {
+                            phase = TaskPhase::Active { job_id, stage };
                             continue;
                         }
                         ActiveBreak::Finished(Ok(())) => {
-                            last_outcome = TaskOutcome::Completed;
-                            CloseReason::NormalEnd
+                            (CloseReason::NormalEnd, TaskOutcome::Completed, false)
                         }
                         ActiveBreak::Finished(Err(err)) => {
-                            last_outcome = TaskOutcome::Failed(err);
-                            CloseReason::StageError
+                            (CloseReason::StageError, TaskOutcome::Failed(err), false)
                         }
                     };
 
-                    self.report_state(ExternalState::Closing);
-                    self.slot = TaskSlot::Closing(active.into_closing(reason));
-                    self.state = ExternalState::Closing;
+                    let next = TaskPhase::Closing {
+                        job_id,
+                        stage: stage.into_closing(reason),
+                        outcome,
+                        shutdown_after_close,
+                    };
+                    self.report_state(job_id, next.external_state());
+                    next
                 }
-                ExternalState::Closing => {
-                    if let TaskSlot::Closing(ref mut closing) = self.slot
-                        && let Err(err) = closing.run().await
-                        && !matches!(last_outcome, TaskOutcome::Failed(_))
+                TaskPhase::Closing {
+                    job_id,
+                    mut stage,
+                    mut outcome,
+                    shutdown_after_close,
+                } => {
+                    if let Err(err) = stage.run().await
+                        && !matches!(outcome, TaskOutcome::Failed(_))
                     {
-                        last_outcome = TaskOutcome::Failed(err);
+                        outcome = TaskOutcome::Failed(err);
                     }
-                    self.slot = TaskSlot::Empty;
-                    self.recycle_or_exit(&last_outcome);
+                    drop(stage);
+                    self.recycle_or_exit(job_id, outcome, shutdown_after_close)
                 }
-                ExternalState::Closed => {
-                    self.slot = TaskSlot::Empty;
-                    break;
-                }
-            }
+                TaskPhase::Closed { outcome } => break outcome,
+            };
         }
-
-        last_outcome
     }
 
-    fn report_state(&self, state: ExternalState) {
-        let _ = self
-            .micro_tx
-            .send(Microtask::StateChanged { id: self.id, state });
+    fn report_state(&self, job_id: JobId, state: ExternalState) {
+        let _ = self.micro_tx.send(Microtask::StateChanged {
+            id: self.id,
+            job_id,
+            state,
+        });
     }
 
-    fn recycle_or_exit(&mut self, outcome: &TaskOutcome) {
-        self.slot = TaskSlot::Empty;
-        if self.shutdown_after_close {
-            self.state = ExternalState::Closed;
-            return;
+    fn recycle_or_exit(
+        &self,
+        job_id: JobId,
+        outcome: TaskOutcome,
+        shutdown_after_close: bool,
+    ) -> TaskPhase<W> {
+        if shutdown_after_close {
+            return TaskPhase::Closed { outcome };
         }
-        // Reset local state to Empty BEFORE notifying Coordinator so FIFO ordering on
-        // `micro_tx` guarantees no stale events from the previous run follow `RecycledToEmpty`.
-        self.state = ExternalState::Empty;
+        // Send RecycledToEmpty AFTER resetting local payload & state (now returning Empty) so
+        // no further job-scoped StateChanged messages for `job_id` can follow.
         if self
             .micro_tx
             .send(Microtask::RecycledToEmpty {
                 id: self.id,
+                job_id,
                 outcome: outcome.clone(),
             })
             .is_err()
         {
-            self.state = ExternalState::Closed;
+            TaskPhase::Closed { outcome }
+        } else {
+            TaskPhase::Empty
         }
     }
 }

@@ -20,7 +20,9 @@ pub mod task;
 #[cfg(test)]
 mod tests;
 
-pub use coordinator::{Coordinator, CoordinatorHandle, CoordinatorSummary, Microtask};
+pub use coordinator::{
+    CompletedJob, Coordinator, CoordinatorHandle, CoordinatorSummary, Microtask,
+};
 pub use engine::StateEngine;
 pub use error::TaskError;
 pub use forward::{ForwardInput, ForwardRunner, ForwardWorkflow};
@@ -34,10 +36,11 @@ pub use relay::{
     TransferDirection,
 };
 pub use reverse::{
+    ReverseClientConfig, ReverseClientInput, ReverseClientRunner, ReverseClientWorkflow,
     ReverseServerRunner, ReverseSignaler, ReverseVisitorInput, ReverseVisitorWorkflow,
 };
 pub use stage::{ActiveStage, ClosingStage, ConnectingContext, TaskWorkflow};
 pub use state::{
-    CloseReason, ExternalState, TaskDirective, TaskId, TaskOutcome, TunnelPhase, WaitResult,
+    CloseReason, ExternalState, JobId, TaskDirective, TaskId, TaskOutcome, TunnelPhase, WaitResult,
 };
 pub use task::IoTask;

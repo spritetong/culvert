@@ -194,7 +194,7 @@ async fn reverse_runner_zero_rtt_fast_path_skips_signaling() {
         .unwrap();
     assert_eq!(summary.final_phase, TunnelPhase::Stopped);
     assert_eq!(summary.completed_jobs.len(), 1);
-    assert_eq!(summary.completed_jobs[0].1, TaskOutcome::Completed);
+    assert_eq!(summary.completed_jobs[0].outcome, TaskOutcome::Completed);
 }
 
 #[tokio::test]
@@ -314,4 +314,139 @@ async fn reverse_runner_cancels_hanging_signaling_immediately_on_shutdown() {
         .unwrap();
     assert!(started.elapsed() < Duration::from_millis(250));
     assert_eq!(summary.final_phase, TunnelPhase::Stopped);
+}
+
+#[tokio::test]
+async fn reverse_client_real_ws_server_e2e_on_demand_and_prewarmed() {
+    use crate::config::model::{AppConfig, EndpointConfig, ServerConfig, TunnelMode};
+    use crate::dialer::endpoint::EndpointContext;
+    use crate::server::ServerRunner;
+    use crate::session::SessionManager;
+    use crate::transport::ws::WsTransportDriver;
+    use crate::transport::{TransportConnector, TransportRegistry};
+    use crate::v2::reverse::{ReverseClientConfig, ReverseClientRunner};
+
+    let probe_echo = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let echo_port = probe_echo.local_addr().unwrap().port();
+    probe_echo.set_nonblocking(true).unwrap();
+    let echo_listener = tokio::net::TcpListener::from_std(probe_echo).unwrap();
+
+    let probe_ws = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let ws_port = probe_ws.local_addr().unwrap().port();
+    drop(probe_ws);
+
+    let probe_rev = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let rev_port = probe_rev.local_addr().unwrap().port();
+    drop(probe_rev);
+
+    let server_cancel = CancellationToken::new();
+    let echo_cancel = server_cancel.clone();
+    let echo_handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = echo_cancel.cancelled() => break,
+                res = echo_listener.accept() => {
+                    let Ok((mut sock, _)) = res else { break; };
+                    tokio::spawn(async move {
+                        let (mut rd, mut wr) = sock.split();
+                        let _ = tokio::io::copy(&mut rd, &mut wr).await;
+                    });
+                }
+            }
+        }
+    });
+
+    let mut registry = TransportRegistry::new();
+    registry.register(WsTransportDriver);
+    let registry = Arc::new(registry);
+
+    let auth_token = "v2-rev-ws-e2e";
+    let ws_listen = format!("127.0.0.1:{ws_port}");
+    let server_runner = ServerRunner::new(
+        ServerConfig {
+            listen: vec![format!("ws://{ws_listen}/tunnel")],
+            token: Some(auth_token.to_string()),
+            default_target: None,
+            ..Default::default()
+        },
+        Arc::clone(&registry),
+        Arc::new(SessionManager::new()),
+    );
+    let server_tok = server_cancel.clone();
+    let server_handle = tokio::spawn(async move { server_runner.run(server_tok).await });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let endpoint_cfg = EndpointConfig::Simple(format!("ws://{ws_listen}/tunnel"));
+    let endpoint_ctx = EndpointContext::build(&endpoint_cfg, &AppConfig::default()).unwrap();
+    let connector: Arc<dyn TransportConnector> = Arc::from(
+        registry
+            .create_connector(&endpoint_ctx, Some(auth_token), TunnelMode::Reverse)
+            .unwrap(),
+    );
+
+    let rev_listen = format!("127.0.0.1:{rev_port}");
+    let target_addr = format!("127.0.0.1:{echo_port}");
+    let client = ReverseClientRunner::new(
+        ReverseClientConfig {
+            listen_addr: rev_listen.clone(),
+            target_addr,
+            protocol: L4Protocol::Tcp,
+            pool_size: Some(2),
+            tunnel_id: None,
+            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            relay_idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            drain_timeout: DEFAULT_RELAY_DRAIN_TIMEOUT,
+        },
+        connector,
+    );
+
+    let client_cancel = CancellationToken::new();
+    let client_handle = tokio::spawn(client.run(client_cancel.clone()));
+
+    // Wait for server reverse port to bind and prewarmed pool streams to settle.
+    let mut visitor = None;
+    for _ in 0..40 {
+        if let Ok(s) = tokio::net::TcpStream::connect(&rev_listen).await {
+            visitor = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    let mut visitor = visitor.expect("reverse listener must bind on server");
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    visitor.write_all(b"v2-reverse-e2e-ok").await.unwrap();
+    visitor.shutdown().await.unwrap();
+    let mut buf = [0u8; 17];
+    tokio::time::timeout(Duration::from_secs(5), visitor.read_exact(&mut buf))
+        .await
+        .expect("reverse echo timeout")
+        .unwrap();
+    assert_eq!(&buf, b"v2-reverse-e2e-ok");
+
+    // Second visitor exercises replenished or 0-RTT pre-warmed worker.
+    let mut visitor2 = tokio::net::TcpStream::connect(&rev_listen).await.unwrap();
+    visitor2.write_all(b"v2-reverse-second").await.unwrap();
+    visitor2.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), visitor2.read_exact(&mut buf))
+        .await
+        .expect("second reverse echo timeout")
+        .unwrap();
+    assert_eq!(&buf, b"v2-reverse-second");
+
+    client_cancel.cancel();
+    let summary = tokio::time::timeout(Duration::from_secs(3), client_handle)
+        .await
+        .expect("v2 ReverseClientRunner must exit cleanly")
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.final_phase, TunnelPhase::Stopped);
+    assert!(summary.completed_jobs.len() >= 2);
+
+    server_cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+        let _ = tokio::join!(echo_handle, server_handle);
+    })
+    .await;
 }

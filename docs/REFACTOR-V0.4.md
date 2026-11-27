@@ -104,21 +104,17 @@ Internal State 属于 IO Task 自己，主要描述内部异步操作的执行�
 
 External State 由 Coordinator 统一管理，用于描述 IO Task 对调度系统和关闭流程可见的生命周期阶段与资源归属。
 
-经过针对 TCP Forward 的收口分析，External State 不直接照搬候选全集（`EMPTY` / `IDLE` / `HALF_OPEN` / `ACTIVE` / `CLOSING` / `CLOSED`），而是遵循以下取舍：
-
-- **`IDLE` 属于 Transport Pool 的空闲资源状态，不属于 IO Task 状态。**
-- **IO Task 按连接动态创建，终结后直接从状态表移除**，不作为空槽位长期保留，因此不需要 `EMPTY` 和终态 `CLOSED` 长期驻留。
-- **`HALF_CLOSE` 属于数据面转发的 Internal State**，不是 External State。
-
-最终每个 IO Task 的 External State 收敛为清晰的三态（详见第 14 节）：
+经实现期收敛，每个 `IoTask` 支持空闲预热（Prewarm）与单连接周期结束后的回收复用（`Empty` 槽位），`ExternalState` 确定为五态（`IDLE` 仍专属于 `TransportPool`，`HALF_CLOSE` 仍专属于数据面转发的 Internal State）：
 
 | 状态 | 含义 |
 |---|---|
-| `Connecting` | 已接收并独占 `Frontend` 流，正在取得（直连或从池中租用并激活）`Backend` 流 |
-| `Active` | 前后端资源已全部就绪并交由 IO Task 独占执行双向数据转发 |
-| `Closing` | 正在退出（已触发 Stop 或内部转发结束），等待最终清理与 Handle 回收 |
+| `Empty` | 任务槽位空闲，未持有任何流资源；可被 `Assign` 唤醒进入下一轮 `JobId` |
+| `Connecting` | 已分配 `JobId` 并独占输入资源（如 `Frontend` 流），正在建连或激活 `Backend` |
+| `Active` | 前后端资源已全部配对就绪，交由 IO Task 独占执行数据面转发（`ChannelRelay`） |
+| `Closing` | 正在执行有界优雅排空与底层关闭，随后在 `Running` 阶段回收到 `Empty`，或在关闭阶段退出至 `Closed` |
+| `Closed` | 任务事件循环结束并即将从 `JoinSet` 移除的终态 |
 
-**External State 描述资源关系和调度/关闭资格，而不是复制内部 IO 进度。**
+**External State 描述资源关系、Waiter 依赖与关闭资格，而不是复制内部 IO 进度；Task 内部以单一枚举 `TaskPhase<W>` 将阶段与资源所有权强绑定，杜绝双份状态不一致。**
 
 ### 3.3 两层状态允许短暂不一致
 
@@ -281,11 +277,18 @@ async fn run_io_task(...) -> TaskOutcome {
 - `Connecting` → `Active` 只能在 `Backend` 流已成功获取且激活握手完成、前后端均已归位到 IO Task 手中之后提交。
 - 在此之前若发生 `Stop` 或失败，IO Task 仅持有 `Frontend`（或刚打开即失败的 `Backend`），直接进入清理退出，不会污染任何“已连接”状态。
 
-### 7.3 迟到事件与 Task 重用
+### 7.3 身份模型（`TaskId` 与 `JobId`）及迟到事件防护
 
-由于本设计采用**每次连接分配单调递增的 `TaskId(u64)`**（而非复用固定下标的 Task 槽位），旧 IO Task 结束时上报的 `Completed(TaskId, Outcome)` 永远不可能匹配到新连接的 `TaskId`，从而通过所有权与唯一 ID 直接消除了 IO Task 层面的迟到事件污染。
+由于 `IoTask` 支持 `Empty` 预热与跨连接复用，身份模型显式区分为两层：
 
-仅对**确实存在跨生命周期复用的资源**（如 `TransportPool` 中的连接补建结果与池代际，以及后续扩展阶段的 Reverse 控制通道槽位）保留显式代际/租约校验。
+- **`TaskId(u64)`**：标识一个长期存活、可回收复用的受监管 Worker 槽位（从 spawn 直到退出 `Closed`）。
+- **`JobId(u64)`**：每次 `Assign` 分配给该 Worker 的单调递增作业周期标识，在任务回收到 `Empty` 或退出时清除。
+
+Coordinator 通过 `(TaskId, JobId)` 精确校验内部异步通知：
+
+- `Microtask::StateChanged` 与 `Microtask::RecycledToEmpty` 均携带 `job_id`，`StateEngine` 直接忽略 `job_id` 与当前 `entry.current_job` 不匹配的任何迟到事件。
+- 回收（`* -> Empty`）与退出（`* -> Closed`）严格区分：`Empty` 仅唤醒等待 `Empty` 的 Waiter，将针对上一轮活跃阶段的 Waiter 判定为 `TargetClosed(Empty)` 以防跨代际挂起，而等待 `Closed` 的 Waiter 仅在任务真正退出时唤醒。
+- `TransportPool` 内部继续对其跨生命周期资源及连接补建保留显式代际/租约校验。
 
 ---
 
@@ -404,60 +407,60 @@ async fn run_io_task(...) -> TaskOutcome {
 1. **Coordinator 粒度：每个 Tunnel 一个，还是多个共用？**
    - **定稿**：**每个 Tunnel 一个 Coordinator**。故障与关闭域天然隔离，符合单 Tunnel TCP Forward 最小原型的验证边界。
 2. **IO Task 是长期存在的资源槽位，还是每次连接创建、结束后销毁？**
-   - **定稿**：**按连接动态创建、结束后销毁**，由 Coordinator 通过单调递增的 `TaskId(u64)` 登记并持有其 `JoinHandle`（经 `JoinSet` 管理）。避免人为引入槽位池化与复用的复杂度。
+   - **定稿**：**支持按需动态创建，也支持 `Empty` 预热与跨连接回收复用**。`TaskId` 唯一标识可复用 Worker，`JobId` 唯一标识每次指派的连接作业周期，在保持简洁的前提下可无缝承接未来 WS/QUIC 会话复用需求。
 3. **`EMPTY`、`IDLE`、`HALF_OPEN` 是否需要全部独立存在？**
-   - **定稿**：**不需要**。`IDLE` 属于 `TransportPool` 的资源属性，不属于 IO Task；因 IO Task 不复用槽位，也不需要 `EMPTY` 和持久化的 `CLOSED`；`HALF_OPEN` 合并为 `Connecting`（尚未完成前后端配对）与 `Active`（配对完成，双向转发中）。
+   - **定稿**：`IDLE` 仍专属于 `TransportPool`；`HALF_CLOSE` 仍专属于数据面内部；`IoTask` 的 `ExternalState` 收敛为 `Empty`、`Connecting`、`Active`、`Closing`、`Closed` 五态，并在任务内部由单一枚举 `TaskPhase<W>` 将状态与资源 payload 一一绑定，杜绝合法外状态组合缺失或错配。
 4. **Transport Pool 和 IO Task 集合是否应该是两个独立的资源管理系统？**
-   - **定稿**：**是两个职责正交的子系统**。`TransportPool` 负责空闲流预热、保活、过期淘汰；流一旦被租出，所有权即移交对应 IO Task，不再受 Pool 回调计数（如旧版 `on_stream_closed`）耦合。Pool 的后台任务句柄同样纳入受监督的生命周期管理，绝不裸 `tokio::spawn`。
-5. **External State 如何向其他 Task 发布？哪些状态实际上不需要被其他 Task 读取？**
-   - **定稿**：**External State 仅由 Coordinator 内部持有，其他 IO Task 不需要读取外部状态表**。IO Task 仅通过单向信号（如 `watch::Receiver<StopMode>`）接收控制平面的状态变更指令（`Running` / `GracefulDrain` / `ForceStop`）。
+   - **定稿**：**是两个职责正交的控制平面 Actor**。`TransportPool` 负责空闲流预热、保活、过期淘汰；流一旦租出即移交带 RAII `LeaseGuard` 的 `StreamLease` 给 IO Task（原子 `active_count` + 容量为 1 的合并唤醒通道）。Pool 的后台句柄纳入受监督生命周期，绝不裸 `tokio::spawn`。
+5. **External State 如何向其他 Task 发布？Coordinator 通道如何防死锁与背压？**
+   - **定稿**：Coordinator 采用双通道优先级模型：
+     - **外部事件通道（`event_rx`）**：有界队列（容量 1024），为外部 `assign` / `prewarm` / 查询请求提供背压。
+     - **高优先级同步微任务通道（`micro_rx`）** 与 **Task 指令通道（`directive_tx`）**：无界异步发送以确保单写者 Coordinator 与 Task 之间永不因相互 `.await` 形成死锁；`Coordinator::run` 每次循环对 `drain_microtasks()` 施加单轮上限（`MAX_MICROTASKS_PER_TURN = 256`），保证 `CancellationToken` 与 `drain_timeout` 永不被微任务风暴饿死；`StateEngine` 同时限制最大并发 Waiter 数量（`MAX_PENDING_WAITERS = 4096`）。
 6. **Graceful Shutdown 的排空边界在哪里？**
    - **定稿**：
      - 收到 Stop 后立即停止 `Frontend::accept`。
-     - 处于 `Connecting` 的 Task 立即取消（不允许等待连接/握手超时）。
-     - 处于 `Active` 的 Task 在 `GracefulDrain` 下停止从源端读取新数据，仅给予全局统一的短排空窗口将已缓冲尾部数据写出并调用 `poll_shutdown`；到达全局截止时间或直接收到 `ForceStop` 时立即结束所有 `Active` Task。
+     - 向 `TransportPool` 发送 `stop_replenishing()`，立即停止 Drain 期间无意义的新增后台拨号。
+     - 处于 `Empty` 的 Task 收到 `Shutdown` 直接退出；处于 `Connecting` 的 Task 收到 `Drain` 立即取消并回收/退出；处于 `Active` 的 Task 停止源端新读取，在有界 `drain_timeout` 内完成尾部写出和半关闭；到达全局截止时间或收到 `ForceStop`（`CancellationToken` 及最后 `CoordinatorHandle` 的 `Drop`）时立即终止全部子任务。
 7. **是否需要 `generation/lease`？**
-   - **定稿**：IO Task 采用单调递增 `TaskId(u64)`，天然无迟到事件污染，不需要 generation。仅在存在跨代际资源复用的部件（`TransportPool` 内部流管理、后续阶段的 Reverse 监听槽位）保留显式代际标识。
+   - **定稿**：`IoTask` 同时拥有 Worker 身份 `TaskId(u64)` 与作业代际 `JobId(u64)`，严格校验跨周期事件隔离；`TransportPool` 采用 RAII `StreamLease` / `LeaseGuard` 管理租约计数，并保留面向控制通道/反向代际的显式校验能力。
 8. **Coordinator 退出时，如何保证所有 Task 和 Transport 都有确定的终止结果？**
-   - **定稿**：Coordinator 唯一持有所有 IO Task 的 `JoinSet`、Accept Loop Handle 与 Pool 句柄。退出时依次执行：广播停止信号 → 停止并关闭 `Frontend` → 等待（或在截止时间切换 `ForceStop` 后等待）全部 `JoinHandle` 清空 → 等待 Pool Actor 退出。
+   - **定稿**：Coordinator 通过 `JoinSet<TaskReport>` 及 `tokio::task::Id -> TaskId` 映射监督所有 IO Task，任何正常结束、异常 `panic` 或 `abort` 返回的 `JoinError` 都会触发 `StateEngine::complete_task` 清理状态表；退出时按「停止 Accept → `Pool::stop_replenishing()` → `Coordinator::graceful_stop()` 等 `JoinSet` 清空 → `Pool::shutdown()` 等 Pool 退出」顺序完成确定性收敛。
 9. **Tokio Task 的数量和 IO State Machine 的数量是否应该解耦？**
-   - **定稿**：阶段二~五保持 `1 IO Task = 1 Tokio Task`（内部 `async/await`），不引入自建调度器或 M:N 协程复用。只有在明确测出 Tokio Task 开销成为瓶颈时再重新评估。
+   - **定稿**：保持 `1 IO Task = 1 Tokio Task`（边界异步调度，热路径使用无分配 `poll_drive` 状态机）。只有在明确测出 Tokio Task 开销成为瓶颈时再重新评估。
 
 ---
 
-## 14. 阶段二交付设计：TCP Forward 最小状态模型与资源所有权
+## 14. 收敛设计模型：双通道 Coordinator、可回收 IO Task 与池协同状态机
 
-> 本节为阶段三原型实现前的锁定模型，覆盖单 Tunnel 下 TCP Forward（含无池直连与有池激活回退两条路径）。
+> 本节同步记录 `v2` 当前已实现并验证的状态模型（覆盖 Forward、Reverse 与 TCP/UDP 多路复用）。
 
 ### 14.1 模块与资源所有权拓扑
 
 ```text
-                +-------------------------------+
-                |      Tunnel Coordinator       |  <-- 唯一 External State 写入者
-                |  - state: TunnelPhase         |      唯一持有 JoinSet 与子系统生命周期
-                |  - tasks: HashMap<TaskId, ..> |
-                |  - stop_tx: watch<StopMode>   |
-                +-------+---------------+-------+
-                        |               |
-         (accept loop)  |               | (spawn / track / stop)
-                        v               v
-           +----------------+     +-----------------------------------+
-           |    Frontend    |     |            IO Task (id)           |
-           | ReusableFuture |     |  Owns:                            |
-           +--------+-------+     |   - frontend: IoChannel (moved)   |
-                    |             |   - backend: Option<IoChannel>    |
-                    | Frontend    |   - stop_rx: watch<StopMode>      |
-                    +------------>|  Phases (Internal async/await):   |
-                       Accept     |   1. acquire/dial + 0xA5/0xAC ack |
-                                  |   2. pure duplex relay + drain    |
-                                  +-----------------+-----------------+
-                                                    ^
-                                    Acquire/Lease   | (moves Box<dyn TunnelStream>)
-                                    (optional)      |
-                                          +---------+---------+
-                                          |   TransportPool   |
-                                          | (idle inventory)  |
-                                          +-------------------+
+                +-----------------------------------+
+                |      Tunnel Coordinator Actor     |  <-- 唯一 StateEngine 写入者
+                |  - phase: TunnelPhase             |      唯一持有 JoinSet 与 JoinId->TaskId 映射
+                |  - micro_rx (unbounded, capped)   |      CancellationToken 统一 ForceStop + Drop
+                |  - event_rx (bounded 1024)        |
+                +-------+-------------------+-------+
+                        |                   |
+         (accept loop)  |                   | TaskDirective<I> (Assign{job_id,input}/Drain/Shutdown)
+                        v                   v
+           +----------------+     +---------------------------------------+
+           |    Frontend    |     |        IoTask (TaskId, JobId)         |
+           | ReusableFuture |     |  Single enum TaskPhase<W>:            |
+           +--------+-------+     |   Empty | Connecting | Active |       |
+                    |             |   Closing | Closed                    |
+                    | Assign      |  ActiveStage: ChannelRelay (poll_fn)  |
+                    +------------>|  ClosingStage: bounded drain & close  |
+                                  +-------------------+-------------------+
+                                                      ^
+                                      Acquire/Lease   | StreamLease (RAII LeaseGuard)
+                                      (optional)      |
+                                            +---------+---------+
+                                            |   TransportPool   |
+                                            | (Forward/Reverse) |
+                                            +-------------------+
 ```
 
 ### 14.2 状态定义
@@ -466,52 +469,29 @@ async fn run_io_task(...) -> TaskOutcome {
 
 | 状态 | 含义 |
 |---|---|
-| `Running` | 正常接收 `Frontend` 新连接并派发 IO Task |
-| `Draining` | 已触发 Graceful Stop：停止 `Frontend::accept`，通知所有任务按排空规则退出 |
-| `ForceStopping` | 排空超时或直接触发 Force Stop：通知所有任务立即终止内部 Future |
-| `Stopped` | 所有 IO Task、`Frontend::shutdown` 与 Pool 已确定性退出完毕 |
+| `Running` | 正常接收新工作派发，并将完成任务的 Worker 回收到 `Empty` 池 |
+| `Draining` | 已触发 Graceful Stop：拒绝新工作，对 `Empty` 发 `Shutdown`，对 `Connecting`/`Active` 发 `Drain`，并开启有界 `drain_timeout` |
+| `ForceStopping` | 超时或触发 `ForceStop`：激活根 `CancellationToken` 立即中止所有未完成阶段 |
+| `Stopped` | `JoinSet` 为空且所有资源收敛完毕 |
 
-#### B. IO Task 外部状态（`TaskState`）
+#### B. IO Task 外部状态（`ExternalState`）
 
-| 状态 | 资源所有权 | 含义 |
+| 状态 | 资源所有权 (`TaskPhase<W>`) | 含义 |
 |---|---|---|
-| `Connecting` | Task 独占 `Frontend`；正在尝试取得并激活 `Backend` | 尚未配对成功，收到任何 Stop 应立即取消 |
-| `Active` | Task 独占 `Frontend` + `Backend` | 正在执行纯双向数据转发 |
-| `Closing` | Task 正在收尾并即将释放两侧资源 | 处于排空或退出阶段，等待退出回报 |
+| `Empty` | `TaskPhase::Empty`（零 I/O 资源） | 空闲复用槽位，等待下一个 `Assign { job_id, input }` 或 `Shutdown` |
+| `Connecting` | `TaskPhase::Connecting { job_id, input }` | 独占输入并正在建连/激活配对 |
+| `Active` | `TaskPhase::Active { job_id, stage }` | 独占双端通道，在热路径 `poll_drive` 转发 |
+| `Closing` | `TaskPhase::Closing { job_id, stage, .. }` | 有界排空写缓冲与关闭清理，随后回收到 `Empty` 或进入 `Closed` |
+| `Closed` | `TaskPhase::Closed { outcome }` | 事件循环结束，等待 `JoinSet` 回收 |
 
-### 14.3 状态转换表（Coordinator 控制平面）
+### 14.3 协同关闭顺序与取消边界不变量
 
-#### A. Tunnel 生命周期状态转换
-
-| State | Event | Guard | Action | Next State | Failure |
-|---|---|---|---|---|---|
-| `Running` | `InboundAccepted(frontend)` | `tasks.len() < max_conns`（若有上限） | 分配新 `TaskId`，记录 `TaskState::Connecting`，spawn IO Task 移交 `frontend` 所有权 | `Running` | 超限或内部错误时直接 drop `frontend` |
-| `Running` | `CmdGracefulStop` | 无 | `stop_tx.send(StopMode::GracefulDrain)`；停止 accept 并启动统一 drain 定时器；调用 `frontend.shutdown()` | `Draining` | 重复命令幂等忽略 |
-| `Running` | `CmdForceStop` | 无 | `stop_tx.send(StopMode::ForceStop)`；停止 accept；调用 `frontend.shutdown()` | `ForceStopping` | 重复命令幂等忽略 |
-| `Draining` | `DrainDeadlineReached` | `!tasks.is_empty()` | `stop_tx.send(StopMode::ForceStop)` | `ForceStopping` | 若 `tasks.is_empty()` 直接进 `Stopped` |
-| `Draining` | `CmdForceStop` | 无 | `stop_tx.send(StopMode::ForceStop)` | `ForceStopping` | — |
-| `Draining` / `ForceStopping` | `TaskFinished(id, outcome)` | `tasks.contains_key(&id)` | 从 `tasks` 移除并回收句柄；若 `tasks.is_empty()` 且 Pool/Frontend 已关闭，完成退出 | `Draining`/`ForceStopping` 或 `Stopped` | 未知 `id` 忽略并记录告警（不变量断言） |
-| `Stopped` | 任何 `Stop` / 迟到事件 | 无 | 幂等忽略 | `Stopped` | — |
-
-#### B. IO Task 外部状态转换（针对单个 `TaskId`）
-
-| State | Event | Guard | Action | Next State | Failure |
-|---|---|---|---|---|---|
-| *(不存在)* | `SpawnTask(id, frontend)` | `TunnelPhase == Running` | 插入 `tasks[id] = Connecting`，将 `frontend` 移交该 Task | `Connecting` | 非 `Running` 时拒绝 spawn 并立即释放 `frontend` |
-| `Connecting` | `TaskEvent::Paired(id)` | `tasks[id] == Connecting` | 确认 `Backend` 已就绪且已进入数据面，更新记录为 `Active` | `Active` | 若收到时已不在表内或状态非 `Connecting`，视为非法转换并告警 |
-| `Connecting` | `TaskEvent::Failed(id, err)` / `Cancelled(id)` | `tasks[id] == Connecting` | 从 `tasks` 移除，Task 已内部 drop 临时资源 | *(已移除)* | 重复结束事件忽略 |
-| `Active` | `StopMode` 变为 `GracefulDrain` | Task 正在运行 | Task 停止读新数据，进入有限排空与 `poll_shutdown` 流程（External 状态可标记为 `Closing` 或由 Task 收尾后直接结束） | `Closing` | — |
-| `Active` / `Closing` | `TaskEvent::Finished(id, outcome)` | `tasks.contains_key(&id)` | 从 `tasks` 移除，JoinSet 回收完成 | *(已移除)* | 未知 `id` 忽略并记录告警 |
-
-> **关键设计说明**：
-> `TaskEvent::Paired(id)` 的提交顺序必须严格保证：**IO Task 先在内部成功拿到并激活 `Backend`（所有权已完全归自己），发出 `Paired(id)` 事件后，再开始转发；或者 Task 内部完成配对后发送非阻塞 `try_send(Paired(id))` 通知 Coordinator 记账。** Coordinator 不介入连接建立的阻塞过程，从而避免状态推进阻塞数据面。
-
-### 14.4 不变量列表（测试与审计必检）
-
-1. **单写者不变量**：除 Coordinator Actor 外，没有任何线程或任务可以修改 `TunnelPhase` 与 `tasks` 状态表。
-2. **所有权守恒不变量**：任意时刻，任意 `IoChannel` / `TunnelStream` 至多只有一个所有者（Listener / Pool / 某个唯一 `TaskId`），一旦连接被移交给 IO Task 或在 `Connecting` 失败丢弃，Pool 与 Coordinator 不保留其访问路径。
-3. **非阻塞边界不变量**：IO Task 在 `Connecting` 和 `Active` 内部禁止包含无界同步阻塞，外层必须通过 `tokio::select!` 响应 `stop_rx` 的状态切换，保证 `ForceStop` 在毫秒级退出（即使内部 read/write 永远 `Pending`）。
-4. **无孤儿任务不变量**：Coordinator 返回（进入 `Stopped`）时，`JoinSet` 必须为空，Pool Actor 与 Frontend Listener 均已 `shutdown` 并 `await` 完毕，不存在任何 detached 后台任务。
+1. **协同关闭顺序**：`Frontend::shutdown()` → `PoolHandle::stop_replenishing()` → `Coordinator::graceful_stop()` + `coord_join.await` → `PoolHandle::shutdown()` + `pool_join.await`。保证 Drain 期间无多余后台拨号，且所有持有 `StreamLease` 的 Task 都在 Pool 关闭前完成释放（`active_count == 0`）。
+2. **取消安全边界**：
+   - `workflow.connect()` 在 `Connecting` 被 `Drain`/`ForceStop` 取消时直接丢弃未来并释放其持有的临时通道或 `StreamLease`（半激活流绝不归还空闲池）。
+   - `TransportPool::acquire()` 发出请求后若调用方 Future 取消：已出队的 `StreamLease` 通过 `reclaim_stream()` 撤销计数并放回队列头部；排队的 `PendingAcquire` 通过 `reply.is_closed()` 及时清理，不引发幽灵拨号。
+   - `Active` 切换 `Closing` 时通过借用 `poll_fn(|cx| stage.poll_drive(cx))` 仅中止轮询 Future 而不丢失阶段对象及半写缓冲。
+3. **非阻塞与异常终结不变量**：`Microtask` 处理全程零 `.await`；`JoinSet` 返回任何 `Ok(report)` 或 `Err(join_err)` 均清理对应 `TaskEntry`，防止残余条目阻断 `Draining -> Stopped` 收敛。
 
 ---
 

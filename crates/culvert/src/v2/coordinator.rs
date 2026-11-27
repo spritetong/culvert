@@ -9,9 +9,10 @@ use crate::v2::engine::StateEngine;
 use crate::v2::error::TaskError;
 use crate::v2::stage::TaskWorkflow;
 use crate::v2::state::{
-    ExternalState, TaskDirective, TaskId, TaskOutcome, TunnelPhase, WaitResult,
+    ExternalState, JobId, TaskDirective, TaskId, TaskOutcome, TunnelPhase, WaitResult,
 };
 use crate::v2::task::IoTask;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,10 +22,13 @@ use tokio::time::Sleep;
 use tokio_util::sync::CancellationToken;
 
 const COORDINATOR_EVENT_QUEUE_CAPACITY: usize = 1024;
+/// Fair per-turn microtask batch cap so a microtask storm cannot starve cancellation or timers.
+const MAX_MICROTASKS_PER_TURN: usize = 256;
 
 /// Final report returned when an `IoTask` exits its `JoinSet` handle.
 struct TaskReport {
     id: TaskId,
+    join_id: tokio::task::Id,
     outcome: TaskOutcome,
 }
 
@@ -35,10 +39,12 @@ struct TaskReport {
 pub enum Microtask {
     StateChanged {
         id: TaskId,
+        job_id: JobId,
         state: ExternalState,
     },
     RecycledToEmpty {
         id: TaskId,
+        job_id: JobId,
         outcome: TaskOutcome,
     },
     AwaitState {
@@ -212,11 +218,19 @@ impl<W: TaskWorkflow> CoordinatorHandle<W> {
     }
 }
 
+/// Completion record for one job cycle executed on a supervised `IoTask`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletedJob {
+    pub task_id: TaskId,
+    pub job_id: JobId,
+    pub outcome: TaskOutcome,
+}
+
 /// Summary produced when the Coordinator Actor exits cleanly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoordinatorSummary {
     pub final_phase: TunnelPhase,
-    pub completed_jobs: Vec<(TaskId, TaskOutcome)>,
+    pub completed_jobs: Vec<CompletedJob>,
 }
 
 /// Single-writer Coordinator Actor supervising all `IoTask` lifecycles.
@@ -224,6 +238,7 @@ pub struct Coordinator<W: TaskWorkflow> {
     workflow: Arc<W>,
     engine: StateEngine<W::Input>,
     join_set: JoinSet<TaskReport>,
+    join_tasks: HashMap<tokio::task::Id, TaskId>,
     drain_timeout: Duration,
     drain_sleep: Option<Pin<Box<Sleep>>>,
     cancel_token: CancellationToken,
@@ -231,7 +246,7 @@ pub struct Coordinator<W: TaskWorkflow> {
     micro_rx: mpsc::UnboundedReceiver<Microtask>,
     _keep_event_tx: mpsc::Sender<CoordinatorEvent<W::Input>>,
     event_rx: mpsc::Receiver<CoordinatorEvent<W::Input>>,
-    completed_jobs: Vec<(TaskId, TaskOutcome)>,
+    completed_jobs: Vec<CompletedJob>,
 }
 
 impl<W: TaskWorkflow> Coordinator<W> {
@@ -255,6 +270,7 @@ impl<W: TaskWorkflow> Coordinator<W> {
             workflow: Arc::new(workflow),
             engine: StateEngine::new(),
             join_set: JoinSet::new(),
+            join_tasks: HashMap::new(),
             drain_timeout,
             drain_sleep: None,
             cancel_token,
@@ -321,19 +337,33 @@ impl<W: TaskWorkflow> Coordinator<W> {
     }
 
     fn drain_microtasks(&mut self) {
-        while let Ok(micro) = self.micro_rx.try_recv() {
+        for _ in 0..MAX_MICROTASKS_PER_TURN {
+            let Ok(micro) = self.micro_rx.try_recv() else {
+                break;
+            };
             self.handle_microtask(micro);
         }
     }
 
     fn handle_microtask(&mut self, micro: Microtask) {
         match micro {
-            Microtask::StateChanged { id, state } => {
-                self.engine.apply_task_state(id, state);
+            Microtask::StateChanged { id, job_id, state } => {
+                self.engine.apply_task_state(id, job_id, state);
             }
-            Microtask::RecycledToEmpty { id, outcome } => {
-                self.completed_jobs.push((id, outcome));
-                self.engine.on_task_recycled(id);
+            Microtask::RecycledToEmpty {
+                id,
+                job_id,
+                outcome,
+            } => {
+                if self.engine.on_task_recycled(id, job_id)
+                    || !matches!(outcome, TaskOutcome::Shutdown)
+                {
+                    self.completed_jobs.push(CompletedJob {
+                        task_id: id,
+                        job_id,
+                        outcome,
+                    });
+                }
             }
             Microtask::AwaitState {
                 waiter,
@@ -349,20 +379,32 @@ impl<W: TaskWorkflow> Coordinator<W> {
     fn handle_join_result(&mut self, join_res: Result<TaskReport, tokio::task::JoinError>) {
         match join_res {
             Ok(report) => {
-                self.engine.complete_task(report.id);
-                if !matches!(report.outcome, TaskOutcome::Shutdown) {
-                    self.completed_jobs.push((report.id, report.outcome));
+                self.join_tasks.remove(&report.join_id);
+                if let Some((_, Some(job_id))) = self.engine.complete_task(report.id)
+                    && !matches!(report.outcome, TaskOutcome::Shutdown)
+                {
+                    self.completed_jobs.push(CompletedJob {
+                        task_id: report.id,
+                        job_id,
+                        outcome: report.outcome,
+                    });
                 }
             }
             Err(join_err) => {
-                tracing::error!(error = ?join_err, "Supervised IO task panicked or aborted unexpectedly");
-                if self.join_set.is_empty()
-                    && matches!(
-                        self.engine.phase(),
-                        TunnelPhase::Draining | TunnelPhase::ForceStopping
-                    )
+                tracing::error!(
+                    error = ?join_err,
+                    "Supervised IO task terminated unexpectedly"
+                );
+                if let Some(task_id) = self.join_tasks.remove(&join_err.id())
+                    && let Some((_, Some(job_id))) = self.engine.complete_task(task_id)
                 {
-                    self.engine.finish_stop();
+                    self.completed_jobs.push(CompletedJob {
+                        task_id,
+                        job_id,
+                        outcome: TaskOutcome::Failed(TaskError::StageFailed(format!(
+                            "supervised task terminated unexpectedly: {join_err}"
+                        ))),
+                    });
                 }
             }
         }
@@ -371,20 +413,36 @@ impl<W: TaskWorkflow> Coordinator<W> {
         }
     }
 
-    fn spawn_task_in(&mut self, initial_state: ExternalState) -> Result<TaskId, TaskError> {
-        let (id, directive_rx) = self.engine.register_task(initial_state)?;
+    fn spawn_task_with(&mut self, initial_input: Option<W::Input>) -> Result<TaskId, TaskError> {
+        let initial_state = if initial_input.is_some() {
+            ExternalState::Connecting
+        } else {
+            ExternalState::Empty
+        };
+        let reg = self.engine.register_task(initial_state)?;
+        let id = reg.id;
+        let initial_job = match (reg.job_id, initial_input) {
+            (Some(jid), Some(input)) => Some((jid, input)),
+            _ => None,
+        };
         let task = IoTask::new(
             id,
-            initial_state,
+            initial_job,
             Arc::clone(&self.workflow),
             self.micro_tx.clone(),
-            directive_rx,
+            reg.directive_rx,
             self.cancel_token.child_token(),
         );
-        self.join_set.spawn(async move {
+        let abort_handle = self.join_set.spawn(async move {
+            let join_id = tokio::task::id();
             let outcome = task.run().await;
-            TaskReport { id, outcome }
+            TaskReport {
+                id,
+                join_id,
+                outcome,
+            }
         });
+        self.join_tasks.insert(abort_handle.id(), id);
         Ok(id)
     }
 
@@ -394,7 +452,7 @@ impl<W: TaskWorkflow> Coordinator<W> {
                 let mut ids = Vec::with_capacity(count);
                 let mut res = Ok(());
                 for _ in 0..count {
-                    match self.spawn_task_in(ExternalState::Empty) {
+                    match self.spawn_task_with(None) {
                         Ok(id) => ids.push(id),
                         Err(err) => {
                             res = Err(err);
@@ -406,17 +464,11 @@ impl<W: TaskWorkflow> Coordinator<W> {
             }
             CoordinatorEvent::AssignWork { input, reply } => {
                 let res = match self.engine.pop_idle_for_connect() {
-                    Ok(Some(id)) => {
-                        self.engine.dispatch_to_task(id, input);
+                    Ok(Some((id, job_id))) => {
+                        self.engine.dispatch_to_task(id, job_id, input);
                         Ok(id)
                     }
-                    Ok(None) => {
-                        let spawned = self.spawn_task_in(ExternalState::Connecting);
-                        if let Ok(id) = spawned {
-                            self.engine.dispatch_to_task(id, input);
-                        }
-                        spawned
-                    }
+                    Ok(None) => self.spawn_task_with(Some(input)),
                     Err(err) => Err(err),
                 };
                 let _ = reply.send(res);

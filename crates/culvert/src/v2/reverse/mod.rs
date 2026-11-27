@@ -2,15 +2,19 @@
 // SPDX-License-Identifier: MPL-2.0
 // culvert is licensed under the Mozilla Public License Version 2.0.
 
-//! Reverse tunnel (`-R`) visitor pairing workflow and server runner built on
-//! `TransportPool` (`PassiveInbound`), `Coordinator`, and `DuplexRelay`.
+//! Reverse tunnel (`-R`) client and server workflows built on `Coordinator`,
+//! `TransportPool`, and `ChannelRelay`.
 //! All comments and docstrings must be in English.
 
+pub mod client;
 pub mod runner;
 pub mod visitor;
 
 #[cfg(test)]
 mod tests;
 
+pub use client::{
+    ReverseClientConfig, ReverseClientInput, ReverseClientRunner, ReverseClientWorkflow,
+};
 pub use runner::ReverseServerRunner;
 pub use visitor::{ReverseSignaler, ReverseVisitorInput, ReverseVisitorWorkflow};
