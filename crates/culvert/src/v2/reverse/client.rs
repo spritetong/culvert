@@ -31,6 +31,39 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
+/// Coordinates readiness between reverse mapping control registration and a shared reverse pool.
+#[derive(Default)]
+pub struct ReverseReadyNotifier {
+    is_ready: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl ReverseReadyNotifier {
+    /// Creates a new notifier initially in the unready state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Marks the control channel registered and wakes waiting pool workers.
+    pub fn mark_ready(&self) {
+        self.is_ready
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    /// Waits until marked ready or `cancel_token` is cancelled; returns `false` if cancelled.
+    pub async fn wait_ready(&self, cancel_token: &CancellationToken) -> bool {
+        if self.is_ready.load(std::sync::atomic::Ordering::Acquire) {
+            return true;
+        }
+        tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => false,
+            _ = self.notify.notified() => true,
+        }
+    }
+}
+
 /// Internal replenishment notification from a pre-warmed worker back to `ReverseClientRunner`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrewarmSignal {
@@ -365,6 +398,8 @@ pub struct ReverseClientRunner {
     config: ReverseClientConfig,
     connector: Arc<dyn TransportConnector>,
     counters: Option<Arc<RelayCounters>>,
+    ready_notifier: Option<Arc<ReverseReadyNotifier>>,
+    external_shared_pool: bool,
 }
 
 impl ReverseClientRunner {
@@ -374,12 +409,22 @@ impl ReverseClientRunner {
             config,
             connector,
             counters: None,
+            ready_notifier: None,
+            external_shared_pool: false,
         }
     }
 
     /// Attaches shared relay byte counters.
     pub fn with_counters(mut self, counters: Arc<RelayCounters>) -> Self {
         self.counters = Some(counters);
+        self
+    }
+
+    /// Coordinates with an external shared reverse pool (`TunnelCluster`) instead of spawning
+    /// per-mapping pre-warmed workers.
+    pub fn with_shared_pool(mut self, ready: Arc<ReverseReadyNotifier>) -> Self {
+        self.ready_notifier = Some(ready);
+        self.external_shared_pool = true;
         self
     }
 
@@ -404,7 +449,11 @@ impl ReverseClientRunner {
         let (coord, coord_join) =
             Coordinator::start(workflow, self.config.drain_timeout, coord_force_token);
 
-        let pool_workers = clamp_reverse_pool_size(self.config.pool_size).unwrap_or(0);
+        let pool_workers = if self.external_shared_pool {
+            0
+        } else {
+            clamp_reverse_pool_size(self.config.pool_size).unwrap_or(0)
+        };
         if pool_workers > 0 {
             let _ = coord.prewarm(pool_workers).await;
         }
@@ -483,6 +532,10 @@ impl ReverseClientRunner {
                 }
                 backoff = (backoff * 2).min(DEFAULT_REVERSE_BACKOFF_MAX);
                 continue;
+            }
+
+            if let Some(ref notifier) = self.ready_notifier {
+                notifier.mark_ready();
             }
 
             let loop_start = Instant::now();

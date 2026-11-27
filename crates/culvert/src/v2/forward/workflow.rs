@@ -36,6 +36,7 @@ pub struct ForwardWorkflow {
     connector: Option<Arc<dyn TransportConnector>>,
     heartbeat_interval: Duration,
     idle_timeout: Duration,
+    relay_idle_timeout: Duration,
     drain_timeout: Duration,
     counters: Option<Arc<RelayCounters>>,
 }
@@ -54,9 +55,16 @@ impl ForwardWorkflow {
             connector,
             heartbeat_interval,
             idle_timeout,
+            relay_idle_timeout: idle_timeout,
             drain_timeout,
             counters: None,
         }
+    }
+
+    /// Overrides the relay idle timeout independently from pool/activation timeouts (e.g. for UDP).
+    pub fn with_relay_idle_timeout(mut self, relay_idle_timeout: Duration) -> Self {
+        self.relay_idle_timeout = relay_idle_timeout;
+        self
     }
 
     /// Attaches optional shared relay byte counters (primarily for tests and telemetry).
@@ -179,7 +187,7 @@ impl TaskWorkflow for ForwardWorkflow {
                 input.frontend,
                 backend,
                 this.heartbeat_interval,
-                this.idle_timeout,
+                this.relay_idle_timeout,
                 this.drain_timeout,
                 this.counters,
             ))

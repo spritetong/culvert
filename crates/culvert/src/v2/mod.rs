@@ -6,6 +6,7 @@
 //! Isolated from existing `core`, `tunnel`, `pool`, and `io/pump` implementations.
 //! All comments and docstrings must be in English.
 
+pub mod cluster;
 pub mod coordinator;
 pub mod engine;
 pub mod error;
@@ -16,11 +17,13 @@ pub mod reverse;
 pub mod server;
 pub mod stage;
 pub mod state;
+pub mod supervisor;
 pub mod task;
 
 #[cfg(test)]
 mod tests;
 
+pub use cluster::TunnelCluster;
 pub use coordinator::{
     CompletedJob, Coordinator, CoordinatorHandle, CoordinatorSummary, Microtask,
 };
@@ -38,7 +41,8 @@ pub use relay::{
 };
 pub use reverse::{
     ReverseClientConfig, ReverseClientInput, ReverseClientRunner, ReverseClientWorkflow,
-    ReverseServerRunner, ReverseSignaler, ReverseVisitorInput, ReverseVisitorWorkflow,
+    ReverseReadyNotifier, ReverseServerRunner, ReverseSignaler, ReverseVisitorInput,
+    ReverseVisitorWorkflow,
 };
 pub use server::{
     ReverseControlSession, ReverseSessionHub, RouterReverseSignaler, ServerForwardInput,
@@ -48,4 +52,5 @@ pub use stage::{ActiveStage, ClosingStage, ConnectingContext, TaskWorkflow};
 pub use state::{
     CloseReason, ExternalState, JobId, TaskDirective, TaskId, TaskOutcome, TunnelPhase, WaitResult,
 };
+pub use supervisor::{ClientRunner, TunnelSupervisor};
 pub use task::IoTask;

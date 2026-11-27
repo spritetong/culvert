@@ -14,7 +14,8 @@ pub mod visitor;
 mod tests;
 
 pub use client::{
-    ReverseClientConfig, ReverseClientInput, ReverseClientRunner, ReverseClientWorkflow,
+    PrewarmSignal, ReverseClientConfig, ReverseClientInput, ReverseClientRunner,
+    ReverseClientWorkflow, ReverseReadyNotifier,
 };
 pub use runner::ReverseServerRunner;
 pub use visitor::{ReverseSignaler, ReverseVisitorInput, ReverseVisitorWorkflow};
