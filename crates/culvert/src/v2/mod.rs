@@ -28,7 +28,11 @@ pub use pool::{
     LeaseGuard, PoolConfig, PoolDialConfig, PoolHandle, PoolInventory, PoolRole, PoolStats,
     PoolSummary, StreamLease, SweepOutcome, TransportPool,
 };
-pub use relay::{DuplexRelay, RelayClosing, RelayCounters, TransferDirection};
+pub use relay::{
+    ChannelClosing, ChannelRelay, DatagramDatagramClosing, DatagramDatagramRelay,
+    DatagramStreamClosing, DatagramStreamRelay, DuplexRelay, RelayClosing, RelayCounters,
+    TransferDirection,
+};
 pub use reverse::{
     ReverseServerRunner, ReverseSignaler, ReverseVisitorInput, ReverseVisitorWorkflow,
 };

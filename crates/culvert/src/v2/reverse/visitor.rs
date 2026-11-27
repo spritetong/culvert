@@ -13,7 +13,7 @@ use crate::io::channel::IoChannel;
 use crate::pool::activation::encode_activation_with_proto;
 use crate::v2::error::TaskError;
 use crate::v2::pool::{PoolHandle, StreamLease};
-use crate::v2::relay::{DuplexRelay, RelayCounters};
+use crate::v2::relay::{ChannelRelay, RelayCounters};
 use crate::v2::stage::{ConnectingContext, TaskWorkflow};
 use std::future::Future;
 use std::io;
@@ -84,14 +84,14 @@ impl ReverseVisitorWorkflow {
         peer: PeerAddr,
         target: &TargetAddr,
         protocol: L4Protocol,
-    ) -> Result<Box<dyn TunnelStream>, TaskError> {
+    ) -> Result<IoChannel, TaskError> {
         // 1. Fast Path (0-RTT PassiveInbound pool + 0xAC round-trip verification)
         if let Some(ref pool) = self.pool
             && let Ok(Some(mut lease)) = pool.try_acquire().await
         {
             let ack_timeout = reverse_ack_timeout(self.idle_timeout);
             match Self::activate_and_verify(&mut lease, target, protocol, ack_timeout).await {
-                Ok(()) => return Ok(Box::new(lease)),
+                Ok(()) => return Ok(IoChannel::from_stream(lease)),
                 Err(err) => {
                     tracing::debug!(
                         visitor = %peer,
@@ -104,7 +104,10 @@ impl ReverseVisitorWorkflow {
         }
 
         // 2. Slow Path (Control-channel NewConnection signaling)
-        self.signaler.request_pair(peer).await
+        self.signaler
+            .request_pair(peer)
+            .await
+            .map(IoChannel::from_boxed_stream)
     }
 
     async fn activate_and_verify(
@@ -139,7 +142,7 @@ impl ReverseVisitorWorkflow {
 
 impl TaskWorkflow for ReverseVisitorWorkflow {
     type Input = ReverseVisitorInput;
-    type Active = DuplexRelay;
+    type Active = ChannelRelay;
 
     fn connect(
         &self,
@@ -148,24 +151,17 @@ impl TaskWorkflow for ReverseVisitorWorkflow {
     ) -> impl Future<Output = Result<Self::Active, TaskError>> + Send {
         let this = self.clone();
         async move {
-            let visitor = input
-                .visitor
-                .into_stream()
-                .map_err(|e| TaskError::StageFailed(e.to_string()))?;
             let backend = this
                 .acquire_backend(input.peer, &input.target, input.protocol)
                 .await?;
-            let mut relay = DuplexRelay::new(
-                visitor,
+            Ok(ChannelRelay::from_channels(
+                input.visitor,
                 backend,
                 this.heartbeat_interval,
                 this.idle_timeout,
                 this.drain_timeout,
-            );
-            if let Some(ref counters) = this.counters {
-                relay = relay.with_counters(Arc::clone(counters));
-            }
-            Ok(relay)
+                this.counters,
+            ))
         }
     }
 }

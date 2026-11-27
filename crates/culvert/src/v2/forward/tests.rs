@@ -423,3 +423,127 @@ async fn forward_runner_real_ws_server_e2e_pooled_and_recycled() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn forward_runner_real_ws_udp_e2e() {
+    use crate::config::model::{AppConfig, EndpointConfig, ServerConfig, TunnelMode};
+    use crate::dialer::endpoint::EndpointContext;
+    use crate::frontend;
+    use crate::io::addr::MappingSpec;
+    use crate::server::ServerRunner;
+    use crate::session::SessionManager;
+    use crate::transport::TransportRegistry;
+    use crate::transport::ws::WsTransportDriver;
+
+    let udp_echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = udp_echo.local_addr().unwrap().port();
+
+    let probe_ws = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let ws_port = probe_ws.local_addr().unwrap().port();
+    drop(probe_ws);
+
+    let probe_client_udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let client_udp_port = probe_client_udp.local_addr().unwrap().port();
+    drop(probe_client_udp);
+
+    let server_cancel = CancellationToken::new();
+    let echo_cancel = server_cancel.clone();
+    let echo_handle = tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        loop {
+            tokio::select! {
+                _ = echo_cancel.cancelled() => break,
+                res = udp_echo.recv_from(&mut buf) => {
+                    if let Ok((n, peer)) = res {
+                        let _ = udp_echo.send_to(&buf[..n], peer).await;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut registry = TransportRegistry::new();
+    registry.register(WsTransportDriver);
+    let registry = Arc::new(registry);
+
+    let auth_token = "v2-ws-udp-token";
+    let ws_listen = format!("127.0.0.1:{ws_port}");
+    let server_runner = ServerRunner::new(
+        ServerConfig {
+            listen: vec![format!("ws://{ws_listen}/tunnel")],
+            token: Some(auth_token.to_string()),
+            default_target: None,
+            ..Default::default()
+        },
+        Arc::clone(&registry),
+        Arc::new(SessionManager::new()),
+    );
+    let server_tok = server_cancel.clone();
+    let server_handle = tokio::spawn(async move { server_runner.run(server_tok).await });
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let endpoint_cfg = EndpointConfig::Simple(format!("ws://{ws_listen}/tunnel"));
+    let endpoint_ctx = EndpointContext::build(&endpoint_cfg, &AppConfig::default()).unwrap();
+    let connector: Arc<dyn TransportConnector> = Arc::from(
+        registry
+            .create_connector(&endpoint_ctx, Some(auth_token), TunnelMode::Forward)
+            .unwrap(),
+    );
+
+    let client_listen = format!("127.0.0.1:{client_udp_port}");
+    let echo_target = format!("127.0.0.1:{echo_port}");
+    let udp_frontend = frontend::bind(&MappingSpec::new(
+        L4Protocol::Udp,
+        &client_listen,
+        &echo_target,
+    ))
+    .await
+    .unwrap();
+
+    let workflow = ForwardWorkflow::new(
+        None,
+        Some(connector),
+        DEFAULT_HEARTBEAT_INTERVAL,
+        Duration::from_secs(5),
+        DEFAULT_RELAY_DRAIN_TIMEOUT,
+    );
+
+    let runner = ForwardRunner::new(
+        udp_frontend,
+        TargetAddr::Ip(echo_target.parse().unwrap()),
+        L4Protocol::Udp,
+        workflow,
+        None,
+        DEFAULT_RELAY_DRAIN_TIMEOUT,
+    );
+
+    let client_cancel = CancellationToken::new();
+    let runner_handle = tokio::spawn(runner.run(client_cancel.clone()));
+
+    let client_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client_sock.connect(&client_listen).await.unwrap();
+    client_sock.send(b"v2-udp-over-ws").await.unwrap();
+
+    let mut resp = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), client_sock.recv(&mut resp))
+        .await
+        .expect("UDP echo timeout")
+        .unwrap();
+    assert_eq!(&resp[..n], b"v2-udp-over-ws");
+
+    client_cancel.cancel();
+    let summary = tokio::time::timeout(Duration::from_secs(3), runner_handle)
+        .await
+        .expect("v2 UDP ForwardRunner must shut down cleanly")
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.final_phase, TunnelPhase::Stopped);
+    assert_eq!(summary.completed_jobs.len(), 1);
+
+    server_cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+        let _ = tokio::join!(echo_handle, server_handle);
+    })
+    .await;
+}

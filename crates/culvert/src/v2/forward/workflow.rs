@@ -8,14 +8,13 @@
 
 use crate::consts::{ACTIVATE_STREAM_ACK, reverse_ack_timeout};
 use crate::core::error::TunnelError;
-use crate::core::stream::TunnelStream;
 use crate::io::addr::{L4Protocol, TargetAddr};
 use crate::io::channel::IoChannel;
 use crate::pool::activation::encode_activation_with_proto;
 use crate::transport::TransportConnector;
 use crate::v2::error::TaskError;
 use crate::v2::pool::{PoolHandle, StreamLease};
-use crate::v2::relay::{DuplexRelay, RelayCounters};
+use crate::v2::relay::{ChannelRelay, RelayCounters};
 use crate::v2::stage::{ConnectingContext, TaskWorkflow};
 use std::future::Future;
 use std::io;
@@ -70,13 +69,13 @@ impl ForwardWorkflow {
         &self,
         target: &TargetAddr,
         protocol: L4Protocol,
-    ) -> Result<Box<dyn TunnelStream>, TaskError> {
+    ) -> Result<IoChannel, TaskError> {
         if let Some(ref pool) = self.pool {
             match self
                 .acquire_and_activate_pooled(pool, target, protocol)
                 .await
             {
-                Ok(lease) => return Ok(Box::new(lease)),
+                Ok(lease) => return Ok(IoChannel::from_stream(lease)),
                 Err(err) => {
                     tracing::debug!(
                         target = %target,
@@ -89,7 +88,7 @@ impl ForwardWorkflow {
                     let retry_lease = self
                         .acquire_and_activate_pooled(pool, target, protocol)
                         .await?;
-                    return Ok(Box::new(retry_lease));
+                    return Ok(IoChannel::from_stream(retry_lease));
                 }
             }
         }
@@ -152,12 +151,11 @@ impl ForwardWorkflow {
         connector: &dyn TransportConnector,
         target: &TargetAddr,
         protocol: L4Protocol,
-    ) -> Result<Box<dyn TunnelStream>, TaskError> {
-        let channel = connector
+    ) -> Result<IoChannel, TaskError> {
+        connector
             .connect_with_protocol(target, None, protocol)
             .await
-            .map_err(Self::tunnel_err_to_task)?;
-        channel.into_stream().map_err(Self::tunnel_err_to_task)
+            .map_err(Self::tunnel_err_to_task)
     }
 
     fn tunnel_err_to_task(err: TunnelError) -> TaskError {
@@ -167,7 +165,7 @@ impl ForwardWorkflow {
 
 impl TaskWorkflow for ForwardWorkflow {
     type Input = ForwardInput;
-    type Active = DuplexRelay;
+    type Active = ChannelRelay;
 
     fn connect(
         &self,
@@ -176,22 +174,15 @@ impl TaskWorkflow for ForwardWorkflow {
     ) -> impl Future<Output = Result<Self::Active, TaskError>> + Send {
         let this = self.clone();
         async move {
-            let frontend = input
-                .frontend
-                .into_stream()
-                .map_err(Self::tunnel_err_to_task)?;
             let backend = this.acquire_backend(&input.target, input.protocol).await?;
-            let mut relay = DuplexRelay::new(
-                frontend,
+            Ok(ChannelRelay::from_channels(
+                input.frontend,
                 backend,
                 this.heartbeat_interval,
                 this.idle_timeout,
                 this.drain_timeout,
-            );
-            if let Some(ref counters) = this.counters {
-                relay = relay.with_counters(Arc::clone(counters));
-            }
-            Ok(relay)
+                this.counters,
+            ))
         }
     }
 }
