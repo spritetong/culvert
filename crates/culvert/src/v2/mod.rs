@@ -9,7 +9,9 @@
 pub mod coordinator;
 pub mod engine;
 pub mod error;
+pub mod forward;
 pub mod pool;
+pub mod relay;
 pub mod stage;
 pub mod state;
 pub mod task;
@@ -20,10 +22,12 @@ mod tests;
 pub use coordinator::{Coordinator, CoordinatorHandle, CoordinatorSummary, Microtask};
 pub use engine::StateEngine;
 pub use error::TaskError;
+pub use forward::{ForwardInput, ForwardRunner, ForwardWorkflow};
 pub use pool::{
     LeaseGuard, PoolConfig, PoolDialConfig, PoolHandle, PoolInventory, PoolRole, PoolStats,
     PoolSummary, StreamLease, SweepOutcome, TransportPool,
 };
+pub use relay::{DuplexRelay, RelayClosing, RelayCounters, TransferDirection};
 pub use stage::{ActiveStage, ClosingStage, ConnectingContext, TaskWorkflow};
 pub use state::{
     CloseReason, ExternalState, TaskDirective, TaskId, TaskOutcome, TunnelPhase, WaitResult,
