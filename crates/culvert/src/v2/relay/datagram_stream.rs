@@ -117,6 +117,7 @@ impl DatagramStreamRelay {
 
     fn has_pending_data(&self) -> bool {
         self.in_flight_chunk.is_some()
+            || self.need_flush
             || !self.tx_scratch.is_empty()
             || !self.pending_dgrams.is_empty()
             || !self.rx_buf.is_empty()

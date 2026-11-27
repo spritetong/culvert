@@ -584,14 +584,16 @@ async fn coordinator_assign_join_and_drain_progress_under_microtask_burst() {
         .unwrap();
     active_notify.notified().await;
 
-    for _ in 0..400 {
-        handle
-            .assign(MockInput::Immediate {
-                wait_for: Some((sticky, ExternalState::Active)),
-                on_ready: None,
-            })
-            .await
-            .unwrap();
+    // Submit 400 concurrent assign calls simultaneously while all tasks generate heavy
+    // microtask traffic against the Coordinator.
+    let assign_futs = (0..400).map(|_| {
+        handle.assign(MockInput::Immediate {
+            wait_for: Some((sticky, ExternalState::Active)),
+            on_ready: None,
+        })
+    });
+    for res in futures_util::future::join_all(assign_futs).await {
+        res.unwrap();
     }
 
     tokio::time::sleep(Duration::from_millis(60)).await;

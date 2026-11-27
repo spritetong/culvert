@@ -483,6 +483,148 @@ impl TaskWorkflow for SingleShotRelayWorkflow {
 }
 
 #[tokio::test]
+async fn datagram_stream_pending_flush_does_not_exit_on_idle_timeout() {
+    use crate::io::channel::{Datagram, FlowKey, IoChannel};
+    use bytes::Bytes;
+
+    struct PendingFlushStream {
+        allow_flush: Arc<AtomicBool>,
+        written: Arc<parking_lot::Mutex<Vec<u8>>>,
+        flushed: Arc<std::sync::atomic::AtomicUsize>,
+        waker: Arc<parking_lot::Mutex<Option<std::task::Waker>>>,
+        activity_ms: u64,
+    }
+
+    impl AsyncRead for PendingFlushStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for PendingFlushStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.written.lock().extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if !self.allow_flush.load(Ordering::Acquire) {
+                *self.waker.lock() = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            self.flushed
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl TunnelStream for PendingFlushStream {
+        fn last_activity_ms(&self) -> Option<u64> {
+            Some(self.activity_ms)
+        }
+
+        fn poll_check_alive(&mut self, _cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+            Poll::Ready(HeartbeatStatus::Alive)
+        }
+    }
+
+    struct FlushTestWorkflow;
+    struct FlushTestInput {
+        dgram: MockDatagramChannel,
+        stream: PendingFlushStream,
+    }
+    impl TaskWorkflow for FlushTestWorkflow {
+        type Input = FlushTestInput;
+        type Active = ChannelRelay;
+        async fn connect(
+            &self,
+            _ctx: &mut ConnectingContext<'_>,
+            input: Self::Input,
+        ) -> Result<Self::Active, TaskError> {
+            Ok(ChannelRelay::from_channels(
+                IoChannel::from_datagram(input.dgram),
+                IoChannel::from_boxed_stream(Box::new(input.stream)),
+                Duration::from_millis(10),
+                Duration::from_millis(45),
+                DEFAULT_RELAY_DRAIN_TIMEOUT,
+                None,
+            ))
+        }
+    }
+
+    let cancel = CancellationToken::new();
+    let (handle, join) = Coordinator::start(FlushTestWorkflow, DEFAULT_RELAY_DRAIN_TIMEOUT, cancel);
+
+    let (d_in_tx, d_in_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (d_out_tx, _d_out_rx) = tokio::sync::mpsc::unbounded_channel();
+    let allow_flush = Arc::new(AtomicBool::new(false));
+    let written = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let flushed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let waker = Arc::new(parking_lot::Mutex::new(None));
+
+    let task_id = handle
+        .assign(FlushTestInput {
+            dgram: MockDatagramChannel {
+                inbound_rx: d_in_rx,
+                outbound_tx: d_out_tx,
+            },
+            stream: PendingFlushStream {
+                allow_flush: Arc::clone(&allow_flush),
+                written: Arc::clone(&written),
+                flushed: Arc::clone(&flushed),
+                waker: Arc::clone(&waker),
+                activity_ms: activity_now_ms(),
+            },
+        })
+        .await
+        .unwrap();
+
+    // Send a datagram: poll_write succeeds and clears in_flight_chunk, setting need_flush = true,
+    // while poll_flush stays Pending well past the 45ms idle_timeout.
+    d_in_tx
+        .send(Datagram {
+            flow: FlowKey::default(),
+            payload: Bytes::from_static(b"flush-backpressure"),
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert_eq!(written.lock().len(), 2 + b"flush-backpressure".len());
+    assert_eq!(flushed.load(Ordering::Acquire), 0);
+    assert_eq!(
+        handle.query_task_state(task_id).await.unwrap(),
+        Some(crate::v2::ExternalState::Active)
+    );
+
+    allow_flush.store(true, Ordering::Release);
+    if let Some(w) = waker.lock().take() {
+        w.wake();
+    }
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(flushed.load(Ordering::Acquire) >= 1);
+
+    drop(d_in_tx);
+    handle.graceful_stop().await.unwrap();
+    let summary = tokio::time::timeout(Duration::from_secs(1), join)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.final_phase, TunnelPhase::Stopped);
+}
+
+#[tokio::test]
 async fn datagram_stream_backpressure_does_not_drop_buffered_data_on_idle_timeout() {
     use crate::io::channel::IoChannel;
 
