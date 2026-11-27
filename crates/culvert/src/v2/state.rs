@@ -2,21 +2,18 @@
 // SPDX-License-Identifier: MPL-2.0
 // culvert is licensed under the Mozilla Public License Version 2.0.
 
-//! Core state vocabulary for the v2 Coordinator and IO Task prototype.
+//! Core state vocabulary for the v2 Coordinator and IO Task state machine.
 //! All comments and docstrings must be in English.
 
 use crate::v2::error::TaskError;
 use std::fmt;
 
-/// Monotonic unique task identifier assigned by the Coordinator.
-///
-/// Tasks are never pooled by slot index, so a monotonically increasing ID
-/// eliminates stale-event contamination across task lifetimes.
+/// Unique task identifier assigned by the Coordinator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TaskId(u64);
 
 impl TaskId {
-    /// Creates a `TaskId` from a raw monotonic sequence number.
+    /// Creates a `TaskId` from a raw sequence number.
     #[inline]
     pub const fn new(raw: u64) -> Self {
         Self(raw)
@@ -38,18 +35,20 @@ impl fmt::Display for TaskId {
 /// External lifecycle states of an `IoTask` as tracked by the Coordinator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExternalState {
-    /// Task has been spawned and is acquiring or handshaking its resources.
+    /// Task is idle with zero I/O resources, awaiting `Assign` or `Shutdown`.
+    Empty,
+    /// Task received input and is acquiring or handshaking its resources.
     Connecting,
-    /// Task exclusively owns its paired resources and runs the hot-path loop.
+    /// Task exclusively owns paired resources and runs the hot-path loop.
     Active,
-    /// Task is draining buffered work or releasing resources before exiting.
+    /// Task is draining buffered work or releasing resources before recycling/exiting.
     Closing,
     /// Terminal state after the task event loop exits.
     Closed,
 }
 
 impl ExternalState {
-    /// Returns `true` if `self` can monotonically progress to `target` without rewinding.
+    /// Returns `true` if `self` can progress forward to `target` within a single cycle.
     #[inline]
     pub const fn can_reach(self, target: Self) -> bool {
         self.rank() <= target.rank()
@@ -64,10 +63,11 @@ impl ExternalState {
     #[inline]
     const fn rank(self) -> u8 {
         match self {
-            Self::Connecting => 0,
-            Self::Active => 1,
-            Self::Closing => 2,
-            Self::Closed => 3,
+            Self::Empty => 0,
+            Self::Connecting => 1,
+            Self::Active => 2,
+            Self::Closing => 3,
+            Self::Closed => 4,
         }
     }
 }
@@ -75,6 +75,7 @@ impl ExternalState {
 impl fmt::Display for ExternalState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::Empty => "Empty",
             Self::Connecting => "Connecting",
             Self::Active => "Active",
             Self::Closing => "Closing",
@@ -86,20 +87,20 @@ impl fmt::Display for ExternalState {
 /// Tunnel-level coordination phase owned exclusively by the Coordinator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TunnelPhase {
-    /// Accepting new tasks and allowing transitions into `Active`.
+    /// Accepting new work and recycling completed tasks back to `Empty`.
     Running,
-    /// Rejecting new tasks and draining active tasks within a bounded window.
+    /// Rejecting new work, shutting down idle tasks, and draining active tasks.
     Draining,
-    /// Immediately terminating all tasks without waiting for drain completion.
+    /// Immediately terminating all tasks via `CancellationToken`.
     ForceStopping,
-    /// All tasks have terminated and the Coordinator has finished.
+    /// All tasks have terminated and the Coordinator has exited.
     Stopped,
 }
 
 impl TunnelPhase {
-    /// Returns `true` when new tasks and transitions into `Active` are permitted.
+    /// Returns `true` when new assignments and task recycling are permitted.
     #[inline]
-    pub const fn accepts_active_work(self) -> bool {
+    pub const fn accepts_work(self) -> bool {
         matches!(self, Self::Running)
     }
 }
@@ -115,15 +116,15 @@ impl fmt::Display for TunnelPhase {
     }
 }
 
-/// Control directive broadcast from Coordinator to a Task via a non-blocking `watch` channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaskDirective {
-    /// Normal operation.
-    Run,
-    /// Stop accepting new work; enter bounded graceful drain if `Active`, or exit if `Connecting`.
-    EnterDrain,
-    /// Terminate immediately without awaiting drain or internal timeouts.
-    ForceStop,
+/// Asynchronous directive sent from Coordinator to a Task over its unbounded channel.
+#[derive(Debug)]
+pub enum TaskDirective<I> {
+    /// Delivers input payload (such as `(tunnel_id, stream)`) to transition `Empty -> Connecting`.
+    Assign(I),
+    /// Requests bounded graceful drain/recycle; ignored when the task is already `Empty`.
+    Drain,
+    /// Requests the task loop to terminate cleanly and exit to `Closed`.
+    Shutdown,
 }
 
 /// Reason an `ActiveStage` is transitioning into `ClosingStage`.
@@ -133,22 +134,22 @@ pub enum CloseReason {
     NormalEnd,
     /// Active stage encountered a runtime error.
     StageError,
-    /// Coordinator requested a graceful drain.
+    /// Coordinator requested a graceful drain or proactive task recycle.
     GracefulDrain,
 }
 
-/// Outcome returned when a task exits its single event loop.
+/// Outcome recorded for one completed job or terminated task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskOutcome {
-    /// Completed normally through `Active` -> `Closing` -> `Closed`.
+    /// Job completed normally through `Active` -> `Closing`.
     Completed,
-    /// Completed graceful drain after Coordinator entered `Draining`.
+    /// Job completed graceful drain or proactive recycle.
     GracefullyDrained,
-    /// Terminated immediately on `ForceStop` (or cancelled during `Connecting`).
+    /// Task was terminated immediately via `CancellationToken` (`ForceStop`).
     ForceStopped,
-    /// Transition into `Active` was rejected by Coordinator (e.g. shutting down).
-    Rejected(TunnelPhase),
-    /// Task aborted due to a stage or coordination failure.
+    /// Task exited cleanly while idle or after graceful drain.
+    Shutdown,
+    /// Job aborted due to a stage or coordination error.
     Failed(TaskError),
 }
 
@@ -157,7 +158,7 @@ pub enum TaskOutcome {
 pub enum WaitResult {
     /// Target task reached the desired external state.
     Reached,
-    /// Target task closed or entered a later state that can no longer reach the desired state.
+    /// Target task entered a later state that can no longer reach the desired state.
     TargetClosed(ExternalState),
     /// Tunnel began shutting down before the dependency was satisfied.
     Cancelled,

@@ -2,66 +2,64 @@
 // SPDX-License-Identifier: MPL-2.0
 // culvert is licensed under the Mozilla Public License Version 2.0.
 
-//! Minimal state-machine and Coordinator/Task coordination prototype tests.
+//! Minimal tests for two-channel Coordinator, task recycling, and CancellationToken force-stop.
 //! All comments and docstrings must be in English.
 
 use crate::v2::{
-    ActiveStage, CloseReason, ClosingStage, ConnectingStage, Coordinator, ExternalState,
-    StageContext, StateEngine, TaskError, TaskId, TaskOutcome, TunnelPhase, WaitResult,
+    ActiveStage, CloseReason, ClosingStage, ConnectingContext, Coordinator, ExternalState,
+    StateEngine, TaskDirective, TaskError, TaskId, TaskOutcome, TaskWorkflow, TunnelPhase,
+    WaitResult,
 };
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::{Notify, oneshot};
+use tokio_util::sync::CancellationToken;
 
 // =============================================================================
 // 1. Pure StateEngine Tests (No Tokio / No Network)
 // =============================================================================
 
 #[test]
-fn state_engine_valid_lifecycle_and_invalid_transitions() {
-    let mut engine = StateEngine::new();
-    let (id, _rx) = engine.register_task().unwrap();
+fn state_engine_recycle_and_draining_shutdown() {
+    let mut engine = StateEngine::<()>::new();
+    let (id, mut rx) = engine.register_task(ExternalState::Empty).unwrap();
+    assert_eq!(engine.task_state(id), Some(ExternalState::Empty));
+    assert_eq!(engine.idle_task_count(), 1);
+
+    // Pop idle for connect: Empty -> Connecting
+    assert_eq!(engine.pop_idle_for_connect().unwrap(), Some(id));
+    assert_eq!(engine.idle_task_count(), 0);
     assert_eq!(engine.task_state(id), Some(ExternalState::Connecting));
+    engine.dispatch_to_task(id, ());
+    assert!(matches!(rx.try_recv(), Ok(TaskDirective::Assign(()))));
 
-    // Cannot skip Connecting -> Active guard with mismatched `from`
-    assert!(matches!(
-        engine.transition_task(id, ExternalState::Active, ExternalState::Active),
-        Err(TaskError::InvalidTransition { .. })
-    ));
-
-    // Valid: Connecting -> Active -> Closing -> Closed
-    assert_eq!(
-        engine
-            .transition_task(id, ExternalState::Connecting, ExternalState::Active)
-            .unwrap(),
-        ExternalState::Active
-    );
+    // Connecting -> Active -> Closing -> Recycled back to Empty
+    engine.apply_task_state(id, ExternalState::Active);
     assert_eq!(engine.task_state(id), Some(ExternalState::Active));
+    engine.apply_task_state(id, ExternalState::Closing);
+    assert_eq!(engine.task_state(id), Some(ExternalState::Closing));
 
-    // Cannot transition backwards to Connecting
-    assert!(matches!(
-        engine.transition_task(id, ExternalState::Active, ExternalState::Connecting),
-        Err(TaskError::InvalidTransition { .. })
-    ));
+    assert!(engine.on_task_recycled(id));
+    assert_eq!(engine.task_state(id), Some(ExternalState::Empty));
+    assert_eq!(engine.idle_task_count(), 1);
 
-    assert_eq!(
-        engine
-            .transition_task(id, ExternalState::Active, ExternalState::Closing)
-            .unwrap(),
-        ExternalState::Closing
-    );
-    assert_eq!(engine.complete_task(id), Some(ExternalState::Closing));
-    assert_eq!(engine.task_state(id), None);
+    // Graceful stop sends Shutdown to Empty task
+    assert_eq!(engine.begin_graceful_stop(), TunnelPhase::Draining);
+    assert!(matches!(rx.try_recv(), Ok(TaskDirective::Shutdown)));
+    assert_eq!(engine.idle_task_count(), 0);
+
+    engine.complete_task(id);
+    assert_eq!(engine.phase(), TunnelPhase::Stopped);
 }
 
 #[test]
 fn state_engine_detects_wait_cycles_and_resolves_dependencies() {
-    let mut engine = StateEngine::new();
-    let (a, _rx_a) = engine.register_task().unwrap();
-    let (b, _rx_b) = engine.register_task().unwrap();
+    let mut engine = StateEngine::<()>::new();
+    let (a, _rx_a) = engine.register_task(ExternalState::Connecting).unwrap();
+    let (b, _rx_b) = engine.register_task(ExternalState::Connecting).unwrap();
 
     // Self-wait is an immediate cycle
     let (tx_self, mut rx_self) = oneshot::channel();
@@ -79,81 +77,74 @@ fn state_engine_detects_wait_cycles_and_resolves_dependencies() {
     assert_eq!(rx_ab.try_recv().unwrap(), WaitResult::CycleDetected);
 
     // Transition A -> Active wakes B
-    engine
-        .transition_task(a, ExternalState::Connecting, ExternalState::Active)
-        .unwrap();
+    engine.apply_task_state(a, ExternalState::Active);
     assert_eq!(rx_ba.try_recv().unwrap(), WaitResult::Reached);
 }
 
-#[test]
-fn state_engine_rejects_active_transition_during_draining() {
-    let mut engine = StateEngine::new();
-    let (a, _rx_a) = engine.register_task().unwrap();
-    assert_eq!(engine.begin_graceful_stop(), TunnelPhase::Draining);
-
-    let res = engine.transition_task(a, ExternalState::Connecting, ExternalState::Active);
-    assert_eq!(
-        res,
-        Err(TaskError::RejectedByCoordinator(TunnelPhase::Draining))
-    );
-}
-
 // =============================================================================
-// 2. Minimal Mock Stages for Coordinator + IoTask Integration
+// 2. Minimal Mock Workflow for Coordinator + Recyclable IoTask Integration
 // =============================================================================
 
-struct MockConnecting {
-    wait_for: Option<(TaskId, ExternalState)>,
-    observed_wait: Option<Arc<Notify>>,
-    active_mode: MockActiveMode,
-    drained_flag: Arc<AtomicBool>,
+#[derive(Clone)]
+struct MockWorkflow {
+    closed_jobs: Arc<AtomicUsize>,
 }
 
-#[derive(Clone, Copy)]
-enum MockActiveMode {
-    ImmediateComplete,
-    ForeverPending,
+enum MockInput {
+    Immediate {
+        wait_for: Option<(TaskId, ExternalState)>,
+        on_ready: Option<Arc<Notify>>,
+    },
+    ForeverPending {
+        on_active: Option<Arc<Notify>>,
+    },
 }
 
 struct MockActive {
-    mode: MockActiveMode,
-    drained_flag: Arc<AtomicBool>,
-    state_gate: Option<oneshot::Sender<()>>,
+    forever_pending: bool,
+    on_active: Option<Arc<Notify>>,
+    closed_jobs: Arc<AtomicUsize>,
 }
 
 struct MockClosing {
-    reason: CloseReason,
-    drained_flag: Arc<AtomicBool>,
-    hang_forever: bool,
+    _reason: CloseReason,
+    closed_jobs: Arc<AtomicUsize>,
 }
 
-impl ConnectingStage for MockConnecting {
+impl TaskWorkflow for MockWorkflow {
+    type Input = MockInput;
     type Active = MockActive;
 
-    fn run(
-        &mut self,
-        ctx: &mut StageContext<'_>,
+    fn connect(
+        &self,
+        ctx: &mut ConnectingContext<'_>,
+        input: Self::Input,
     ) -> impl Future<Output = Result<Self::Active, TaskError>> + Send {
-        let wait_for = self.wait_for;
-        let observed_wait = self.observed_wait.clone();
-        let mode = self.active_mode;
-        let drained_flag = Arc::clone(&self.drained_flag);
-
+        let closed_jobs = Arc::clone(&self.closed_jobs);
         async move {
-            if let Some((target, desired)) = wait_for {
-                let res = ctx.await_task_state(target, desired).await?;
-                if res != WaitResult::Reached {
-                    return Err(TaskError::DependencyFailed(format!("{res:?}")));
+            match input {
+                MockInput::Immediate { wait_for, on_ready } => {
+                    if let Some((target, desired)) = wait_for {
+                        let res = ctx.await_task_state(target, desired).await?;
+                        if res != WaitResult::Reached {
+                            return Err(TaskError::DependencyFailed(format!("{res:?}")));
+                        }
+                        if let Some(n) = on_ready {
+                            n.notify_one();
+                        }
+                    }
+                    Ok(MockActive {
+                        forever_pending: false,
+                        on_active: None,
+                        closed_jobs,
+                    })
                 }
-                if let Some(n) = observed_wait {
-                    n.notify_one();
-                }
+                MockInput::ForeverPending { on_active } => Ok(MockActive {
+                    forever_pending: true,
+                    on_active,
+                    closed_jobs,
+                }),
             }
-            Ok(MockActive {
-                mode,
-                drained_flag,
-                state_gate: None,
-            })
         }
     }
 }
@@ -162,145 +153,151 @@ impl ActiveStage for MockActive {
     type Closing = MockClosing;
 
     fn poll_drive(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), TaskError>> {
-        if let Some(tx) = self.state_gate.take() {
-            let _ = tx.send(());
+        if let Some(n) = self.on_active.take() {
+            n.notify_one();
         }
-        match self.mode {
-            MockActiveMode::ImmediateComplete => Poll::Ready(Ok(())),
-            MockActiveMode::ForeverPending => Poll::Pending,
+        if self.forever_pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(()))
         }
     }
 
     fn into_closing(self, reason: CloseReason) -> Self::Closing {
         MockClosing {
-            reason,
-            drained_flag: self.drained_flag,
-            hang_forever: false,
+            _reason: reason,
+            closed_jobs: self.closed_jobs,
         }
     }
 }
 
 impl ClosingStage for MockClosing {
     fn run(&mut self) -> impl Future<Output = Result<(), TaskError>> + Send {
-        let flag = Arc::clone(&self.drained_flag);
-        let hang = self.hang_forever;
-        let _reason = self.reason;
+        let closed_jobs = Arc::clone(&self.closed_jobs);
         async move {
-            if hang {
-                std::future::pending::<()>().await;
-            }
-            flag.store(true, Ordering::Release);
+            closed_jobs.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
     }
 }
 
 #[tokio::test]
-async fn task_and_coordinator_complete_full_lifecycle() {
-    let (handle, join) = Coordinator::start(Duration::from_millis(200));
-    let drained = Arc::new(AtomicBool::new(false));
+async fn task_recycles_to_empty_and_reuses_same_id() {
+    let cancel = CancellationToken::new();
+    let closed_jobs = Arc::new(AtomicUsize::new(0));
+    let (handle, join) = Coordinator::start(
+        MockWorkflow {
+            closed_jobs: Arc::clone(&closed_jobs),
+        },
+        Duration::from_millis(200),
+        cancel,
+    );
 
-    let id = handle
-        .spawn_task(MockConnecting {
+    // Prewarm 1 Empty task, assign job 1 -> completes & recycles -> assign job 2 reuses same TaskId
+    let prewarmed = handle.prewarm(1).await.unwrap();
+    let task_id = prewarmed[0];
+    assert_eq!(
+        handle.query_task_state(task_id).await.unwrap(),
+        Some(ExternalState::Empty)
+    );
+
+    let assigned_1 = handle
+        .assign(MockInput::Immediate {
             wait_for: None,
-            observed_wait: None,
-            active_mode: MockActiveMode::ImmediateComplete,
-            drained_flag: Arc::clone(&drained),
+            on_ready: None,
         })
         .await
         .unwrap();
+    assert_eq!(assigned_1, task_id);
 
-    // Wait briefly for task completion and stop coordinator.
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(handle.query_task_state(id).await.unwrap(), None);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(
+        handle.query_task_state(task_id).await.unwrap(),
+        Some(ExternalState::Empty)
+    );
+    assert_eq!(handle.query_idle_count().await.unwrap(), 1);
+
+    // Late Drain delivered to Empty task must be ignored and keep the task reusable
+    assert!(handle.request_recycle(task_id).await.unwrap());
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    assert_eq!(
+        handle.query_task_state(task_id).await.unwrap(),
+        Some(ExternalState::Empty)
+    );
+
+    let assigned_2 = handle
+        .assign(MockInput::Immediate {
+            wait_for: None,
+            on_ready: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(assigned_2, task_id);
+
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(closed_jobs.load(Ordering::Acquire), 2);
 
     let phase = handle.graceful_stop().await.unwrap();
-    assert_eq!(phase, TunnelPhase::Stopped);
-
-    let summary = join.await.unwrap();
-    assert_eq!(summary.final_phase, TunnelPhase::Stopped);
-    assert_eq!(summary.completed_tasks, vec![(id, TaskOutcome::Completed)]);
-    assert!(drained.load(Ordering::Acquire));
-}
-
-#[tokio::test]
-async fn inter_task_coordination_awaits_target_active_state() {
-    let (handle, join) = Coordinator::start(Duration::from_millis(200));
-    let drained_a = Arc::new(AtomicBool::new(false));
-    let drained_b = Arc::new(AtomicBool::new(false));
-    let dep_reached = Arc::new(Notify::new());
-
-    // Task A holds Active forever until force_stop.
-    let task_a = handle
-        .spawn_task(MockConnecting {
-            wait_for: None,
-            observed_wait: None,
-            active_mode: MockActiveMode::ForeverPending,
-            drained_flag: Arc::clone(&drained_a),
-        })
-        .await
-        .unwrap();
-
-    // Task B waits in Connecting until Task A reaches Active.
-    let task_b = handle
-        .spawn_task(MockConnecting {
-            wait_for: Some((task_a, ExternalState::Active)),
-            observed_wait: Some(Arc::clone(&dep_reached)),
-            active_mode: MockActiveMode::ImmediateComplete,
-            drained_flag: Arc::clone(&drained_b),
-        })
-        .await
-        .unwrap();
-
-    tokio::time::timeout(Duration::from_secs(1), dep_reached.notified())
-        .await
-        .expect("task B should observe task A reaching Active");
-
-    let phase = handle.force_stop().await.unwrap();
     assert!(matches!(
         phase,
-        TunnelPhase::ForceStopping | TunnelPhase::Stopped
+        TunnelPhase::Draining | TunnelPhase::Stopped
     ));
 
     let summary = tokio::time::timeout(Duration::from_secs(1), join)
         .await
-        .expect("coordinator must exit promptly on force stop")
+        .expect("coordinator should exit after graceful stop")
         .unwrap();
     assert_eq!(summary.final_phase, TunnelPhase::Stopped);
-    assert!(
-        summary
-            .completed_tasks
-            .iter()
-            .any(|(id, out)| *id == task_a && *out == TaskOutcome::ForceStopped)
-    );
-    assert!(
-        summary
-            .completed_tasks
-            .iter()
-            .any(|(id, out)| *id == task_b && *out == TaskOutcome::Completed)
+    assert_eq!(
+        summary.completed_jobs,
+        vec![
+            (task_id, TaskOutcome::Completed),
+            (task_id, TaskOutcome::Completed),
+        ]
     );
 }
 
 #[tokio::test]
-async fn graceful_stop_drains_active_task_without_waiting_on_forever_pending_deadline() {
-    let (handle, join) = Coordinator::start(Duration::from_millis(50));
-    let drained = Arc::new(AtomicBool::new(false));
+async fn inter_task_coordination_and_proactive_recycle() {
+    let cancel = CancellationToken::new();
+    let closed_jobs = Arc::new(AtomicUsize::new(0));
+    let (handle, join) = Coordinator::start(
+        MockWorkflow {
+            closed_jobs: Arc::clone(&closed_jobs),
+        },
+        Duration::from_millis(200),
+        cancel,
+    );
 
-    let id = handle
-        .spawn_task(MockConnecting {
-            wait_for: None,
-            observed_wait: None,
-            active_mode: MockActiveMode::ForeverPending,
-            drained_flag: Arc::clone(&drained),
+    let active_notify = Arc::new(Notify::new());
+    let dep_notify = Arc::new(Notify::new());
+
+    let task_a = handle
+        .assign(MockInput::ForeverPending {
+            on_active: Some(Arc::clone(&active_notify)),
+        })
+        .await
+        .unwrap();
+    active_notify.notified().await;
+
+    let task_b = handle
+        .assign(MockInput::Immediate {
+            wait_for: Some((task_a, ExternalState::Active)),
+            on_ready: Some(Arc::clone(&dep_notify)),
         })
         .await
         .unwrap();
 
-    // Ensure task reached Active before graceful_stop.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    tokio::time::timeout(Duration::from_secs(1), dep_notify.notified())
+        .await
+        .expect("task B should observe task A in Active");
+
+    // Coordinator proactively recycles forever-pending task_a back to Empty via async Drain
+    assert!(handle.request_recycle(task_a).await.unwrap());
+    tokio::time::sleep(Duration::from_millis(25)).await;
     assert_eq!(
-        handle.query_task_state(id).await.unwrap(),
-        Some(ExternalState::Active)
+        handle.query_task_state(task_a).await.unwrap(),
+        Some(ExternalState::Empty)
     );
 
     let phase = handle.graceful_stop().await.unwrap();
@@ -311,12 +308,53 @@ async fn graceful_stop_drains_active_task_without_waiting_on_forever_pending_dea
 
     let summary = tokio::time::timeout(Duration::from_secs(1), join)
         .await
-        .expect("graceful drain must finish cleanly")
+        .expect("coordinator must drain cleanly")
+        .unwrap();
+    assert_eq!(summary.final_phase, TunnelPhase::Stopped);
+    assert!(
+        summary
+            .completed_jobs
+            .contains(&(task_a, TaskOutcome::GracefullyDrained))
+    );
+    assert!(
+        summary
+            .completed_jobs
+            .contains(&(task_b, TaskOutcome::Completed))
+    );
+}
+
+#[tokio::test]
+async fn dropping_all_handles_triggers_force_stop_immediately() {
+    let cancel = CancellationToken::new();
+    let closed_jobs = Arc::new(AtomicUsize::new(0));
+    let (handle, join) = Coordinator::start(
+        MockWorkflow {
+            closed_jobs: Arc::clone(&closed_jobs),
+        },
+        Duration::from_secs(30),
+        cancel,
+    );
+
+    let active_notify = Arc::new(Notify::new());
+    let task_id = handle
+        .assign(MockInput::ForeverPending {
+            on_active: Some(Arc::clone(&active_notify)),
+        })
+        .await
+        .unwrap();
+    active_notify.notified().await;
+
+    // Dropping the sole handle must cancel via Inner::drop and terminate promptly without waiting 30s.
+    drop(handle);
+
+    let summary = tokio::time::timeout(Duration::from_secs(1), join)
+        .await
+        .expect("coordinator must exit promptly when all handles drop")
         .unwrap();
     assert_eq!(summary.final_phase, TunnelPhase::Stopped);
     assert_eq!(
-        summary.completed_tasks,
-        vec![(id, TaskOutcome::GracefullyDrained)]
+        summary.completed_jobs,
+        vec![(task_id, TaskOutcome::ForceStopped)]
     );
-    assert!(drained.load(Ordering::Acquire));
+    assert_eq!(closed_jobs.load(Ordering::Acquire), 0);
 }

@@ -16,11 +16,11 @@ pub mod task;
 #[cfg(test)]
 mod tests;
 
-pub use coordinator::{Coordinator, CoordinatorHandle, CoordinatorSummary};
+pub use coordinator::{Coordinator, CoordinatorHandle, CoordinatorSummary, Microtask};
 pub use engine::StateEngine;
 pub use error::TaskError;
-pub use stage::{ActiveStage, ClosingStage, ConnectingStage, StageContext};
+pub use stage::{ActiveStage, ClosingStage, ConnectingContext, TaskWorkflow};
 pub use state::{
     CloseReason, ExternalState, TaskDirective, TaskId, TaskOutcome, TunnelPhase, WaitResult,
 };
-pub use task::{IoTask, TaskControl};
+pub use task::IoTask;

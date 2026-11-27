@@ -8,23 +8,23 @@
 use crate::v2::error::TaskError;
 use crate::v2::state::{ExternalState, TaskDirective, TaskId, TunnelPhase, WaitResult};
 use std::collections::{HashMap, HashSet, VecDeque};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 
-/// Coordinator-owned record for one live task.
-struct TaskEntry {
+/// Coordinator-owned record for one live `IoTask`.
+struct TaskEntry<I> {
     state: ExternalState,
-    directive_tx: watch::Sender<TaskDirective>,
+    directive_tx: mpsc::UnboundedSender<TaskDirective<I>>,
 }
 
-impl TaskEntry {
-    fn new(state: ExternalState, directive_tx: watch::Sender<TaskDirective>) -> Self {
+impl<I> TaskEntry<I> {
+    fn new(state: ExternalState, directive_tx: mpsc::UnboundedSender<TaskDirective<I>>) -> Self {
         Self {
             state,
             directive_tx,
         }
     }
 
-    fn send_directive(&self, directive: TaskDirective) {
+    fn send_directive(&self, directive: TaskDirective<I>) {
         let _ = self.directive_tx.send(directive);
     }
 }
@@ -37,24 +37,26 @@ struct StateWaiter {
     reply: oneshot::Sender<WaitResult>,
 }
 
-/// Pure, synchronous state engine for Tunnel phases, Task external states, and inter-task waits.
+/// Pure synchronous state engine for Tunnel phases, Task states, idle recycling, and waits.
 ///
-/// Designed so all state-transition invariants and cycle checks can be verified
-/// deterministically without network I/O or a Tokio runtime.
-pub struct StateEngine {
+/// Designed for zero-blocking single-writer execution inside the Coordinator Microtask
+/// handler and deterministic unit testing without Tokio or network I/O.
+pub struct StateEngine<I> {
     phase: TunnelPhase,
     next_task_seq: u64,
-    tasks: HashMap<TaskId, TaskEntry>,
+    tasks: HashMap<TaskId, TaskEntry<I>>,
+    idle_tasks: VecDeque<TaskId>,
     waiters: Vec<StateWaiter>,
 }
 
-impl StateEngine {
+impl<I> StateEngine<I> {
     /// Creates a new `StateEngine` in the `Running` phase.
     pub fn new() -> Self {
         Self {
             phase: TunnelPhase::Running,
             next_task_seq: 1,
             tasks: HashMap::new(),
+            idle_tasks: VecDeque::new(),
             waiters: Vec::new(),
         }
     }
@@ -65,100 +67,112 @@ impl StateEngine {
         self.phase
     }
 
-    /// Returns the number of tracked active (non-closed) tasks.
+    /// Returns the number of tracked live tasks (including `Empty` tasks).
     #[inline]
-    pub fn active_task_count(&self) -> usize {
+    pub fn live_task_count(&self) -> usize {
         self.tasks.len()
     }
 
-    /// Queries the current external state of `task_id`, if still active.
+    /// Returns the number of currently idle `Empty` tasks available for reuse.
+    #[inline]
+    pub fn idle_task_count(&self) -> usize {
+        self.idle_tasks.len()
+    }
+
+    /// Queries the current external state of `task_id`, if live.
     #[inline]
     pub fn task_state(&self, task_id: TaskId) -> Option<ExternalState> {
         self.tasks.get(&task_id).map(|entry| entry.state)
     }
 
-    /// Allocates a new `TaskId` and registers the task in `ExternalState::Connecting`.
-    ///
-    /// Fails if the tunnel is no longer in `TunnelPhase::Running`.
-    pub fn register_task(&mut self) -> Result<(TaskId, watch::Receiver<TaskDirective>), TaskError> {
-        if !self.phase.accepts_active_work() {
+    /// Pops an idle `Empty` task if available and transitions it to `Connecting`.
+    pub fn pop_idle_for_connect(&mut self) -> Result<Option<TaskId>, TaskError> {
+        if !self.phase.accepts_work() {
+            return Err(TaskError::RejectedByCoordinator(self.phase));
+        }
+        while let Some(id) = self.idle_tasks.pop_front() {
+            if let Some(entry) = self.tasks.get_mut(&id)
+                && entry.state == ExternalState::Empty
+            {
+                entry.state = ExternalState::Connecting;
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Registers a newly spawned `IoTask` in the requested initial state (`Empty` or `Connecting`).
+    pub fn register_task(
+        &mut self,
+        initial_state: ExternalState,
+    ) -> Result<(TaskId, mpsc::UnboundedReceiver<TaskDirective<I>>), TaskError> {
+        if !self.phase.accepts_work() {
             return Err(TaskError::RejectedByCoordinator(self.phase));
         }
         let id = TaskId::new(self.next_task_seq);
         self.next_task_seq = self.next_task_seq.saturating_add(1);
-        let (directive_tx, directive_rx) = watch::channel(TaskDirective::Run);
+        let (directive_tx, directive_rx) = mpsc::unbounded_channel();
         self.tasks
-            .insert(id, TaskEntry::new(ExternalState::Connecting, directive_tx));
+            .insert(id, TaskEntry::new(initial_state, directive_tx));
+        if initial_state == ExternalState::Empty {
+            self.idle_tasks.push_back(id);
+        }
         Ok((id, directive_rx))
     }
 
-    /// Attempts to transition `task_id` from `expected_from` to `next`.
-    ///
-    /// Returns the committed `ExternalState` on success, or an error if the guard fails.
-    pub fn transition_task(
-        &mut self,
-        task_id: TaskId,
-        expected_from: ExternalState,
-        next: ExternalState,
-    ) -> Result<ExternalState, TaskError> {
-        let Some(entry) = self.tasks.get_mut(&task_id) else {
-            return Err(TaskError::InvalidTransition {
-                task_id,
-                from: expected_from,
-                to: next,
-            });
-        };
-
-        let current = entry.state;
-        match next {
-            ExternalState::Active => {
-                if !self.phase.accepts_active_work() {
-                    return Err(TaskError::RejectedByCoordinator(self.phase));
-                }
-                if current != ExternalState::Connecting
-                    || expected_from != ExternalState::Connecting
-                {
-                    return Err(TaskError::InvalidTransition {
-                        task_id,
-                        from: current,
-                        to: next,
-                    });
-                }
-                entry.state = ExternalState::Active;
-                self.resolve_waiters_for(task_id, ExternalState::Active);
-                Ok(ExternalState::Active)
-            }
-            ExternalState::Closing => {
-                // Convergent idempotency: if Coordinator already initiated Draining while an
-                // Active task was simultaneously finishing, keep Closing without error.
-                if current == ExternalState::Closing && expected_from == ExternalState::Active {
-                    return Ok(ExternalState::Closing);
-                }
-                if current != expected_from
-                    || !matches!(current, ExternalState::Connecting | ExternalState::Active)
-                {
-                    return Err(TaskError::InvalidTransition {
-                        task_id,
-                        from: current,
-                        to: next,
-                    });
-                }
-                entry.state = ExternalState::Closing;
-                self.resolve_waiters_for(task_id, ExternalState::Closing);
-                Ok(ExternalState::Closing)
-            }
-            ExternalState::Connecting | ExternalState::Closed => {
-                Err(TaskError::InvalidTransition {
-                    task_id,
-                    from: current,
-                    to: next,
-                })
-            }
+    /// Assigns `input` to a newly registered `Connecting` task.
+    pub fn dispatch_to_task(&self, task_id: TaskId, input: I) {
+        if let Some(entry) = self.tasks.get(&task_id) {
+            entry.send_directive(TaskDirective::Assign(input));
         }
     }
 
-    /// Marks `task_id` as `Closed`, removes it from active tracking, and resolves all
-    /// waiters targeting or owned by this task.
+    /// Sends an asynchronous directive (`Drain` or `Shutdown`) to a specific task.
+    pub fn send_directive(&self, task_id: TaskId, directive: TaskDirective<I>) -> bool {
+        if let Some(entry) = self.tasks.get(&task_id) {
+            entry.send_directive(directive);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Applies an asynchronous state notification reported by a task (`Active` or `Closing`).
+    pub fn apply_task_state(&mut self, task_id: TaskId, next: ExternalState) {
+        let Some(entry) = self.tasks.get_mut(&task_id) else {
+            return;
+        };
+        if !entry.state.can_reach(next) || entry.state == next {
+            return;
+        }
+        entry.state = next;
+        self.resolve_waiters_for(task_id, next);
+    }
+
+    /// Handles a task's synchronous self-recycle notification (`Closing`/`Connecting` -> `Empty`).
+    ///
+    /// If the tunnel is `Running`, returns the task to `idle_tasks` for reuse. Otherwise
+    /// instructs the task to `Shutdown` cleanly so the `JoinSet` can drain.
+    pub fn on_task_recycled(&mut self, task_id: TaskId) -> bool {
+        self.resolve_waiters_for(task_id, ExternalState::Closed);
+        self.drop_waiters_owned_by(task_id);
+
+        let Some(entry) = self.tasks.get_mut(&task_id) else {
+            return false;
+        };
+
+        if self.phase.accepts_work() {
+            entry.state = ExternalState::Empty;
+            self.idle_tasks.push_back(task_id);
+            true
+        } else {
+            entry.state = ExternalState::Closing;
+            entry.send_directive(TaskDirective::Shutdown);
+            false
+        }
+    }
+
+    /// Marks `task_id` fully exited (`Closed`) and removes it from tracking.
     pub fn complete_task(&mut self, task_id: TaskId) -> Option<ExternalState> {
         let removed = self.tasks.remove(&task_id)?;
         self.resolve_waiters_for(task_id, ExternalState::Closed);
@@ -185,7 +199,7 @@ impl StateEngine {
         desired: ExternalState,
         reply: oneshot::Sender<WaitResult>,
     ) {
-        if !self.phase.accepts_active_work() {
+        if !self.phase.accepts_work() {
             let _ = reply.send(WaitResult::Cancelled);
             return;
         }
@@ -217,49 +231,47 @@ impl StateEngine {
         });
     }
 
-    /// Transitions the tunnel into `Draining` (or `Stopped` immediately if no tasks remain)
-    /// and broadcasts `TaskDirective::EnterDrain` to all live tasks.
+    /// Transitions the tunnel into `Draining` (or `Stopped` immediately if no tasks remain):
+    /// `Empty` tasks receive `Shutdown` while active/connecting tasks receive `Drain`.
     pub fn begin_graceful_stop(&mut self) -> TunnelPhase {
-        match self.phase {
-            TunnelPhase::Running => {
-                self.cancel_all_waiters();
-                if self.tasks.is_empty() {
-                    self.phase = TunnelPhase::Stopped;
-                } else {
-                    self.phase = TunnelPhase::Draining;
-                    for entry in self.tasks.values() {
-                        entry.send_directive(TaskDirective::EnterDrain);
+        if self.phase == TunnelPhase::Running {
+            self.cancel_all_waiters();
+            self.idle_tasks.clear();
+            if self.tasks.is_empty() {
+                self.phase = TunnelPhase::Stopped;
+            } else {
+                self.phase = TunnelPhase::Draining;
+                for entry in self.tasks.values_mut() {
+                    if entry.state == ExternalState::Empty {
+                        entry.state = ExternalState::Closing;
+                        entry.send_directive(TaskDirective::Shutdown);
+                    } else {
+                        entry.send_directive(TaskDirective::Drain);
                     }
                 }
             }
-            TunnelPhase::Draining | TunnelPhase::ForceStopping | TunnelPhase::Stopped => {}
         }
         self.phase
     }
 
-    /// Transitions the tunnel into `ForceStopping` (or `Stopped` immediately if no tasks remain)
-    /// and broadcasts `TaskDirective::ForceStop` to all live tasks.
+    /// Transitions the tunnel into `ForceStopping` (or `Stopped` immediately if no tasks remain).
     pub fn begin_force_stop(&mut self) -> TunnelPhase {
-        match self.phase {
-            TunnelPhase::Running | TunnelPhase::Draining => {
-                self.cancel_all_waiters();
-                if self.tasks.is_empty() {
-                    self.phase = TunnelPhase::Stopped;
-                } else {
-                    self.phase = TunnelPhase::ForceStopping;
-                    for entry in self.tasks.values() {
-                        entry.send_directive(TaskDirective::ForceStop);
-                    }
-                }
-            }
-            TunnelPhase::ForceStopping | TunnelPhase::Stopped => {}
+        if matches!(self.phase, TunnelPhase::Running | TunnelPhase::Draining) {
+            self.cancel_all_waiters();
+            self.idle_tasks.clear();
+            self.phase = if self.tasks.is_empty() {
+                TunnelPhase::Stopped
+            } else {
+                TunnelPhase::ForceStopping
+            };
         }
         self.phase
     }
 
-    /// Marks the engine fully stopped once all task handles have been drained.
+    /// Marks the engine fully stopped once all task handles have drained.
     pub fn finish_stop(&mut self) {
         self.cancel_all_waiters();
+        self.idle_tasks.clear();
         self.phase = TunnelPhase::Stopped;
     }
 
@@ -286,8 +298,7 @@ impl StateEngine {
     fn resolve_waiters_for(&mut self, target: TaskId, new_state: ExternalState) {
         let mut i = 0;
         while i < self.waiters.len() {
-            let matches_target = self.waiters[i].target == target;
-            if !matches_target {
+            if self.waiters[i].target != target {
                 i += 1;
                 continue;
             }
@@ -323,7 +334,7 @@ impl StateEngine {
     }
 }
 
-impl Default for StateEngine {
+impl<I> Default for StateEngine<I> {
     fn default() -> Self {
         Self::new()
     }

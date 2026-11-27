@@ -2,22 +2,15 @@
 // SPDX-License-Identifier: MPL-2.0
 // culvert is licensed under the Mozilla Public License Version 2.0.
 
-//! Error types for the v2 Coordinator and IO Task state machine prototype.
+//! Error types for the v2 Coordinator and IO Task state machine.
 //! All comments and docstrings must be in English.
 
-use crate::v2::state::{ExternalState, TaskId, TunnelPhase};
+use crate::v2::state::TunnelPhase;
 use thiserror::Error;
 
-/// Errors produced by state transitions, coordination requests, and stage execution.
+/// Errors produced by coordination requests and task stage execution.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum TaskError {
-    #[error("invalid state transition for {task_id}: {from} -> {to}")]
-    InvalidTransition {
-        task_id: TaskId,
-        from: ExternalState,
-        to: ExternalState,
-    },
-
     #[error("coordinator is no longer running")]
     CoordinatorGone,
 
