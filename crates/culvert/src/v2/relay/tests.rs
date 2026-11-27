@@ -9,7 +9,7 @@ use crate::consts::{
     DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_IDLE_TIMEOUT, DEFAULT_RELAY_DRAIN_TIMEOUT,
 };
 use crate::core::stream::{HeartbeatStatus, TunnelStream, activity_now_ms};
-use crate::v2::relay::{DuplexRelay, RelayCounters};
+use crate::v2::relay::{ChannelRelay, DuplexRelay, RelayCounters};
 use crate::v2::stage::ConnectingContext;
 use crate::v2::{Coordinator, TaskError, TaskOutcome, TaskWorkflow, TunnelPhase};
 use std::io;
@@ -405,6 +405,145 @@ async fn channel_relay_datagram_stream_frames_and_half_closes() {
     assert_eq!(summary.completed_jobs[0].outcome, TaskOutcome::Completed);
 }
 
+struct BackpressuredDatagram {
+    inbound_rx: tokio::sync::mpsc::UnboundedReceiver<crate::io::channel::Datagram>,
+    allow_send: Arc<AtomicBool>,
+    sent: Arc<parking_lot::Mutex<std::collections::VecDeque<bytes::Bytes>>>,
+    waker_slot: Arc<parking_lot::Mutex<Option<std::task::Waker>>>,
+}
+
+impl crate::io::channel::DatagramIo for BackpressuredDatagram {
+    fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+        batch: &mut [crate::io::channel::Datagram],
+    ) -> Poll<io::Result<usize>> {
+        match self.inbound_rx.poll_recv(cx) {
+            Poll::Ready(Some(d)) if !batch.is_empty() => {
+                batch[0] = d;
+                Poll::Ready(Ok(1))
+            }
+            Poll::Ready(None) => Poll::Ready(Ok(0)),
+            _ => Poll::Pending,
+        }
+    }
+
+    fn poll_send(
+        &mut self,
+        cx: &mut Context<'_>,
+        batch: &[crate::io::channel::Datagram],
+    ) -> Poll<io::Result<usize>> {
+        if batch.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        if !self.allow_send.load(Ordering::Acquire) {
+            *self.waker_slot.lock() = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+        let mut sent = self.sent.lock();
+        for d in batch {
+            sent.push_back(d.payload.clone());
+        }
+        Poll::Ready(Ok(batch.len()))
+    }
+}
+
+struct SingleShotRelayWorkflow {
+    idle_timeout: Duration,
+    counters: Arc<RelayCounters>,
+}
+
+struct SingleShotInput {
+    a: crate::io::channel::IoChannel,
+    b: crate::io::channel::IoChannel,
+}
+
+impl TaskWorkflow for SingleShotRelayWorkflow {
+    type Input = SingleShotInput;
+    type Active = ChannelRelay;
+
+    fn connect(
+        &self,
+        _ctx: &mut ConnectingContext<'_>,
+        input: Self::Input,
+    ) -> impl std::future::Future<Output = Result<Self::Active, TaskError>> + Send {
+        let idle_timeout = self.idle_timeout;
+        let counters = Arc::clone(&self.counters);
+        async move {
+            Ok(ChannelRelay::from_channels(
+                input.a,
+                input.b,
+                Duration::from_millis(10),
+                idle_timeout,
+                DEFAULT_RELAY_DRAIN_TIMEOUT,
+                Some(counters),
+            ))
+        }
+    }
+}
+
+#[tokio::test]
+async fn datagram_stream_backpressure_does_not_drop_buffered_data_on_idle_timeout() {
+    use crate::io::channel::IoChannel;
+
+    let cancel = CancellationToken::new();
+    let (handle, join) = Coordinator::start(
+        SingleShotRelayWorkflow {
+            idle_timeout: Duration::from_millis(45),
+            counters: Arc::new(RelayCounters::new()),
+        },
+        DEFAULT_RELAY_DRAIN_TIMEOUT,
+        cancel,
+    );
+
+    let (mut app_stream, relay_stream) = duplex(1024);
+    let (_d_in_tx, d_in_rx) = tokio::sync::mpsc::unbounded_channel();
+    let allow_send = Arc::new(AtomicBool::new(false));
+    let sent = Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new()));
+    let waker = Arc::new(parking_lot::Mutex::new(None));
+
+    handle
+        .assign(SingleShotInput {
+            a: IoChannel::from_boxed_stream(Box::new(relay_stream)),
+            b: IoChannel::from_datagram(BackpressuredDatagram {
+                inbound_rx: d_in_rx,
+                allow_send: Arc::clone(&allow_send),
+                sent: Arc::clone(&sent),
+                waker_slot: Arc::clone(&waker),
+            }),
+        })
+        .await
+        .unwrap();
+
+    // Write one length-prefixed datagram frame from stream into backpressured DatagramIo:
+    // 2-byte big-endian len (13) + b"dgram-bp-test".
+    let mut framed = Vec::from(13u16.to_be_bytes());
+    framed.extend_from_slice(b"dgram-bp-test");
+    app_stream.write_all(&framed).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(sent.lock().is_empty());
+
+    allow_send.store(true, Ordering::Release);
+    if let Some(w) = waker.lock().take() {
+        w.wake();
+    }
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(
+        sent.lock().pop_front().as_deref(),
+        Some(&b"dgram-bp-test"[..])
+    );
+
+    drop(app_stream);
+    handle.graceful_stop().await.unwrap();
+    let summary = tokio::time::timeout(Duration::from_secs(1), join)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.final_phase, TunnelPhase::Stopped);
+}
+
 #[tokio::test]
 async fn channel_relay_datagram_datagram_forwards_batches() {
     use crate::io::channel::{Datagram, FlowKey, IoChannel};
@@ -472,4 +611,78 @@ async fn channel_relay_datagram_datagram_forwards_batches() {
     assert_eq!(summary.completed_jobs.len(), 1);
     assert_eq!(summary.completed_jobs[0].task_id, task_id);
     assert_eq!(summary.completed_jobs[0].outcome, TaskOutcome::Completed);
+}
+
+#[tokio::test]
+async fn udp_relay_backpressure_does_not_drop_queued_datagrams_on_idle_timeout() {
+    use crate::io::channel::{Datagram, FlowKey, IoChannel};
+    use bytes::Bytes;
+    use std::collections::VecDeque;
+
+    let cancel = CancellationToken::new();
+    let counters = Arc::new(RelayCounters::new());
+    let (handle, join) = Coordinator::start(
+        SingleShotRelayWorkflow {
+            idle_timeout: Duration::from_millis(45),
+            counters: Arc::clone(&counters),
+        },
+        DEFAULT_RELAY_DRAIN_TIMEOUT,
+        cancel,
+    );
+
+    let (a_in_tx, a_in_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_b_in_tx, b_in_rx) = tokio::sync::mpsc::unbounded_channel();
+    let allow_send_b = Arc::new(AtomicBool::new(false));
+    let sent_b = Arc::new(parking_lot::Mutex::new(VecDeque::new()));
+    let waker_b = Arc::new(parking_lot::Mutex::new(None));
+
+    let a_dev = MockDatagramChannel {
+        inbound_rx: a_in_rx,
+        outbound_tx: tokio::sync::mpsc::unbounded_channel().0,
+    };
+    let b_dev = BackpressuredDatagram {
+        inbound_rx: b_in_rx,
+        allow_send: Arc::clone(&allow_send_b),
+        sent: Arc::clone(&sent_b),
+        waker_slot: Arc::clone(&waker_b),
+    };
+
+    handle
+        .assign(SingleShotInput {
+            a: IoChannel::from_datagram(a_dev),
+            b: IoChannel::from_datagram(b_dev),
+        })
+        .await
+        .unwrap();
+
+    // Send a datagram while destination poll_send() stays Pending beyond idle_timeout (45ms).
+    a_in_tx
+        .send(Datagram {
+            flow: FlowKey::default(),
+            payload: Bytes::from_static(b"must-not-drop-under-backpressure"),
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(sent_b.lock().is_empty());
+
+    // Release backpressure -> queued packet MUST still be flushed intact.
+    allow_send_b.store(true, Ordering::Release);
+    if let Some(w) = waker_b.lock().take() {
+        w.wake();
+    }
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(
+        sent_b.lock().pop_front().as_deref(),
+        Some(&b"must-not-drop-under-backpressure"[..])
+    );
+
+    drop(a_in_tx);
+    handle.graceful_stop().await.unwrap();
+    let summary = tokio::time::timeout(Duration::from_secs(1), join)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.final_phase, TunnelPhase::Stopped);
 }

@@ -450,3 +450,109 @@ async fn reverse_client_real_ws_server_e2e_on_demand_and_prewarmed() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn reverse_old_generation_cannot_promote_new_signaling_attachment() {
+    use crate::consts::ACTIVATE_STREAM_PROMOTE;
+    use crate::control::{SignalingChannel, SignalingConfig, SignalingRouter};
+    use crate::v2::Coordinator;
+    use crate::v2::reverse::{ReverseClientInput, ReverseClientWorkflow};
+    use std::sync::atomic::AtomicU64;
+
+    struct PromotingConnector {
+        stream_holder: Arc<tokio::sync::Mutex<Option<Box<dyn TunnelStream>>>>,
+    }
+    impl crate::transport::TransportConnector for PromotingConnector {
+        fn connect<'a>(
+            &'a self,
+            _target: &'a TargetAddr,
+            _session_id: Option<&'a str>,
+        ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
+            Box::pin(async { Err(TunnelError::Shutdown) })
+        }
+
+        fn connect_pooled<'a>(
+            &'a self,
+            _target: &'a TargetAddr,
+        ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
+            let holder = Arc::clone(&self.stream_holder);
+            Box::pin(async move {
+                let s = holder.lock().await.take().ok_or(TunnelError::Shutdown)?;
+                Ok(IoChannel::from_boxed_stream(s))
+            })
+        }
+    }
+
+    let (client_prewarm, mut server_prewarm) = duplex(1024);
+    let (ctrl_client, ctrl_server) = duplex(1024);
+    let sig_cfg = SignalingConfig::default();
+    let router_cancel = CancellationToken::new();
+    let (sig_handle, sig_rx) =
+        SignalingChannel::spawn(Box::new(ctrl_client), sig_cfg, router_cancel.child_token());
+    let router = SignalingRouter::new(sig_handle);
+
+    let workflow = ReverseClientWorkflow::new(
+        Arc::new(PromotingConnector {
+            stream_holder: Arc::new(tokio::sync::Mutex::new(Some(Box::new(client_prewarm)))),
+        }),
+        DEFAULT_HEARTBEAT_INTERVAL,
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+        DEFAULT_RELAY_DRAIN_TIMEOUT,
+    );
+    // Active generation is already 2 and router is attached to generation 2.
+    let active_generation = Arc::new(AtomicU64::new(2));
+    workflow
+        .attachment()
+        .set(
+            2,
+            router.clone(),
+            sig_rx.event_sink(),
+            sig_cfg,
+            router_cancel.clone(),
+        )
+        .await;
+
+    let (replenish_tx, mut replenish_rx) = mpsc::unbounded_channel();
+    let (coord, coord_join) = Coordinator::start(
+        workflow,
+        DEFAULT_RELAY_DRAIN_TIMEOUT,
+        CancellationToken::new(),
+    );
+
+    // Dispatch an old generation-1 Prewarmed worker; server sends 0xA6 promotion.
+    coord
+        .assign(ReverseClientInput::Prewarmed {
+            listen_targets: vec![TargetAddr::Ip("127.0.0.1:8080".parse().unwrap())],
+            default_target: TargetAddr::Ip("127.0.0.1:8080".parse().unwrap()),
+            default_protocol: L4Protocol::Tcp,
+            tunnel_id: None,
+            replenish_tx,
+            generation: 1,
+            active_generation,
+        })
+        .await
+        .unwrap();
+
+    server_prewarm
+        .write_all(&[ACTIVATE_STREAM_PROMOTE])
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    // Superseded generation-1 worker must neither emit replenish signals nor attach onto gen-2 router.
+    assert!(replenish_rx.try_recv().is_err());
+    drop(ctrl_server);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!router.promote_standby_if_closed());
+    assert!(!router.has_active_channel());
+
+    router_cancel.cancel();
+    coord.graceful_stop().await.unwrap();
+    let summary = coord_join.await.unwrap();
+    assert_eq!(summary.completed_jobs.len(), 1);
+    assert!(matches!(
+        summary.completed_jobs[0].outcome,
+        TaskOutcome::Failed(_)
+    ));
+}

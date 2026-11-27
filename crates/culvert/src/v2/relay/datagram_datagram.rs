@@ -85,6 +85,10 @@ impl DatagramDatagramRelay {
         }
     }
 
+    fn has_pending_outbound(&self) -> bool {
+        !self.queue_a_to_b.is_empty() || !self.queue_b_to_a.is_empty()
+    }
+
     fn poll_step_inner(
         &mut self,
         cx: &mut Context<'_>,
@@ -173,21 +177,24 @@ impl ActiveStage for DatagramDatagramRelay {
     type Closing = DatagramDatagramClosing;
 
     fn poll_drive(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), TaskError>> {
+        let res = self.poll_step_inner(cx, false);
+        if res.is_ready() {
+            self.sync_counters();
+            return res;
+        }
+
         if self.idle_timer.as_mut().poll(cx).is_ready() {
-            if self.last_activity.elapsed() >= self.idle_timeout {
+            if !self.has_pending_outbound() && self.last_activity.elapsed() >= self.idle_timeout {
                 self.sync_counters();
                 return Poll::Ready(Ok(()));
             }
             self.idle_timer
                 .as_mut()
                 .reset(tokio::time::Instant::now() + self.tick_interval);
+            let _ = self.idle_timer.as_mut().poll(cx);
         }
 
-        let res = self.poll_step_inner(cx, false);
-        if res.is_ready() {
-            self.sync_counters();
-        }
-        res
+        Poll::Pending
     }
 
     fn into_closing(self, reason: CloseReason) -> Self::Closing {

@@ -57,6 +57,7 @@ impl<'a> ConnectingContext<'a> {
         self.micro_tx
             .send(Microtask::AwaitState {
                 waiter: self.task_id,
+                waiter_job: self.job_id,
                 target,
                 desired,
                 reply: reply_tx,

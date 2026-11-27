@@ -33,14 +33,15 @@ impl<I> TaskEntry<I> {
         }
     }
 
-    fn send_directive(&self, directive: TaskDirective<I>) {
-        let _ = self.directive_tx.send(directive);
+    fn send_directive(&self, directive: TaskDirective<I>) -> Result<(), TaskDirective<I>> {
+        self.directive_tx.send(directive).map_err(|err| err.0)
     }
 }
 
 /// Pending inter-task state dependency mediated by the Coordinator.
 struct StateWaiter {
     waiter: TaskId,
+    waiter_job: JobId,
     target: TaskId,
     desired: ExternalState,
     reply: oneshot::Sender<WaitResult>,
@@ -115,9 +116,14 @@ impl<I> StateEngine<I> {
         self.tasks.get(&task_id).and_then(|entry| entry.current_job)
     }
 
-    /// Pops an idle `Empty` task if available, transitions it to `Connecting`, and
-    /// allocates a fresh `JobId`.
-    pub fn pop_idle_for_connect(&mut self) -> Result<Option<(TaskId, JobId)>, TaskError> {
+    /// Pops an idle `Empty` task and atomically dispatches `input` over its directive channel.
+    ///
+    /// Returns `Ok(Ok((id, job_id)))` when accepted, or `Ok(Err(input))` if no live idle worker
+    /// could receive the directive (recovering `input` untouched when a receiver closed).
+    pub fn try_assign_idle(
+        &mut self,
+        mut input: I,
+    ) -> Result<Result<(TaskId, JobId), I>, TaskError> {
         if !self.phase.accepts_work() {
             return Err(TaskError::RejectedByCoordinator(self.phase));
         }
@@ -126,17 +132,31 @@ impl<I> StateEngine<I> {
                 .tasks
                 .get(&id)
                 .is_some_and(|entry| entry.state == ExternalState::Empty);
-            if is_idle {
-                let job_id = self.alloc_job_id();
-                if let Some(entry) = self.tasks.get_mut(&id) {
+            if !is_idle {
+                continue;
+            }
+            let job_id = self.alloc_job_id();
+            let Some(entry) = self.tasks.get_mut(&id) else {
+                continue;
+            };
+            match entry.send_directive(TaskDirective::Assign { job_id, input }) {
+                Ok(()) => {
                     entry.state = ExternalState::Connecting;
                     entry.current_job = Some(job_id);
+                    self.resolve_waiters_for(id, ExternalState::Connecting);
+                    return Ok(Ok((id, job_id)));
                 }
-                self.resolve_waiters_for(id, ExternalState::Connecting);
-                return Ok(Some((id, job_id)));
+                Err(TaskDirective::Assign {
+                    input: recovered, ..
+                }) => {
+                    input = recovered;
+                }
+                Err(_) => {
+                    unreachable!("only TaskDirective::Assign is passed into try_assign_idle")
+                }
             }
         }
-        Ok(None)
+        Ok(Err(input))
     }
 
     /// Registers a newly spawned `IoTask` in either `Empty` (`job_id == None`) or
@@ -168,21 +188,13 @@ impl<I> StateEngine<I> {
         })
     }
 
-    /// Dispatches `Assign { job_id, input }` to an idle task popped via `pop_idle_for_connect`.
-    pub fn dispatch_to_task(&self, task_id: TaskId, job_id: JobId, input: I) {
-        if let Some(entry) = self.tasks.get(&task_id) {
-            entry.send_directive(TaskDirective::Assign { job_id, input });
-        }
-    }
-
-    /// Sends an asynchronous directive (`Drain` or `Shutdown`) to a specific task.
+    /// Sends an asynchronous directive (`Drain` or `Shutdown`) to `task_id`.
+    ///
+    /// Returns `true` only if `task_id` exists AND the directive was queued onto a live channel.
     pub fn send_directive(&self, task_id: TaskId, directive: TaskDirective<I>) -> bool {
-        if let Some(entry) = self.tasks.get(&task_id) {
-            entry.send_directive(directive);
-            true
-        } else {
-            false
-        }
+        self.tasks
+            .get(&task_id)
+            .is_some_and(|entry| entry.send_directive(directive).is_ok())
     }
 
     /// Applies an asynchronous state notification reported by `task_id` for `job_id`.
@@ -204,14 +216,9 @@ impl<I> StateEngine<I> {
 
     /// Handles a task's synchronous self-recycle notification (`Closing`/`Connecting` -> `Empty`).
     ///
-    /// Strictly distinguishes task recycling (`* -> Empty`) from task exit (`* -> Closed`):
-    /// - Waiters targeting `Empty` receive `WaitResult::Reached`.
-    /// - Waiters targeting `Closed` stay pending until `complete_task` runs.
-    /// - Waiters targeting earlier job stages (`Connecting`/`Active`/`Closing`) receive
-    ///   `WaitResult::TargetClosed(Empty)` so they never stall across job generations.
+    /// Validates `job_id` before performing any side effects so stale events can never disturb
+    /// the current job's state or registered waiters.
     pub fn on_task_recycled(&mut self, task_id: TaskId, job_id: JobId) -> bool {
-        self.drop_waiters_owned_by(task_id);
-
         let Some(entry) = self.tasks.get_mut(&task_id) else {
             return false;
         };
@@ -220,25 +227,32 @@ impl<I> StateEngine<I> {
         }
         entry.current_job = None;
 
-        if self.phase.accepts_work() {
+        let accepted_idle = if self.phase.accepts_work() {
             entry.state = ExternalState::Empty;
             self.idle_tasks.push_back(task_id);
-            self.resolve_waiters_on_recycle(task_id);
             true
         } else {
             entry.state = ExternalState::Closing;
-            entry.send_directive(TaskDirective::Shutdown);
-            self.resolve_waiters_for(task_id, ExternalState::Closing);
+            let _ = entry.send_directive(TaskDirective::Shutdown);
             false
+        };
+
+        self.drop_waiters_owned_by_job(task_id, job_id);
+        if accepted_idle {
+            self.resolve_waiters_on_recycle(task_id);
+        } else {
+            self.resolve_waiters_for(task_id, ExternalState::Closing);
         }
+        accepted_idle
     }
 
-    /// Marks `task_id` fully exited (`Closed`), clears tracking, and returns its last
-    /// external state and unfinished `JobId` (if any).
+    /// Marks `task_id` fully exited (`Closed`), prunes `idle_tasks`, clears tracking,
+    /// and returns its last external state and unfinished `JobId` (if any).
     pub fn complete_task(&mut self, task_id: TaskId) -> Option<(ExternalState, Option<JobId>)> {
         let removed = self.tasks.remove(&task_id)?;
+        self.idle_tasks.retain(|&id| id != task_id);
         self.resolve_waiters_for(task_id, ExternalState::Closed);
-        self.drop_waiters_owned_by(task_id);
+        self.drop_waiters_owned_by_task(task_id);
         if self.tasks.is_empty()
             && matches!(
                 self.phase,
@@ -250,18 +264,24 @@ impl<I> StateEngine<I> {
         Some((removed.state, removed.current_job))
     }
 
-    /// Registers an inter-task state dependency (`waiter` waits for `target` to reach `desired`).
+    /// Registers an inter-task state dependency (`waiter`/`waiter_job` waits for `target`
+    /// to reach `desired`).
     ///
-    /// Performs synchronous cycle detection on the waiter graph so task-to-task waits
-    /// can never deadlock.
+    /// Performs synchronous job verification and cycle detection so waits cannot deadlock
+    /// or leak across recycled job generations.
     pub fn register_waiter(
         &mut self,
         waiter: TaskId,
+        waiter_job: JobId,
         target: TaskId,
         desired: ExternalState,
         reply: oneshot::Sender<WaitResult>,
     ) {
         if !self.phase.accepts_work() || self.waiters.len() >= MAX_PENDING_WAITERS {
+            let _ = reply.send(WaitResult::Cancelled);
+            return;
+        }
+        if self.tasks.get(&waiter).and_then(|e| e.current_job) != Some(waiter_job) {
             let _ = reply.send(WaitResult::Cancelled);
             return;
         }
@@ -287,6 +307,7 @@ impl<I> StateEngine<I> {
         }
         self.waiters.push(StateWaiter {
             waiter,
+            waiter_job,
             target,
             desired,
             reply,
@@ -306,9 +327,9 @@ impl<I> StateEngine<I> {
                 for entry in self.tasks.values_mut() {
                     if entry.state == ExternalState::Empty {
                         entry.state = ExternalState::Closing;
-                        entry.send_directive(TaskDirective::Shutdown);
+                        let _ = entry.send_directive(TaskDirective::Shutdown);
                     } else {
-                        entry.send_directive(TaskDirective::Drain);
+                        let _ = entry.send_directive(TaskDirective::Drain);
                     }
                 }
             }
@@ -400,10 +421,22 @@ impl<I> StateEngine<I> {
         }
     }
 
-    fn drop_waiters_owned_by(&mut self, waiter: TaskId) {
+    fn drop_waiters_owned_by_task(&mut self, waiter: TaskId) {
         let mut i = 0;
         while i < self.waiters.len() {
             if self.waiters[i].waiter == waiter {
+                let w = self.waiters.swap_remove(i);
+                let _ = w.reply.send(WaitResult::Cancelled);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn drop_waiters_owned_by_job(&mut self, waiter: TaskId, waiter_job: JobId) {
+        let mut i = 0;
+        while i < self.waiters.len() {
+            if self.waiters[i].waiter == waiter && self.waiters[i].waiter_job == waiter_job {
                 let w = self.waiters.swap_remove(i);
                 let _ = w.reply.send(WaitResult::Cancelled);
             } else {

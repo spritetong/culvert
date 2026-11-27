@@ -415,7 +415,7 @@ Coordinator 通过 `(TaskId, JobId)` 精确校验内部异步通知：
 5. **External State 如何向其他 Task 发布？Coordinator 通道如何防死锁与背压？**
    - **定稿**：Coordinator 采用双通道优先级模型：
      - **外部事件通道（`event_rx`）**：有界队列（容量 1024），为外部 `assign` / `prewarm` / 查询请求提供背压。
-     - **高优先级同步微任务通道（`micro_rx`）** 与 **Task 指令通道（`directive_tx`）**：无界异步发送以确保单写者 Coordinator 与 Task 之间永不因相互 `.await` 形成死锁；`Coordinator::run` 每次循环对 `drain_microtasks()` 施加单轮上限（`MAX_MICROTASKS_PER_TURN = 256`），保证 `CancellationToken` 与 `drain_timeout` 永不被微任务风暴饿死；`StateEngine` 同时限制最大并发 Waiter 数量（`MAX_PENDING_WAITERS = 4096`）。
+     - **高优先级同步微任务通道（`micro_rx`）** 与 **Task 指令通道（`directive_tx`）**：无界异步发送以确保单写者 Coordinator 与 Task 之间永不因相互 `.await` 形成死锁；`micro_rx` 严格按最高优先级在每轮 `select!` 入口通过 `while let Ok` 极速排空（所有 `Microtask` 均受契约约束为 O(1) 纯内存同步状态变更、禁止任何 `.await`）；`StateEngine` 同时限制最大并发 Waiter 数量（`MAX_PENDING_WAITERS = 4096`）。
 6. **Graceful Shutdown 的排空边界在哪里？**
    - **定稿**：
      - 收到 Stop 后立即停止 `Frontend::accept`。
@@ -440,7 +440,7 @@ Coordinator 通过 `(TaskId, JobId)` 精确校验内部异步通知：
                 +-----------------------------------+
                 |      Tunnel Coordinator Actor     |  <-- 唯一 StateEngine 写入者
                 |  - phase: TunnelPhase             |      唯一持有 JoinSet 与 JoinId->TaskId 映射
-                |  - micro_rx (unbounded, capped)   |      CancellationToken 统一 ForceStop + Drop
+                |  - micro_rx (unbounded, loop-drain)|      CancellationToken 统一 ForceStop + Drop
                 |  - event_rx (bounded 1024)        |
                 +-------+-------------------+-------+
                         |                   |

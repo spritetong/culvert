@@ -115,8 +115,16 @@ impl DatagramStreamRelay {
         }
     }
 
+    fn has_pending_data(&self) -> bool {
+        self.in_flight_chunk.is_some()
+            || !self.tx_scratch.is_empty()
+            || !self.pending_dgrams.is_empty()
+            || !self.rx_buf.is_empty()
+    }
+
     fn check_heartbeats(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), TaskError>> {
-        if self.last_dgram_activity.elapsed() >= self.idle_timeout {
+        let pending_data = self.has_pending_data();
+        if !pending_data && self.last_dgram_activity.elapsed() >= self.idle_timeout {
             return Poll::Ready(Ok(()));
         }
         if !self.stream_read_done {
@@ -131,7 +139,7 @@ impl DatagramStreamRelay {
                 self.heartbeat_interval,
                 self.idle_timeout.saturating_add(self.tick_interval),
             );
-            if expired {
+            if !pending_data && expired {
                 return Poll::Ready(Err(TaskError::StageFailed(
                     "datagram relay stream idle timeout".into(),
                 )));
@@ -176,6 +184,7 @@ impl DatagramStreamRelay {
                 }
                 Poll::Ready(Ok(n)) => {
                     self.chunk_pos += n;
+                    self.last_dgram_activity = Instant::now();
                     progress = true;
                     if self.chunk_pos >= chunk.len() {
                         self.in_flight_chunk = None;
@@ -330,21 +339,24 @@ impl ActiveStage for DatagramStreamRelay {
     type Closing = DatagramStreamClosing;
 
     fn poll_drive(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), TaskError>> {
+        let res = self.poll_step_inner(cx, false);
+        if res.is_ready() {
+            self.sync_counters();
+            return res;
+        }
+
         if self.heartbeat_timer.as_mut().poll(cx).is_ready() {
             self.heartbeat_timer
                 .as_mut()
                 .reset(tokio::time::Instant::now() + self.tick_interval);
-            if let Poll::Ready(res) = self.check_heartbeats(cx) {
+            let _ = self.heartbeat_timer.as_mut().poll(cx);
+            if let Poll::Ready(hb_res) = self.check_heartbeats(cx) {
                 self.sync_counters();
-                return Poll::Ready(res);
+                return Poll::Ready(hb_res);
             }
         }
 
-        let res = self.poll_step_inner(cx, false);
-        if res.is_ready() {
-            self.sync_counters();
-        }
-        res
+        Poll::Pending
     }
 
     fn into_closing(self, reason: CloseReason) -> Self::Closing {

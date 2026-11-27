@@ -55,6 +55,12 @@ impl TransferDirection {
             && self.write_shutdown
     }
 
+    /// Returns `true` if there is any buffered payload waiting to be written.
+    #[inline]
+    pub fn has_buffered_data(&self) -> bool {
+        self.in_flight_chunk.is_some() || self.write_pos < self.read_pos
+    }
+
     /// Returns the total number of bytes written in this direction.
     #[inline]
     pub fn total_bytes(&self) -> u64 {

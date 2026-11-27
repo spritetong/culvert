@@ -40,6 +40,7 @@ pub enum PrewarmSignal {
 }
 
 struct SignalingAttachmentInner {
+    generation: u64,
     router: SignalingRouter,
     sink: Option<SignalingSink>,
     sig_config: SignalingConfig,
@@ -59,12 +60,14 @@ impl SignalingAttachment {
 
     pub async fn set(
         &self,
+        generation: u64,
         router: SignalingRouter,
         sink: Option<SignalingSink>,
         sig_config: SignalingConfig,
         cancel: CancellationToken,
     ) {
         *self.inner.write().await = Some(SignalingAttachmentInner {
+            generation,
             router,
             sink,
             sig_config,
@@ -76,9 +79,14 @@ impl SignalingAttachment {
         *self.inner.write().await = None;
     }
 
-    async fn try_promote(&self, stream: Box<dyn crate::core::stream::TunnelStream>) -> bool {
+    async fn try_promote(
+        &self,
+        generation: u64,
+        stream: Box<dyn crate::core::stream::TunnelStream>,
+    ) -> bool {
         let guard = self.inner.read().await;
         if let Some(ref att) = *guard
+            && att.generation == generation
             && let Some(ref sink) = att.sink
         {
             let handle = SignalingChannel::spawn_with_event_sink(
@@ -153,7 +161,7 @@ impl ReverseClientWorkflow {
         self
     }
 
-    fn attachment(&self) -> &SignalingAttachment {
+    pub(crate) fn attachment(&self) -> &SignalingAttachment {
         &self.attachment
     }
 
@@ -242,8 +250,14 @@ impl ReverseClientWorkflow {
             }
         };
 
+        if active_generation.load(std::sync::atomic::Ordering::Acquire) != generation {
+            return Err(TaskError::StageFailed(
+                "reverse pre-warmed generation superseded".into(),
+            ));
+        }
+
         if hdr.is_promotion {
-            let _ = self.attachment.try_promote(stream).await;
+            let _ = self.attachment.try_promote(generation, stream).await;
             if active_generation.load(std::sync::atomic::Ordering::Acquire) == generation {
                 let _ = replenish_tx.send(PrewarmSignal::RetryImmediately);
             }
@@ -471,18 +485,18 @@ impl ReverseClientRunner {
                 continue;
             }
 
+            let loop_start = Instant::now();
+            let generation =
+                active_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
             attachment
                 .set(
+                    generation,
                     router.clone(),
                     sig_rx.event_sink(),
                     sig_config,
                     ctrl_cancel.clone(),
                 )
                 .await;
-
-            let loop_start = Instant::now();
-            let generation =
-                active_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
             let (replenish_tx, mut replenish_rx) = mpsc::unbounded_channel();
             let mut prewarm_backoff = POOL_BACKOFF_BASE;
 

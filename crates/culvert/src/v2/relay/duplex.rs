@@ -165,10 +165,10 @@ impl DuplexRelay {
             self.idle_timeout,
         );
 
-        if !self.a_to_b.is_read_done() && expired_a {
+        if !self.a_to_b.is_read_done() && !self.a_to_b.has_buffered_data() && expired_a {
             return Err(TaskError::StageFailed("stream A idle timeout".into()));
         }
-        if !self.b_to_a.is_read_done() && expired_b {
+        if !self.b_to_a.is_read_done() && !self.b_to_a.has_buffered_data() && expired_b {
             return Err(TaskError::StageFailed("stream B idle timeout".into()));
         }
 
@@ -227,16 +227,6 @@ impl ActiveStage for DuplexRelay {
     type Closing = RelayClosing;
 
     fn poll_drive(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), TaskError>> {
-        if self.heartbeat_timer.as_mut().poll(cx).is_ready() {
-            self.heartbeat_timer
-                .as_mut()
-                .reset(tokio::time::Instant::now() + self.tick_interval);
-            if let Err(err) = self.check_heartbeats(cx) {
-                self.sync_counters();
-                return Poll::Ready(Err(err));
-            }
-        }
-
         let mut progress = false;
 
         match self.a_to_b.poll_step(
@@ -272,6 +262,17 @@ impl ActiveStage for DuplexRelay {
         if self.a_to_b.is_finished() && self.b_to_a.is_finished() {
             self.sync_counters();
             return Poll::Ready(Ok(()));
+        }
+
+        if self.heartbeat_timer.as_mut().poll(cx).is_ready() {
+            self.heartbeat_timer
+                .as_mut()
+                .reset(tokio::time::Instant::now() + self.tick_interval);
+            let _ = self.heartbeat_timer.as_mut().poll(cx);
+            if let Err(err) = self.check_heartbeats(cx) {
+                self.sync_counters();
+                return Poll::Ready(Err(err));
+            }
         }
 
         if progress {

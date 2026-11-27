@@ -22,8 +22,6 @@ use tokio::time::Sleep;
 use tokio_util::sync::CancellationToken;
 
 const COORDINATOR_EVENT_QUEUE_CAPACITY: usize = 1024;
-/// Fair per-turn microtask batch cap so a microtask storm cannot starve cancellation or timers.
-const MAX_MICROTASKS_PER_TURN: usize = 256;
 
 /// Final report returned when an `IoTask` exits its `JoinSet` handle.
 struct TaskReport {
@@ -49,6 +47,7 @@ pub enum Microtask {
     },
     AwaitState {
         waiter: TaskId,
+        waiter_job: JobId,
         target: TaskId,
         desired: ExternalState,
         reply: oneshot::Sender<WaitResult>,
@@ -337,10 +336,7 @@ impl<W: TaskWorkflow> Coordinator<W> {
     }
 
     fn drain_microtasks(&mut self) {
-        for _ in 0..MAX_MICROTASKS_PER_TURN {
-            let Ok(micro) = self.micro_rx.try_recv() else {
-                break;
-            };
+        while let Ok(micro) = self.micro_rx.try_recv() {
             self.handle_microtask(micro);
         }
     }
@@ -367,11 +363,13 @@ impl<W: TaskWorkflow> Coordinator<W> {
             }
             Microtask::AwaitState {
                 waiter,
+                waiter_job,
                 target,
                 desired,
                 reply,
             } => {
-                self.engine.register_waiter(waiter, target, desired, reply);
+                self.engine
+                    .register_waiter(waiter, waiter_job, target, desired, reply);
             }
         }
     }
@@ -463,12 +461,9 @@ impl<W: TaskWorkflow> Coordinator<W> {
                 let _ = reply.send(res.map(|()| ids));
             }
             CoordinatorEvent::AssignWork { input, reply } => {
-                let res = match self.engine.pop_idle_for_connect() {
-                    Ok(Some((id, job_id))) => {
-                        self.engine.dispatch_to_task(id, job_id, input);
-                        Ok(id)
-                    }
-                    Ok(None) => self.spawn_task_with(Some(input)),
+                let res = match self.engine.try_assign_idle(input) {
+                    Ok(Ok((id, _job_id))) => Ok(id),
+                    Ok(Err(recovered_input)) => self.spawn_task_with(Some(recovered_input)),
                     Err(err) => Err(err),
                 };
                 let _ = reply.send(res);

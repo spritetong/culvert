@@ -32,13 +32,12 @@ fn state_engine_recycle_and_draining_shutdown() {
     assert_eq!(engine.task_state(id), Some(ExternalState::Empty));
     assert_eq!(engine.idle_task_count(), 1);
 
-    // Pop idle for connect: Empty -> Connecting with fresh JobId
-    let (popped_id, job_1) = engine.pop_idle_for_connect().unwrap().unwrap();
+    // Pop idle for connect: Empty -> Connecting with fresh JobId via atomic try_assign_idle
+    let (popped_id, job_1) = engine.try_assign_idle(()).unwrap().unwrap();
     assert_eq!(popped_id, id);
     assert_eq!(engine.task_job(id), Some(job_1));
     assert_eq!(engine.idle_task_count(), 0);
     assert_eq!(engine.task_state(id), Some(ExternalState::Connecting));
-    engine.dispatch_to_task(id, job_1, ());
     assert!(matches!(
         rx.try_recv(),
         Ok(TaskDirective::Assign { job_id, .. }) if job_id == job_1
@@ -76,20 +75,21 @@ fn state_engine_detects_wait_cycles_and_resolves_dependencies() {
     let a = reg_a.id;
     let job_a = reg_a.job_id.unwrap();
     let b = reg_b.id;
+    let job_b = reg_b.job_id.unwrap();
 
     // Self-wait is an immediate cycle
     let (tx_self, mut rx_self) = oneshot::channel();
-    engine.register_waiter(a, a, ExternalState::Active, tx_self);
+    engine.register_waiter(a, job_a, a, ExternalState::Active, tx_self);
     assert_eq!(rx_self.try_recv().unwrap(), WaitResult::CycleDetected);
 
     // B waits for A -> Active
     let (tx_ba, mut rx_ba) = oneshot::channel();
-    engine.register_waiter(b, a, ExternalState::Active, tx_ba);
+    engine.register_waiter(b, job_b, a, ExternalState::Active, tx_ba);
     assert!(rx_ba.try_recv().is_err());
 
     // A waiting for B -> Active would create cycle A -> B -> A
     let (tx_ab, mut rx_ab) = oneshot::channel();
-    engine.register_waiter(a, b, ExternalState::Active, tx_ab);
+    engine.register_waiter(a, job_a, b, ExternalState::Active, tx_ab);
     assert_eq!(rx_ab.try_recv().unwrap(), WaitResult::CycleDetected);
 
     // Transition A -> Active wakes B
@@ -113,9 +113,27 @@ fn state_engine_waiter_recycle_semantics_distinguishes_empty_and_closed() {
     let (tx_empty, mut rx_empty) = oneshot::channel();
     let (tx_closed, mut rx_closed) = oneshot::channel();
     let (tx_active, mut rx_active) = oneshot::channel();
-    engine.register_waiter(waiter_empty, target, ExternalState::Empty, tx_empty);
-    engine.register_waiter(waiter_closed, target, ExternalState::Closed, tx_closed);
-    engine.register_waiter(waiter_active, target, ExternalState::Active, tx_active);
+    engine.register_waiter(
+        waiter_empty,
+        reg_e.job_id.unwrap(),
+        target,
+        ExternalState::Empty,
+        tx_empty,
+    );
+    engine.register_waiter(
+        waiter_closed,
+        reg_c.job_id.unwrap(),
+        target,
+        ExternalState::Closed,
+        tx_closed,
+    );
+    engine.register_waiter(
+        waiter_active,
+        reg_a.job_id.unwrap(),
+        target,
+        ExternalState::Active,
+        tx_active,
+    );
 
     // Target recycles back to Empty after failing Connecting (without reaching Active or Closed):
     // - Waiter for Empty -> Reached
@@ -132,6 +150,86 @@ fn state_engine_waiter_recycle_semantics_distinguishes_empty_and_closed() {
     // Only when target actually completes to Closed does waiter_closed receive Reached
     engine.complete_task(target);
     assert_eq!(rx_closed.try_recv().unwrap(), WaitResult::Reached);
+}
+
+#[test]
+fn closed_directive_channel_rejected_and_recovers_input() {
+    let mut engine = StateEngine::<u32>::new();
+    let dead_reg = engine.register_task(ExternalState::Empty).unwrap();
+    let live_reg = engine.register_task(ExternalState::Empty).unwrap();
+    let dead_id = dead_reg.id;
+    let live_id = live_reg.id;
+    let mut live_rx = live_reg.directive_rx;
+
+    // Drop the dead worker's directive receiver before any directive is sent.
+    drop(dead_reg.directive_rx);
+
+    assert!(!engine.send_directive(dead_id, TaskDirective::Drain));
+    assert!(engine.send_directive(live_id, TaskDirective::Drain));
+    assert!(matches!(live_rx.try_recv(), Ok(TaskDirective::Drain)));
+
+    // try_assign_idle skips the dead worker without losing `42` or corrupting dead_id to Connecting,
+    // and delivers `42` to the live idle worker instead.
+    let assigned = engine.try_assign_idle(42).unwrap().unwrap();
+    assert_eq!(assigned.0, live_id);
+    assert_eq!(engine.task_state(dead_id), Some(ExternalState::Empty));
+    assert!(matches!(
+        live_rx.try_recv(),
+        Ok(TaskDirective::Assign { input: 42, .. })
+    ));
+
+    // If all idle channels are closed, try_assign_idle returns Ok(Err(input)) intact.
+    let dead2 = engine.register_task(ExternalState::Empty).unwrap();
+    drop(dead2.directive_rx);
+    let recovered = engine.try_assign_idle(99).unwrap().unwrap_err();
+    assert_eq!(recovered, 99);
+}
+
+#[test]
+fn complete_task_prunes_idle_queue_and_stale_job_waiters_remain_isolated() {
+    let mut engine = StateEngine::<()>::new();
+    let worker_a = engine.register_task(ExternalState::Connecting).unwrap();
+    let target_t = engine.register_task(ExternalState::Connecting).unwrap();
+    let dead_idle = engine.register_task(ExternalState::Empty).unwrap();
+
+    // Removing an Empty task via complete_task immediately prunes idle_tasks.
+    assert_eq!(engine.idle_task_count(), 1);
+    engine.complete_task(dead_idle.id);
+    assert_eq!(engine.idle_task_count(), 0);
+    assert_eq!(engine.live_task_count(), 2);
+
+    // Worker A finishes Job 1 and receives Job 2.
+    let job_1 = worker_a.job_id.unwrap();
+    assert!(engine.on_task_recycled(worker_a.id, job_1));
+    let (_, job_2) = engine.try_assign_idle(()).unwrap().unwrap();
+    assert_ne!(job_1, job_2);
+
+    // Job 2 registers a waiter on Target T.
+    let (tx_job2, mut rx_job2) = oneshot::channel();
+    engine.register_waiter(
+        worker_a.id,
+        job_2,
+        target_t.id,
+        ExternalState::Active,
+        tx_job2,
+    );
+
+    // Stale events carrying job_1 MUST NOT cancel job_2's waiter or recycle worker_a.
+    assert!(!engine.on_task_recycled(worker_a.id, job_1));
+    let (tx_stale, mut rx_stale) = oneshot::channel();
+    engine.register_waiter(
+        worker_a.id,
+        job_1,
+        target_t.id,
+        ExternalState::Active,
+        tx_stale,
+    );
+    assert_eq!(rx_stale.try_recv().unwrap(), WaitResult::Cancelled);
+    assert!(rx_job2.try_recv().is_err());
+
+    // Target T reaching Active wakes Job 2's waiter cleanly.
+    engine.apply_task_state(target_t.id, target_t.job_id.unwrap(), ExternalState::Active);
+    assert_eq!(rx_job2.try_recv().unwrap(), WaitResult::Reached);
 }
 
 // =============================================================================
@@ -460,4 +558,49 @@ async fn coordinator_cleans_up_panicked_task_and_exits_gracefully() {
         summary.completed_jobs[0].outcome,
         TaskOutcome::Failed(_)
     ));
+}
+
+#[tokio::test]
+async fn coordinator_assign_join_and_drain_progress_under_microtask_burst() {
+    let cancel = CancellationToken::new();
+    let closed_jobs = Arc::new(AtomicUsize::new(0));
+    let (handle, join) = Coordinator::start(
+        MockWorkflow {
+            closed_jobs: Arc::clone(&closed_jobs),
+        },
+        Duration::from_millis(80),
+        cancel,
+    );
+
+    // Prewarm a worker pool and flood 400 rapid jobs generating heavy microtask traffic
+    // while concurrently keeping a long-lived task active until bounded graceful_stop.
+    handle.prewarm(16).await.unwrap();
+    let active_notify = Arc::new(Notify::new());
+    let sticky = handle
+        .assign(MockInput::ForeverPending {
+            on_active: Some(Arc::clone(&active_notify)),
+        })
+        .await
+        .unwrap();
+    active_notify.notified().await;
+
+    for _ in 0..400 {
+        handle
+            .assign(MockInput::Immediate {
+                wait_for: Some((sticky, ExternalState::Active)),
+                on_ready: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(handle.graceful_stop().await.unwrap(), TunnelPhase::Draining);
+
+    let summary = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("coordinator must drain & join promptly after microtask burst")
+        .unwrap();
+    assert_eq!(summary.final_phase, TunnelPhase::Stopped);
+    assert_eq!(summary.completed_jobs.len(), 401);
 }
