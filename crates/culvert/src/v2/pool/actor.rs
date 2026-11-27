@@ -156,6 +156,12 @@ impl PoolHandle {
     pub fn cancel_token(&self) -> CancellationToken {
         self.inner.cancel_token.clone()
     }
+
+    /// Returns `true` if `self` and `other` point to the same underlying `TransportPool` instance.
+    #[inline]
+    pub fn same_pool(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
 }
 
 /// Unified single-writer stream pool supporting Forward active pre-warming and
