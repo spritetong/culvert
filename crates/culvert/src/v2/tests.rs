@@ -30,13 +30,13 @@ fn state_engine_recycle_and_draining_shutdown() {
     let mut rx = reg.directive_rx;
     assert_eq!(reg.job_id, None);
     assert_eq!(engine.task_state(id), Some(ExternalState::Empty));
-    assert_eq!(engine.idle_task_count(), 1);
+    assert_eq!(engine.empty_task_count(), 1);
 
-    // Pop idle for connect: Empty -> Connecting with fresh JobId via atomic try_assign_idle
+    // Pop empty for connect: Empty -> Connecting with fresh JobId via atomic try_assign_idle
     let (popped_id, job_1) = engine.try_assign_idle(()).unwrap().unwrap();
     assert_eq!(popped_id, id);
     assert_eq!(engine.task_job(id), Some(job_1));
-    assert_eq!(engine.idle_task_count(), 0);
+    assert_eq!(engine.empty_task_count(), 0);
     assert_eq!(engine.task_state(id), Some(ExternalState::Connecting));
     assert!(matches!(
         rx.try_recv(),
@@ -52,7 +52,7 @@ fn state_engine_recycle_and_draining_shutdown() {
     assert!(engine.on_task_recycled(id, job_1));
     assert_eq!(engine.task_state(id), Some(ExternalState::Empty));
     assert_eq!(engine.task_job(id), None);
-    assert_eq!(engine.idle_task_count(), 1);
+    assert_eq!(engine.empty_task_count(), 1);
 
     // Stale job notification after recycle must be ignored
     engine.apply_task_state(id, job_1, ExternalState::Active);
@@ -61,7 +61,7 @@ fn state_engine_recycle_and_draining_shutdown() {
     // Graceful stop sends Shutdown to Empty task
     assert_eq!(engine.begin_graceful_stop(), TunnelPhase::Draining);
     assert!(matches!(rx.try_recv(), Ok(TaskDirective::Shutdown)));
-    assert_eq!(engine.idle_task_count(), 0);
+    assert_eq!(engine.empty_task_count(), 0);
 
     engine.complete_task(id);
     assert_eq!(engine.phase(), TunnelPhase::Stopped);
@@ -192,10 +192,10 @@ fn complete_task_prunes_idle_queue_and_stale_job_waiters_remain_isolated() {
     let target_t = engine.register_task(ExternalState::Connecting).unwrap();
     let dead_idle = engine.register_task(ExternalState::Empty).unwrap();
 
-    // Removing an Empty task via complete_task immediately prunes idle_tasks.
-    assert_eq!(engine.idle_task_count(), 1);
+    // Removing an Empty task via complete_task immediately prunes empty_tasks.
+    assert_eq!(engine.empty_task_count(), 1);
     engine.complete_task(dead_idle.id);
-    assert_eq!(engine.idle_task_count(), 0);
+    assert_eq!(engine.empty_task_count(), 0);
     assert_eq!(engine.live_task_count(), 2);
 
     // Worker A finishes Job 1 and receives Job 2.
@@ -368,7 +368,7 @@ async fn task_recycles_to_empty_and_reuses_same_id() {
         handle.query_task_state(task_id).await.unwrap(),
         Some(ExternalState::Empty)
     );
-    assert_eq!(handle.query_idle_count().await.unwrap(), 1);
+    assert_eq!(handle.query_empty_count().await.unwrap(), 1);
 
     // Late Drain delivered to Empty task must be ignored and keep the task reusable
     assert!(handle.request_recycle(task_id).await.unwrap());
@@ -605,4 +605,444 @@ async fn coordinator_assign_join_and_drain_progress_under_microtask_burst() {
         .unwrap();
     assert_eq!(summary.final_phase, TunnelPhase::Stopped);
     assert_eq!(summary.completed_jobs.len(), 401);
+}
+
+// =============================================================================
+// 3. Unified IoTask::Idle, Keepalive, Sweep, Extraction, and Race Recovery Tests
+// =============================================================================
+
+struct MockIdleStream {
+    inner: tokio::io::DuplexStream,
+    sid: Option<u64>,
+    alive: Arc<std::sync::atomic::AtomicBool>,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl MockIdleStream {
+    fn new(
+        sid: Option<u64>,
+        alive: Arc<std::sync::atomic::AtomicBool>,
+        dropped: Arc<AtomicUsize>,
+    ) -> (Self, tokio::io::DuplexStream) {
+        let (a, b) = tokio::io::duplex(256);
+        (
+            Self {
+                inner: a,
+                sid,
+                alive,
+                dropped,
+            },
+            b,
+        )
+    }
+}
+
+impl Drop for MockIdleStream {
+    fn drop(&mut self) {
+        self.dropped.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+impl tokio::io::AsyncRead for MockIdleStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for MockIdleStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl crate::io::stream::TunnelStream for MockIdleStream {
+    fn poll_check_alive(
+        &mut self,
+        _cx: &mut Context<'_>,
+    ) -> Poll<crate::io::stream::HeartbeatStatus> {
+        if self.alive.load(Ordering::Acquire) {
+            Poll::Ready(crate::io::stream::HeartbeatStatus::Alive)
+        } else {
+            Poll::Ready(crate::io::stream::HeartbeatStatus::Dead)
+        }
+    }
+
+    fn session_id(&self) -> Option<u64> {
+        self.sid
+    }
+}
+
+#[derive(Clone)]
+struct TransportCheckingWorkflow {
+    saw_transport: Arc<AtomicUsize>,
+    saw_missing: Arc<AtomicUsize>,
+    report_dead_sid: Option<u64>,
+}
+
+impl TaskWorkflow for TransportCheckingWorkflow {
+    type Input = ();
+    type Active = MockActive;
+
+    fn connect(
+        &self,
+        ctx: &mut ConnectingContext<'_>,
+        _input: Self::Input,
+    ) -> impl Future<Output = Result<Self::Active, TaskError>> + Send {
+        let saw_transport = Arc::clone(&self.saw_transport);
+        let saw_missing = Arc::clone(&self.saw_missing);
+        let report_dead_sid = self.report_dead_sid;
+        let has_t = ctx.take_transport().is_some();
+        if let Some(sid) = report_dead_sid {
+            ctx.report_dead_session(sid);
+        }
+        async move {
+            if has_t {
+                saw_transport.fetch_add(1, Ordering::AcqRel);
+            } else {
+                saw_missing.fetch_add(1, Ordering::AcqRel);
+            }
+            Ok(MockActive {
+                closed_jobs: Arc::new(AtomicUsize::new(0)),
+                forever_pending: false,
+                on_active: None,
+            })
+        }
+    }
+}
+
+#[tokio::test]
+async fn io_task_idle_keepalive_dead_self_evicts_and_counts_loss() {
+    let cfg = crate::v2::CoordinatorConfig {
+        drain_timeout: Duration::from_millis(80),
+        max_idle_capacity: 4,
+        idle_policy: crate::v2::IdlePolicy::forward(
+            Duration::from_millis(15),
+            Duration::from_millis(200),
+        ),
+        dial: None,
+    };
+    let wf = TransportCheckingWorkflow {
+        saw_transport: Arc::new(AtomicUsize::new(0)),
+        saw_missing: Arc::new(AtomicUsize::new(0)),
+        report_dead_sid: None,
+    };
+    let (handle, join) = Coordinator::start_with_config(wf, cfg, CancellationToken::new());
+
+    let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let (stream, _peer) = MockIdleStream::new(Some(7), Arc::clone(&alive), Arc::clone(&dropped));
+
+    assert!(
+        handle
+            .supply_transport(crate::v2::PooledTransport::new(Box::new(stream), 1))
+            .await
+            .unwrap()
+    );
+    assert_eq!(handle.query_idle_count().await.unwrap(), 1);
+    assert_eq!(handle.query_empty_count().await.unwrap(), 0);
+
+    // Flip heartbeat probe status to Dead; next interval tick must evict stream back to Empty.
+    alive.store(false, Ordering::Release);
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    assert_eq!(dropped.load(Ordering::Acquire), 1);
+    assert_eq!(handle.query_idle_count().await.unwrap(), 0);
+    assert_eq!(handle.query_empty_count().await.unwrap(), 1);
+    let stats = handle.query_pool_stats().await.unwrap();
+    assert_eq!(stats.total_idle_lost, 1);
+
+    handle.graceful_stop().await.unwrap();
+    let summary = join.await.unwrap();
+    assert_eq!(summary.final_phase, TunnelPhase::Stopped);
+}
+
+#[tokio::test]
+async fn io_task_idle_max_age_expiry_self_evicts_in_reverse_policy() {
+    let cfg = crate::v2::CoordinatorConfig::reverse_inbound(
+        4,
+        Duration::from_millis(45),
+        Duration::from_millis(80),
+    );
+    let wf = TransportCheckingWorkflow {
+        saw_transport: Arc::new(AtomicUsize::new(0)),
+        saw_missing: Arc::new(AtomicUsize::new(0)),
+        report_dead_sid: None,
+    };
+    let (handle, join) = Coordinator::start_with_config(wf, cfg, CancellationToken::new());
+
+    let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let (stream, _peer) = MockIdleStream::new(None, alive, Arc::clone(&dropped));
+
+    assert!(
+        handle
+            .supply_transport(crate::v2::PooledTransport::new(Box::new(stream), 1))
+            .await
+            .unwrap()
+    );
+    assert_eq!(handle.query_idle_count().await.unwrap(), 1);
+
+    tokio::time::sleep(Duration::from_millis(90)).await;
+
+    assert_eq!(dropped.load(Ordering::Acquire), 1);
+    assert_eq!(handle.query_idle_count().await.unwrap(), 0);
+    assert_eq!(handle.query_empty_count().await.unwrap(), 1);
+
+    handle.graceful_stop().await.unwrap();
+    let _ = join.await.unwrap();
+}
+
+#[tokio::test]
+async fn coordinator_session_id_sweep_evicts_only_matching_siblings() {
+    let cfg = crate::v2::CoordinatorConfig::reverse_inbound(
+        8,
+        Duration::from_secs(30),
+        Duration::from_millis(80),
+    );
+    let wf = TransportCheckingWorkflow {
+        saw_transport: Arc::new(AtomicUsize::new(0)),
+        saw_missing: Arc::new(AtomicUsize::new(0)),
+        report_dead_sid: None,
+    };
+    let (handle, join) = Coordinator::start_with_config(wf, cfg, CancellationToken::new());
+
+    let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let dropped_42 = Arc::new(AtomicUsize::new(0));
+    let dropped_99 = Arc::new(AtomicUsize::new(0));
+
+    let (s1, _p1) = MockIdleStream::new(Some(42), Arc::clone(&alive), Arc::clone(&dropped_42));
+    let (s2, _p2) = MockIdleStream::new(Some(42), Arc::clone(&alive), Arc::clone(&dropped_42));
+    let (s3, _p3) = MockIdleStream::new(Some(99), Arc::clone(&alive), Arc::clone(&dropped_99));
+
+    for s in [s1, s2, s3] {
+        assert!(
+            handle
+                .supply_transport(crate::v2::PooledTransport::new(Box::new(s), 1))
+                .await
+                .unwrap()
+        );
+    }
+    assert_eq!(handle.query_idle_count().await.unwrap(), 3);
+
+    let swept = handle.sweep_session(42).await.unwrap();
+    assert_eq!(swept, 2);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    assert_eq!(dropped_42.load(Ordering::Acquire), 2);
+    assert_eq!(dropped_99.load(Ordering::Acquire), 0);
+    assert_eq!(handle.query_idle_count().await.unwrap(), 1);
+    assert_eq!(handle.query_empty_count().await.unwrap(), 2);
+
+    handle.graceful_stop().await.unwrap();
+    let _ = join.await.unwrap();
+}
+
+#[tokio::test]
+async fn coordinator_generation_sweep_evicts_old_and_rejects_stale_supplies() {
+    let cfg = crate::v2::CoordinatorConfig::reverse_inbound(
+        4,
+        Duration::from_secs(30),
+        Duration::from_millis(80),
+    );
+    let wf = TransportCheckingWorkflow {
+        saw_transport: Arc::new(AtomicUsize::new(0)),
+        saw_missing: Arc::new(AtomicUsize::new(0)),
+        report_dead_sid: None,
+    };
+    let (handle, join) = Coordinator::start_with_config(wf, cfg, CancellationToken::new());
+
+    let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let (s1, _p1) = MockIdleStream::new(None, Arc::clone(&alive), Arc::clone(&dropped));
+    assert!(
+        handle
+            .supply_transport(crate::v2::PooledTransport::new(Box::new(s1), 1))
+            .await
+            .unwrap()
+    );
+
+    assert_eq!(handle.sweep_before_generation(2).await.unwrap(), 1);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(dropped.load(Ordering::Acquire), 1);
+    assert_eq!(handle.query_idle_count().await.unwrap(), 0);
+
+    // Late arrival tagged with generation 1 (< 2) must be rejected cleanly.
+    let (s_stale, _p_stale) = MockIdleStream::new(None, Arc::clone(&alive), Arc::clone(&dropped));
+    assert!(
+        !handle
+            .supply_transport(crate::v2::PooledTransport::new(Box::new(s_stale), 1))
+            .await
+            .unwrap()
+    );
+    assert_eq!(handle.query_idle_count().await.unwrap(), 0);
+
+    // Arrival tagged with generation 2 is accepted.
+    let (s_fresh, _p_fresh) = MockIdleStream::new(None, alive, dropped);
+    assert!(
+        handle
+            .supply_transport(crate::v2::PooledTransport::new(Box::new(s_fresh), 2))
+            .await
+            .unwrap()
+    );
+    assert_eq!(handle.query_idle_count().await.unwrap(), 1);
+
+    handle.graceful_stop().await.unwrap();
+    let _ = join.await.unwrap();
+}
+
+#[tokio::test]
+async fn coordinator_take_idle_transport_extracts_and_frees_slot() {
+    let cfg = crate::v2::CoordinatorConfig::reverse_inbound(
+        4,
+        Duration::from_secs(30),
+        Duration::from_millis(80),
+    );
+    let wf = TransportCheckingWorkflow {
+        saw_transport: Arc::new(AtomicUsize::new(0)),
+        saw_missing: Arc::new(AtomicUsize::new(0)),
+        report_dead_sid: None,
+    };
+    let (handle, join) = Coordinator::start_with_config(wf, cfg, CancellationToken::new());
+
+    assert!(handle.take_idle_transport().await.unwrap().is_none());
+
+    let (a, _b) = tokio::io::duplex(256);
+    assert!(
+        handle
+            .supply_transport(crate::v2::PooledTransport::new(Box::new(a), 1))
+            .await
+            .unwrap()
+    );
+    assert_eq!(handle.query_idle_count().await.unwrap(), 1);
+
+    let extracted = handle.take_idle_transport().await.unwrap();
+    assert!(extracted.is_some());
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(handle.query_idle_count().await.unwrap(), 0);
+    assert_eq!(handle.query_empty_count().await.unwrap(), 1);
+    assert!(handle.take_idle_transport().await.unwrap().is_none());
+
+    handle.graceful_stop().await.unwrap();
+    let _ = join.await.unwrap();
+}
+
+#[tokio::test]
+async fn coordinator_connecting_dead_session_report_sweeps_idle_siblings() {
+    let cfg = crate::v2::CoordinatorConfig::reverse_inbound(
+        4,
+        Duration::from_secs(30),
+        Duration::from_millis(80),
+    );
+    let saw_transport = Arc::new(AtomicUsize::new(0));
+    let saw_missing = Arc::new(AtomicUsize::new(0));
+    let wf = TransportCheckingWorkflow {
+        saw_transport: Arc::clone(&saw_transport),
+        saw_missing: Arc::clone(&saw_missing),
+        report_dead_sid: Some(555),
+    };
+    let (handle, join) = Coordinator::start_with_config(wf, cfg, CancellationToken::new());
+
+    let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    for _ in 0..2 {
+        let (s, _p) = MockIdleStream::new(Some(555), Arc::clone(&alive), Arc::clone(&dropped));
+        assert!(
+            handle
+                .supply_transport(crate::v2::PooledTransport::new(Box::new(s), 1))
+                .await
+                .unwrap()
+        );
+    }
+    assert_eq!(handle.query_idle_count().await.unwrap(), 2);
+
+    // Assign picks one Idle task, which reports dead session 555 -> sweeps remaining sibling.
+    handle.assign(()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    assert_eq!(saw_transport.load(Ordering::Acquire), 1);
+    assert_eq!(saw_missing.load(Ordering::Acquire), 0);
+    assert_eq!(handle.query_idle_count().await.unwrap(), 0);
+    assert_eq!(handle.query_empty_count().await.unwrap(), 2);
+
+    handle.graceful_stop().await.unwrap();
+    let _ = join.await.unwrap();
+}
+
+#[test]
+fn state_engine_dispatch_assign_and_extract_lifo_invariants() {
+    let mut engine = StateEngine::<()>::new();
+    let r1 = engine.register_task(ExternalState::Empty).unwrap();
+    let r2 = engine.register_task(ExternalState::Empty).unwrap();
+    let mut rx1 = r1.directive_rx;
+    let mut rx2 = r2.directive_rx;
+
+    // Supply two transports -> Empty -> Idle (r1 then r2)
+    let (s1, _p1) = tokio::io::duplex(64);
+    let (s2, _p2) = tokio::io::duplex(64);
+    assert!(matches!(
+        engine.try_dispatch_transport(
+            crate::v2::PooledTransport::new(Box::new(s1), 1),
+            crate::v2::IdlePolicy::default(),
+            4
+        ),
+        crate::v2::engine::TransportDispatch::AssignedIdle(id) if id == r1.id
+    ));
+    assert!(matches!(
+        engine.try_dispatch_transport(
+            crate::v2::PooledTransport::new(Box::new(s2), 1),
+            crate::v2::IdlePolicy::default(),
+            4
+        ),
+        crate::v2::engine::TransportDispatch::AssignedIdle(id) if id == r2.id
+    ));
+    assert_eq!(engine.idle_task_count(), 2);
+    assert_eq!(engine.empty_task_count(), 0);
+
+    assert!(matches!(
+        rx1.try_recv(),
+        Ok(TaskDirective::SupplyIdle { .. })
+    ));
+    assert!(matches!(
+        rx2.try_recv(),
+        Ok(TaskDirective::SupplyIdle { .. })
+    ));
+
+    // Assign pops freshest Idle (LIFO -> r2) first
+    let (assigned_id, _) = engine.try_assign_idle(()).unwrap().unwrap();
+    assert_eq!(assigned_id, r2.id);
+    assert_eq!(engine.task_state(r2.id), Some(ExternalState::Connecting));
+    assert_eq!(engine.idle_task_count(), 1);
+    assert!(matches!(rx2.try_recv(), Ok(TaskDirective::Assign { .. })));
+
+    // ExtractIdle pops remaining r1 with ExtractTransport
+    let (tx, _rx) = oneshot::channel();
+    assert!(engine.extract_idle_transport(tx));
+    assert_eq!(engine.idle_task_count(), 0);
+    assert!(matches!(
+        rx1.try_recv(),
+        Ok(TaskDirective::ExtractTransport { .. })
+    ));
 }

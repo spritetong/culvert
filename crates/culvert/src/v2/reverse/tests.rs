@@ -14,8 +14,8 @@ use crate::core::stream::{BoxFuture, TunnelStream};
 use crate::frontend::{Frontend, FrontendAccept, FrontendOutput};
 use crate::io::addr::{L4Protocol, PeerAddr, TargetAddr};
 use crate::io::channel::IoChannel;
-use crate::v2::pool::{PoolConfig, TransportPool};
 use crate::v2::reverse::{ReverseServerRunner, ReverseSignaler, ReverseVisitorWorkflow};
+use crate::v2::{Coordinator, CoordinatorConfig, PooledTransport};
 use crate::v2::{TaskError, TaskOutcome, TunnelPhase};
 use reusable_future::ReusableFutureRef;
 use std::sync::Arc;
@@ -136,35 +136,35 @@ async fn reverse_runner_zero_rtt_fast_path_skips_signaling() {
         hang_forever: false,
     });
 
-    let (pool_handle, pool_join) = TransportPool::start(
-        PoolConfig::reverse_inbound(4, DEFAULT_IDLE_TIMEOUT),
+    let workflow = ReverseVisitorWorkflow::new(
+        signaler,
+        DEFAULT_HEARTBEAT_INTERVAL,
+        DEFAULT_IDLE_TIMEOUT,
+        DEFAULT_RELAY_DRAIN_TIMEOUT,
+    );
+    let (coord, coord_join) = Coordinator::start_with_config(
+        workflow,
+        CoordinatorConfig::reverse_inbound(4, DEFAULT_IDLE_TIMEOUT, DEFAULT_RELAY_DRAIN_TIMEOUT),
         CancellationToken::new(),
     );
 
     let (client_stream, worker_half) = duplex(4096);
     spawn_reverse_worker_echo(worker_half, true);
     assert!(
-        pool_handle
-            .push_idle(Box::new(client_stream))
+        coord
+            .supply_transport(PooledTransport::new(Box::new(client_stream), 1))
             .await
             .unwrap()
     );
 
-    let workflow = ReverseVisitorWorkflow::new(
-        Some(pool_handle.clone()),
-        signaler,
-        DEFAULT_HEARTBEAT_INTERVAL,
-        DEFAULT_IDLE_TIMEOUT,
-        DEFAULT_RELAY_DRAIN_TIMEOUT,
-    );
-
-    let runner = ReverseServerRunner::new(
+    let runner = ReverseServerRunner::with_coordinator(
         Box::new(frontend),
         TargetAddr::Ip("127.0.0.1:8080".parse().unwrap()),
         L4Protocol::Tcp,
-        workflow,
-        Some((pool_handle, pool_join)),
-        DEFAULT_RELAY_DRAIN_TIMEOUT,
+        coord,
+        Some(coord_join),
+        None,
+        None,
     );
 
     let cancel = CancellationToken::new();
@@ -191,6 +191,7 @@ async fn reverse_runner_zero_rtt_fast_path_skips_signaling() {
         .await
         .unwrap()
         .unwrap()
+        .unwrap()
         .unwrap();
     assert_eq!(summary.final_phase, TunnelPhase::Stopped);
     assert_eq!(summary.completed_jobs.len(), 1);
@@ -206,31 +207,37 @@ async fn reverse_runner_half_open_pool_stream_fails_over_to_signaling() {
         hang_forever: false,
     });
 
-    let (pool_handle, pool_join) = TransportPool::start(
-        PoolConfig::reverse_inbound(4, DEFAULT_IDLE_TIMEOUT),
+    let workflow = ReverseVisitorWorkflow::new(
+        signaler,
+        DEFAULT_HEARTBEAT_INTERVAL,
+        DEFAULT_IDLE_TIMEOUT,
+        DEFAULT_RELAY_DRAIN_TIMEOUT,
+    );
+    let (coord, coord_join) = Coordinator::start_with_config(
+        workflow,
+        CoordinatorConfig::reverse_inbound(4, DEFAULT_IDLE_TIMEOUT, DEFAULT_RELAY_DRAIN_TIMEOUT),
         CancellationToken::new(),
     );
 
     // Seed a half-open stream that drops without echoing 0xAC ACK.
     let (stale_stream, stale_worker) = duplex(4096);
     spawn_reverse_worker_echo(stale_worker, false);
-    assert!(pool_handle.push_idle(Box::new(stale_stream)).await.unwrap());
-
-    let workflow = ReverseVisitorWorkflow::new(
-        Some(pool_handle.clone()),
-        signaler,
-        DEFAULT_HEARTBEAT_INTERVAL,
-        DEFAULT_IDLE_TIMEOUT,
-        DEFAULT_RELAY_DRAIN_TIMEOUT,
+    assert!(
+        coord
+            .supply_transport(PooledTransport::new(Box::new(stale_stream), 1))
+            .await
+            .unwrap()
     );
 
-    let runner = ReverseServerRunner::new(
+    let coord_observer = coord.clone();
+    let runner = ReverseServerRunner::with_coordinator(
         Box::new(frontend),
         TargetAddr::Ip("127.0.0.1:8080".parse().unwrap()),
         L4Protocol::Tcp,
-        workflow,
-        Some((pool_handle.clone(), pool_join)),
-        DEFAULT_RELAY_DRAIN_TIMEOUT,
+        coord,
+        Some(coord_join),
+        None,
+        None,
     );
 
     let cancel = CancellationToken::new();
@@ -253,11 +260,19 @@ async fn reverse_runner_half_open_pool_stream_fails_over_to_signaling() {
     assert_eq!(signal_calls.load(Ordering::Acquire), 1);
 
     tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(pool_handle.stats().await.unwrap().active_count, 0);
+    assert_eq!(
+        coord_observer
+            .query_pool_stats()
+            .await
+            .unwrap()
+            .active_count,
+        0
+    );
 
     cancel.cancel();
     let summary = tokio::time::timeout(Duration::from_secs(1), runner_handle)
         .await
+        .unwrap()
         .unwrap()
         .unwrap()
         .unwrap();
@@ -274,7 +289,6 @@ async fn reverse_runner_cancels_hanging_signaling_immediately_on_shutdown() {
     });
 
     let workflow = ReverseVisitorWorkflow::new(
-        None,
         signaler,
         DEFAULT_HEARTBEAT_INTERVAL,
         Duration::from_secs(30),
@@ -286,8 +300,7 @@ async fn reverse_runner_cancels_hanging_signaling_immediately_on_shutdown() {
         TargetAddr::Ip("127.0.0.1:8080".parse().unwrap()),
         L4Protocol::Tcp,
         workflow,
-        None,
-        DEFAULT_RELAY_DRAIN_TIMEOUT,
+        CoordinatorConfig::plain(DEFAULT_RELAY_DRAIN_TIMEOUT),
     );
 
     let cancel = CancellationToken::new();
@@ -310,6 +323,7 @@ async fn reverse_runner_cancels_hanging_signaling_immediately_on_shutdown() {
     let summary = tokio::time::timeout(Duration::from_secs(1), runner_handle)
         .await
         .expect("hanging reverse pairing must cancel immediately on shutdown")
+        .unwrap()
         .unwrap()
         .unwrap();
     assert!(started.elapsed() < Duration::from_millis(250));

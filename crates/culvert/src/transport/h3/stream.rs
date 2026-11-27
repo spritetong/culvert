@@ -266,6 +266,10 @@ impl TunnelStream for QuinnTunnelStream {
             Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
         }
     }
+
+    fn session_id(&self) -> Option<u64> {
+        self.session.as_ref().map(QuicSessionHandle::session_id)
+    }
 }
 
 /// Bidirectional stream adapter for HTTP/3 request streams (`h3::client` or `h3::server`).
@@ -659,6 +663,10 @@ impl TunnelStream for H3TunnelStream {
             Poll::Ready(Some(Err(_))) | Poll::Ready(None) => Poll::Ready(HeartbeatStatus::Dead),
             Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
         }
+    }
+
+    fn session_id(&self) -> Option<u64> {
+        self.session.as_ref().map(QuicSessionHandle::session_id)
     }
 }
 

@@ -2,56 +2,101 @@
 // SPDX-License-Identifier: MPL-2.0
 // culvert is licensed under the Mozilla Public License Version 2.0.
 
-//! Supervised Reverse visitor listener runner integrating `Frontend`, `TransportPool`,
-//! and `Coordinator`.
+//! Supervised Reverse visitor listener runner integrating `Frontend` and unified `Coordinator`.
 //! All comments and docstrings must be in English.
 
 use crate::core::error::TunnelError;
 use crate::frontend::{Frontend, FrontendOutput};
 use crate::io::addr::{L4Protocol, TargetAddr};
-use crate::v2::coordinator::{Coordinator, CoordinatorSummary};
-use crate::v2::pool::{PoolHandle, PoolSummary};
-use crate::v2::reverse::visitor::{ReverseVisitorInput, ReverseVisitorWorkflow};
+use crate::v2::coordinator::{Coordinator, CoordinatorHandle, CoordinatorSummary};
+use crate::v2::reverse::visitor::{ReverseSignaler, ReverseVisitorInput, ReverseVisitorWorkflow};
+use crate::v2::state::CoordinatorConfig;
 use reusable_future::ReusableFutureRef;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-/// Runs a reverse visitor listener using the v2 `Coordinator` + `IoTask` + `TransportPool` stack.
+enum CoordMode {
+    Owned {
+        workflow: ReverseVisitorWorkflow,
+        config: Box<CoordinatorConfig>,
+        prewarm_tasks: usize,
+    },
+    External {
+        coord: CoordinatorHandle<ReverseVisitorWorkflow>,
+        coord_join: Option<JoinHandle<CoordinatorSummary>>,
+        signaler: Option<Arc<dyn ReverseSignaler>>,
+        relay_idle_timeout: Option<Duration>,
+    },
+}
+
+/// Runs a reverse visitor listener using the unified v2 `Coordinator` + `IoTask` stack.
 pub struct ReverseServerRunner {
     frontend: Box<dyn Frontend>,
     target: TargetAddr,
     protocol: L4Protocol,
-    workflow: ReverseVisitorWorkflow,
-    pool: Option<(PoolHandle, JoinHandle<PoolSummary>)>,
-    prewarm_tasks: usize,
-    drain_timeout: Duration,
+    mode: CoordMode,
 }
 
 impl ReverseServerRunner {
-    /// Creates a new `ReverseServerRunner`.
+    /// Creates a new `ReverseServerRunner` that owns and supervises its own `Coordinator`.
     pub fn new(
         frontend: Box<dyn Frontend>,
         target: TargetAddr,
         protocol: L4Protocol,
         workflow: ReverseVisitorWorkflow,
-        pool: Option<(PoolHandle, JoinHandle<PoolSummary>)>,
-        drain_timeout: Duration,
+        coord_config: CoordinatorConfig,
     ) -> Self {
         Self {
             frontend,
             target,
             protocol,
-            workflow,
-            pool,
-            prewarm_tasks: 0,
-            drain_timeout,
+            mode: CoordMode::Owned {
+                workflow,
+                config: Box::new(coord_config),
+                prewarm_tasks: 0,
+            },
         }
     }
 
-    /// Pre-spawns `count` idle `Empty` tasks inside the `Coordinator`.
+    /// Creates a `ReverseServerRunner` driving an existing `CoordinatorHandle` (for ingress
+    /// `pool_idle` delivery, `0xA6` promotion, or shared `tunnel_id` clusters).
+    ///
+    /// When `coord_join` is `Some`, this runner owns the `Coordinator` lifetime and executes
+    /// `graceful_stop()` + join on shutdown; when `None`, coordinator shutdown is coordinated
+    /// externally by the shared cluster owner.
+    pub fn with_coordinator(
+        frontend: Box<dyn Frontend>,
+        target: TargetAddr,
+        protocol: L4Protocol,
+        coord: CoordinatorHandle<ReverseVisitorWorkflow>,
+        coord_join: Option<JoinHandle<CoordinatorSummary>>,
+        signaler: Option<Arc<dyn ReverseSignaler>>,
+        relay_idle_timeout: Option<Duration>,
+    ) -> Self {
+        Self {
+            frontend,
+            target,
+            protocol,
+            mode: CoordMode::External {
+                coord,
+                coord_join,
+                signaler,
+                relay_idle_timeout,
+            },
+        }
+    }
+
+    /// Pre-spawns `count` empty worker tasks inside an owned `Coordinator`.
     pub fn with_prewarm_tasks(mut self, count: usize) -> Self {
-        self.prewarm_tasks = count;
+        if let CoordMode::Owned {
+            ref mut prewarm_tasks,
+            ..
+        } = self.mode
+        {
+            *prewarm_tasks = count;
+        }
         self
     }
 
@@ -59,14 +104,28 @@ impl ReverseServerRunner {
     pub async fn run(
         mut self,
         shutdown_token: CancellationToken,
-    ) -> Result<CoordinatorSummary, TunnelError> {
-        let coord_force_token = CancellationToken::new();
-        let (coord, coord_join) =
-            Coordinator::start(self.workflow, self.drain_timeout, coord_force_token);
-
-        if self.prewarm_tasks > 0 {
-            let _ = coord.prewarm(self.prewarm_tasks).await;
-        }
+    ) -> Result<Option<CoordinatorSummary>, TunnelError> {
+        let (coord, coord_join, signaler_override, relay_idle_timeout) = match self.mode {
+            CoordMode::Owned {
+                workflow,
+                config,
+                prewarm_tasks,
+            } => {
+                let coord_force_token = CancellationToken::new();
+                let (coord, join) =
+                    Coordinator::start_with_config(workflow, *config, coord_force_token);
+                if prewarm_tasks > 0 {
+                    let _ = coord.prewarm(prewarm_tasks).await;
+                }
+                (coord, Some(join), None, None)
+            }
+            CoordMode::External {
+                coord,
+                coord_join,
+                signaler,
+                relay_idle_timeout,
+            } => (coord, coord_join, signaler, relay_idle_timeout),
+        };
 
         let mut accept_slot: ReusableFutureRef<'static, FrontendOutput> =
             ReusableFutureRef::default();
@@ -87,6 +146,8 @@ impl ReverseServerRunner {
                                 peer: accepted.peer,
                                 target: self.target.clone(),
                                 protocol: self.protocol,
+                                relay_idle_timeout,
+                                signaler: signaler_override.clone(),
                             };
                             if let Err(err) = coord.assign(input).await {
                                 tracing::debug!(error = %err, "Reverse visitor rejected during shutdown");
@@ -106,20 +167,14 @@ impl ReverseServerRunner {
         accept_slot.reset();
         self.frontend.shutdown().await;
 
-        if let Some((ref pool_handle, _)) = self.pool {
-            let _ = pool_handle.stop_replenishing().await;
+        if let Some(join) = coord_join {
+            let _ = coord.graceful_stop().await;
+            let summary = join.await.map_err(|e| {
+                TunnelError::Internal(format!("v2 reverse coordinator join error: {e}"))
+            })?;
+            Ok(Some(summary))
+        } else {
+            Ok(None)
         }
-
-        let _ = coord.graceful_stop().await;
-        let summary = coord_join.await.map_err(|e| {
-            TunnelError::Internal(format!("v2 reverse coordinator join error: {e}"))
-        })?;
-
-        if let Some((pool_handle, pool_join)) = self.pool {
-            pool_handle.shutdown();
-            let _ = pool_join.await;
-        }
-
-        Ok(summary)
     }
 }

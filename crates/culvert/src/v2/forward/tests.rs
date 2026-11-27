@@ -16,9 +16,8 @@ use crate::io::addr::{L4Protocol, PeerAddr, TargetAddr};
 use crate::io::channel::IoChannel;
 use crate::transport::TransportConnector;
 use crate::v2::forward::{ForwardRunner, ForwardWorkflow};
-use crate::v2::pool::{PoolConfig, TransportPool};
 use crate::v2::relay::RelayCounters;
-use crate::v2::{TaskOutcome, TunnelPhase};
+use crate::v2::{CoordinatorConfig, TaskOutcome, TunnelPhase};
 use reusable_future::ReusableFutureRef;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -139,7 +138,6 @@ async fn forward_runner_direct_echo_recycles_tasks_and_shuts_down() {
     let counters = Arc::new(RelayCounters::new());
 
     let workflow = ForwardWorkflow::new(
-        None,
         Some(connector),
         DEFAULT_HEARTBEAT_INTERVAL,
         DEFAULT_IDLE_TIMEOUT,
@@ -152,8 +150,7 @@ async fn forward_runner_direct_echo_recycles_tasks_and_shuts_down() {
         TargetAddr::Ip("127.0.0.1:9000".parse().unwrap()),
         L4Protocol::Tcp,
         workflow,
-        None,
-        DEFAULT_RELAY_DRAIN_TIMEOUT,
+        CoordinatorConfig::plain(DEFAULT_RELAY_DRAIN_TIMEOUT),
     )
     .with_prewarm_tasks(1);
 
@@ -217,37 +214,36 @@ async fn forward_runner_pooled_activation_falls_back_to_direct_on_missing_ack() 
         fail_first_pooled_ack: Arc::new(AtomicBool::new(true)),
     });
 
-    let pool_cfg = PoolConfig::forward(
+    let coord_cfg = CoordinatorConfig::forward_pooled(
         Arc::clone(&connector) as Arc<dyn TransportConnector>,
         1,
         DEFAULT_HEARTBEAT_INTERVAL,
         DEFAULT_IDLE_TIMEOUT,
+        DEFAULT_RELAY_DRAIN_TIMEOUT,
     );
-    let (pool_handle, pool_join) = TransportPool::start(pool_cfg, CancellationToken::new());
-
-    // Wait for 1 prewarmed stream (whose server half will drop without 0xAC ACK).
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    assert_eq!(pool_handle.stats().await.unwrap().idle_count, 1);
 
     let workflow = ForwardWorkflow::new(
-        Some(pool_handle.clone()),
         Some(connector),
         DEFAULT_HEARTBEAT_INTERVAL,
         DEFAULT_IDLE_TIMEOUT,
         DEFAULT_RELAY_DRAIN_TIMEOUT,
-    );
+    )
+    .with_pooled(true);
 
     let runner = ForwardRunner::new(
         Box::new(frontend),
         TargetAddr::Domain("app.internal".into(), 8080),
         L4Protocol::Tcp,
         workflow,
-        Some((pool_handle.clone(), pool_join)),
-        DEFAULT_RELAY_DRAIN_TIMEOUT,
+        coord_cfg,
     );
 
     let cancel = CancellationToken::new();
     let runner_handle = tokio::spawn(runner.run(cancel.clone()));
+
+    // Wait for DialDriver to prewarm 1 Idle task (whose server half drops without 0xAC ACK).
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(pooled_dials.load(Ordering::Acquire) >= 1);
 
     let (mut visitor, stream) = duplex(4096);
     accept_tx
@@ -264,10 +260,9 @@ async fn forward_runner_pooled_activation_falls_back_to_direct_on_missing_ack() 
     visitor.read_exact(&mut echoed).await.unwrap();
     assert_eq!(&echoed, b"fallback-ok");
 
-    // First pooled attempt failed ACK -> fell back to 1 direct dial, and LeaseGuard released active_count.
+    // First pooled attempt failed ACK -> fell back to 1 direct dial, and IoTask recycled cleanly.
     assert_eq!(direct_dials.load(Ordering::Acquire), 1);
     tokio::time::sleep(Duration::from_millis(30)).await;
-    assert_eq!(pool_handle.stats().await.unwrap().active_count, 0);
 
     cancel.cancel();
     let summary = tokio::time::timeout(Duration::from_secs(1), runner_handle)
@@ -350,13 +345,13 @@ async fn forward_runner_real_ws_server_e2e_pooled_and_recycled() {
             .unwrap(),
     );
 
-    let pool_cfg = PoolConfig::forward(
+    let coord_cfg = CoordinatorConfig::forward_pooled(
         Arc::clone(&connector),
         2,
         DEFAULT_HEARTBEAT_INTERVAL,
         DEFAULT_IDLE_TIMEOUT,
+        DEFAULT_RELAY_DRAIN_TIMEOUT,
     );
-    let (pool_handle, pool_join) = TransportPool::start(pool_cfg, CancellationToken::new());
 
     let client_listen = format!("127.0.0.1:{client_port}");
     let echo_target = format!("127.0.0.1:{echo_port}");
@@ -369,20 +364,19 @@ async fn forward_runner_real_ws_server_e2e_pooled_and_recycled() {
     .unwrap();
 
     let workflow = ForwardWorkflow::new(
-        Some(pool_handle.clone()),
         Some(connector),
         DEFAULT_HEARTBEAT_INTERVAL,
         DEFAULT_IDLE_TIMEOUT,
         DEFAULT_RELAY_DRAIN_TIMEOUT,
-    );
+    )
+    .with_pooled(true);
 
     let runner = ForwardRunner::new(
         tcp_frontend,
         TargetAddr::Ip(echo_target.parse().unwrap()),
         L4Protocol::Tcp,
         workflow,
-        Some((pool_handle, pool_join)),
-        DEFAULT_RELAY_DRAIN_TIMEOUT,
+        coord_cfg,
     )
     .with_prewarm_tasks(1);
 
@@ -509,7 +503,6 @@ async fn forward_runner_real_ws_udp_e2e() {
     .unwrap();
 
     let workflow = ForwardWorkflow::new(
-        None,
         Some(connector),
         DEFAULT_HEARTBEAT_INTERVAL,
         Duration::from_secs(5),
@@ -521,8 +514,7 @@ async fn forward_runner_real_ws_udp_e2e() {
         TargetAddr::Ip(echo_target.parse().unwrap()),
         L4Protocol::Udp,
         workflow,
-        None,
-        DEFAULT_RELAY_DRAIN_TIMEOUT,
+        CoordinatorConfig::plain(DEFAULT_RELAY_DRAIN_TIMEOUT),
     );
 
     let client_cancel = CancellationToken::new();
@@ -660,13 +652,13 @@ async fn forward_runner_real_h3_concurrent_streams_and_quic_shutdown() {
             .unwrap(),
     );
 
-    let pool_cfg = PoolConfig::forward(
+    let coord_cfg = CoordinatorConfig::forward_pooled(
         Arc::clone(&connector),
         4,
         DEFAULT_HEARTBEAT_INTERVAL,
         DEFAULT_IDLE_TIMEOUT,
+        DEFAULT_RELAY_DRAIN_TIMEOUT,
     );
-    let (pool_handle, pool_join) = TransportPool::start(pool_cfg, CancellationToken::new());
 
     let client_listen = format!("127.0.0.1:{client_port}");
     let echo_target = format!("127.0.0.1:{echo_port}");
@@ -679,20 +671,19 @@ async fn forward_runner_real_h3_concurrent_streams_and_quic_shutdown() {
     .unwrap();
 
     let workflow = ForwardWorkflow::new(
-        Some(pool_handle.clone()),
         Some(connector),
         DEFAULT_HEARTBEAT_INTERVAL,
         DEFAULT_IDLE_TIMEOUT,
         DEFAULT_RELAY_DRAIN_TIMEOUT,
-    );
+    )
+    .with_pooled(true);
 
     let runner = ForwardRunner::new(
         tcp_frontend,
         TargetAddr::Ip(echo_target.parse().unwrap()),
         L4Protocol::Tcp,
         workflow,
-        Some((pool_handle.clone(), pool_join)),
-        DEFAULT_RELAY_DRAIN_TIMEOUT,
+        coord_cfg,
     )
     .with_prewarm_tasks(4);
 
@@ -700,7 +691,7 @@ async fn forward_runner_real_h3_concurrent_streams_and_quic_shutdown() {
     let runner_handle = tokio::spawn(runner.run(client_cancel.clone()));
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Burst 24 concurrent TCP connections over multiplexed HTTP/3 + TransportPool.
+    // Burst 24 concurrent TCP connections over multiplexed HTTP/3 + unified Coordinator Idle tasks.
     let mut join_set = tokio::task::JoinSet::new();
     for idx in 0..24usize {
         let addr = client_listen.clone();
@@ -723,7 +714,6 @@ async fn forward_runner_real_h3_concurrent_streams_and_quic_shutdown() {
     }
 
     tokio::time::sleep(Duration::from_millis(60)).await;
-    assert_eq!(pool_handle.stats().await.unwrap().active_count, 0);
 
     client_cancel.cancel();
     let summary = tokio::time::timeout(Duration::from_secs(3), runner_handle)
@@ -758,39 +748,38 @@ async fn forward_runner_coordinated_pool_drain_halts_replenish_and_zeroes_leases
         fail_first_pooled_ack: Arc::new(AtomicBool::new(false)),
     });
 
-    let pool_cfg = PoolConfig::forward(
+    let drain_timeout = Duration::from_millis(120);
+    let coord_cfg = CoordinatorConfig::forward_pooled(
         Arc::clone(&connector) as Arc<dyn TransportConnector>,
         2,
         DEFAULT_HEARTBEAT_INTERVAL,
         DEFAULT_IDLE_TIMEOUT,
+        drain_timeout,
     );
-    let (pool_handle, pool_join) = TransportPool::start(pool_cfg, CancellationToken::new());
-    let pool_observer = pool_handle.clone();
-    tokio::time::sleep(Duration::from_millis(40)).await;
-    let initial_dials = pooled_dials.load(Ordering::Acquire);
-    assert!(initial_dials >= 2);
 
     let workflow = ForwardWorkflow::new(
-        Some(pool_handle.clone()),
         Some(connector),
         DEFAULT_HEARTBEAT_INTERVAL,
         DEFAULT_IDLE_TIMEOUT,
         Duration::from_millis(80),
-    );
+    )
+    .with_pooled(true);
     let runner = ForwardRunner::new(
         Box::new(frontend),
         TargetAddr::Domain("app.internal".into(), 8080),
         L4Protocol::Tcp,
         workflow,
-        Some((pool_handle, pool_join)),
-        Duration::from_millis(120),
+        coord_cfg,
     );
 
     let cancel = CancellationToken::new();
     let runner_handle = tokio::spawn(runner.run(cancel.clone()));
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let initial_dials = pooled_dials.load(Ordering::Acquire);
+    assert!(initial_dials >= 2);
 
     // Keep an active relay open across shutdown trigger so Coordinator enters Draining while
-    // TransportPool must stop replenishing and wait for LeaseGuard drop before exiting.
+    // DialDriver stops replenishing before draining active jobs.
     let (mut visitor, stream) = duplex(4096);
     accept_tx
         .send(Ok(FrontendAccept {
@@ -810,7 +799,7 @@ async fn forward_runner_coordinated_pool_drain_halts_replenish_and_zeroes_leases
 
     let summary = tokio::time::timeout(Duration::from_secs(2), runner_handle)
         .await
-        .expect("coordinated forward + pool shutdown must finish promptly")
+        .expect("coordinated forward + idle shutdown must finish promptly")
         .unwrap()
         .unwrap();
     assert_eq!(summary.final_phase, TunnelPhase::Stopped);
@@ -819,7 +808,6 @@ async fn forward_runner_coordinated_pool_drain_halts_replenish_and_zeroes_leases
         summary.completed_jobs[0].outcome,
         TaskOutcome::GracefullyDrained
     );
-    // Once stop_replenishing() ran, no extra background dials were launched during drain.
+    // Once Coordinator enters Draining, no extra background dials are launched during drain.
     assert_eq!(pooled_dials.load(Ordering::Acquire), dials_at_shutdown);
-    assert!(pool_observer.stats().await.is_err());
 }

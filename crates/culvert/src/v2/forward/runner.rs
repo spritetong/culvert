@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 // culvert is licensed under the Mozilla Public License Version 2.0.
 
-//! Supervised Forward listener runner coordinating `Frontend`, `TransportPool`, and `Coordinator`.
+//! Supervised Forward listener runner coordinating `Frontend` and unified `Coordinator`.
 //! All comments and docstrings must be in English.
 
 use crate::core::error::TunnelError;
@@ -10,21 +10,18 @@ use crate::frontend::{Frontend, FrontendOutput};
 use crate::io::addr::{L4Protocol, TargetAddr};
 use crate::v2::coordinator::{Coordinator, CoordinatorSummary};
 use crate::v2::forward::workflow::{ForwardInput, ForwardWorkflow};
-use crate::v2::pool::{PoolHandle, PoolSummary};
+use crate::v2::state::CoordinatorConfig;
 use reusable_future::ReusableFutureRef;
-use std::time::Duration;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-/// Runs a single forward mapping using the v2 `Coordinator` + `IoTask` + `TransportPool` stack.
+/// Runs a single forward mapping using the unified v2 `Coordinator` + `IoTask` stack.
 pub struct ForwardRunner {
     frontend: Box<dyn Frontend>,
     target: TargetAddr,
     protocol: L4Protocol,
     workflow: ForwardWorkflow,
-    pool: Option<(PoolHandle, JoinHandle<PoolSummary>)>,
+    coord_config: CoordinatorConfig,
     prewarm_tasks: usize,
-    drain_timeout: Duration,
 }
 
 impl ForwardRunner {
@@ -34,21 +31,19 @@ impl ForwardRunner {
         target: TargetAddr,
         protocol: L4Protocol,
         workflow: ForwardWorkflow,
-        pool: Option<(PoolHandle, JoinHandle<PoolSummary>)>,
-        drain_timeout: Duration,
+        coord_config: CoordinatorConfig,
     ) -> Self {
         Self {
             frontend,
             target,
             protocol,
             workflow,
-            pool,
+            coord_config,
             prewarm_tasks: 0,
-            drain_timeout,
         }
     }
 
-    /// Pre-spawns `count` idle `Empty` tasks inside the `Coordinator` before accepting connections.
+    /// Pre-spawns `count` empty worker tasks inside the `Coordinator` before accepting connections.
     pub fn with_prewarm_tasks(mut self, count: usize) -> Self {
         self.prewarm_tasks = count;
         self
@@ -61,7 +56,7 @@ impl ForwardRunner {
     ) -> Result<CoordinatorSummary, TunnelError> {
         let coord_force_token = CancellationToken::new();
         let (coord, coord_join) =
-            Coordinator::start(self.workflow, self.drain_timeout, coord_force_token);
+            Coordinator::start_with_config(self.workflow, self.coord_config, coord_force_token);
 
         if self.prewarm_tasks > 0 {
             let _ = coord.prewarm(self.prewarm_tasks).await;
@@ -83,11 +78,11 @@ impl ForwardRunner {
                 accept_res = &mut accept_slot => {
                     match accept_res {
                         Ok(accepted) => {
-                            let input = ForwardInput {
-                                frontend: accepted.channel,
-                                target: self.target.clone(),
-                                protocol: self.protocol,
-                            };
+                            let input = ForwardInput::new(
+                                accepted.channel,
+                                self.target.clone(),
+                                self.protocol,
+                            );
                             if let Err(err) = coord.assign(input).await {
                                 tracing::debug!(error = %err, "Forward assignment rejected during shutdown");
                                 break;
@@ -106,19 +101,10 @@ impl ForwardRunner {
         accept_slot.reset();
         self.frontend.shutdown().await;
 
-        if let Some((ref pool_handle, _)) = self.pool {
-            let _ = pool_handle.stop_replenishing().await;
-        }
-
         let _ = coord.graceful_stop().await;
         let summary = coord_join
             .await
             .map_err(|e| TunnelError::Internal(format!("v2 coordinator join error: {e}")))?;
-
-        if let Some((pool_handle, pool_join)) = self.pool {
-            pool_handle.shutdown();
-            let _ = pool_join.await;
-        }
 
         Ok(summary)
     }

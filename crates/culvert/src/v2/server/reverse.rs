@@ -3,8 +3,8 @@
 // culvert is licensed under the Mozilla Public License Version 2.0.
 
 //! Server-side Reverse session registry, real `RouterReverseSignaler`, and
-//! supervised `ReverseControlSession` managing registration, 0-RTT inbound pool,
-//! `0xA6` emergency promotion, and bounded grace-period reattachment.
+//! supervised `ReverseControlSession` managing registration, 0-RTT `Idle`-task
+//! coordination, `0xA6` emergency promotion, and bounded grace-period reattachment.
 //! All comments and docstrings must be in English.
 
 use crate::consts::{
@@ -20,17 +20,19 @@ use crate::core::stream::{BoxFuture, TunnelStream};
 use crate::frontend;
 use crate::io::addr::{L4Protocol, MappingSpec, PeerAddr, TargetAddr};
 use crate::session::manager::canonical_reverse_key;
+use crate::v2::coordinator::{Coordinator, CoordinatorHandle, CoordinatorSummary};
 use crate::v2::error::TaskError;
-use crate::v2::pool::{PoolConfig, PoolHandle, TransportPool};
 use crate::v2::reverse::{ReverseServerRunner, ReverseSignaler, ReverseVisitorWorkflow};
+use crate::v2::state::CoordinatorConfig;
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio::time::Sleep;
 use tokio_util::sync::CancellationToken;
 
@@ -47,9 +49,37 @@ struct GraceSlot {
     closed: Arc<Notify>,
 }
 
-struct TunnelPoolSlot {
-    pool: PoolHandle,
+struct ReverseIdleTarget {
+    coord: CoordinatorHandle<ReverseVisitorWorkflow>,
+    generation: AtomicU64,
     listeners: AtomicUsize,
+    join: Mutex<Option<JoinHandle<CoordinatorSummary>>>,
+}
+
+impl ReverseIdleTarget {
+    fn new(
+        coord: CoordinatorHandle<ReverseVisitorWorkflow>,
+        join: JoinHandle<CoordinatorSummary>,
+    ) -> Self {
+        Self {
+            coord,
+            generation: AtomicU64::new(1),
+            listeners: AtomicUsize::new(0),
+            join: Mutex::new(Some(join)),
+        }
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn bump_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn take_join(&self) -> Option<JoinHandle<CoordinatorSummary>> {
+        self.join.lock().ok().and_then(|mut guard| guard.take())
+    }
 }
 
 /// Active grace-period registration preserving a bound reverse listener across brief disconnects.
@@ -113,33 +143,57 @@ impl Drop for PendingSessionGuard {
     }
 }
 
-struct RegisteredPoolGuard {
+struct RegisteredCoordinatorGuard {
     hub: Arc<ReverseSessionHub>,
     protocol: L4Protocol,
     listen_addr: String,
     tunnel_id: Option<String>,
-    pool: PoolHandle,
+    target: Arc<ReverseIdleTarget>,
+    released: bool,
 }
 
-impl Drop for RegisteredPoolGuard {
-    fn drop(&mut self) {
-        self.hub.unregister_pool(
+impl RegisteredCoordinatorGuard {
+    async fn shutdown(mut self) {
+        self.released = true;
+        let is_last = self.hub.unregister_coordinator(
             self.protocol,
             &self.listen_addr,
             self.tunnel_id.as_deref(),
-            &self.pool,
+            &self.target,
         );
+        if is_last || self.tunnel_id.is_none() {
+            let _ = self.target.coord.graceful_stop().await;
+            if let Some(join) = self.target.take_join() {
+                let _ = join.await;
+            }
+        }
+    }
+}
+
+impl Drop for RegisteredCoordinatorGuard {
+    fn drop(&mut self) {
+        if !self.released {
+            let is_last = self.hub.unregister_coordinator(
+                self.protocol,
+                &self.listen_addr,
+                self.tunnel_id.as_deref(),
+                &self.target,
+            );
+            if is_last || self.tunnel_id.is_none() {
+                self.target.coord.force_stop();
+            }
+        }
     }
 }
 
 /// Thread-safe v2 server registry pairing inbound reverse data streams, routing
-/// pre-warmed `PoolIdle` streams into `TransportPool` handles, and coordinating
-/// grace-period control channel reattachment.
+/// pre-warmed `PoolIdle` streams into unified `Coordinator` `Idle` tasks, and
+/// coordinating grace-period control channel reattachment.
 #[derive(Default)]
 pub struct ReverseSessionHub {
     pending_sessions: DashMap<String, oneshot::Sender<Box<dyn TunnelStream>>>,
-    reverse_pools: DashMap<String, PoolHandle>,
-    tunnel_pools: DashMap<String, Arc<TunnelPoolSlot>>,
+    reverse_coordinators: DashMap<String, Arc<ReverseIdleTarget>>,
+    tunnel_coordinators: DashMap<String, Arc<ReverseIdleTarget>>,
     grace_listeners: Arc<DashMap<String, GraceSlot>>,
     next_grace_id: AtomicU64,
 }
@@ -184,106 +238,127 @@ impl ReverseSessionHub {
         tx.send(stream).map_err(|_| TunnelError::SessionClosed)
     }
 
-    /// Resolves the destination `PoolHandle` for an inbound `pool_idle` reverse stream
-    /// without holding any map lock across `.await`.
-    pub fn lookup_idle_pool(
+    /// Resolves the destination `CoordinatorHandle` and current generation for an inbound
+    /// `pool_idle` reverse stream without holding any map lock across `.await`.
+    pub fn lookup_idle_coordinator(
         &self,
         tunnel_id: Option<&str>,
         protocol: L4Protocol,
         target: Option<&TargetAddr>,
-    ) -> Option<PoolHandle> {
+    ) -> Option<(CoordinatorHandle<ReverseVisitorWorkflow>, u64)> {
         if let Some(tid) = tunnel_id
-            && let Some(slot) = self.tunnel_pools.get(tid)
+            && let Some(slot) = self.tunnel_coordinators.get(tid)
         {
-            return Some(slot.pool.clone());
+            return Some((slot.coord.clone(), slot.current_generation()));
         }
         let target_addr = target?;
         let key = canonical_reverse_key(protocol, &target_addr.to_string());
-        self.reverse_pools
+        self.reverse_coordinators
             .get(&key)
-            .map(|entry| entry.value().clone())
+            .map(|entry| (entry.coord.clone(), entry.current_generation()))
     }
 
-    /// Registers an active `PoolHandle` (or attaches to a shared `tunnel_id` pool slot)
-    /// and returns it along with an RAII guard that unregisters on exit.
-    fn register_or_join_pool(
+    /// Registers an exclusive or shared `tunnel_id` `Coordinator` for a bound reverse listener.
+    #[allow(clippy::too_many_arguments)]
+    fn register_or_join_coordinator(
         self: &Arc<Self>,
         protocol: L4Protocol,
         listen_addr: &str,
         tunnel_id: Option<String>,
+        fallback_signaler: Arc<dyn ReverseSignaler>,
+        heartbeat_interval: Duration,
         idle_timeout: Duration,
+        relay_idle_timeout: Duration,
         soft_cap: usize,
-        cancel_token: &CancellationToken,
-    ) -> (
-        PoolHandle,
-        Option<tokio::task::JoinHandle<crate::v2::pool::PoolSummary>>,
-        RegisteredPoolGuard,
-    ) {
+    ) -> (Arc<ReverseIdleTarget>, RegisteredCoordinatorGuard) {
         if let Some(ref tid) = tunnel_id {
-            let mut spawned_join = None;
-            let slot = Arc::clone(&*self.tunnel_pools.entry(tid.clone()).or_insert_with(|| {
-                let (pool, join) = TransportPool::start(
-                    PoolConfig::reverse_inbound(soft_cap, idle_timeout),
-                    cancel_token.child_token(),
-                );
-                spawned_join = Some(join);
-                Arc::new(TunnelPoolSlot {
-                    pool,
-                    listeners: AtomicUsize::new(0),
-                })
-            }));
+            let slot = Arc::clone(
+                &*self
+                    .tunnel_coordinators
+                    .entry(tid.clone())
+                    .or_insert_with(|| {
+                        let workflow = ReverseVisitorWorkflow::shared(
+                            heartbeat_interval,
+                            relay_idle_timeout,
+                            DEFAULT_RELAY_DRAIN_TIMEOUT,
+                        );
+                        let cfg = CoordinatorConfig::reverse_inbound(
+                            soft_cap,
+                            idle_timeout,
+                            DEFAULT_RELAY_DRAIN_TIMEOUT,
+                        );
+                        let (coord, join) =
+                            Coordinator::start_with_config(workflow, cfg, CancellationToken::new());
+                        Arc::new(ReverseIdleTarget::new(coord, join))
+                    }),
+            );
             slot.listeners.fetch_add(1, Ordering::AcqRel);
-            let pool = slot.pool.clone();
-            let guard = RegisteredPoolGuard {
+            let guard = RegisteredCoordinatorGuard {
                 hub: Arc::clone(self),
                 protocol,
                 listen_addr: listen_addr.to_string(),
                 tunnel_id: Some(tid.clone()),
-                pool: pool.clone(),
+                target: Arc::clone(&slot),
+                released: false,
             };
-            (pool, spawned_join, guard)
+            (slot, guard)
         } else {
             let key = canonical_reverse_key(protocol, listen_addr);
-            let (pool, join) = TransportPool::start(
-                PoolConfig::reverse_inbound(soft_cap, idle_timeout),
-                cancel_token.child_token(),
+            let workflow = ReverseVisitorWorkflow::new(
+                fallback_signaler,
+                heartbeat_interval,
+                relay_idle_timeout,
+                DEFAULT_RELAY_DRAIN_TIMEOUT,
             );
-            if let Some(old) = self.reverse_pools.insert(key, pool.clone()) {
-                old.shutdown();
+            let cfg = CoordinatorConfig::reverse_inbound(
+                soft_cap,
+                idle_timeout,
+                DEFAULT_RELAY_DRAIN_TIMEOUT,
+            );
+            let (coord, join) =
+                Coordinator::start_with_config(workflow, cfg, CancellationToken::new());
+            let target = Arc::new(ReverseIdleTarget::new(coord, join));
+            if let Some(old) = self.reverse_coordinators.insert(key, Arc::clone(&target)) {
+                old.coord.force_stop();
             }
-            let guard = RegisteredPoolGuard {
+            let guard = RegisteredCoordinatorGuard {
                 hub: Arc::clone(self),
                 protocol,
                 listen_addr: listen_addr.to_string(),
                 tunnel_id: None,
-                pool: pool.clone(),
+                target: Arc::clone(&target),
+                released: false,
             };
-            (pool, Some(join), guard)
+            (target, guard)
         }
     }
 
-    fn unregister_pool(
+    fn unregister_coordinator(
         &self,
         protocol: L4Protocol,
         listen_addr: &str,
         tunnel_id: Option<&str>,
-        pool: &PoolHandle,
-    ) {
+        target: &Arc<ReverseIdleTarget>,
+    ) -> bool {
         if let Some(tid) = tunnel_id {
-            let mut should_remove = false;
-            if let Some(slot) = self.tunnel_pools.get(tid)
-                && slot.listeners.fetch_sub(1, Ordering::AcqRel) == 1
-            {
-                should_remove = true;
-            }
+            let should_remove = self
+                .tunnel_coordinators
+                .get(tid)
+                .is_some_and(|slot| slot.listeners.fetch_sub(1, Ordering::AcqRel) == 1);
             if should_remove {
-                self.tunnel_pools
-                    .remove_if(tid, |_, slot| slot.listeners.load(Ordering::Acquire) == 0);
+                return self
+                    .tunnel_coordinators
+                    .remove_if(tid, |_, s| s.listeners.load(Ordering::Acquire) == 0)
+                    .is_some();
             }
+            false
         } else {
             let key = canonical_reverse_key(protocol, listen_addr);
-            self.reverse_pools
-                .remove_if(&key, |_, current| current.same_pool(pool));
+            self.reverse_coordinators
+                .remove_if(&key, |_, current| {
+                    current.coord.same_coordinator(&target.coord)
+                })
+                .is_some()
         }
     }
 
@@ -375,45 +450,28 @@ impl ReverseSignaler for RouterReverseSignaler {
         let disconnect_notify = Arc::clone(&self.disconnect_notify);
 
         Box::pin(async move {
-            if !router.has_active_channel() {
-                disconnect_notify.notify_one();
-                return Err(TaskError::StageFailed(
-                    "reverse signaling channel unavailable".into(),
-                ));
-            }
-
-            let session_id = format!(
-                "v2_sess_{}_{}",
-                std::process::id(),
-                NEXT_SESSION_SEQ.fetch_add(1, Ordering::Relaxed)
-            );
-            let (pair_rx, guard) = hub.register_guarded(session_id.clone());
+            let seq = NEXT_SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
+            let session_id = format!("v2s-{seq}");
+            let (rx, guard) = hub.register_guarded(session_id.clone());
 
             let msg = ControlMessage::NewConnection {
-                session_id: session_id.clone(),
+                session_id,
                 client_addr: visitor_peer.to_string(),
             };
             if let Err(err) = router.send(msg).await {
-                if !err.to_string().contains("timed out") {
-                    disconnect_notify.notify_one();
-                }
+                disconnect_notify.notify_one();
                 return Err(TaskError::StageFailed(format!(
-                    "failed signaling NewConnection for {session_id}: {err}"
+                    "failed to send NewConnection signal: {err}"
                 )));
             }
 
-            match tokio::time::timeout(pair_timeout, pair_rx).await {
-                Ok(Ok(stream)) => {
-                    guard.defuse();
-                    Ok(stream)
-                }
-                Ok(Err(_)) => Err(TaskError::StageFailed(format!(
-                    "reverse session {session_id} sender dropped"
-                ))),
-                Err(_) => Err(TaskError::StageFailed(format!(
-                    "timed out waiting for reverse session {session_id}"
-                ))),
-            }
+            let stream = tokio::time::timeout(pair_timeout, rx)
+                .await
+                .map_err(|_| TaskError::StageFailed("reverse pair timeout".to_string()))?
+                .map_err(|_| TaskError::StageFailed("reverse session dropped".to_string()))?;
+
+            guard.defuse();
+            Ok(stream)
         })
     }
 }
@@ -474,16 +532,6 @@ impl ReverseControlSession {
             }
         };
 
-        let soft_cap = reverse_pool_soft_cap(pool_size);
-        let (pool_handle, pool_join, _pool_guard) = hub.register_or_join_pool(
-            protocol,
-            &listen_addr,
-            tunnel_id.clone(),
-            idle_timeout,
-            soft_cap,
-            &cancel_token,
-        );
-
         let sig_config = SignalingConfig {
             heartbeat_interval,
             idle_timeout,
@@ -491,6 +539,30 @@ impl ReverseControlSession {
         let (signaling, mut sig_rx) =
             SignalingChannel::spawn_framed(ctrl_stream, sig_config, cancel_token.child_token());
         let router = SignalingRouter::new(signaling);
+
+        let relay_idle_timeout = match protocol {
+            L4Protocol::Tcp => idle_timeout,
+            L4Protocol::Udp => udp_idle_timeout,
+        };
+        let disconnect_notify = Arc::new(Notify::new());
+        let signaler: Arc<dyn ReverseSignaler> = Arc::new(RouterReverseSignaler::new(
+            router.clone(),
+            Arc::clone(&hub),
+            DEFAULT_SESSION_PAIR_TIMEOUT,
+            Arc::clone(&disconnect_notify),
+        ));
+
+        let soft_cap = reverse_pool_soft_cap(pool_size);
+        let (coord_target, coord_guard) = hub.register_or_join_coordinator(
+            protocol,
+            &listen_addr,
+            tunnel_id.clone(),
+            Arc::clone(&signaler),
+            heartbeat_interval,
+            idle_timeout,
+            relay_idle_timeout,
+            soft_cap,
+        );
 
         let ack_sent = tokio::select! {
             biased;
@@ -504,47 +576,30 @@ impl ReverseControlSession {
         if !ack_sent {
             fe.shutdown().await;
             drop(fe);
-            if let Some(join) = pool_join {
-                pool_handle.shutdown();
-                let _ = join.await;
-            }
+            coord_guard.shutdown().await;
             return;
         }
 
-        let relay_idle_timeout = match protocol {
-            L4Protocol::Tcp => idle_timeout,
-            L4Protocol::Udp => udp_idle_timeout,
-        };
-        let disconnect_notify = Arc::new(Notify::new());
-        let signaler = Arc::new(RouterReverseSignaler::new(
-            router.clone(),
-            Arc::clone(&hub),
-            DEFAULT_SESSION_PAIR_TIMEOUT,
-            Arc::clone(&disconnect_notify),
-        ));
         let Ok(target_parsed) = crate::io::addr::parse_target_addr(&target_addr) else {
             fe.shutdown().await;
             drop(fe);
-            if let Some(join) = pool_join {
-                pool_handle.shutdown();
-                let _ = join.await;
-            }
+            coord_guard.shutdown().await;
             return;
         };
 
-        let runner = ReverseServerRunner::new(
+        let exclusive_join = if tunnel_id.is_none() {
+            coord_target.take_join()
+        } else {
+            None
+        };
+        let runner = ReverseServerRunner::with_coordinator(
             fe,
             target_parsed,
             protocol,
-            ReverseVisitorWorkflow::new(
-                (soft_cap > 0).then_some(pool_handle.clone()),
-                signaler,
-                heartbeat_interval,
-                relay_idle_timeout,
-                DEFAULT_RELAY_DRAIN_TIMEOUT,
-            ),
-            pool_join.map(|j| (pool_handle.clone(), j)),
-            DEFAULT_RELAY_DRAIN_TIMEOUT,
+            coord_target.coord.clone(),
+            exclusive_join,
+            tunnel_id.as_ref().map(|_| Arc::clone(&signaler)),
+            tunnel_id.as_ref().map(|_| relay_idle_timeout),
         );
 
         let runner_cancel = cancel_token.child_token();
@@ -559,7 +614,7 @@ impl ReverseControlSession {
                 biased;
                 _ = cancel_token.cancelled() => break,
                 _ = &mut runner_handle => {
-                    // ReverseServerRunner exited prematurely; tear down control session cleanly.
+                    coord_guard.shutdown().await;
                     return;
                 }
                 Some(reattach) = Self::poll_grace_reattach(&mut grace_handle), if grace_handle.is_some() => {
@@ -567,7 +622,8 @@ impl ReverseControlSession {
                         g.finish();
                     }
                     grace_deadline = None;
-                    let _ = pool_handle.clear_idle().await;
+                    let new_gen = coord_target.bump_generation();
+                    let _ = coord_target.coord.sweep_before_generation(new_gen).await;
                     if let Some(sink) = sig_rx.event_sink() {
                         let new_handle = SignalingChannel::spawn_framed_with_event_sink(
                             *reattach.ctrl_stream,
@@ -591,7 +647,8 @@ impl ReverseControlSession {
                             g.finish();
                         }
                         grace_deadline = None;
-                        let _ = pool_handle.clear_idle().await;
+                        let new_gen = coord_target.bump_generation();
+                        let _ = coord_target.coord.sweep_before_generation(new_gen).await;
                         if let Some(sink) = sig_rx.event_sink() {
                             let new_handle = SignalingChannel::spawn_framed_with_event_sink(
                                 *reattach.ctrl_stream,
@@ -623,7 +680,7 @@ impl ReverseControlSession {
                             sig_config,
                             &cancel_token,
                             &hub,
-                            &pool_handle,
+                            &coord_target,
                             &router,
                             &sig_rx,
                             &mut grace_handle,
@@ -646,7 +703,7 @@ impl ReverseControlSession {
                                 sig_config,
                                 &cancel_token,
                                 &hub,
-                                &pool_handle,
+                                &coord_target,
                                 &router,
                                 &sig_rx,
                                 &mut grace_handle,
@@ -665,6 +722,7 @@ impl ReverseControlSession {
         }
         runner_cancel.cancel();
         let _ = runner_handle.await;
+        coord_guard.shutdown().await;
     }
 
     async fn poll_grace_reattach(grace: &mut Option<GraceHandle>) -> Option<ReattachPayload> {
@@ -690,7 +748,7 @@ impl ReverseControlSession {
         sig_config: SignalingConfig,
         cancel_token: &CancellationToken,
         hub: &ReverseSessionHub,
-        pool_handle: &PoolHandle,
+        coord_target: &ReverseIdleTarget,
         router: &SignalingRouter,
         sig_rx: &SignalingReceiver,
         grace_handle: &mut Option<GraceHandle>,
@@ -706,14 +764,17 @@ impl ReverseControlSession {
             *grace_handle = Some(hub.register_grace_listener(protocol, listen_addr));
         }
 
-        // Generalized 0xA6 promotion directly from the Tunnel's PassiveInbound PoolHandle
+        // Generalized 0xA6 promotion extracting an Idle transport straight from Coordinator
         // when no dedicated standby channel exists (single-listener mode without shared tunnel_id).
         if tunnel_id.is_none()
-            && let Ok(Some(mut lease)) = pool_handle.try_acquire().await
+            && let Ok(Some(mut transport)) = coord_target.coord.take_idle_transport().await
         {
             let write_fut = async {
-                lease.write_all(&[ACTIVATE_STREAM_PROMOTE]).await?;
-                lease.flush().await
+                transport
+                    .stream
+                    .write_all(&[ACTIVATE_STREAM_PROMOTE])
+                    .await?;
+                transport.stream.flush().await
             };
             if tokio::time::timeout(reverse_frame_timeout(idle_timeout), write_fut)
                 .await
@@ -721,7 +782,7 @@ impl ReverseControlSession {
                 && let Some(sink) = sig_rx.event_sink()
             {
                 let promoted_handle = SignalingChannel::spawn_with_event_sink(
-                    Box::new(lease),
+                    transport.stream,
                     sig_config,
                     sink,
                     cancel_token.child_token(),

@@ -112,6 +112,10 @@ impl QuicSessionHandle {
         &self.conn
     }
 
+    pub(crate) fn session_id(&self) -> u64 {
+        self.conn.stable_id() as u64
+    }
+
     pub(crate) fn is_alive(&self) -> bool {
         !self.dead.load(Ordering::Acquire) && self.conn.close_reason().is_none()
     }

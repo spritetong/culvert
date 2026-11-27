@@ -90,10 +90,9 @@ async fn pure_v2_server_and_clients_ws_forward_and_reverse_e2e() {
     use crate::io::addr::MappingSpec;
     use crate::transport::ws::WsTransportDriver;
     use crate::transport::{TransportConnector, TransportRegistry};
-    use crate::v2::TunnelPhase;
     use crate::v2::forward::{ForwardRunner, ForwardWorkflow};
-    use crate::v2::pool::{PoolConfig, TransportPool};
     use crate::v2::reverse::{ReverseClientConfig, ReverseClientRunner};
+    use crate::v2::{CoordinatorConfig, TunnelPhase};
 
     let probe_echo = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let echo_port = probe_echo.local_addr().unwrap().port();
@@ -153,20 +152,18 @@ async fn pure_v2_server_and_clients_ws_forward_and_reverse_e2e() {
     let endpoint_ctx = EndpointContext::build(&endpoint_cfg, &AppConfig::default()).unwrap();
     let echo_target = format!("127.0.0.1:{echo_port}");
 
-    // 1. v2 Forward client (with pooled 0-RTT activation) -> v2::ServerRunner
+    // 1. v2 Forward client (with unified Coordinator Idle + DialDriver 0-RTT activation) -> v2::ServerRunner
     let fwd_connector: Arc<dyn TransportConnector> = Arc::from(
         registry
             .create_connector(&endpoint_ctx, Some(auth_token), TunnelMode::Forward)
             .unwrap(),
     );
-    let (fwd_pool, fwd_pool_join) = TransportPool::start(
-        PoolConfig::forward(
-            Arc::clone(&fwd_connector),
-            2,
-            DEFAULT_HEARTBEAT_INTERVAL,
-            DEFAULT_IDLE_TIMEOUT,
-        ),
-        CancellationToken::new(),
+    let fwd_coord_cfg = CoordinatorConfig::forward_pooled(
+        Arc::clone(&fwd_connector),
+        2,
+        DEFAULT_HEARTBEAT_INTERVAL,
+        DEFAULT_IDLE_TIMEOUT,
+        DEFAULT_RELAY_DRAIN_TIMEOUT,
     );
     let fwd_listen = format!("127.0.0.1:{fwd_port}");
     let fwd_fe = frontend::bind(&MappingSpec::new(
@@ -181,14 +178,13 @@ async fn pure_v2_server_and_clients_ws_forward_and_reverse_e2e() {
         TargetAddr::Ip(echo_target.parse().unwrap()),
         L4Protocol::Tcp,
         ForwardWorkflow::new(
-            Some(fwd_pool.clone()),
             Some(fwd_connector),
             DEFAULT_HEARTBEAT_INTERVAL,
             DEFAULT_IDLE_TIMEOUT,
             DEFAULT_RELAY_DRAIN_TIMEOUT,
-        ),
-        Some((fwd_pool, fwd_pool_join)),
-        DEFAULT_RELAY_DRAIN_TIMEOUT,
+        )
+        .with_pooled(true),
+        fwd_coord_cfg,
     );
     let fwd_cancel = CancellationToken::new();
     let fwd_handle = tokio::spawn(fwd_runner.run(fwd_cancel.clone()));

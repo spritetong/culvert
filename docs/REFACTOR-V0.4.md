@@ -104,12 +104,13 @@ Internal State 属于 IO Task 自己，主要描述内部异步操作的执行�
 
 External State 由 Coordinator 统一管理，用于描述 IO Task 对调度系统和关闭流程可见的生命周期阶段与资源归属。
 
-经实现期收敛，每个 `IoTask` 支持空闲预热（Prewarm）与单连接周期结束后的回收复用（`Empty` 槽位），`ExternalState` 确定为五态（`IDLE` 仍专属于 `TransportPool`，`HALF_CLOSE` 仍专属于数据面转发的 Internal State）：
+经实现期演进与最终统一，每个 `IoTask` 将空闲流保活/过期淘汰与连接复用合并为一体化生命周期，不再单独运行独立的 `TransportPool` Actor；`ExternalState` 收敛为六态（`HALF_CLOSE` 仍专属于数据面转发的 Internal State）：
 
 | 状态 | 含义 |
 |---|---|
-| `Empty` | 任务槽位空闲，未持有任何流资源；可被 `Assign` 唤醒进入下一轮 `JobId` |
-| `Connecting` | 已分配 `JobId` 并独占输入资源（如 `Frontend` 流），正在建连或激活 `Backend` |
+| `Empty` | 任务槽位空闲，未持有任何流资源；可由 `Assign` 直接激活或由 `SupplyIdle` 装载预建流 |
+| `Idle` | 任务持有活跃预建/入站 `PooledTransport`，本地 `poll_check_alive` 与年龄上限驱动保活及失活自淘汰 |
+| `Connecting` | 已分配 `JobId` 并独占输入资源（如 `Frontend` 流），承接 `Idle` 携带流或向 Coordinator 申领流并完成激活 |
 | `Active` | 前后端资源已全部配对就绪，交由 IO Task 独占执行数据面转发（`ChannelRelay`） |
 | `Closing` | 正在执行有界优雅排空与底层关闭，随后在 `Running` 阶段回收到 `Empty`，或在关闭阶段退出至 `Closed` |
 | `Closed` | 任务事件循环结束并即将从 `JoinSet` 移除的终态 |
@@ -407,60 +408,59 @@ Coordinator 通过 `(TaskId, JobId)` 精确校验内部异步通知：
 1. **Coordinator 粒度：每个 Tunnel 一个，还是多个共用？**
    - **定稿**：**每个 Tunnel 一个 Coordinator**。故障与关闭域天然隔离，符合单 Tunnel TCP Forward 最小原型的验证边界。
 2. **IO Task 是长期存在的资源槽位，还是每次连接创建、结束后销毁？**
-   - **定稿**：**支持按需动态创建，也支持 `Empty` 预热与跨连接回收复用**。`TaskId` 唯一标识可复用 Worker，`JobId` 唯一标识每次指派的连接作业周期，在保持简洁的前提下可无缝承接未来 WS/QUIC 会话复用需求。
+   - **定稿**：**支持按需动态创建，也支持 `Empty` 预热与 `Idle` 资源驻留及跨连接回收复用**。`TaskId` 唯一标识可复用 Worker，`IdleId` 唯一标识一次 `Idle` 驻留期，`JobId` 唯一标识每次指派的连接作业周期。
 3. **`EMPTY`、`IDLE`、`HALF_OPEN` 是否需要全部独立存在？**
-   - **定稿**：`IDLE` 仍专属于 `TransportPool`；`HALF_CLOSE` 仍专属于数据面内部；`IoTask` 的 `ExternalState` 收敛为 `Empty`、`Connecting`、`Active`、`Closing`、`Closed` 五态，并在任务内部由单一枚举 `TaskPhase<W>` 将状态与资源 payload 一一绑定，杜绝合法外状态组合缺失或错配。
+   - **定稿**：`HALF_CLOSE` 仍专属于数据面转发内部；`IoTask` 的 `ExternalState` 将 `Idle` 统一纳入 `Empty`、`Idle`、`Connecting`、`Active`、`Closing`、`Closed` 六态，并在任务内部由单一枚举 `TaskPhase<W>` 将状态与资源 payload 一一绑定，杜绝双状态机失步。
 4. **Transport Pool 和 IO Task 集合是否应该是两个独立的资源管理系统？**
-   - **定稿**：**是两个职责正交的控制平面 Actor**。`TransportPool` 负责空闲流预热、保活、过期淘汰；流一旦租出即移交带 RAII `LeaseGuard` 的 `StreamLease` 给 IO Task（原子 `active_count` + 容量为 1 的合并唤醒通道）。Pool 的后台句柄纳入受监督生命周期，绝不裸 `tokio::spawn`。
+   - **定稿**：**统一归并到单一 Coordinator + `IoTask::Idle` 模型**。所有有状态 I/O（含空闲流的周期保活、过期自淘汰、异步 `CloseTransport` 清理）均下沉至 `IoTask`；Forward 后台拨号由嵌入式 `DialDriver` 直接归属 Coordinator `select!` 驱动，取消独立 `TransportPool` Actor、队列锁与 `StreamLease`/`LeaseGuard` 引用计数。
 5. **External State 如何向其他 Task 发布？Coordinator 通道如何防死锁与背压？**
    - **定稿**：Coordinator 采用双通道优先级模型：
-     - **外部事件通道（`event_rx`）**：有界队列（容量 1024），为外部 `assign` / `prewarm` / 查询请求提供背压。
-     - **高优先级同步微任务通道（`micro_rx`）** 与 **Task 指令通道（`directive_tx`）**：无界异步发送以确保单写者 Coordinator 与 Task 之间永不因相互 `.await` 形成死锁；`micro_rx` 严格按最高优先级在每轮 `select!` 入口通过 `while let Ok` 极速排空（所有 `Microtask` 均受契约约束为 O(1) 纯内存同步状态变更、禁止任何 `.await`）；`StateEngine` 同时限制最大并发 Waiter 数量（`MAX_PENDING_WAITERS = 4096`）。
+     - **外部事件通道（`event_rx`）**：有界队列（容量 1024），为外部 `assign` / `prewarm` / `supply_transport` / 查询请求提供背压。
+     - **高优先级同步微任务通道（`micro_rx`）** 与 **Task 指令通道（`directive_tx`）**：无界异步发送以确保单写者 Coordinator 与 Task 之间永不因相互 `.await` 形成死锁；`micro_rx` 严格按最高优先级在每轮 `select!` 入口通过 `while let Ok` 极速排空（所有 `Microtask` 均受契约约束为 O(1) 纯内存同步状态变更、禁止任何 `.await`）；错态投递的流通过 `Microtask::ReturnTransport` 无阻塞退回 Coordinator 自动恢复。
 6. **Graceful Shutdown 的排空边界在哪里？**
    - **定稿**：
      - 收到 Stop 后立即停止 `Frontend::accept`。
-     - 向 `TransportPool` 发送 `stop_replenishing()`，立即停止 Drain 期间无意义的新增后台拨号。
-     - 处于 `Empty` 的 Task 收到 `Shutdown` 直接退出；处于 `Connecting` 的 Task 收到 `Drain` 立即取消并回收/退出；处于 `Active` 的 Task 停止源端新读取，在有界 `drain_timeout` 内完成尾部写出和半关闭；到达全局截止时间或收到 `ForceStop`（`CancellationToken` 及最后 `CoordinatorHandle` 的 `Drop`）时立即终止全部子任务。
+     - Coordinator 清理 `DialDriver` 停止一切后台拨号。
+     - 处于 `Empty` / `Idle` 的 Task 收到 `Shutdown` 关闭其托管流并直接退出；处于 `Connecting` 的 Task 收到 `Drain` 立即取消并回收/退出；处于 `Active` 的 Task 停止源端新读取，在有界 `drain_timeout` 内完成尾部写出和半关闭；到达全局截止时间或收到 `ForceStop`（`CancellationToken` 及最后 `CoordinatorHandle` 的 `Drop`）时立即终止全部子任务。
 7. **是否需要 `generation/lease`？**
-   - **定稿**：`IoTask` 同时拥有 Worker 身份 `TaskId(u64)` 与作业代际 `JobId(u64)`，严格校验跨周期事件隔离；`TransportPool` 采用 RAII `StreamLease` / `LeaseGuard` 管理租约计数，并保留面向控制通道/反向代际的显式校验能力。
+   - **定稿**：`IoTask` 同时拥有 Worker 身份 `TaskId(u64)`、驻留标识 `IdleId(u64)` 与作业代际 `JobId(u64)`，严格校验跨周期事件隔离；`PooledTransport` 携带 `session_id`（支持 QUIC 关联会话批量清扫）与 `generation`（支持 Reverse 控制通道重连后的代际过滤与清扫），彻底替代手工 `LeaseGuard` 计数。
 8. **Coordinator 退出时，如何保证所有 Task 和 Transport 都有确定的终止结果？**
-   - **定稿**：Coordinator 通过 `JoinSet<TaskReport>` 及 `tokio::task::Id -> TaskId` 映射监督所有 IO Task，任何正常结束、异常 `panic` 或 `abort` 返回的 `JoinError` 都会触发 `StateEngine::complete_task` 清理状态表；退出时按「停止 Accept → `Pool::stop_replenishing()` → `Coordinator::graceful_stop()` 等 `JoinSet` 清空 → `Pool::shutdown()` 等 Pool 退出」顺序完成确定性收敛。
+   - **定稿**：Coordinator 通过 `JoinSet<TaskReport>` 及 `tokio::task::Id -> TaskId` 映射监督所有 IO Task，任何正常结束、异常 `panic` 或 `abort` 返回的 `JoinError` 都会触发 `StateEngine::complete_task` 清理状态表；退出时只需「停止 Accept → `Coordinator::graceful_stop()` 等 `JoinSet` 清空」即可完成全部资源与传输流的确定性收敛。
 9. **Tokio Task 的数量和 IO State Machine 的数量是否应该解耦？**
    - **定稿**：保持 `1 IO Task = 1 Tokio Task`（边界异步调度，热路径使用无分配 `poll_drive` 状态机）。只有在明确测出 Tokio Task 开销成为瓶颈时再重新评估。
 
 ---
 
-## 14. 收敛设计模型：双通道 Coordinator、可回收 IO Task 与池协同状态机
+## 14. 收敛设计模型：双通道 Coordinator 与一体化 IO Task（含 `Idle` 保活）
 
 > 本节同步记录 `v2` 当前已实现并验证的状态模型（覆盖 Forward、Reverse 与 TCP/UDP 多路复用）。
 
 ### 14.1 模块与资源所有权拓扑
 
 ```text
-                +-----------------------------------+
-                |      Tunnel Coordinator Actor     |  <-- 唯一 StateEngine 写入者
-                |  - phase: TunnelPhase             |      唯一持有 JoinSet 与 JoinId->TaskId 映射
-                |  - micro_rx (unbounded, loop-drain)|      CancellationToken 统一 ForceStop + Drop
-                |  - event_rx (bounded 1024)        |
-                +-------+-------------------+-------+
-                        |                   |
-         (accept loop)  |                   | TaskDirective<I> (Assign{job_id,input}/Drain/Shutdown)
-                        v                   v
-           +----------------+     +---------------------------------------+
-           |    Frontend    |     |        IoTask (TaskId, JobId)         |
-           | ReusableFuture |     |  Single enum TaskPhase<W>:            |
-           +--------+-------+     |   Empty | Connecting | Active |       |
-                    |             |   Closing | Closed                    |
-                    | Assign      |  ActiveStage: ChannelRelay (poll_fn)  |
-                    +------------>|  ClosingStage: bounded drain & close  |
-                                  +-------------------+-------------------+
-                                                      ^
-                                      Acquire/Lease   | StreamLease (RAII LeaseGuard)
-                                      (optional)      |
-                                            +---------+---------+
-                                            |   TransportPool   |
-                                            | (Forward/Reverse) |
-                                            +-------------------+
+                +----------------------------------------+
+                |       Tunnel Coordinator Actor         | <-- 唯一 StateEngine 写入者
+                |  - phase: TunnelPhase                  |     嵌入式 DialDriver (可选 Forward 拨号)
+                |  - micro_rx (unbounded, loop-drain)    |     唯一持有 JoinSet 与 JoinId->TaskId
+                |  - event_rx (bounded 1024)             |     CancellationToken 统一 ForceStop
+                +------+--------------------------+------+
+                       |                          |
+        (accept/dial)  |                          | TaskDirective<I>:
+                       v                          |   Assign / SupplyIdle / ExtractTransport
+           +----------------+                     |   CloseTransport / Drain / Shutdown
+           |    Frontend    |                     v
+           | ReusableFuture |         +---------------------------------------------+
+           +--------+-------+         |       IoTask (TaskId, IdleId, JobId)        |
+                    |                 |  Single enum TaskPhase<W>:                  |
+                    |                 |   Empty | Idle | Connecting | Active |      |
+                    | Assign          |   Closing | Closed                          |
+                    +---------------->|  Idle: local keepalive & max_idle_age check |
+                                      |  Connecting: idle carry-over / 0xA5 / 0xAC  |
+                                      |  ActiveStage: ChannelRelay (poll_fn)        |
+                                      |  ClosingStage: bounded drain & close        |
+                                      +----------------------+----------------------+
+                                                             |
+                                 ReturnTransport / SweepSession (non-blocking Microtask)
 ```
 
 ### 14.2 状态定义
@@ -469,8 +469,8 @@ Coordinator 通过 `(TaskId, JobId)` 精确校验内部异步通知：
 
 | 状态 | 含义 |
 |---|---|
-| `Running` | 正常接收新工作派发，并将完成任务的 Worker 回收到 `Empty` 池 |
-| `Draining` | 已触发 Graceful Stop：拒绝新工作，对 `Empty` 发 `Shutdown`，对 `Connecting`/`Active` 发 `Drain`，并开启有界 `drain_timeout` |
+| `Running` | 正常接收新工作与预热流派发，将闲置流挂载至 `Idle` 并复用已完成作业的 `Empty` 槽位 |
+| `Draining` | 已触发 Graceful Stop：拒绝新工作、停止 `DialDriver`，对 `Empty`/`Idle` 发 `Shutdown`，对 `Connecting`/`Active` 发 `Drain`，并开启有界 `drain_timeout` |
 | `ForceStopping` | 超时或触发 `ForceStop`：激活根 `CancellationToken` 立即中止所有未完成阶段 |
 | `Stopped` | `JoinSet` 为空且所有资源收敛完毕 |
 
@@ -478,20 +478,23 @@ Coordinator 通过 `(TaskId, JobId)` 精确校验内部异步通知：
 
 | 状态 | 资源所有权 (`TaskPhase<W>`) | 含义 |
 |---|---|---|
-| `Empty` | `TaskPhase::Empty`（零 I/O 资源） | 空闲复用槽位，等待下一个 `Assign { job_id, input }` 或 `Shutdown` |
-| `Connecting` | `TaskPhase::Connecting { job_id, input }` | 独占输入并正在建连/激活配对 |
+| `Empty` | `TaskPhase::Empty`（零 I/O 资源） | 空闲复用槽位，等待 `Assign { job_id, input }`、`SupplyIdle` 或 `Shutdown` |
+| `Idle` | `TaskPhase::Idle { idle_id, transport, .. }` | 独占闲置传输流，驱动本地心跳保活/超时自淘汰，随时无缝升级为 `Connecting` 或响应 `ExtractTransport`（如 `0xA6`）与异步 `CloseTransport`（QUIC/代际清扫） |
+| `Connecting` | `TaskPhase::Connecting { job_id, input, transport }` | 独占输入并激活预建流或向 Coordinator 申领流 / 发起直连 |
 | `Active` | `TaskPhase::Active { job_id, stage }` | 独占双端通道，在热路径 `poll_drive` 转发 |
 | `Closing` | `TaskPhase::Closing { job_id, stage, .. }` | 有界排空写缓冲与关闭清理，随后回收到 `Empty` 或进入 `Closed` |
 | `Closed` | `TaskPhase::Closed { outcome }` | 事件循环结束，等待 `JoinSet` 回收 |
 
-### 14.3 协同关闭顺序与取消边界不变量
+### 14.3 协同关闭、清扫与无锁竞态恢复不变量
 
-1. **协同关闭顺序**：`Frontend::shutdown()` → `PoolHandle::stop_replenishing()` → `Coordinator::graceful_stop()` + `coord_join.await` → `PoolHandle::shutdown()` + `pool_join.await`。保证 Drain 期间无多余后台拨号，且所有持有 `StreamLease` 的 Task 都在 Pool 关闭前完成释放（`active_count == 0`）。
-2. **取消安全边界**：
-   - `workflow.connect()` 在 `Connecting` 被 `Drain`/`ForceStop` 取消时直接丢弃未来并释放其持有的临时通道或 `StreamLease`（半激活流绝不归还空闲池）。
-   - `TransportPool::acquire()` 发出请求后若调用方 Future 取消：已出队的 `StreamLease` 通过 `reclaim_stream()` 撤销计数并放回队列头部；排队的 `PendingAcquire` 通过 `reply.is_closed()` 及时清理，不引发幽灵拨号。
-   - `Active` 切换 `Closing` 时通过借用 `poll_fn(|cx| stage.poll_drive(cx))` 仅中止轮询 Future 而不丢失阶段对象及半写缓冲。
-3. **非阻塞与异常终结不变量**：`Microtask` 处理全程零 `.await`；`JoinSet` 返回任何 `Ok(report)` 或 `Err(join_err)` 均清理对应 `TaskEntry`，防止残余条目阻断 `Draining -> Stopped` 收敛。
+1. **统一关闭顺序**：`Frontend::shutdown()` → `Coordinator::graceful_stop()` + `coord_join.await`。Coordinator 在进入 `Draining` 时同步清零 `DialDriver` 并销毁所有 `Idle` 流，无需再维护外部 Pool 停补与二级 Join 顺序。
+2. **异步批量清扫与代际过滤**：
+   - QUIC `session_id` 失活（`report_dead_session` / `sweep_session`）与 Reverse 控制重连（`sweep_before_generation`）均通过同步内存筛选向匹配的 `Idle` 任务异步投递 `TaskDirective::CloseTransport { expected_idle_id }`，并提升 `min_idle_generation` 拒绝滞后入站流。
+3. **无锁竞态自动恢复**：
+   - Coordinator 派发 `Assign` 至 `Idle` 任务，若此时 `Idle` 流恰好在本地保活心跳中失活，`IoTask` 直接丢弃失效流并携带输入无缝进入 `Connecting { transport: None }`，不丢失外部连接。
+   - 若 `SupplyIdle` 到达已处于非 `Empty` 状态的任务（或 `ExtractTransport` 遇调用方 `oneshot` 提前丢弃），`IoTask` 通过 `Microtask::ReturnTransport` 无阻塞将传输流退回 Coordinator 重新分派。
+   - 若 `workflow.connect()` 的 `request_transport()` 未来在 `Drain`/`ForceStop` 下提前取消，`oneshot::Receiver` 销毁后 StateEngine 自动剔除 waiter 并改派未投递流。
+4. **非阻塞与异常终结不变量**：`Microtask` 与 `Event` 处理全程零 `.await`；`JoinSet` 返回任何 `Ok(report)` 或 `Err(join_err)` 均清理对应 `TaskEntry`，防止残余条目阻断 `Draining -> Stopped` 收敛。
 
 ---
 

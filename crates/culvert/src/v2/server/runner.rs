@@ -18,6 +18,7 @@ use crate::transport::{StreamMetadata, TransportRegistry};
 use crate::v2::coordinator::{Coordinator, CoordinatorHandle};
 use crate::v2::server::forward::{ServerForwardInput, ServerForwardWorkflow};
 use crate::v2::server::reverse::{ReverseControlSession, ReverseSessionHub};
+use crate::v2::state::PooledTransport;
 use reusable_future::ReusableFutureRef;
 use std::sync::Arc;
 use std::time::Duration;
@@ -319,14 +320,15 @@ impl ServerRunner {
                 tracing::warn!(session = %session_id, error = ?err, "Failed to fulfill v2 reverse session");
             }
         } else if metadata.pool_idle {
-            let pool_opt = hub.lookup_idle_pool(
+            let coord_opt = hub.lookup_idle_coordinator(
                 metadata.tunnel_id.as_deref(),
                 metadata.protocol,
                 metadata.target.as_ref(),
             );
-            if let Some(pool) = pool_opt {
+            if let Some((coord, generation)) = coord_opt {
+                let transport = PooledTransport::new(stream, generation);
                 reverse_tasks.spawn(async move {
-                    let _ = pool.push_idle(stream).await;
+                    let _ = coord.supply_transport(transport).await;
                 });
             }
         } else {

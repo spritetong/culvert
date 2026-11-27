@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MPL-2.0
 // culvert is licensed under the Mozilla Public License Version 2.0.
 
-//! Reverse tunnel (`-R`) client and server workflows built on `Coordinator`,
-//! `TransportPool`, and `ChannelRelay`.
+//! Reverse tunnel (`-R`) client and server workflows built on unified `Coordinator`,
+//! `IoTask` (`Idle` + `Connecting` + `Active`), and `ChannelRelay`.
 //! All comments and docstrings must be in English.
 
 pub mod client;

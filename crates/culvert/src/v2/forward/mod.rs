@@ -3,7 +3,7 @@
 // culvert is licensed under the Mozilla Public License Version 2.0.
 
 //! TCP/stream Forward workflow (`TaskWorkflow`) and runner integrating `Frontend`,
-//! `TransportConnector`, `TransportPool`, `Coordinator`, and `DuplexRelay`.
+//! `TransportConnector`, `Coordinator` (with embedded `Idle` + `DialDriver`), and `ChannelRelay`.
 //! All comments and docstrings must be in English.
 
 pub mod runner;

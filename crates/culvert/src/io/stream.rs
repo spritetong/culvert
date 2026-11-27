@@ -124,6 +124,13 @@ pub trait TunnelStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {
     /// Returns `Poll::Ready(HeartbeatStatus::Dead)` if EOF, RST, or broken pipe is detected.
     /// Returns `Poll::Ready(HeartbeatStatus::Alive)` or `Poll::Pending` if still healthy.
     fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus>;
+
+    /// Optional stable identifier of a shared underlying session (such as a QUIC connection).
+    ///
+    /// Used by `v2::Coordinator` to batch-sweep sibling `Idle` tasks when a shared session dies.
+    fn session_id(&self) -> Option<u64> {
+        None
+    }
 }
 
 // Implement TunnelStream for tokio::net::TcpStream using poll_peek to detect EOF/RST without consuming bytes.

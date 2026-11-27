@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MPL-2.0
 // culvert is licensed under the Mozilla Public License Version 2.0.
 
-//! Multi-mapping tunnel cluster orchestrating shared Forward `TransportPool`, shared
-//! Reverse pre-warmed workers, and per-mapping `v2` Coordinators under one lifecycle boundary.
+//! Multi-mapping tunnel cluster orchestrating a shared unified Forward `Coordinator`,
+//! shared Reverse pre-warmed workers, and per-mapping Reverse Coordinators under one boundary.
 //! All comments and docstrings must be in English.
 
 use crate::config::model::{PortMappingConfig, TunnelConfig, TunnelMode};
@@ -13,16 +13,17 @@ use crate::consts::{
 };
 use crate::core::error::TunnelError;
 use crate::dialer::endpoint::EndpointContext;
-use crate::frontend;
+use crate::frontend::{self, Frontend, FrontendOutput};
 use crate::io::addr::{L4Protocol, MappingSpec, TargetAddr, parse_target_addr};
 use crate::transport::{TransportConnector, TransportRegistry};
-use crate::v2::coordinator::Coordinator;
-use crate::v2::forward::{ForwardRunner, ForwardWorkflow};
-use crate::v2::pool::{PoolConfig, TransportPool};
+use crate::v2::coordinator::{Coordinator, CoordinatorHandle};
+use crate::v2::forward::{ForwardInput, ForwardWorkflow};
 use crate::v2::reverse::{
     PrewarmSignal, ReverseClientConfig, ReverseClientInput, ReverseClientRunner,
     ReverseClientWorkflow, ReverseReadyNotifier,
 };
+use crate::v2::state::CoordinatorConfig;
+use reusable_future::ReusableFutureRef;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -130,7 +131,7 @@ impl SharedReversePoolRunner {
     }
 }
 
-/// Runs all Forward and Reverse mappings for one `TunnelConfig` with shared pool supervision.
+/// Runs all Forward and Reverse mappings for one `TunnelConfig` with unified supervision.
 pub struct TunnelCluster;
 
 impl TunnelCluster {
@@ -148,21 +149,36 @@ impl TunnelCluster {
         let default_udp_idle = endpoint_ctx.udp_idle_timeout();
 
         let has_forward = mappings.iter().any(|m| m.mode == TunnelMode::Forward);
-        let fwd_connector: Option<Arc<dyn TransportConnector>> = if has_forward {
-            Some(Arc::from(transport_registry.create_connector(
-                &endpoint_ctx,
-                config.token.as_deref(),
-                TunnelMode::Forward,
-            )?))
-        } else {
-            None
-        };
-
-        let shared_fwd_pool = if let Some(ref conn) = fwd_connector
-            && let Some(size) = config.forward_pool_size().filter(|&s| s > 0)
-        {
-            let pool_cfg = PoolConfig::forward(Arc::clone(conn), size, hb_interval, idle_timeout);
-            Some(TransportPool::start(pool_cfg, CancellationToken::new()))
+        let fwd_pool_size = config.forward_pool_size().filter(|&s| s > 0);
+        let shared_fwd_coord = if has_forward {
+            let conn: Arc<dyn TransportConnector> =
+                Arc::from(transport_registry.create_connector(
+                    &endpoint_ctx,
+                    config.token.as_deref(),
+                    TunnelMode::Forward,
+                )?);
+            let workflow = ForwardWorkflow::new(
+                Some(Arc::clone(&conn)),
+                hb_interval,
+                idle_timeout,
+                DEFAULT_RELAY_DRAIN_TIMEOUT,
+            )
+            .with_pooled(fwd_pool_size.is_some());
+            let coord_cfg = match fwd_pool_size {
+                Some(size) => CoordinatorConfig::forward_pooled(
+                    Arc::clone(&conn),
+                    size,
+                    hb_interval,
+                    idle_timeout,
+                    DEFAULT_RELAY_DRAIN_TIMEOUT,
+                ),
+                None => CoordinatorConfig::plain(DEFAULT_RELAY_DRAIN_TIMEOUT),
+            };
+            Some(Coordinator::start_with_config(
+                workflow,
+                coord_cfg,
+                CancellationToken::new(),
+            ))
         } else {
             None
         };
@@ -206,7 +222,7 @@ impl TunnelCluster {
             workers.spawn(async move { pool_runner.run(pool_tok).await });
         }
 
-        let shared_pool_handle = shared_fwd_pool.as_ref().map(|(h, _)| h.clone());
+        let shared_fwd_handle = shared_fwd_coord.as_ref().map(|(h, _)| h.clone());
 
         for mapping in mappings {
             let PortMappingConfig {
@@ -219,31 +235,29 @@ impl TunnelCluster {
 
             match mode {
                 TunnelMode::Forward => {
+                    let Some(ref coord) = shared_fwd_handle else {
+                        return Err(TunnelError::Internal(
+                            "missing shared forward coordinator".into(),
+                        ));
+                    };
                     let fe = frontend::bind(&MappingSpec::new(protocol, &listen, &target)).await?;
                     let target_parsed = parse_target_addr(&target)?;
                     let relay_idle = match protocol {
                         L4Protocol::Tcp => idle_timeout,
                         L4Protocol::Udp => udp_idle_timeout.unwrap_or(default_udp_idle),
                     };
-                    let workflow = ForwardWorkflow::new(
-                        shared_pool_handle.clone(),
-                        fwd_connector.clone(),
-                        hb_interval,
-                        idle_timeout,
-                        DEFAULT_RELAY_DRAIN_TIMEOUT,
-                    )
-                    .with_relay_idle_timeout(relay_idle);
-                    let runner = ForwardRunner::new(
-                        fe,
-                        target_parsed,
-                        protocol,
-                        workflow,
-                        None,
-                        DEFAULT_RELAY_DRAIN_TIMEOUT,
-                    );
+                    let coord_clone = coord.clone();
                     let tok = cluster_cancel.child_token();
                     workers.spawn(async move {
-                        let _ = runner.run(tok).await?;
+                        Self::run_forward_frontend(
+                            fe,
+                            target_parsed,
+                            protocol,
+                            relay_idle,
+                            coord_clone,
+                            tok,
+                        )
+                        .await;
                         Ok(())
                     });
                 }
@@ -320,18 +334,12 @@ impl TunnelCluster {
             }
         }
 
-        // Coordinated shutdown order:
-        // 1. Halt background pool replenishment during drain.
-        // 2. Cancel mapping runners so every Coordinator finishes and releases StreamLeases.
-        // 3. Shut down shared Forward TransportPool after all leases have dropped.
-        if let Some((ref pool_handle, _)) = shared_fwd_pool {
-            let _ = pool_handle.stop_replenishing().await;
-        }
         cluster_cancel.cancel();
         while workers.join_next().await.is_some() {}
-        if let Some((pool_handle, pool_join)) = shared_fwd_pool {
-            pool_handle.shutdown();
-            let _ = pool_join.await;
+
+        if let Some((coord, join)) = shared_fwd_coord {
+            let _ = coord.graceful_stop().await;
+            let _ = join.await;
         }
 
         if let Some(err) = exit_err
@@ -340,5 +348,52 @@ impl TunnelCluster {
             return Err(err);
         }
         Ok(())
+    }
+
+    async fn run_forward_frontend(
+        mut frontend: Box<dyn Frontend>,
+        target: TargetAddr,
+        protocol: L4Protocol,
+        relay_idle_timeout: Duration,
+        coord: CoordinatorHandle<ForwardWorkflow>,
+        shutdown_token: CancellationToken,
+    ) {
+        let mut accept_slot: ReusableFutureRef<'static, FrontendOutput> =
+            ReusableFutureRef::default();
+
+        loop {
+            if accept_slot.is_empty() {
+                frontend.accept(&mut accept_slot);
+            }
+
+            tokio::select! {
+                biased;
+                _ = shutdown_token.cancelled() => break,
+                accept_res = &mut accept_slot => {
+                    match accept_res {
+                        Ok(accepted) => {
+                            let input = ForwardInput {
+                                frontend: accepted.channel,
+                                target: target.clone(),
+                                protocol,
+                                relay_idle_timeout: Some(relay_idle_timeout),
+                            };
+                            if let Err(err) = coord.assign(input).await {
+                                tracing::debug!(error = %err, "Forward assignment rejected during shutdown");
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            if !shutdown_token.is_cancelled() && !matches!(err, TunnelError::Shutdown) {
+                                tracing::error!(error = %err, "Forward frontend accept failed");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        accept_slot.reset();
+        frontend.shutdown().await;
     }
 }

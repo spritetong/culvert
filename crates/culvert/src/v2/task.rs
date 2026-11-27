@@ -2,26 +2,63 @@
 // SPDX-License-Identifier: MPL-2.0
 // culvert is licensed under the Mozilla Public License Version 2.0.
 
-//! IO Task prototype: single outer cancellation boundary and single event loop.
+//! IO Task: single outer cancellation boundary and unified event loop owning
+//! `Empty`, `Idle` (local keepalive/eviction), `Connecting`, `Active`, and `Closing`.
 //! All comments and docstrings must be in English.
 
+use crate::consts::{
+    POOL_HEARTBEAT_TICK_INTERVAL, POOL_HEARTBEAT_TIMEOUT, reverse_pool_expiration_margin,
+};
+use crate::io::stream::{HeartbeatStatus, activity_now_ms, heartbeat_timing};
 use crate::v2::coordinator::Microtask;
 use crate::v2::error::TaskError;
 use crate::v2::stage::{ActiveStage, ClosingStage, ConnectingContext, TaskWorkflow};
-use crate::v2::state::{CloseReason, ExternalState, JobId, TaskDirective, TaskId, TaskOutcome};
+use crate::v2::state::{
+    CloseReason, ExternalState, IdleId, IdlePolicy, JobId, PooledTransport, TaskDirective, TaskId,
+    TaskOutcome,
+};
 use std::future::poll_fn;
 use std::sync::Arc;
+use std::task::Poll;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// Reason a local `Idle` keepalive loop retired its `PooledTransport`.
+enum IdleExitReason {
+    Dead(Option<u64>),
+    Expired,
+}
+
+/// Initial state passed when spawning an `IoTask` (`Empty`, `Idle`, or `Connecting`).
+pub enum InitialTaskPhase<I> {
+    Empty,
+    Idle {
+        idle_id: IdleId,
+        transport: PooledTransport,
+        policy: IdlePolicy,
+    },
+    Connecting {
+        job_id: JobId,
+        input: I,
+    },
+}
+
 /// Single source of truth binding external lifecycle phase to its exact resource payload.
 ///
-/// Illegal combinations such as `(state = Active, payload = Empty)` are unrepresentable.
+/// Illegal combinations such as `(state = Idle, transport = None)` are unrepresentable.
 enum TaskPhase<W: TaskWorkflow> {
     Empty,
+    Idle {
+        idle_id: IdleId,
+        transport: PooledTransport,
+        policy: IdlePolicy,
+        enqueued_at: Instant,
+    },
     Connecting {
         job_id: JobId,
         input: W::Input,
+        transport: Option<PooledTransport>,
     },
     Active {
         job_id: JobId,
@@ -43,6 +80,7 @@ impl<W: TaskWorkflow> TaskPhase<W> {
     fn external_state(&self) -> ExternalState {
         match self {
             Self::Empty => ExternalState::Empty,
+            Self::Idle { .. } => ExternalState::Idle,
             Self::Connecting { .. } => ExternalState::Connecting,
             Self::Active { .. } => ExternalState::Active,
             Self::Closing { .. } => ExternalState::Closing,
@@ -54,7 +92,8 @@ impl<W: TaskWorkflow> TaskPhase<W> {
 /// Self-contained recyclable IO Task running a single event loop.
 ///
 /// `CancellationToken` acts as the sole `ForceStop` boundary around `run_loop`,
-/// eliminating scattered force-stop checks across internal state branches.
+/// while idle transport keepalive, ping probing, and dead/expiry cleanup run directly
+/// inside `TaskPhase::Idle`.
 pub struct IoTask<W: TaskWorkflow> {
     id: TaskId,
     workflow: Arc<W>,
@@ -65,19 +104,32 @@ pub struct IoTask<W: TaskWorkflow> {
 }
 
 impl<W: TaskWorkflow> IoTask<W> {
-    /// Constructs a new `IoTask` starting either in `Empty` (`None`) or directly in
-    /// `Connecting` (`Some((job_id, input))`).
+    /// Constructs a new `IoTask` in `Empty`, `Idle`, or `Connecting`.
     pub fn new(
         id: TaskId,
-        initial_job: Option<(JobId, W::Input)>,
+        initial: InitialTaskPhase<W::Input>,
         workflow: Arc<W>,
         micro_tx: mpsc::UnboundedSender<Microtask>,
         directive_rx: mpsc::UnboundedReceiver<TaskDirective<W::Input>>,
         cancel: CancellationToken,
     ) -> Self {
-        let initial_phase = match initial_job {
-            Some((job_id, input)) => TaskPhase::Connecting { job_id, input },
-            None => TaskPhase::Empty,
+        let initial_phase = match initial {
+            InitialTaskPhase::Empty => TaskPhase::Empty,
+            InitialTaskPhase::Idle {
+                idle_id,
+                transport,
+                policy,
+            } => TaskPhase::Idle {
+                idle_id,
+                transport,
+                policy,
+                enqueued_at: Instant::now(),
+            },
+            InitialTaskPhase::Connecting { job_id, input } => TaskPhase::Connecting {
+                job_id,
+                input,
+                transport: None,
+            },
         };
         Self {
             id,
@@ -105,17 +157,142 @@ impl<W: TaskWorkflow> IoTask<W> {
         loop {
             phase = match phase {
                 TaskPhase::Empty => match self.directive_rx.recv().await {
-                    Some(TaskDirective::Assign { job_id, input }) => {
-                        TaskPhase::Connecting { job_id, input }
+                    // Race recovery: if Coordinator dispatched Assign expecting Idle right after
+                    // local transport loss, proceed seamlessly into Connecting with `transport: None`.
+                    Some(TaskDirective::Assign { job_id, input }) => TaskPhase::Connecting {
+                        job_id,
+                        input,
+                        transport: None,
+                    },
+                    Some(TaskDirective::SupplyIdle {
+                        idle_id,
+                        transport,
+                        policy,
+                    }) => TaskPhase::Idle {
+                        idle_id,
+                        transport,
+                        policy,
+                        enqueued_at: Instant::now(),
+                    },
+                    Some(TaskDirective::ExtractTransport { reply, .. }) => {
+                        let _ = reply.send(None);
+                        TaskPhase::Empty
                     }
-                    // Ignore late Drain directives when already idle in Empty.
-                    Some(TaskDirective::Drain) => TaskPhase::Empty,
+                    // Ignore late CloseTransport / Drain directives when already Empty.
+                    Some(TaskDirective::CloseTransport { .. } | TaskDirective::Drain) => {
+                        TaskPhase::Empty
+                    }
                     Some(TaskDirective::Shutdown) | None => TaskPhase::Closed {
                         outcome: TaskOutcome::Shutdown,
                     },
                 },
-                TaskPhase::Connecting { job_id, input } => {
-                    let mut ctx = ConnectingContext::new(self.id, job_id, &self.micro_tx);
+                TaskPhase::Idle {
+                    idle_id,
+                    mut transport,
+                    policy,
+                    enqueued_at,
+                } => {
+                    enum IdleBreak<I> {
+                        KeepaliveExit(IdleExitReason),
+                        Directive(Option<TaskDirective<I>>),
+                    }
+
+                    let brk = tokio::select! {
+                        biased;
+                        dir = self.directive_rx.recv() => IdleBreak::Directive(dir),
+                        reason = Self::drive_idle_keepalive(&mut transport, enqueued_at, policy) => {
+                            IdleBreak::KeepaliveExit(reason)
+                        }
+                    };
+
+                    match brk {
+                        IdleBreak::Directive(Some(TaskDirective::Assign { job_id, input })) => {
+                            TaskPhase::Connecting {
+                                job_id,
+                                input,
+                                transport: Some(transport),
+                            }
+                        }
+                        IdleBreak::Directive(Some(TaskDirective::CloseTransport {
+                            expected_idle_id,
+                        })) => {
+                            if expected_idle_id.is_none_or(|exp| exp == idle_id) {
+                                drop(transport);
+                                self.clear_idle_or_exit(idle_id, None)
+                            } else {
+                                TaskPhase::Idle {
+                                    idle_id,
+                                    transport,
+                                    policy,
+                                    enqueued_at,
+                                }
+                            }
+                        }
+                        IdleBreak::Directive(Some(TaskDirective::ExtractTransport {
+                            expected_idle_id,
+                            reply,
+                        })) => {
+                            if expected_idle_id == idle_id {
+                                match reply.send(Some(transport)) {
+                                    Ok(()) => self.clear_idle_or_exit(idle_id, None),
+                                    Err(Some(returned)) => {
+                                        // Caller dropped reply receiver; return transport to Coordinator
+                                        // so tracking stays synchronized without losing the stream.
+                                        self.return_transport(returned);
+                                        self.clear_idle_or_exit(idle_id, None)
+                                    }
+                                    Err(None) => self.clear_idle_or_exit(idle_id, None),
+                                }
+                            } else {
+                                let _ = reply.send(None);
+                                TaskPhase::Idle {
+                                    idle_id,
+                                    transport,
+                                    policy,
+                                    enqueued_at,
+                                }
+                            }
+                        }
+                        IdleBreak::Directive(Some(TaskDirective::Drain)) => {
+                            drop(transport);
+                            self.clear_idle_or_exit(idle_id, None)
+                        }
+                        IdleBreak::Directive(Some(TaskDirective::Shutdown) | None) => {
+                            drop(transport);
+                            TaskPhase::Closed {
+                                outcome: TaskOutcome::Shutdown,
+                            }
+                        }
+                        IdleBreak::Directive(Some(TaskDirective::SupplyIdle {
+                            transport: extra,
+                            ..
+                        })) => {
+                            // Unexpected SupplyIdle while already Idle: return synchronously to Coordinator.
+                            self.return_transport(extra);
+                            TaskPhase::Idle {
+                                idle_id,
+                                transport,
+                                policy,
+                                enqueued_at,
+                            }
+                        }
+                        IdleBreak::KeepaliveExit(reason) => {
+                            let dead_session = match reason {
+                                IdleExitReason::Dead(sid) => sid,
+                                IdleExitReason::Expired => None,
+                            };
+                            drop(transport);
+                            self.clear_idle_or_exit(idle_id, dead_session)
+                        }
+                    }
+                }
+                TaskPhase::Connecting {
+                    job_id,
+                    input,
+                    transport,
+                } => {
+                    let mut ctx =
+                        ConnectingContext::new(self.id, job_id, transport, &self.micro_tx);
                     enum ConnectBreak<A, I> {
                         Done(Result<A, TaskError>),
                         Directive(Option<TaskDirective<I>>),
@@ -134,6 +311,24 @@ impl<W: TaskWorkflow> IoTask<W> {
                         ConnectBreak::Directive(Some(TaskDirective::Drain)) => {
                             self.recycle_or_exit(job_id, TaskOutcome::GracefullyDrained, false)
                         }
+                        ConnectBreak::Directive(Some(TaskDirective::SupplyIdle {
+                            transport: unwanted,
+                            ..
+                        })) => {
+                            // Non-blocking auto-recovery: wrong-state transport goes straight back to Coordinator.
+                            self.return_transport(unwanted);
+                            self.recycle_or_exit(job_id, TaskOutcome::GracefullyDrained, false)
+                        }
+                        ConnectBreak::Directive(Some(TaskDirective::ExtractTransport {
+                            reply,
+                            ..
+                        })) => {
+                            let _ = reply.send(None);
+                            self.recycle_or_exit(job_id, TaskOutcome::GracefullyDrained, false)
+                        }
+                        ConnectBreak::Directive(Some(TaskDirective::CloseTransport { .. })) => {
+                            self.recycle_or_exit(job_id, TaskOutcome::GracefullyDrained, false)
+                        }
                         ConnectBreak::Directive(Some(TaskDirective::Assign {
                             job_id: next_job,
                             input: next_input,
@@ -143,6 +338,7 @@ impl<W: TaskWorkflow> IoTask<W> {
                             TaskPhase::Connecting {
                                 job_id: next_job,
                                 input: next_input,
+                                transport: None,
                             }
                         }
                         ConnectBreak::Done(Ok(stage)) => {
@@ -178,7 +374,25 @@ impl<W: TaskWorkflow> IoTask<W> {
                             TaskOutcome::GracefullyDrained,
                             false,
                         ),
-                        ActiveBreak::Directive(Some(TaskDirective::Assign { .. })) => {
+                        ActiveBreak::Directive(Some(TaskDirective::SupplyIdle {
+                            transport,
+                            ..
+                        })) => {
+                            self.return_transport(transport);
+                            phase = TaskPhase::Active { job_id, stage };
+                            continue;
+                        }
+                        ActiveBreak::Directive(Some(TaskDirective::ExtractTransport {
+                            reply,
+                            ..
+                        })) => {
+                            let _ = reply.send(None);
+                            phase = TaskPhase::Active { job_id, stage };
+                            continue;
+                        }
+                        ActiveBreak::Directive(Some(
+                            TaskDirective::Assign { .. } | TaskDirective::CloseTransport { .. },
+                        )) => {
                             phase = TaskPhase::Active { job_id, stage };
                             continue;
                         }
@@ -218,12 +432,101 @@ impl<W: TaskWorkflow> IoTask<W> {
         }
     }
 
+    async fn drive_idle_keepalive(
+        transport: &mut PooledTransport,
+        enqueued_at: Instant,
+        policy: IdlePolicy,
+    ) -> IdleExitReason {
+        let tick = (policy.heartbeat_interval / 2)
+            .min(policy.idle_timeout / 2)
+            .min(POOL_HEARTBEAT_TICK_INTERVAL)
+            .max(Duration::from_millis(10));
+        let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + tick, tick);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let max_age_sleep = policy.max_idle_age.map(|max_age| {
+            let margin = reverse_pool_expiration_margin(max_age);
+            let effective = max_age.saturating_sub(margin);
+            Box::pin(tokio::time::sleep_until((enqueued_at + effective).into()))
+        });
+        tokio::pin!(max_age_sleep);
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = async {
+                    if let Some(s) = max_age_sleep.as_mut().as_pin_mut() {
+                        s.await;
+                    }
+                }, if max_age_sleep.is_some() => {
+                    return IdleExitReason::Expired;
+                }
+                _ = interval.tick() => {
+                    let alive = poll_fn(|cx| match transport.stream.poll_check_alive(cx) {
+                        Poll::Ready(HeartbeatStatus::Dead) => Poll::Ready(false),
+                        _ => Poll::Ready(true),
+                    })
+                    .await;
+                    if !alive {
+                        return IdleExitReason::Dead(transport.session_id);
+                    }
+
+                    let (probe, expired) = heartbeat_timing(
+                        transport.stream.last_activity_ms(),
+                        activity_now_ms(),
+                        policy.heartbeat_interval,
+                        policy.idle_timeout,
+                    );
+                    if expired {
+                        return IdleExitReason::Expired;
+                    }
+
+                    if policy.probe_enabled && probe {
+                        let ping_res = tokio::time::timeout(
+                            POOL_HEARTBEAT_TIMEOUT,
+                            poll_fn(|cx| transport.stream.poll_send_ping(cx)),
+                        )
+                        .await;
+                        if !matches!(ping_res, Ok(Ok(()))) {
+                            return IdleExitReason::Dead(transport.session_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn report_state(&self, job_id: JobId, state: ExternalState) {
         let _ = self.micro_tx.send(Microtask::StateChanged {
             id: self.id,
             job_id,
             state,
         });
+    }
+
+    fn return_transport(&self, transport: PooledTransport) {
+        let _ = self.micro_tx.send(Microtask::ReturnTransport {
+            id: self.id,
+            transport,
+        });
+    }
+
+    fn clear_idle_or_exit(&self, idle_id: IdleId, dead_session: Option<u64>) -> TaskPhase<W> {
+        if self
+            .micro_tx
+            .send(Microtask::IdleCleared {
+                id: self.id,
+                idle_id,
+                dead_session,
+            })
+            .is_err()
+        {
+            TaskPhase::Closed {
+                outcome: TaskOutcome::Shutdown,
+            }
+        } else {
+            TaskPhase::Empty
+        }
     }
 
     fn recycle_or_exit(
@@ -235,8 +538,6 @@ impl<W: TaskWorkflow> IoTask<W> {
         if shutdown_after_close {
             return TaskPhase::Closed { outcome };
         }
-        // Send RecycledToEmpty AFTER resetting local payload & state (now returning Empty) so
-        // no further job-scoped StateChanged messages for `job_id` can follow.
         if self
             .micro_tx
             .send(Microtask::RecycledToEmpty {

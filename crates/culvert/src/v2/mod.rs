@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 // culvert is licensed under the Mozilla Public License Version 2.0.
 
-//! Experimental v2 Coordinator + IO Task state-machine prototype.
+//! Experimental v2 Coordinator + IO Task state-machine architecture.
 //! Isolated from existing `core`, `tunnel`, `pool`, and `io/pump` implementations.
 //! All comments and docstrings must be in English.
 
@@ -11,7 +11,6 @@ pub mod coordinator;
 pub mod engine;
 pub mod error;
 pub mod forward;
-pub mod pool;
 pub mod relay;
 pub mod reverse;
 pub mod server;
@@ -30,10 +29,6 @@ pub use coordinator::{
 pub use engine::StateEngine;
 pub use error::TaskError;
 pub use forward::{ForwardInput, ForwardRunner, ForwardWorkflow};
-pub use pool::{
-    LeaseGuard, PoolConfig, PoolDialConfig, PoolHandle, PoolInventory, PoolRole, PoolStats,
-    PoolSummary, StreamLease, SweepOutcome, TransportPool,
-};
 pub use relay::{
     ChannelClosing, ChannelRelay, DatagramDatagramClosing, DatagramDatagramRelay,
     DatagramStreamClosing, DatagramStreamRelay, DuplexRelay, RelayClosing, RelayCounters,
@@ -50,7 +45,8 @@ pub use server::{
 };
 pub use stage::{ActiveStage, ClosingStage, ConnectingContext, TaskWorkflow};
 pub use state::{
-    CloseReason, ExternalState, JobId, TaskDirective, TaskId, TaskOutcome, TunnelPhase, WaitResult,
+    CloseReason, CoordinatorConfig, DialConfig, ExternalState, IdleId, IdlePolicy, JobId,
+    PoolStats, PooledTransport, TaskDirective, TaskId, TaskOutcome, TunnelPhase, WaitResult,
 };
 pub use supervisor::{ClientRunner, TunnelSupervisor};
 pub use task::IoTask;
