@@ -12,6 +12,7 @@ pub mod error;
 pub mod forward;
 pub mod pool;
 pub mod relay;
+pub mod reverse;
 pub mod stage;
 pub mod state;
 pub mod task;
@@ -28,6 +29,9 @@ pub use pool::{
     PoolSummary, StreamLease, SweepOutcome, TransportPool,
 };
 pub use relay::{DuplexRelay, RelayClosing, RelayCounters, TransferDirection};
+pub use reverse::{
+    ReverseServerRunner, ReverseSignaler, ReverseVisitorInput, ReverseVisitorWorkflow,
+};
 pub use stage::{ActiveStage, ClosingStage, ConnectingContext, TaskWorkflow};
 pub use state::{
     CloseReason, ExternalState, TaskDirective, TaskId, TaskOutcome, TunnelPhase, WaitResult,

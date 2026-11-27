@@ -272,3 +272,154 @@ async fn forward_runner_pooled_activation_falls_back_to_direct_on_missing_ack() 
     assert_eq!(summary.completed_jobs.len(), 1);
     assert_eq!(summary.completed_jobs[0].1, TaskOutcome::Completed);
 }
+
+#[tokio::test]
+async fn forward_runner_real_ws_server_e2e_pooled_and_recycled() {
+    use crate::config::model::{AppConfig, EndpointConfig, ServerConfig, TunnelMode};
+    use crate::dialer::endpoint::EndpointContext;
+    use crate::frontend;
+    use crate::io::addr::MappingSpec;
+    use crate::server::ServerRunner;
+    use crate::session::SessionManager;
+    use crate::transport::TransportRegistry;
+    use crate::transport::ws::WsTransportDriver;
+
+    let probe_echo = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let echo_port = probe_echo.local_addr().unwrap().port();
+    probe_echo.set_nonblocking(true).unwrap();
+    let echo_listener = tokio::net::TcpListener::from_std(probe_echo).unwrap();
+
+    let probe_ws = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let ws_port = probe_ws.local_addr().unwrap().port();
+    drop(probe_ws);
+
+    let probe_client = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let client_port = probe_client.local_addr().unwrap().port();
+    drop(probe_client);
+
+    let server_cancel = CancellationToken::new();
+    let echo_cancel = server_cancel.clone();
+    let echo_handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = echo_cancel.cancelled() => break,
+                res = echo_listener.accept() => {
+                    let Ok((mut sock, _)) = res else { break; };
+                    tokio::spawn(async move {
+                        let (mut rd, mut wr) = sock.split();
+                        let _ = tokio::io::copy(&mut rd, &mut wr).await;
+                    });
+                }
+            }
+        }
+    });
+
+    let mut registry = TransportRegistry::new();
+    registry.register(WsTransportDriver);
+    let registry = Arc::new(registry);
+
+    let auth_token = "v2-ws-e2e-token";
+    let ws_listen = format!("127.0.0.1:{ws_port}");
+    let server_runner = ServerRunner::new(
+        ServerConfig {
+            listen: vec![format!("ws://{ws_listen}/tunnel")],
+            token: Some(auth_token.to_string()),
+            default_target: None,
+            ..Default::default()
+        },
+        Arc::clone(&registry),
+        Arc::new(SessionManager::new()),
+    );
+    let server_tok = server_cancel.clone();
+    let server_handle = tokio::spawn(async move { server_runner.run(server_tok).await });
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let endpoint_cfg = EndpointConfig::Simple(format!("ws://{ws_listen}/tunnel"));
+    let endpoint_ctx = EndpointContext::build(&endpoint_cfg, &AppConfig::default()).unwrap();
+    let connector: Arc<dyn TransportConnector> = Arc::from(
+        registry
+            .create_connector(&endpoint_ctx, Some(auth_token), TunnelMode::Forward)
+            .unwrap(),
+    );
+
+    let pool_cfg = PoolConfig::forward(
+        Arc::clone(&connector),
+        2,
+        DEFAULT_HEARTBEAT_INTERVAL,
+        DEFAULT_IDLE_TIMEOUT,
+    );
+    let (pool_handle, pool_join) = TransportPool::start(pool_cfg, CancellationToken::new());
+
+    let client_listen = format!("127.0.0.1:{client_port}");
+    let echo_target = format!("127.0.0.1:{echo_port}");
+    let tcp_frontend = frontend::bind(&MappingSpec::new(
+        L4Protocol::Tcp,
+        &client_listen,
+        &echo_target,
+    ))
+    .await
+    .unwrap();
+
+    let workflow = ForwardWorkflow::new(
+        Some(pool_handle.clone()),
+        Some(connector),
+        DEFAULT_HEARTBEAT_INTERVAL,
+        DEFAULT_IDLE_TIMEOUT,
+        DEFAULT_RELAY_DRAIN_TIMEOUT,
+    );
+
+    let runner = ForwardRunner::new(
+        tcp_frontend,
+        TargetAddr::Ip(echo_target.parse().unwrap()),
+        L4Protocol::Tcp,
+        workflow,
+        Some((pool_handle, pool_join)),
+        DEFAULT_RELAY_DRAIN_TIMEOUT,
+    )
+    .with_prewarm_tasks(1);
+
+    let client_cancel = CancellationToken::new();
+    let runner_handle = tokio::spawn(runner.run(client_cancel.clone()));
+
+    // Wait briefly for prewarmed pooled streams, then run 3 sequential TCP connections.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    for idx in 0..3 {
+        let mut tcp = tokio::net::TcpStream::connect(&client_listen)
+            .await
+            .unwrap();
+        let msg = format!("v2-real-ws-echo-{idx}");
+        tcp.write_all(msg.as_bytes()).await.unwrap();
+        tcp.shutdown().await.unwrap();
+
+        let mut buf = vec![0u8; msg.len()];
+        tokio::time::timeout(Duration::from_secs(5), tcp.read_exact(&mut buf))
+            .await
+            .expect("echo timeout")
+            .unwrap();
+        assert_eq!(buf, msg.as_bytes());
+    }
+
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    client_cancel.cancel();
+    let summary = tokio::time::timeout(Duration::from_secs(3), runner_handle)
+        .await
+        .expect("v2 ForwardRunner must shut down cleanly")
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.final_phase, TunnelPhase::Stopped);
+    assert_eq!(summary.completed_jobs.len(), 3);
+    assert!(
+        summary
+            .completed_jobs
+            .iter()
+            .all(|(_, outcome)| *outcome == TaskOutcome::Completed)
+    );
+
+    server_cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+        let _ = tokio::join!(echo_handle, server_handle);
+    })
+    .await;
+}
