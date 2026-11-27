@@ -383,8 +383,9 @@ impl TunnelCluster {
                                 break;
                             }
                         }
+                        Err(TunnelError::Shutdown) => break,
                         Err(err) => {
-                            if !shutdown_token.is_cancelled() && !matches!(err, TunnelError::Shutdown) {
+                            if !shutdown_token.is_cancelled() {
                                 tracing::error!(error = %err, "Forward frontend accept failed");
                             }
                         }

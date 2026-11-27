@@ -279,7 +279,7 @@ impl ReverseSessionHub {
                     .or_insert_with(|| {
                         let workflow = ReverseVisitorWorkflow::shared(
                             heartbeat_interval,
-                            relay_idle_timeout,
+                            idle_timeout,
                             DEFAULT_RELAY_DRAIN_TIMEOUT,
                         );
                         let cfg = CoordinatorConfig::reverse_inbound(

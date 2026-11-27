@@ -20,6 +20,8 @@ pub mod supervisor;
 pub mod task;
 
 #[cfg(test)]
+mod shared_idle_tests;
+#[cfg(test)]
 mod tests;
 
 pub use cluster::TunnelCluster;
