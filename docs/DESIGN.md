@@ -100,7 +100,7 @@ the async implementation from it.
 
 ## 2. Repository Layout
 
-```
+```text
 Cargo.toml                     workspace: crates/culvert, crates/culvert-cli
 config-example.yaml            canonical configuration example
 crates/culvert-cli/src/main.rs CLI, logging setup, Tokio runtime, --check
@@ -382,7 +382,7 @@ the parsed `ServerListenSpec.scheme` and passes the root cancellation token.
 On raw QUIC the same `StreamMetadata` is serialized with MessagePack and sent
 in a length-prefixed handshake:
 
-```
+```text
 4 bytes auth_len (big-endian) | auth_token bytes
 4 bytes meta_len (big-endian) | MessagePack(StreamMetadata)
 ```
@@ -697,7 +697,7 @@ events are prioritized above visitor accept in the biased select.
 
 ### 7.6 Activation packet
 
-```
+```text
 magic (1 byte) | length: u16 big-endian | UTF-8 target string (Forward mode only)
 ```
 
@@ -713,7 +713,7 @@ half-open window where a write succeeds only into the local send buffer.
 
 ### 7.7 Retry supervision
 
-```
+```text
 loop:
   run tunnel cluster
   Ok / Shutdown                  -> exit
