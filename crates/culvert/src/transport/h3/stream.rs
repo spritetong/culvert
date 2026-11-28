@@ -237,7 +237,6 @@ impl TunnelStream for QuinnTunnelStream {
                     "Underlying QUIC connection unresponsive to pings",
                 )));
             }
-            self.touch_activity();
         }
         Poll::Ready(Ok(()))
     }
@@ -272,11 +271,36 @@ impl TunnelStream for QuinnTunnelStream {
     }
 }
 
+enum OutboundItem {
+    Chunk(Bytes),
+    Flush(oneshot::Sender<io::Result<()>>),
+}
+
+fn check_session_health(session: Option<&QuicSessionHandle>) -> io::Result<()> {
+    if let Some(session) = session {
+        if !session.is_alive() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "Underlying QUIC connection closed",
+            ));
+        }
+        if !session.check_liveness() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Underlying QUIC connection unresponsive",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Bidirectional stream adapter for HTTP/3 request streams (`h3::client` or `h3::server`).
 pub struct H3TunnelStream {
-    tx_outbound: Option<PollSender<Bytes>>,
+    tx_outbound: Option<PollSender<OutboundItem>>,
     rx_inbound: mpsc::Receiver<io::Result<Bytes>>,
     read_buf: Option<Bytes>,
+    flush_rx: Option<oneshot::Receiver<io::Result<()>>>,
+    needs_flush: bool,
     shutdown_rx: Option<oneshot::Receiver<io::Result<()>>>,
     session: Option<QuicSessionHandle>,
     shutdown_done: bool,
@@ -315,7 +339,43 @@ impl H3TunnelStream {
             .store(activity_now_ms(), Ordering::Relaxed);
     }
 
-    fn poll_write_bytes(&mut self, cx: &mut Context<'_>, chunk: Bytes) -> Poll<io::Result<usize>> {
+    fn take_outbound_close_error(&mut self) -> io::Error {
+        if let Some(ref mut rx) = self.shutdown_rx
+            && let Ok(Err(e)) = rx.try_recv()
+        {
+            self.shutdown_done = true;
+            self.shutdown_rx.take();
+            return e;
+        }
+        io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "HTTP/3 background pump closed",
+        )
+    }
+
+    fn poll_outbound_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Err(e) = check_session_health(self.session.as_ref()) {
+            return Poll::Ready(Err(e));
+        }
+        let Some(tx) = self.tx_outbound.as_mut() else {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "HTTP/3 stream write direction closed",
+            )));
+        };
+        match tx.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(self.take_outbound_close_error())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_write_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
+        len: usize,
+        make_chunk: impl FnOnce() -> Bytes,
+    ) -> Poll<io::Result<usize>> {
         if self.fin_sent {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -323,47 +383,60 @@ impl H3TunnelStream {
             )));
         }
 
-        if let Some(ref session) = self.session {
-            if !session.is_alive() {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::ConnectionReset,
-                    "Underlying QUIC connection closed",
-                )));
+        if len == 0 {
+            if let Err(e) = check_session_health(self.session.as_ref()) {
+                return Poll::Ready(Err(e));
             }
-            if !session.check_liveness() {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "Underlying QUIC connection unresponsive",
-                )));
-            }
-        }
-
-        let tx = match self.tx_outbound.as_mut() {
-            Some(tx) => tx,
-            None => {
+            if self.tx_outbound.is_none() {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "HTTP/3 stream write direction closed",
                 )));
             }
-        };
-
-        if chunk.is_empty() {
             return Poll::Ready(Ok(0));
         }
 
-        match tx.poll_reserve(cx) {
+        match self.poll_outbound_ready(cx) {
             Poll::Ready(Ok(())) => {
-                let len = chunk.len();
-                let _ = tx.send_item(chunk);
+                if let Some(ref mut tx) = self.tx_outbound {
+                    let _ = tx.send_item(OutboundItem::Chunk(make_chunk()));
+                }
+                // Any newly queued chunk supersedes an incomplete flush barrier so the next
+                // `poll_flush` must wait for this chunk too.
+                self.flush_rx.take();
+                self.needs_flush = true;
                 self.touch_activity();
                 Poll::Ready(Ok(len))
             }
-            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                "HTTP/3 background pump closed",
-            ))),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_shutdown_drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(ref mut rx) = self.shutdown_rx {
+            match Future::poll(Pin::new(rx), cx) {
+                Poll::Ready(Ok(res)) => {
+                    self.shutdown_done = true;
+                    self.shutdown_rx.take();
+                    if res.is_ok() {
+                        self.needs_flush = false;
+                    }
+                    Poll::Ready(res)
+                }
+                Poll::Ready(Err(_)) => {
+                    self.shutdown_done = true;
+                    self.shutdown_rx.take();
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "HTTP/3 background pump task terminated",
+                    )))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            self.shutdown_done = true;
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -372,7 +445,8 @@ impl H3TunnelStream {
         S: H3SendStream,
         R: H3RecvStream,
     {
-        let (tx_outbound, mut rx_outbound) = mpsc::channel::<Bytes>(H3_STREAM_CHUNK_QUEUE_SIZE);
+        let (tx_outbound, mut rx_outbound) =
+            mpsc::channel::<OutboundItem>(H3_STREAM_CHUNK_QUEUE_SIZE);
         let (tx_inbound, rx_inbound) =
             mpsc::channel::<io::Result<Bytes>>(H3_STREAM_CHUNK_QUEUE_SIZE);
         let (tx_shutdown, rx_shutdown) = oneshot::channel::<io::Result<()>>();
@@ -380,11 +454,25 @@ impl H3TunnelStream {
         // Outbound send task: continuously drains outgoing chunks without being blocked by incoming reading
         let outbound_task = tokio::spawn(async move {
             let mut result = Ok(());
-            while let Some(chunk) = rx_outbound.recv().await {
-                if let Err(e) = send_stream.send_chunk(chunk).await {
-                    debug!("H3 send_chunk failed: {:?}", e);
-                    result = Err(e);
-                    break;
+            while let Some(item) = rx_outbound.recv().await {
+                match item {
+                    OutboundItem::Chunk(chunk) => {
+                        if let Err(e) = send_stream.send_chunk(chunk).await {
+                            debug!("H3 send_chunk failed: {:?}", e);
+                            rx_outbound.close();
+                            while let Ok(pending) = rx_outbound.try_recv() {
+                                if let OutboundItem::Flush(reply) = pending {
+                                    let _ =
+                                        reply.send(Err(io::Error::new(e.kind(), e.to_string())));
+                                }
+                            }
+                            result = Err(e);
+                            break;
+                        }
+                    }
+                    OutboundItem::Flush(reply) => {
+                        let _ = reply.send(Ok(()));
+                    }
                 }
             }
             if result.is_ok() {
@@ -434,6 +522,8 @@ impl H3TunnelStream {
             tx_outbound: Some(PollSender::new(tx_outbound)),
             rx_inbound,
             read_buf: None,
+            flush_rx: None,
+            needs_flush: false,
             shutdown_rx: Some(rx_shutdown),
             session: None,
             shutdown_done: false,
@@ -507,50 +597,68 @@ impl AsyncRead for H3TunnelStream {
 
 impl AsyncWrite for H3TunnelStream {
     fn poll_write(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        if this.fin_sent {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "HTTP/3 stream write direction closed",
-            )));
-        }
-
-        let tx = match this.tx_outbound.as_mut() {
-            Some(tx) => tx,
-            None => {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "HTTP/3 stream write direction closed",
-                )));
-            }
-        };
-
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-
-        match tx.poll_reserve(cx) {
-            Poll::Ready(Ok(())) => {
-                let chunk = Bytes::copy_from_slice(buf);
-                let len = chunk.len();
-                let _ = tx.send_item(chunk);
-                this.touch_activity();
-                Poll::Ready(Ok(len))
-            }
-            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                "HTTP/3 background pump closed",
-            ))),
-            Poll::Pending => Poll::Pending,
-        }
+        self.poll_write_chunk(cx, buf.len(), || Bytes::copy_from_slice(buf))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(ref mut rx) = self.flush_rx {
+            return match Future::poll(Pin::new(rx), cx) {
+                Poll::Ready(Ok(res)) => {
+                    self.flush_rx.take();
+                    if res.is_ok() {
+                        self.needs_flush = false;
+                    }
+                    Poll::Ready(res)
+                }
+                Poll::Ready(Err(_)) => {
+                    self.flush_rx.take();
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "HTTP/3 background pump terminated",
+                    )))
+                }
+                Poll::Pending => Poll::Pending,
+            };
+        }
+
+        if !self.needs_flush || self.shutdown_done {
+            return Poll::Ready(Ok(()));
+        }
+
+        if self.tx_outbound.is_none() {
+            return self.poll_shutdown_drain(cx);
+        }
+
+        match self.poll_outbound_ready(cx) {
+            Poll::Ready(Ok(())) => {
+                let (ftx, mut frx) = oneshot::channel();
+                if let Some(ref mut tx) = self.tx_outbound {
+                    let _ = tx.send_item(OutboundItem::Flush(ftx));
+                }
+                match Future::poll(Pin::new(&mut frx), cx) {
+                    Poll::Ready(Ok(res)) => {
+                        if res.is_ok() {
+                            self.needs_flush = false;
+                        }
+                        Poll::Ready(res)
+                    }
+                    Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "HTTP/3 background pump terminated",
+                    ))),
+                    Poll::Pending => {
+                        self.flush_rx = Some(frx);
+                        Poll::Pending
+                    }
+                }
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -575,32 +683,7 @@ impl AsyncWrite for H3TunnelStream {
             self.tx_outbound.take();
         }
 
-        if let Some(ref mut rx) = self.shutdown_rx {
-            match Future::poll(Pin::new(rx), cx) {
-                Poll::Ready(Ok(Ok(()))) => {
-                    self.shutdown_done = true;
-                    self.shutdown_rx.take();
-                    Poll::Ready(Ok(()))
-                }
-                Poll::Ready(Ok(Err(e))) => {
-                    self.shutdown_done = true;
-                    self.shutdown_rx.take();
-                    Poll::Ready(Err(e))
-                }
-                Poll::Ready(Err(_)) => {
-                    self.shutdown_done = true;
-                    self.shutdown_rx.take();
-                    Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::ConnectionReset,
-                        "HTTP/3 background pump task terminated",
-                    )))
-                }
-                Poll::Pending => Poll::Pending,
-            }
-        } else {
-            self.shutdown_done = true;
-            Poll::Ready(Ok(()))
-        }
+        self.poll_shutdown_drain(cx)
     }
 }
 
@@ -613,7 +696,7 @@ impl TunnelStream for H3TunnelStream {
     }
 
     fn poll_write_owned(&mut self, cx: &mut Context<'_>, chunk: Bytes) -> Poll<io::Result<usize>> {
-        self.poll_write_bytes(cx, chunk)
+        self.poll_write_chunk(cx, chunk.len(), || chunk)
     }
 
     fn last_activity_ms(&self) -> Option<u64> {
@@ -634,7 +717,6 @@ impl TunnelStream for H3TunnelStream {
                     "Underlying QUIC connection unresponsive to pings",
                 )));
             }
-            self.touch_activity();
         }
         if let Poll::Ready(HeartbeatStatus::Dead) = self.poll_check_alive(cx) {
             return Poll::Ready(Err(io::Error::new(
@@ -874,6 +956,248 @@ mod tests {
         let err = poll_fn(|cx| stream.poll_write_owned(cx, payload.clone()))
             .await
             .expect_err("write after shutdown must fail");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    struct PendingRecvStream;
+    impl H3RecvStream for PendingRecvStream {
+        async fn recv_chunk(&mut self) -> Result<Option<Bytes>, io::Error> {
+            std::future::pending::<()>().await;
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_h3_stream_ping_does_not_refresh_activity_and_expires_idle_timeout() {
+        use crate::core::error::TunnelError;
+        use crate::io::pump::StreamStreamPump;
+        use std::future::poll_fn;
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        let (server_conn, client_conn) =
+            super::super::connector::tests::create_test_quic_connection_pair().await;
+        let session = QuicSessionHandle::new(client_conn);
+
+        let send = MockSendStream {
+            sent: vec![],
+            finished: false,
+        };
+        let mut stream =
+            H3TunnelStream::spawn_split_pump(send, PendingRecvStream).with_session(session);
+
+        let before = stream.last_activity_ms().unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        for _ in 0..5 {
+            poll_fn(|cx| stream.poll_send_ping(cx)).await.unwrap();
+        }
+        assert_eq!(
+            stream.last_activity_ms().unwrap(),
+            before,
+            "H3 poll_send_ping must not refresh last_activity_ms"
+        );
+
+        let (peer_stream, _peer_keep) = tokio::io::duplex(1024);
+        let cancel = CancellationToken::new();
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            StreamStreamPump::relay_with_heartbeat(
+                Box::new(stream),
+                Box::new(peer_stream),
+                cancel.child_token(),
+                Duration::from_millis(20),
+                Duration::from_millis(80),
+            ),
+        )
+        .await
+        .expect("relay must hit idle_timeout instead of hanging");
+
+        match res {
+            Err(TunnelError::Io(e)) => assert_eq!(e.kind(), io::ErrorKind::TimedOut),
+            other => panic!("expected idle TimedOut error, got {other:?}"),
+        }
+        cancel.cancel();
+        drop(server_conn);
+    }
+
+    #[tokio::test]
+    async fn test_quinn_stream_ping_does_not_refresh_activity_and_expires_idle_timeout() {
+        use crate::core::error::TunnelError;
+        use crate::io::pump::StreamStreamPump;
+        use std::future::poll_fn;
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        let (server_conn, client_conn) =
+            super::super::connector::tests::create_test_quic_connection_pair().await;
+        let (mut c_send, c_recv) = client_conn.open_bi().await.unwrap();
+        // Write 1 byte so Quinn actually opens the stream on the server before we keep it idle.
+        tokio::io::AsyncWriteExt::write_all(&mut c_send, b"x")
+            .await
+            .unwrap();
+        let (s_send, mut s_recv) = server_conn.accept_bi().await.unwrap();
+        let mut init = [0u8; 1];
+        tokio::io::AsyncReadExt::read_exact(&mut s_recv, &mut init)
+            .await
+            .unwrap();
+
+        let mut stream = QuinnTunnelStream::new(c_send, c_recv)
+            .with_session(QuicSessionHandle::new(client_conn));
+
+        let before = stream.last_activity_ms().unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        for _ in 0..5 {
+            poll_fn(|cx| stream.poll_send_ping(cx)).await.unwrap();
+        }
+        assert_eq!(
+            stream.last_activity_ms().unwrap(),
+            before,
+            "Quinn poll_send_ping must not refresh last_activity_ms"
+        );
+
+        let (peer_stream, _peer_keep) = tokio::io::duplex(1024);
+        let cancel = CancellationToken::new();
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            StreamStreamPump::relay_with_heartbeat(
+                Box::new(stream),
+                Box::new(peer_stream),
+                cancel.child_token(),
+                Duration::from_millis(20),
+                Duration::from_millis(80),
+            ),
+        )
+        .await
+        .expect("relay must hit idle_timeout instead of hanging");
+
+        match res {
+            Err(TunnelError::Io(e)) => assert_eq!(e.kind(), io::ErrorKind::TimedOut),
+            other => panic!("expected idle TimedOut error, got {other:?}"),
+        }
+        cancel.cancel();
+        drop((s_send, s_recv, server_conn));
+    }
+
+    #[tokio::test]
+    async fn test_h3_stream_poll_flush_waits_for_outbound_send_chunk() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        use tokio::sync::Notify;
+
+        struct GatedSendStream {
+            sent: Arc<Mutex<Vec<Bytes>>>,
+            entered: Arc<Notify>,
+            release: Arc<Notify>,
+            err_kind: Option<io::ErrorKind>,
+        }
+
+        impl H3SendStream for GatedSendStream {
+            async fn send_chunk(&mut self, chunk: Bytes) -> Result<(), io::Error> {
+                let wait = self.release.notified();
+                tokio::pin!(wait);
+                wait.as_mut().enable();
+                self.entered.notify_waiters();
+                wait.await;
+                if let Some(kind) = self.err_kind {
+                    return Err(io::Error::new(kind, "simulated send_chunk failure"));
+                }
+                self.sent.lock().unwrap().push(chunk);
+                Ok(())
+            }
+
+            async fn finish_stream(&mut self) -> Result<(), io::Error> {
+                Ok(())
+            }
+        }
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let send = GatedSendStream {
+            sent: Arc::clone(&sent),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            err_kind: None,
+        };
+        let mut stream = H3TunnelStream::spawn_split_pump(send, PendingRecvStream);
+
+        // 1. write_all enqueues immediately, but flush must stay pending until send_chunk finishes.
+        let entered_wait = entered.notified();
+        tokio::pin!(entered_wait);
+        entered_wait.as_mut().enable();
+        stream.write_all(b"chunk-1").await.unwrap();
+        entered_wait.await;
+
+        let mut flush_fut = Box::pin(stream.flush());
+        tokio::select! {
+            _ = &mut flush_fut => panic!("flush must not complete before send_chunk finishes"),
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+        }
+        assert!(sent.lock().unwrap().is_empty());
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_millis(500), flush_fut)
+            .await
+            .expect("flush should finish once send_chunk completes")
+            .unwrap();
+        assert_eq!(
+            sent.lock().unwrap().as_slice(),
+            &[Bytes::from_static(b"chunk-1")]
+        );
+
+        // 2. Writing a new chunk invalidates an incomplete flush barrier so the next flush waits for both.
+        let entered_2 = entered.notified();
+        tokio::pin!(entered_2);
+        entered_2.as_mut().enable();
+        stream.write_all(b"chunk-2").await.unwrap();
+        entered_2.await;
+
+        let mut stale_flush = Box::pin(stream.flush());
+        tokio::select! {
+            _ = &mut stale_flush => panic!("flush should block on chunk-2"),
+            _ = tokio::time::sleep(Duration::from_millis(15)) => {}
+        }
+        drop(stale_flush);
+
+        stream.write_all(b"chunk-3").await.unwrap();
+        let mut final_flush = Box::pin(stream.flush());
+        release.notify_one();
+        tokio::select! {
+            _ = &mut final_flush => panic!("flush must still wait for chunk-3 after chunk-2 finishes"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        release.notify_one();
+        tokio::time::timeout(Duration::from_millis(500), final_flush)
+            .await
+            .expect("final flush should complete after chunk-3")
+            .unwrap();
+        assert_eq!(
+            sent.lock().unwrap().as_slice(),
+            &[
+                Bytes::from_static(b"chunk-1"),
+                Bytes::from_static(b"chunk-2"),
+                Bytes::from_static(b"chunk-3"),
+            ]
+        );
+
+        // 3. send_chunk failure propagates through flush().
+        let entered_err = Arc::new(Notify::new());
+        let release_err = Arc::new(Notify::new());
+        let mut err_stream = H3TunnelStream::spawn_split_pump(
+            GatedSendStream {
+                sent: Arc::new(Mutex::new(Vec::new())),
+                entered: Arc::clone(&entered_err),
+                release: Arc::clone(&release_err),
+                err_kind: Some(io::ErrorKind::BrokenPipe),
+            },
+            PendingRecvStream,
+        );
+        err_stream.write_all(b"boom").await.unwrap();
+        release_err.notify_one();
+        let err = tokio::time::timeout(Duration::from_millis(500), err_stream.flush())
+            .await
+            .expect("flush must surface send_chunk failure")
+            .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
     }
 }

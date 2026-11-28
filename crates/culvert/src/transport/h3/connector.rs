@@ -702,7 +702,7 @@ impl TransportConnector for H3Connector {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::config::model::{AppConfig, EndpointConfig};
 
@@ -741,7 +741,8 @@ mod tests {
         }
     }
 
-    async fn create_test_quic_connection_pair() -> (quinn::Connection, quinn::Connection) {
+    pub(in crate::transport::h3) async fn create_test_quic_connection_pair()
+    -> (quinn::Connection, quinn::Connection) {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der = cert.cert.der().to_vec();
         let key_der = cert.signing_key.serialize_der();
