@@ -162,6 +162,13 @@ impl<I> StateEngine<I> {
         self.waiting_transports.len()
     }
 
+    /// Returns the number of currently tracked inter-task state waiters.
+    #[cfg(test)]
+    #[inline]
+    pub fn pending_state_waiter_count(&self) -> usize {
+        self.waiters.len()
+    }
+
     /// Returns a point-in-time `PoolStats` snapshot.
     pub fn pool_stats(&mut self, in_flight_dials: usize) -> PoolStats {
         self.purge_closed_transport_waiters();
@@ -630,6 +637,10 @@ impl<I> StateEngine<I> {
         desired: ExternalState,
         reply: oneshot::Sender<WaitResult>,
     ) {
+        self.purge_closed_waiters();
+        if reply.is_closed() {
+            return;
+        }
         if !self.phase.accepts_work() || self.waiters.len() >= MAX_PENDING_WAITERS {
             let _ = reply.send(WaitResult::Cancelled);
             return;
@@ -715,6 +726,10 @@ impl<I> StateEngine<I> {
         self.phase = TunnelPhase::Stopped;
     }
 
+    fn purge_closed_waiters(&mut self) {
+        self.waiters.retain(|w| !w.reply.is_closed());
+    }
+
     fn purge_closed_transport_waiters(&mut self) {
         let tasks = &self.tasks;
         self.waiting_transports.retain(|w| {
@@ -723,7 +738,8 @@ impl<I> StateEngine<I> {
         });
     }
 
-    fn would_create_cycle(&self, waiter: TaskId, target: TaskId) -> bool {
+    fn would_create_cycle(&mut self, waiter: TaskId, target: TaskId) -> bool {
+        self.purge_closed_waiters();
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
         queue.push_back(target);

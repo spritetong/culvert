@@ -1046,3 +1046,58 @@ fn state_engine_dispatch_assign_and_extract_lifo_invariants() {
         Ok(TaskDirective::ExtractTransport { .. })
     ));
 }
+
+#[test]
+fn cancelled_state_waiter_does_not_consume_capacity_or_create_false_cycle() {
+    let mut engine = StateEngine::<()>::new();
+    let reg_a = engine.register_task(ExternalState::Connecting).unwrap();
+    let reg_b = engine.register_task(ExternalState::Connecting).unwrap();
+    let reg_c = engine.register_task(ExternalState::Connecting).unwrap();
+    let a = reg_a.id;
+    let job_a = reg_a.job_id.unwrap();
+    let b = reg_b.id;
+    let job_b = reg_b.job_id.unwrap();
+    let c = reg_c.id;
+    let job_c = reg_c.job_id.unwrap();
+
+    // 1. Register a waiter then drop its receiver; subsequent registration purges the closed
+    //    waiter, and an already-closed incoming reply is rejected immediately without insertion.
+    let (tx_stale, rx_stale) = oneshot::channel();
+    engine.register_waiter(b, job_b, a, ExternalState::Active, tx_stale);
+    assert_eq!(engine.pending_state_waiter_count(), 1);
+    drop(rx_stale);
+
+    let (tx_closed, rx_closed) = oneshot::channel();
+    drop(rx_closed);
+    engine.register_waiter(c, job_c, a, ExternalState::Active, tx_closed);
+    assert_eq!(engine.pending_state_waiter_count(), 0);
+
+    // 2. Repeatedly creating and cancelling waiters beyond MAX_PENDING_WAITERS (4096)
+    //    must not exhaust capacity for healthy waiters.
+    for _ in 0..5000 {
+        let (tx, rx) = oneshot::channel();
+        engine.register_waiter(c, job_c, a, ExternalState::Active, tx);
+        drop(rx);
+    }
+    let (tx_ca, mut rx_ca) = oneshot::channel();
+    engine.register_waiter(c, job_c, a, ExternalState::Active, tx_ca);
+    assert!(rx_ca.try_recv().is_err());
+    assert_eq!(engine.pending_state_waiter_count(), 1);
+
+    // 3. Cancelled dependency edge A -> B must NOT trigger CycleDetected when B waits on A.
+    let (tx_ab, rx_ab) = oneshot::channel();
+    engine.register_waiter(a, job_a, b, ExternalState::Active, tx_ab);
+    assert_eq!(engine.pending_state_waiter_count(), 2);
+    drop(rx_ab);
+
+    let (tx_ba, mut rx_ba) = oneshot::channel();
+    engine.register_waiter(b, job_b, a, ExternalState::Active, tx_ba);
+    assert!(rx_ba.try_recv().is_err());
+    assert_eq!(engine.pending_state_waiter_count(), 2);
+
+    // Transitioning A -> Active wakes both remaining healthy waiters (C and B).
+    engine.apply_task_state(a, job_a, ExternalState::Active);
+    assert_eq!(rx_ca.try_recv().unwrap(), WaitResult::Reached);
+    assert_eq!(rx_ba.try_recv().unwrap(), WaitResult::Reached);
+    assert_eq!(engine.pending_state_waiter_count(), 0);
+}
