@@ -341,8 +341,10 @@ impl SignalingReceiver {
                 return None;
             }
 
-            let notified = self.actor_exit_notify.notified();
-            tokio::pin!(notified);
+            // Pin and enable the waiter BEFORE checking `active_actors` so the last actor's
+            // `fetch_sub(1)` + `notify_waiters()` can never slip into the pre-poll window.
+            let mut notified = std::pin::pin!(self.actor_exit_notify.notified());
+            notified.as_mut().enable();
 
             if self.active_actors.load(Ordering::SeqCst) == 0 {
                 return self.rx.try_recv().ok();
@@ -353,7 +355,7 @@ impl SignalingReceiver {
                 maybe_res = self.rx.recv() => {
                     return maybe_res;
                 }
-                _ = &mut notified => {
+                () = &mut notified => {
                     continue;
                 }
             }
@@ -931,5 +933,43 @@ mod tests {
         assert_eq!(delivered, ok_msg);
 
         cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn signaling_receiver_does_not_lose_last_actor_exit() {
+        let cfg = SignalingConfig {
+            heartbeat_interval: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(60),
+        };
+
+        for _ in 0..50 {
+            let cancel = CancellationToken::new();
+            let (ch_peer, ch_actor) = duplex(1024);
+            let (_handle, mut rx) = SignalingChannel::spawn(ch_actor, cfg, cancel.child_token());
+            // Keep an active event sink alive just as ReverseSessionHub / SignalingAttachment does.
+            let _kept_sink = rx.event_sink();
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let b_exit = Arc::clone(&barrier);
+            let b_recv = Arc::clone(&barrier);
+
+            let exit_task = tokio::spawn(async move {
+                b_exit.wait().await;
+                drop(ch_peer);
+            });
+            let recv_task = tokio::spawn(async move {
+                b_recv.wait().await;
+                rx.recv_msg().await
+            });
+
+            exit_task.await.unwrap();
+            let got = timeout(Duration::from_millis(500), recv_task)
+                .await
+                .expect("SignalingReceiver::recv_msg must not lose last actor exit wakeup")
+                .unwrap()
+                .unwrap();
+            assert_eq!(got, None);
+            cancel.cancel();
+        }
     }
 }

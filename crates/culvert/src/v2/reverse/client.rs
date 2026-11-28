@@ -53,13 +53,21 @@ impl ReverseReadyNotifier {
 
     /// Waits until marked ready or `cancel_token` is cancelled; returns `false` if cancelled.
     pub async fn wait_ready(&self, cancel_token: &CancellationToken) -> bool {
-        if self.is_ready.load(std::sync::atomic::Ordering::Acquire) {
-            return true;
-        }
-        tokio::select! {
-            biased;
-            _ = cancel_token.cancelled() => false,
-            _ = self.notify.notified() => true,
+        loop {
+            let mut notified = std::pin::pin!(self.notify.notified());
+            notified.as_mut().enable();
+            if self.is_ready.load(std::sync::atomic::Ordering::Acquire) {
+                return true;
+            }
+            tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => return false,
+                () = &mut notified => {
+                    if self.is_ready.load(std::sync::atomic::Ordering::Acquire) {
+                        return true;
+                    }
+                }
+            }
         }
     }
 }
@@ -614,33 +622,16 @@ impl ReverseClientRunner {
                                 if router.promote_standby_if_closed() || router.has_active_channel() {
                                     continue;
                                 }
-                                if pool_workers > 0 && !shutdown_token.is_cancelled() {
-                                    let wait_window = DEFAULT_REVERSE_PROMOTE_WAIT.min(self.config.idle_timeout);
-                                    let mut promoted = false;
-                                    let deadline = tokio::time::sleep(wait_window);
-                                    tokio::pin!(deadline);
-                                    loop {
-                                        let attached = router.notified();
-                                        tokio::pin!(attached);
-                                        if router.promote_standby_if_closed() || router.has_active_channel() {
-                                            promoted = true;
-                                            break;
-                                        }
-                                        tokio::select! {
-                                            biased;
-                                            _ = shutdown_token.cancelled() => break,
-                                            _ = &mut deadline => break,
-                                            _ = &mut attached => {
-                                                if router.promote_standby_if_closed() || router.has_active_channel() {
-                                                    promoted = true;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if promoted {
-                                        continue;
-                                    }
+                                if pool_workers > 0
+                                    && !shutdown_token.is_cancelled()
+                                    && Self::wait_for_router_recovery(
+                                        &router,
+                                        DEFAULT_REVERSE_PROMOTE_WAIT.min(self.config.idle_timeout),
+                                        &shutdown_token,
+                                    )
+                                    .await
+                                {
+                                    continue;
                                 }
                                 break;
                             }
@@ -671,6 +662,32 @@ impl ReverseClientRunner {
         coord_join.await.map_err(|e| {
             TunnelError::Internal(format!("v2 reverse client coordinator join error: {e}"))
         })
+    }
+
+    pub(crate) async fn wait_for_router_recovery(
+        router: &SignalingRouter,
+        wait_window: Duration,
+        shutdown_token: &CancellationToken,
+    ) -> bool {
+        let deadline = tokio::time::sleep(wait_window);
+        tokio::pin!(deadline);
+        loop {
+            let mut attached = std::pin::pin!(router.notified());
+            attached.as_mut().enable();
+            if router.promote_standby_if_closed() || router.has_active_channel() {
+                return true;
+            }
+            tokio::select! {
+                biased;
+                _ = shutdown_token.cancelled() => return false,
+                _ = &mut deadline => return false,
+                () = &mut attached => {
+                    if router.promote_standby_if_closed() || router.has_active_channel() {
+                        return true;
+                    }
+                }
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

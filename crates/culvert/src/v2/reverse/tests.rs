@@ -570,3 +570,93 @@ async fn reverse_old_generation_cannot_promote_new_signaling_attachment() {
         TaskOutcome::Failed(_)
     ));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reverse_ready_notifier_does_not_lose_ready_notification() {
+    use crate::v2::reverse::ReverseReadyNotifier;
+
+    for _ in 0..80 {
+        let notifier = Arc::new(ReverseReadyNotifier::new());
+        let cancel = CancellationToken::new();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let n_mark = Arc::clone(&notifier);
+        let b_mark = Arc::clone(&barrier);
+        let marker = tokio::spawn(async move {
+            b_mark.wait().await;
+            n_mark.mark_ready();
+        });
+
+        let n_wait = Arc::clone(&notifier);
+        let b_wait = Arc::clone(&barrier);
+        let c_wait = cancel.clone();
+        let waiter = tokio::spawn(async move {
+            b_wait.wait().await;
+            n_wait.wait_ready(&c_wait).await
+        });
+
+        marker.await.unwrap();
+        let ready = tokio::time::timeout(Duration::from_millis(500), waiter)
+            .await
+            .expect("ReverseReadyNotifier::wait_ready must not stall on lost notify")
+            .unwrap();
+        assert!(ready);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn router_standby_attach_during_promotion_wait_is_observed() {
+    use crate::control::{SignalingChannel, SignalingConfig, SignalingRouter};
+    use crate::v2::reverse::ReverseClientRunner;
+
+    for _ in 0..50 {
+        let cancel = CancellationToken::new();
+        let cfg = SignalingConfig {
+            heartbeat_interval: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(60),
+        };
+        let (ch1_a, ch1_b) = duplex(1024);
+        let (h1, _rx1) = SignalingChannel::spawn(ch1_a, cfg, cancel.child_token());
+        drop(ch1_b);
+        let router = SignalingRouter::new(h1);
+
+        // Ensure primary channel is closed before starting the standby recovery wait.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(!router.has_active_channel());
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let b_attach = Arc::clone(&barrier);
+        let b_wait = Arc::clone(&barrier);
+
+        let router_attach = router.clone();
+        let cancel_attach = cancel.child_token();
+        let (_ch2_a, ch2_b) = duplex(1024);
+        let attacher = tokio::spawn(async move {
+            b_attach.wait().await;
+            let h2 = SignalingChannel::spawn(ch2_b, cfg, cancel_attach).0;
+            router_attach.attach(h2);
+        });
+
+        let router_wait = router.clone();
+        let cancel_wait = cancel.clone();
+        let waiter = tokio::spawn(async move {
+            b_wait.wait().await;
+            // Use a long promotion window so a lost wakeup would blow past the 500ms timeout.
+            ReverseClientRunner::wait_for_router_recovery(
+                &router_wait,
+                Duration::from_secs(10),
+                &cancel_wait,
+            )
+            .await
+        });
+
+        attacher.await.unwrap();
+        let promoted = tokio::time::timeout(Duration::from_millis(500), waiter)
+            .await
+            .expect("wait_for_router_recovery must observe attach without waiting for deadline")
+            .unwrap();
+        assert!(promoted);
+
+        cancel.cancel();
+    }
+}
