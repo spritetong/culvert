@@ -1266,10 +1266,10 @@ mod tests {
         cancel: tokio_util::sync::CancellationToken,
         heartbeat_interval: std::time::Duration,
         idle_timeout: std::time::Duration,
-    ) -> Result<(u64, u64), crate::v2::TaskError> {
-        use crate::v2::relay::{DuplexRelay, RelayCounters};
-        use crate::v2::stage::{ActiveStage, ClosingStage};
-        use crate::v2::state::CloseReason;
+    ) -> Result<(u64, u64), crate::core::error::TaskError> {
+        use crate::core::stage::{ActiveStage, ClosingStage};
+        use crate::core::state::CloseReason;
+        use crate::relay::{DuplexRelay, RelayCounters};
 
         let counters = std::sync::Arc::new(RelayCounters::new());
         let mut relay = DuplexRelay::new(

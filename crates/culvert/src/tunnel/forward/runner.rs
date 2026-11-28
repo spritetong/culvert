@@ -1,0 +1,103 @@
+// Copyright (c) 2026 Sprite Tong <spritetong@gmail.com>
+// SPDX-License-Identifier: MPL-2.0
+// culvert is licensed under the Mozilla Public License Version 2.0.
+
+//! Supervised Forward listener runner coordinating `Frontend` and unified `Coordinator`.
+//! All comments and docstrings must be in English.
+
+use crate::core::coordinator::{Coordinator, CoordinatorSummary};
+use crate::core::error::TunnelError;
+use crate::core::state::CoordinatorConfig;
+use crate::frontend::{AcceptBackoff, Frontend, FrontendOutput, next_frontend_accept};
+use crate::io::addr::{L4Protocol, TargetAddr};
+use crate::tunnel::forward::workflow::{ForwardInput, ForwardWorkflow};
+use reusable_future::ReusableFutureRef;
+use tokio_util::sync::CancellationToken;
+
+/// Runs a single forward mapping using the unified `Coordinator` + `IoTask` stack.
+pub struct ForwardRunner {
+    frontend: Box<dyn Frontend>,
+    target: TargetAddr,
+    protocol: L4Protocol,
+    workflow: ForwardWorkflow,
+    coord_config: CoordinatorConfig,
+    prewarm_tasks: usize,
+}
+
+impl ForwardRunner {
+    /// Creates a new `ForwardRunner`.
+    pub fn new(
+        frontend: Box<dyn Frontend>,
+        target: TargetAddr,
+        protocol: L4Protocol,
+        workflow: ForwardWorkflow,
+        coord_config: CoordinatorConfig,
+    ) -> Self {
+        Self {
+            frontend,
+            target,
+            protocol,
+            workflow,
+            coord_config,
+            prewarm_tasks: 0,
+        }
+    }
+
+    /// Pre-spawns `count` empty worker tasks inside the `Coordinator` before accepting connections.
+    pub fn with_prewarm_tasks(mut self, count: usize) -> Self {
+        self.prewarm_tasks = count;
+        self
+    }
+
+    /// Runs the accept loop until `shutdown_token` is cancelled, then drains deterministically.
+    pub async fn run(
+        mut self,
+        shutdown_token: CancellationToken,
+    ) -> Result<CoordinatorSummary, TunnelError> {
+        let coord_force_token = CancellationToken::new();
+        let (coord, coord_join) =
+            Coordinator::start_with_config(self.workflow, self.coord_config, coord_force_token);
+
+        if self.prewarm_tasks > 0 {
+            let _ = coord.prewarm(self.prewarm_tasks).await;
+        }
+
+        let mut accept_slot: ReusableFutureRef<'static, FrontendOutput> =
+            ReusableFutureRef::default();
+        let mut accept_backoff = AcceptBackoff::default();
+
+        let accept_res: Result<(), TunnelError> = loop {
+            match next_frontend_accept(
+                &mut *self.frontend,
+                &mut accept_slot,
+                &mut accept_backoff,
+                &shutdown_token,
+                "Forward frontend",
+            )
+            .await
+            {
+                Ok(Some(accepted)) => {
+                    let input =
+                        ForwardInput::new(accepted.channel, self.target.clone(), self.protocol);
+                    if let Err(err) = coord.assign(input).await {
+                        tracing::debug!(error = %err, "Forward assignment rejected during shutdown");
+                        break Ok(());
+                    }
+                }
+                Ok(None) => break Ok(()),
+                Err(err) => break Err(err),
+            }
+        };
+
+        accept_slot.reset();
+        self.frontend.shutdown().await;
+
+        let _ = coord.graceful_stop().await;
+        let summary = coord_join
+            .await
+            .map_err(|e| TunnelError::Internal(format!("coordinator join error: {e}")))?;
+
+        accept_res?;
+        Ok(summary)
+    }
+}

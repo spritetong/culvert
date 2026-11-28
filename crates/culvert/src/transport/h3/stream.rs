@@ -990,9 +990,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_h3_stream_ping_does_not_refresh_activity_and_expires_idle_timeout() {
-        use crate::v2::TaskError;
-        use crate::v2::relay::DuplexRelay;
-        use crate::v2::stage::ActiveStage;
+        use crate::core::error::TaskError;
+        use crate::core::stage::ActiveStage;
+        use crate::relay::DuplexRelay;
         use std::future::poll_fn;
         use std::time::Duration;
 
@@ -1042,9 +1042,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_quinn_stream_ping_does_not_refresh_activity_and_expires_idle_timeout() {
-        use crate::v2::TaskError;
-        use crate::v2::relay::DuplexRelay;
-        use crate::v2::stage::ActiveStage;
+        use crate::core::error::TaskError;
+        use crate::core::stage::ActiveStage;
+        use crate::relay::DuplexRelay;
         use std::future::poll_fn;
         use std::time::Duration;
 

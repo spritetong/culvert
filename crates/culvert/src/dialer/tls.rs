@@ -293,8 +293,8 @@ mod tests {
         assert_eq!(v1.len(), 2);
 
         // 2. (None, Some("1.3")) -> 1.2 + 1.3 (default min is 1.2)
-        let v2 = TlsConfigBuilder::parse_protocol_versions(None, Some("1.3")).unwrap();
-        assert_eq!(v2.len(), 2);
+        let v13 = TlsConfigBuilder::parse_protocol_versions(None, Some("1.3")).unwrap();
+        assert_eq!(v13.len(), 2);
 
         // 3. (None, Some("1.2")) -> 1.2 only
         let v3 = TlsConfigBuilder::parse_protocol_versions(None, Some("1.2")).unwrap();

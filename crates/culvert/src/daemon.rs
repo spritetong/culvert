@@ -11,7 +11,7 @@ use tracing::{error, info};
 use crate::common::CancelFutureExt;
 use crate::config::model::AppConfig;
 use crate::consts::{DEFAULT_SHUTDOWN_HARD_DEADLINE, WATCHDOG_THREAD_NAME};
-use crate::v2::TunnelSupervisor;
+use crate::supervisor::TunnelSupervisor;
 
 /// Runs the culvert daemon until graceful termination signal or fatal error.
 pub async fn run_daemon(app_config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {

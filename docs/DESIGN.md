@@ -3,79 +3,98 @@
 | Field | Value |
 | :--- | :--- |
 | Document | Technical Design / Architecture Specification |
-| Product | culvert (workspace version 0.1.0, Rust edition 2024, MPL-2.0) |
-| Status | Current — describes the implemented code |
+| Product | culvert (workspace version 0.3.8, Rust edition 2024, MPL-2.0) |
+| Status | Current — describes the implemented Coordinator + IO Task runtime |
 | Companion documents | [PRD.md](PRD.md), [README.md](../README.md) |
 | Normative source | `crates/culvert/src`, `crates/culvert-cli/src`, `config-example.yaml` |
 
-This document describes the implementation as it exists. It is not a roadmap:
-modules, configuration fields, and protocols that are not part of the runtime
-data path are listed in [Section 13](#13-not-wired-into-the-runtime-data-path).
+This document describes the code as it exists after the v0.4 refactor. The v1
+`core::serve` / `PumpRegistry` / `ReplenishingStreamPool` / `SessionManager`
+stack was removed; all forwarding now runs on the Coordinator + IO Task state
+machine described below. Modules present in the tree but absent from the
+runtime data path are listed in [Section 13](#13-not-wired-into-the-runtime-data-path).
 
 ---
 
 ## 1. Design Summary
 
-culvert is a TCP and UDP port-forwarding daemon. A single process loads one
-YAML file, optionally starts ingress listeners (`server`), optionally starts one
-or more tunnel clients (`tunnels`), and supervises both. Traffic between a
-client and a server travels over one of three relay drivers (WebSocket,
-HTTP/3/QUIC, WebSocket over a Unix domain socket) as an opaque bidirectional byte
-stream (for TCP/UDS) or `[u16 len | payload]` length-framed datagrams (for UDP).
+culvert is a TCP and UDP port-forwarding daemon. One process loads a YAML file,
+optionally starts ingress listeners (`server`), optionally starts one or more
+tunnel clients (`tunnels`), and supervises both. Traffic between a client and a
+server travels over WS/WSS, HTTP/3/QUIC, or WS over a Unix domain socket, as an
+opaque bidirectional byte stream (TCP/UDS) or `[u16 len | payload]` framed
+datagrams (UDP).
 
-The runtime is split into three independent parts. Independence means the core
-depends **only** on the neutral `io` vocabulary — `core::serve` never names a
-`Frontend` or `Transport*` trait. The runtime layers (`tunnel/`, `server/`)
-build a `PumpRequest` from those traits and hand it to core. Adding UDP port
-mapping required only `UdpFrontend` (`frontend/udp.rs`), `ConnectedUdpSocket`
-(`platform/mod.rs`), registered datagram pumps (`io/pump.rs`), and `L4Protocol`
-metadata propagation — leaving `core/serve.rs`'s `serve()` completely unchanged.
+The runtime is split into three layers:
 
-| Part | Owns | Module |
+| Layer | Owns | Module |
 | :--- | :--- | :--- |
-| **Frontend** | The mapping service exposed to the outside world: TCP/Unix domain sockets (`TcpFrontend`) and UDP with per-peer NAT flow demultiplexing (`UdpFrontend`). | `frontend/` |
-| **Core** | Session lifecycle: pairing, activation, cancellation, retry, statistics, and `core::serve` pump dispatch. It never moves bytes itself. | `core/`, `tunnel/`, `session/`, `pool/`, `control/` |
-| **Backend** | A uniform I/O interface over relay channels: WS, WSS, H3, QUIC, UDS, and future P2P/datagram transports. | `backend/` (traits + registry), `transport/` (drivers) |
+| **Frontend** | The mapping service: TCP/UDS (`TcpFrontend`) and UDP with per-peer NAT flow demultiplexing (`UdpFrontend`). | `frontend/` |
+| **Coordinator + IO Task** | Session lifecycle, external state, resource ownership, relay scheduling, and shutdown. The runtime is a set of single-writer Coordinator Actors, each owning a set of recyclable IO Tasks. | `core/`, `tunnel/`, `server/` |
+| **Backend / Transport** | A uniform I/O interface over relay channels: WS, WSS, H3, QUIC, UDS. | `backend/` (traits + registry), `transport/` (drivers), `relay/` (data-plane state machines) |
 
 `io/` is a shared vocabulary with no business logic: `TargetAddr`, `PeerAddr`,
-`L4Protocol`, `IoChannel`, `TunnelStream`, `DatagramIo`, `TunnelError`,
-`PumpCtx`, and the capability types. All three parts depend on `io/`; none of
-them depends on another part's implementation. `platform/` holds OS-level
-socket primitives wrapped by frontends and target dialers (`GenericListener`,
-`ConnectedUdpSocket`), `config/` holds the declarative schema, and
-`daemon` + `supervisor` + `common::task` own process lifecycle (one cancellation
-token, owned tasks, cancel then await).
+`L4Protocol`, `IoChannel`, `TunnelStream`, `DatagramIo`, `TunnelError`, and
+capability types. `control/` owns the reverse signaling protocol;
+`pool/activation.rs` owns the 0-RTT activation codec; `cert/` owns dynamic TLS
+certificate management. `platform/` holds OS-level socket primitives,
+`config/` holds the declarative schema, and `daemon.rs` owns process lifecycle.
 
-The reverse control plane (`control/`, `session/`, `pool/`) manages signaling
-and idle stream pre-warming (`Stream`-scoped at the transport boundary while
-carrying `L4Protocol` metadata so both TCP and UDP listeners can pre-warm 0-RTT
-streams and fall back to `NewConnection`). Datagram payload framing and NAT flow
-idle expiry live inside the registered pumps, never in `core::serve`.
+### 1.1 Governing principle: internal async, boundary stateful
 
-```mermaid
-flowchart TB
-    IO["io/<br/>TargetAddr · PeerAddr · IoChannel · Pump traits"]
-    FE["frontend/<br/>TcpFrontend · UdpFrontend · bind"]
-    CORE["core::serve<br/>session lifecycle + PumpRegistry"]
-    BE["backend/<br/>Transport* traits · TransportRegistry"]
-    DRV["transport/<br/>WS · WSS · H3 · QUIC · UDS drivers"]
-    PUMP["io::pump::PumpRegistry<br/>StreamStream · DatagramStream · StreamDatagram · DatagramDatagram"]
+The v0.4 refactor is defined by one rule:
 
-    FE --> IO
-    CORE --> IO
-    BE --> IO
-    DRV --> BE
-    FE --> CORE
-    BE --> CORE
-    CORE --> PUMP
+> **Internal IO units use ordinary `async`/`await`; explicit state machines exist
+> only at lifecycle boundaries.**
+
+Inside an IO Task, connecting, activation, and data transfer are asynchronous
+functions and `poll_fn` loops. A single explicit state machine — the
+`ExternalState` owned by the Coordinator and the paired `TaskPhase<W>` owned by
+the IO Task — describes only the lifecycle phases visible to scheduling and
+shutdown. The goal is not a large number of states or abstractions, but fewer
+simultaneous states, branches, and implicit constraints the reader must hold.
+
+### 1.2 What the previous architecture got wrong
+
+The v1 design assembled each connection as a linear chain:
+
+```text
+accept -> spawn -> connect -> create channels -> forward
+       -> handle errors -> cleanup -> wait for timeout
 ```
 
-`core::serve(req: PumpRequest, ctx: PumpCtx)` looks up a `Pump` by
-`(req.frontend.kind(), req.backend.kind())` in a process-wide `PumpRegistry` and
-delegates the transfer. Core contains no `match` on channel variants and no
-byte-copying code. `PumpRegistry` is seeded with `StreamStreamPump`,
-`DatagramStreamPump`, `StreamDatagramPump`, and `DatagramDatagramPump`. See
-[Section 5.7](#57-three-layer-boundaries-and-the-pump-registry).
+That shape caused long-running stability problems:
+
+- Lifecycle was spread across many `async` functions, so a process-level
+  shutdown deadline and `abort_all()` were needed as a backstop.
+- `CancellationToken` was threaded through every layer, from the supervisor
+  down into the relay pump.
+- Each layer added its own `timeout` and `select!`, so exit paths could stack
+  waits or disagree about boundaries.
+- Cleanup lived in error branches and `scopeguard`s; an early abort could leave
+  state and real resources out of sync.
+- The pool combined untracked `tokio::spawn`, `Arc<AtomicUsize>`,
+  `Arc<Mutex<PoolStats>>`, and `mpsc`/`oneshot` channels into implicit coupling.
+- Understanding one connection required tracing several modules.
+
+The replacement establishes a resource and lifecycle model first, then derives
+the async implementation from it.
+
+### 1.3 Design principles
+
+1. **Internal async, boundary stateful.** `async/await` manages internal IO;
+   explicit state machines manage only lifecycle boundaries.
+2. **Single-writer control plane, independent data plane.** The Coordinator owns
+   external state and resource relationships; it does not participate in each IO.
+3. **Ownership before locks.** Define who owns a resource, then decide whether
+   synchronization is needed.
+4. **State may lag; resources may not.** External state need not mirror internal
+   progress in real time, but must never permit double allocation, stale-task
+   interference, or premature release.
+5. **Stop is an architecture contract, not a per-layer timeout.** An IO Task is
+   non-blocking at its boundary and stops within a defined window.
+6. **Correctness is a consequence of the model.** Fix the model first; do not
+   paper over a wrong model with more engineering mechanisms.
 
 ---
 
@@ -88,41 +107,23 @@ crates/culvert-cli/src/main.rs CLI, logging setup, Tokio runtime, --check
 crates/culvert/src/
   lib.rs                       public re-exports and run_* entry points
   consts.rs                    all constants and defaults
-  io/
-    mod.rs                     neutral vocabulary re-exports
-    addr.rs                    L4Protocol, MappingSpec, TargetAddr, PeerAddr, parse_target_addr
-    channel.rs                 FlowKey, ChannelKind, IoChannel, Datagram, DatagramIo
-    stream.rs                  TunnelStream, StreamCaps, liveness helpers
-    error.rs                   TunnelError, is_permanent, is_shutdown
-    pump.rs                    Pump, PumpRegistry, PumpCtx, StreamStreamPump, DatagramStreamPump, StreamDatagramPump, DatagramDatagramPump
-  frontend/
-    mod.rs                     Frontend, FrontendAccept, FrontendRegistry, bind
-    tcp.rs                     TcpFrontend (TCP + Unix domain sockets)
-    udp.rs                     UdpFrontend, UdpFlowChannel (UDP NAT flow demultiplexing)
-  backend/
-    mod.rs                     TransportConnector/Listener/Driver, StreamMetadata
-    registry.rs                TransportRegistry scheme dispatch
-  core/
-    serve.rs                   core::serve pump dispatch
-    error.rs, stream.rs        compatibility re-exports from io/
-    failover.rs                standalone module, not used by the data path
-  config/{model,loader}.rs     schema, deserializers, validation
+  io/                          neutral vocabulary: addr, channel, error, stream
+  frontend/                    Frontend trait, registry, TCP/UDS and UDP frontends
+  backend/                     Transport* traits and TransportRegistry
+  core/                        Coordinator, StateEngine, task stages, state vocabulary
+  config/                      schema and deserializers
   daemon.rs                    signal handling and hard shutdown deadline
-  supervisor/runner.rs         TunnelSupervisor
-  client/runner.rs             ClientRunner and fixed-delay retry loop
-  server/runner.rs             ingress accept loop and stream dispatch
-  tunnel/{cluster,forward,reverse}.rs
-  pool/connection_pool.rs      ReplenishingStreamPool actor
-  control/{channel,stream}.rs  SignalingChannel actor and MessagePack protocol
-  session/manager.rs           reverse data-stream pairing
-  dialer/{endpoint,dns,tls,unified}.rs
-  transport/                   backend driver implementations only
-    mod.rs                     re-exports backend traits, driver modules
-    ws/{mod,connector,listener,model,stream}.rs
-    h3/{mod,connector,listener,stream}.rs
-    uds.rs
-  platform/{mod,unix,windows}.rs  UDS listener, target dialing (TCP/UDS & ConnectedUdpSocket), OS primitives
-  common/{auth,cancel,net,task}.rs
+  cert/                        certificate reader, watcher, manager, resolver, events
+  control/                     SignalingChannel, SignalingRouter, control framing
+  dialer/                      endpoint, DNS, TLS, proxy, unified dialer
+  pool/activation.rs           0-RTT activation codec (no standalone pool actor)
+  relay/                       ChannelRelay and duplex/datagram relay state machines
+  transport/                   h3, uds, ws drivers
+  platform/                    UDS listener, target dialing, OS primitives
+  common/                      auth, cancel, net, task tracker
+  server/                      ServerRunner, reverse control session, forward workflow
+  tunnel/                      cluster, forward workflow/runner, reverse workflows/runner
+  supervisor.rs                ClientRunner and TunnelSupervisor
   mux/                         standalone module, not used by the data path
 crates/culvert/tests/          end-to-end and regression tests
 ```
@@ -141,8 +142,7 @@ named `culvert`). The binary uses the library through `culvert::run_daemon`.
 3. `--check` prints a success line and returns without initializing logging,
    binding sockets, or starting the runtime. It is a static check only.
 4. Logging is initialized with `tracing_subscriber`; `EnvFilter` from `RUST_LOG`
-   takes precedence over `log.level`. Output goes to stdout or stderr; ANSI is
-   controlled by `log.no_color`.
+   takes precedence over `log.level`.
 5. The Tokio runtime is built from `-w` or `worker_threads`: `1` selects
    `new_current_thread`, an explicit `n` selects `new_multi_thread` with
    `worker_threads(n)`, and absence selects `new_multi_thread` with
@@ -156,19 +156,18 @@ named `culvert`). The binary uses the library through `culvert::run_daemon`.
 - `spawn_shutdown_handler` owns a signal task and a dedicated OS-thread
   watchdog (`shutdown-watchdog`). The thread exists so a hard deadline can fire
   even if every Tokio worker is busy.
-- First termination signal: cancel the root token, notify the watchdog to
-  start a 10-second deadline (`DEFAULT_SHUTDOWN_HARD_DEADLINE`). Second signal:
-  exit with code `130`.
+- First termination signal: cancel the root token and start a 10-second deadline
+  (`DEFAULT_SHUTDOWN_HARD_DEADLINE`). Second signal: exit with code `130`.
 - `ShutdownWatchdog::finish()` disarms the deadline and joins both owned
   handles; it is called on every daemon exit path, including clean exits.
-- `TaskTracker::shutdown_and_wait()` cancels child tokens and awaits the
+- `TaskTracker::shutdown_and_wait()` cancels child tokens and awaits its
   `JoinSet`. Nested trackers share one absolute 5-second grace deadline
   (`DEFAULT_GRACE_PERIOD`) rather than compounding windows. `abort_all()` is
   only the deadline fallback, and even then every handle is awaited.
 - Design constraint: no task is detached on the normal path. Every tracked task
-  observes the cancellation token and every await is cancellation-aware or has
-  an explicit timeout. Listeners expose an async `shutdown()`; `Drop` is only
-  an abnormal-path safety net.
+  observes a cancellation token and every await is cancellation-aware or has
+  an explicit timeout. Listeners expose an async `shutdown()`; `Drop` is only an
+  abnormal-path safety net.
 
 ---
 
@@ -186,108 +185,69 @@ structs are too. `EndpointConfig` and `DnsResolverConfig` implement custom
 | `worker_threads` | `Option<usize>` | Tokio worker count; `0` rejected. |
 | `dns` | `Option<DnsConfig>` | `strategy`, `resolvers`, `cache_capacity`. |
 | `dialer` | `Option<DialerConfig>` | `connect_timeout`, `tcp_nodelay`, `bind_interface`, `proxy`, `heartbeat_interval`, `idle_timeout`, `udp_idle_timeout`. |
-| `tls` | `Option<TlsConfig>` | `server_name`, `insecure`, `alpn`, `ca_certificate`, `client_certificate`, `client_key`, `certificate`, `key`, `client_ca_certificate`, `client_auth`, `min_version`, `max_version`. |
-| `server` | `Option<ServerConfig>` | `listen`, `token`, `default_target`, `certificate`, `key`, `client_ca_certificate`, `client_auth`, `tls`, `heartbeat_interval`, `idle_timeout`, `udp_idle_timeout`. |
+| `tls` | `Option<TlsConfig>` | `server_name`, `insecure`, `alpn`, CA/client/leaf certificates, `client_auth`, version bounds. |
+| `server` | `Option<ServerConfig>` | `listen`, `token`, `default_target`, TLS settings, `heartbeat_interval`, `idle_timeout`, `udp_idle_timeout`. |
 | `tunnels` | `Vec<TunnelConfig>` (defaulted) | `tag`, `endpoint`, `token`, `uuid`, `http_headers`, `failover`, `multiplex`, `retry`, `mappings`. |
 
-`TunnelConfig` requires a `mappings` object (`TunnelMappingsConfig`) containing `forward` and/or `reverse` groups (`MappingGroupConfig`), each with an optional `pool_size` and a list of `MappingRuleConfig { protocol, listen, target, udp_idle_timeout }`. `protocol` is mandatory and must be explicitly set to `"TCP"` or `"UDP"` (case-insensitive, no default value). `TunnelRetryConfig { delay, max_retries }` uses a separate duration
-deserializer that accepts seconds, `Ns`, or `Nms`.
+`TunnelConfig` requires a `mappings` object (`TunnelMappingsConfig`) containing
+`forward` and/or `reverse` groups (`MappingGroupConfig`), each with an optional
+`pool_size` and `MappingRuleConfig { protocol, listen, target, udp_idle_timeout }`.
+`protocol` is mandatory (`"TCP"` or `"UDP"`, case-insensitive). Durations accept
+a raw integer (seconds) or a string with `s` / `ms` suffix.
 
-Durations (`dialer`, `server`, `retry`) accept a raw integer (seconds) or a
-string with `s` / `ms` suffix through `humantime_serde_opt` and the retry
-duration helper.
-
-### 4.2 URL parsing
+### 4.2 URL and address parsing
 
 `ServerListenSpec::parse` requires an explicit `://` and lowercase scheme.
-For TCP schemes it splits `host:port` from the HTTP path, requires a non-zero
-`u16` port, and stores the path as `None` when it is `/`. For UDS schemes it
-normalizes the socket path, parses `?path=` (prepending `/` if needed) and
-`?chmod=` (always octal, `<= 0o7777`).
+For TCP schemes it splits `host:port` from the HTTP path and requires a non-zero
+`u16` port. For UDS schemes it normalizes the socket path and parses `?path=`
+and `?chmod=` (octal, `<= 0o7777`).
 
 `dialer::endpoint::Endpoint::parse` uses the `url` crate for `ws`, `wss`,
-`https`, `h3`, `quic`, and a dedicated path parser for `ws+unix` / `wss+unix`.
-Default ports are 80 for `ws` and 443 for the TLS/QUIC schemes. A UDS endpoint
-must include a socket file path.
+`https`, `h3`, `quic`, and a dedicated parser for `ws+unix` / `wss+unix`.
+Default ports are 80 for `ws` and 443 for TLS/QUIC schemes.
 
-`io::addr::ListenAddr` has four variants: `DualStack(u16)`, `Ip(SocketAddr)`, `Domain(String, u16)`, `Path(PathBuf)`. `io::addr::parse_listen_addr` accepts `:port` (dual-stack IPv6/IPv4 binding on `[::]:port` via `socket2` with `set_only_v6(false)` on Windows, Linux, and macOS), `addr:port` (OS default configuration), `hostname:port`, or `unix://path`. Dual-stack sockets automatically normalize accepted IPv4-mapped IPv6 peer addresses (`::ffff:x.x.x.x`) to canonical IPv4 addresses via `addr.ip().to_canonical()`.
+`io::addr::ListenAddr` has `DualStack(u16)`, `Ip(SocketAddr)`,
+`Domain(String, u16)`, and `Path(PathBuf)` variants. `parse_listen_addr` accepts
+`:port` (dual-stack binding), `addr:port`, `hostname:port`, or `unix://path`.
+Dual-stack sockets normalize IPv4-mapped IPv6 peers to canonical IPv4.
 
-`io::addr::TargetAddr` has three variants: `Ip(SocketAddr)`, `Domain(String, u16)`, `Path(PathBuf)`. `io::addr::parse_target_addr` accepts `unix://path`, bracketed IPv6 with port, `ip:port`, or a validated `hostname:port`. A port is mandatory and non-zero for non-UDS forms. `TargetAddr` strictly represents outbound `connect` destinations, and passing a `:port` string without host is strictly rejected. Both live in the neutral vocabulary layer: config, frontend, core, and backend refer to the same type without any of them owning it.
-
-`io::addr::L4Protocol` is `Tcp | Udp` (default `Tcp`, serialized lowercase
-`"tcp"` / `"udp"`). `io::addr::MappingSpec { protocol, listen, target }` is the
-neutral description of one port mapping handed to `frontend::bind` (`MappingSpec::new`,
-`MappingSpec::tcp`, `MappingSpec::udp`). `run_forward_mapping` and
-`ServerRunner::handle_reverse_control` pass the mapping's `L4Protocol` when
-building the spec from `PortMappingConfig` or `RegisterReverse`.
-
-`io::addr::PeerAddr` (`Socket(SocketAddr) | Path(PathBuf) | P2p(String)`)
-represents peer identities in `FrontendAccept` and `FlowKey`. Network TCP/UDP
-traffic uses `Socket(SocketAddr)` with zero heap allocations and compact
-MessagePack serialization.
+`io::addr::TargetAddr` has `Ip`, `Domain`, and `Path` variants and represents
+outbound `connect` destinations only. `L4Protocol` is `Tcp | Udp`, serialized
+lowercase. `MappingSpec { protocol, listen, target }` is the neutral mapping
+description passed to `frontend::bind`. `PeerAddr` is `Socket | Path | P2p`.
 
 ### 4.3 EndpointContext merge
 
-`EndpointContext::build(endpoint_cfg, app_config)` produces the effective
-runtime context for one endpoint:
-
-```
-Endpoint { scheme, host, port, path, query }
-dns_resolver   : CachedDnsResolver from effective DnsConfig
-dialer         : DefaultDialer (or ProxyDialer wrapping DefaultDialer if proxy configured)
-dialer_config  : effective DialerConfig (used for heartbeat/idle/connect timeouts)
-tls_config     : Option<TlsConfig>
-http_headers   : Option<HashMap<String, String>>
-```
-
-Merge order for `dns`, `dialer`, and `tls` fields is
-**endpoint override → global → built-in default**. TLS is activated purely by
-the scheme (`https`, `wss`, `h3`, `quic`, `wss+unix`); a `tls` block on any
-other scheme is an error. When no SNI is configured, the endpoint host is used.
-`http_headers` merges tunnel-level headers over endpoint-level headers,
-overriding keys case-insensitively. A configured `Host` header overrides the
-default `host:port` authority.
-Helpers `heartbeat_interval()`, `idle_timeout()`, `connect_timeout()`, and
-`udp_idle_timeout()` return the effective values used by runtime timers
-(`udp_idle_timeout()` defaults to `DEFAULT_UDP_IDLE_TIMEOUT = 30s`).
+`EndpointContext::build_for_tunnel(endpoint_cfg, app_config)` produces the
+effective runtime context for one endpoint: endpoint, DNS resolver, dialer,
+effective dialer config, TLS config, and HTTP headers. Merge order for `dns`,
+`dialer`, and `tls` is **endpoint override → global → built-in default**. TLS is
+activated by the scheme (`https`, `wss`, `h3`, `quic`, `wss+unix`); a `tls` block
+on any other scheme is an error. `http_headers` merge case-insensitively with
+tunnel-level values overriding endpoint-level ones. Helpers return the
+effective heartbeat, idle, connect, and UDP idle timeouts.
 
 ### 4.4 Validation rules
 
-`ConfigLoader::validate` is executed at every startup and by `--check`:
+`ConfigLoader::validate` runs at every startup and under `--check`:
 
-- At least one server listener or one tunnel must exist. Empty `{}` fails.
-- `worker_threads >= 1`; log level in `trace|debug|info|warn|error`; output in
-  `stdout|stderr`.
+- At least one server listener or one tunnel must exist.
+- `worker_threads >= 1`; log level and output are in their allowed sets.
 - Tokens are non-empty and at most 256 bytes (`TOKEN_MAX_LEN`).
-- `pool_size >= 1`, `retry.delay > 0`, `retry.max_retries > 0`,
-  `dns.cache_capacity >= 1`.
-- `http_headers` header names and values are validated fail-fast: header names
-  cannot be empty and must conform to RFC 9110 token syntax; values must not
-  contain forbidden control characters or CRLF injection.
-- Server `default_target` parses; `certificate` and `key` come as a pair and
-  PEM files are readable and valid; certificates are rejected if every
-  listener is plaintext.
-- TLS version strings are `1.2` or `1.3` and the min is not above max.
-  mTLS certificate/key and CA files are validated.
-- All mapping `listen` / `target` values parse; when `protocol == udp`, `unix://`
-  addresses are rejected on both `listen` and `target`.
-- Forward `(protocol, listen)` pairs are unique across all tunnels (same-port
-  TCP and UDP forward mappings are permitted); tunnel tags are unique and
-  non-empty.
-- Endpoint schemes are in the supported set; detailed endpoints may not
-  configure `tls` on a non-TLS scheme; all DNS resolvers parse;
-  `EndpointContext::build` succeeds.
-- Effective `idle_timeout > heartbeat_interval` after defaults are merged,
-  checked for global dialer, server, and each tunnel.
-- Any configured `udp_idle_timeout` (`dialer`, `server`, `endpoint.dialer`, or
-  `mappings[]`) must be greater than `0`. It is not restricted by
-  `heartbeat_interval` because UDP NAT session expiry tracks datagram activity
-  independently of transport probes.
-- Any configured `dialer.proxy` (global or per-endpoint) must parse as a valid
-  `http`, `https`, `socks5`, or `socks5h` URL. Configuring a proxy on a
-  QUIC/HTTP/3 endpoint (`h3://`, `quic://`) fails validation fast.
-- `multiplex` and `failover` sections are rejected unconditionally with a
-  message stating they are not wired into the data path.
+- `pool_size >= 1`, retry fields and DNS cache capacity are positive.
+- HTTP header names and values are validated against RFC 9110 token syntax and
+  CRLF/control-character injection.
+- Server `default_target`, certificate/key pairs, PEM validity, key/cert
+  matching, and TLS version bounds are checked.
+- Mapping `listen` / `target` values parse; `unix://` is rejected for UDP.
+- Forward `(protocol, listen)` pairs and tunnel tags are unique.
+- Endpoint schemes are supported; DNS resolvers parse; `EndpointContext` builds.
+- Effective `idle_timeout > heartbeat_interval` after defaults are merged;
+  configured `udp_idle_timeout` must be positive.
+- `dialer.proxy` must parse as `http`, `https`, `socks5`, or `socks5h`; proxies
+  are rejected on QUIC/HTTP/3 endpoints.
+- `multiplex` and `failover` sections are currently rejected as not wired into
+  the data path (see [Section 13](#13-not-wired-into-the-runtime-data-path)).
 
 ---
 
@@ -297,18 +257,14 @@ Helpers `heartbeat_interval()`, `idle_timeout()`, `connect_timeout()`, and
 
 `backend/mod.rs` owns the relay-channel interface; `transport/` contains only
 driver implementations and re-exports these traits for existing import paths.
-`backend/registry.rs` owns `TransportRegistry`.
 
 ```rust
-// backend/mod.rs
 pub struct StreamMetadata {
     pub mode: TunnelMode,
     pub session_id: Option<String>,
     pub target: Option<TargetAddr>,
-    #[serde(default)]
-    pub pool_idle: bool,
-    #[serde(default)]
-    pub protocol: L4Protocol,
+    #[serde(default)] pub pool_idle: bool,
+    #[serde(default)] pub protocol: L4Protocol,
 }
 pub type AcceptOutput = Result<(IoChannel, StreamMetadata), TunnelError>;
 
@@ -344,25 +300,12 @@ pub trait TransportDriver: Send + Sync + 'static {
 ```
 
 `BoxFuture` is a boxed, `Send`, lifetime-bound future; the traits avoid
-`async_trait`. `connect_pooled` is required: the old default silently omitted
-the `x-tunnel-pool: idle` marker and produced a normal data stream. There is a
-single `build_listener` carrying the root `CancellationToken`; the previous
-`build_listener` / `build_listener_with_cancel` pair and its legacy fallback are
-gone. `protocol_scheme()` was removed — it had no call sites. The single-shot
-`accept_one` helper for `TransportListener` is a free function in `backend`,
-not a trait default; `GenericListener` keeps its own concrete convenience
-method.
-`TransportListener::shutdown()` is the explicit async termination boundary for
-listener-owned tasks.
-
-`IoChannel` is the one I/O product both sides hand to core. It implements
-`AsyncRead`, `AsyncWrite`, and `TunnelStream` by delegating to its stream
-variant, so the stream-only control plane (pool, session manager, control
-framing) keeps its borrowed-style calls. `IoChannel::into_stream()` is the
-explicit by-value conversion used when a boxed stream is required; on a
-datagram channel it returns `TunnelError::UnsupportedChannel`. This is the only
-place the backend can grow a second I/O shape, and it is shared by `connect`
-and `accept`.
+`async_trait`. `connect_pooled` is mandatory: the old default silently omitted
+the `x-tunnel-pool: idle` marker. `TransportListener::shutdown()` is the
+explicit async termination boundary for listener-owned tasks. `IoChannel` is
+the single I/O product on both sides; `IoChannel::into_stream()` is the explicit
+by-value conversion for stream-only control paths and returns
+`UnsupportedChannel` on a datagram channel.
 
 ### 5.2 TunnelStream and stream capabilities
 
@@ -372,112 +315,71 @@ and `accept`.
 ```rust
 pub struct StreamCaps { pub owned_write: bool, pub half_close: bool }
 // Default: owned_write = false, half_close = true.
+
 pub trait TunnelStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {
     fn caps(&self) -> StreamCaps;
     fn poll_write_owned(&mut self, cx: &mut Context<'_>, chunk: Bytes)
-        -> Poll<io::Result<usize>>;   // default: poll_write(cx, &chunk)
+        -> Poll<io::Result<usize>>;
     fn poll_send_ping(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
     fn last_activity_ms(&self) -> Option<u64>;
     fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus>;
 }
 ```
 
-`StreamStreamPump` reads `caps()` once per direction and selects the owned or
-borrowed write path; `caps().half_close` replaces the old
-`supports_half_close()` method. The previous pair
-`consumes_owned_write()` + `poll_write_bytes()` was replaced by this single
-query so that the owned path cannot be left unselected: `WsTunnelStream` had a
-zero-copy owned write implementation that the relay never called.
-`poll_write_owned` keeps a borrowed default because byte-oriented transports
-such as TCP and TLS have nothing to retain; QUIC and H3 retain `Bytes` and
-advertise `owned_write = true`.
+The relay reads `caps()` once per direction and selects the owned or borrowed
+write path. QUIC and H3 retain `Bytes` and advertise `owned_write = true`; byte
+streams use the borrowed default.
 
 QUIC tuning lives in the top-level `quic` config block: `mtu_upper_bound`
 (default 8192), `immediate_ack` (default false), and `congestion`
-(`bbr` / `cubic` / `new_reno`, default `bbr`). `mtu_upper_bound` sets the
-advertised UDP payload size and PLPMTUD search ceiling; initial MTU stays at
-quinn's safe 1200-byte default, so ordinary Ethernet and IPv6 paths still handshake.
-`immediate_ack` defaults to false to adhere to RFC 9000 delayed ACK behavior,
-protecting asymmetric WAN and mobile links from reverse-path ACK saturation.
-`congestion` defaults to BBR for model-based rate/RTT tracking that is resilient
-against non-congestive packet loss. Transports also enable round-robin stream
-send fairness and an expanded 64 KiB crypto buffer for lossy handshakes.
-`AppConfig.quic` flows into both `EndpointContext` connectors and `ServerRunner`
-listeners. Initial RTT, loss thresholds, and congestion-controller internals are
-deliberately not config surface.
+(`bbr` / `cubic` / `new_reno`, default `bbr`). Transports enable round-robin
+stream send fairness and an expanded 64 KiB crypto buffer. Dialing a QUIC
+endpoint races all addresses returned by the configured DNS strategy, preserving
+the strategy's family filtering and preference order.
 
 Every QUIC connection carries one `QuicSessionHandle` shared by the connector
-cache, accepted relay streams and listener handlers. The handle owns the UDP
-datagram-progress check, the `dead` flag and the single `conn.close()` path, so
-forward and reverse paths agree on when a session is unusable. A stream that
-detects a stalled session reports `Dead` and retires the shared session; the
-next connector call replaces the cached connection. Dialing a QUIC endpoint races all addresses returned by the configured DNS
-strategy concurrently instead of committing to the first DNS record; the
-strategy's family filtering and preference order are preserved because the
-connector does not reorder the resolver output. This removes single-record
-bad-A/AAAA failures without adding a config knob.
-
-`BufferedTlsStream` (one-byte pushback) is still present: TLS drivers require
-it. `impl TunnelStream for Box<dyn TunnelStream>` was removed because no
-production path boxes a boxed stream; `IoChannel` is the only forwarding layer
-in the data path.
+cache, accepted relay streams, and listener handlers. The handle owns the UDP
+datagram-progress check, the `dead` flag, and the single `conn.close()` path.
+The TX-without-RX detector uses a sticky latch: the first TX-only sample starts
+`stalled_since` and anchors `stall_start_tx`; any later TX growth plus ten
+seconds without RX marks the session dead. RX growth clears the latch. No
+component outside the handle closes the connection.
 
 `heartbeat_timing(last_activity_ms, now, heartbeat_interval, idle_timeout)`
-computes whether a probe is needed. Probes never refresh liveness by
-themselves; inbound frames and real outbound data do.
-
-WebSocket has no native transport-level half-close; culvert encodes half-close
-FIN as an in-band zero-length binary frame (`caps().half_close == true`).
-`poll_check_alive(cx)` uses a zero-capacity `ReadBuf` to drive the underlying
-`poll_read` state machine non-destructively, ensuring that in-band FIN frames and
-in-flight data frames are never swallowed during idle liveness sweeps.
-
-Liveness is a read-side question. A local half-close (`fin_queued` / `fin_sent`)
-or a queued RFC 6455 Close reply means "this direction cannot write any more",
-not "the stream is dead": the relay sets those flags as soon as one direction
-drains and may still be streaming the opposite direction for a long time.
-Reporting `Dead` in that window aborts the relay with "unresponsive to
-heartbeats" and truncates the response. Only a failed write half
-(`WriteState::Failed`) or a broken/failed read state is fatal. The hook never
-polls the in-flight write future itself: `poll_read` performs the opportunistic
-control flush, and `poll_check_alive` inspects the write state it leaves behind.
-`poll_send_ping` likewise stops emitting probes after a local FIN, without
-marking the stream dead.
+computes whether a probe is needed. Probes never refresh liveness by themselves;
+inbound frames and real outbound data do. `poll_check_alive` is non-destructive:
+a zero-capacity `ReadBuf` drives the normal `poll_read` state machine and never
+polls an in-flight write future. WebSocket encodes the logical half-close FIN as
+an in-band zero-length binary frame; a local FIN or queued Close reply is not
+liveness-dead.
 
 ### 5.3 Driver registry
 
-`backend::registry::TransportRegistry::default()` (re-exported from
-`transport::registry`) registers three drivers:
+`backend::registry::TransportRegistry::default()` registers three drivers:
 
 | Driver | Schemes | Implementation |
 | :--- | :--- | :--- |
-| `WsTransportDriver` | `ws`, `wss` | `hyper` HTTP/1.1 + `fastwebsockets` Upgrade; `WsTunnelStream`. Optional rustls TLS. |
-| `H3TransportDriver` | `h3`, `https`, `quic` | `quinn` + `h3`; `H3TunnelStream` for CONNECT streams, `QuinnTunnelStream` for raw bidirectional streams. |
+| `WsTransportDriver` | `ws`, `wss` | hyper HTTP/1.1 + fastwebsockets Upgrade; `WsTunnelStream`. Optional rustls TLS. |
+| `H3TransportDriver` | `h3`, `https`, `quic` | quinn + h3; `H3TunnelStream` for CONNECT streams, `QuinnTunnelStream` for raw bidirectional streams. |
 | `UdsTransportDriver` | `ws+unix`, `wss+unix` | HTTP/1.1 Upgrade over a Unix domain socket; optional TLS; `chmod` handling. |
 
-`create_connector` dispatches by `EndpointContext.endpoint.scheme`;
-`create_listener` dispatches by the parsed `ServerListenSpec.scheme` and passes
-the root cancellation token. Unsupported schemes return
-`TunnelError::UnsupportedScheme`.
+`create_connector` dispatches by endpoint scheme; `create_listener` dispatches by
+the parsed `ServerListenSpec.scheme` and passes the root cancellation token.
 
 ### 5.4 Handshake metadata
 
 | Header | Meaning |
 | :--- | :--- |
-| `x-tunnel-auth` | Pre-shared token on WebSocket/UDS; also sent by HTTP/3 clients. |
+| `x-tunnel-auth` | Pre-shared token on WebSocket/UDS; also sent by H3 clients. |
 | `authorization: Bearer …` | Pre-shared token on HTTP/3 `CONNECT` requests. |
 | `x-tunnel-mode` | `forward`, `reverse-ctrl`, `reverse-data`. |
 | `x-session-id` | Reverse data-stream pairing key. |
 | `x-target-host`, `x-target-port`, `x-target-path` | Split target form (WebSocket/UDS). |
 | `x-tunnel-target` | Unified `TargetAddr` string (HTTP/3). |
 | `x-tunnel-pool: idle` | Marks a pre-warmed stream awaiting activation. |
-| `x-tunnel-proto` | `tcp` (default) or `udp`; transmitted on WebSocket, UDS, and HTTP/3 handshakes. |
+| `x-tunnel-proto` | `tcp` (default) or `udp`; sent on WS, UDS, and H3 handshakes. |
 
-`WsHandshakeHeaders` encodes and decodes these headers and produces
-`StreamMetadata` (with `protocol` defaulting to `L4Protocol::Tcp` when
-omitted). On HTTP/3 listeners, equivalent headers are read from the `CONNECT`
-request. On raw QUIC, the same `StreamMetadata` (including `protocol`) is
-serialized with MessagePack (`#[serde(default)]` for compatibility) and sent
+On raw QUIC the same `StreamMetadata` is serialized with MessagePack and sent
 in a length-prefixed handshake:
 
 ```
@@ -489,597 +391,391 @@ The server caps `auth_len` at 1024 bytes and `meta_len` at 65536 bytes.
 
 ### 5.5 Ingress acceptance
 
-- WebSocket/UDS listeners check the request path first (`404` on mismatch),
-  then parse handshake headers (`401` on malformed), then compare the token in
-  constant time (`403` on mismatch), then perform the HTTP Upgrade. Invalid
-  upgrade requests get `400`.
-- HTTP/3 listeners check the path (`404`), read the token from `authorization`
-  first and fall back to `x-tunnel-auth` (`401`), accepting a raw token or a
-  `Bearer `-prefixed value, parse mode/target/session/pool headers, and respond
-  `200 OK` before relaying.
-- Raw QUIC listeners compare the token from the binary handshake in constant
-  time and close the stream on mismatch; no HTTP headers are involved.
-- `common::auth::constant_time_token_eq` copies both values into fixed 256-byte
-  buffers, hashes them with SHA-256, and compares with `subtle::ConstantTimeEq`;
-  values longer than 256 bytes are rejected without early length leakage.
+- WebSocket/UDS listeners check path (`404`), parse headers (`401`), compare
+  the token in constant time (`403`), then perform the HTTP Upgrade.
+- H3 listeners check path (`404`), read the token from `authorization` with
+  `x-tunnel-auth` fallback (`401`), parse metadata, and respond `200 OK`.
+- Raw QUIC listeners compare the binary token in constant time.
+- `common::auth::constant_time_token_eq` hashes both values into fixed 256-byte
+  buffers and compares with `subtle::ConstantTimeEq`.
 
 ### 5.6 TLS, DNS, and dialing
 
-- `dialer::tls::TlsConfigBuilder` builds rustls client and server configs. It
-  loads custom CAs, mTLS client certificate/key, enforces server-side client
-  certificate verification (`WebPkiClientVerifier`) when `client_ca_certificate`
-  or `client_auth` (`required` / `optional`) is configured on server TLS,
-  applies version bounds and ALPN, installs a no-verification verifier when
-  `insecure` is set, and generates an ephemeral self-signed certificate (`rcgen`)
-  when no server certificate/key pair is provided.
-- ALPN defaults: `h3` for HTTP/3 endpoints, `quic` for raw QUIC. The
-  H3 listener ensures `h3` is first in the server ALPN list and adds
-  `quic` for `quic://` listeners.
-- `dialer::dns::CachedDnsResolver` wraps `hickory-resolver`, with a bounded
-  cache (1024 entries, 300 s TTL) and a system/libc fallback. Resolver types
-  are `system`, `udp`/`dns`, `tcp`, `tls` (DoT), `https` (DoH). Structured
-  objects and URL strings (`system://0.0.0.0`, `udp://1.1.1.1:53`,
-  `https://1.1.1.1?sni=cloudflare-dns.com`, `tls://8.8.8.8?sni=dns.google`,
-  `tcp://…`) are both accepted.
-- `dialer::unified::DefaultDialer` resolves the endpoint host, applies the
-  configured strategy, races multiple addresses with RFC 8305 staggering
-  (250 ms), applies `connect_timeout`, `tcp_nodelay`, and `bind_interface`.
-  `common::net::tune_tcp_stream` only sets `TCP_NODELAY`.
-  `bind_interface` requires `SO_BINDTODEVICE` and is rejected elsewhere by
-  `platform::validate_bind_interface`.
-- `dialer::proxy::ProxyDialer` wraps the inner `Dialer` when `dialer.proxy` is
-  configured (`http://`, `https://`, `socks5://`, `socks5h://`). It establishes
-  a TCP connection to the proxy server via the inner dialer (using the local
-  `DnsResolver` exclusively for the proxy host), then executes an HTTP `CONNECT`
-  or SOCKS5 handshake (`ATYP = 0x03` domain name mode, RFC 1928/RFC 1929) passing
-  the target endpoint hostname directly to the proxy. Local DNS resolution is
-  never performed for the destination endpoint, preventing DNS leaks and
-  poisoning. Transports (`ws://`, `wss://`) run transparently over the returned
-  stream without modification.
+- `dialer::tls::TlsConfigBuilder` builds rustls configs with CA loading, mTLS,
+  `WebPkiClientVerifier`, version bounds, ALPN, optional no-verification, and
+  ephemeral self-signed server certificates (`rcgen`).
+- ALPN defaults: `h3` for HTTP/3, `quic` for raw QUIC.
+- `dialer::dns::CachedDnsResolver` wraps `hickory-resolver` with a bounded cache
+  (1024 entries, 300 s TTL) and system/libc fallback. Resolver types are
+  `system`, `udp`/`dns`, `tcp`, `tls` (DoT), and `https` (DoH).
+- `dialer::unified::DefaultDialer` races resolved addresses with RFC 8305
+  staggering (250 ms), applies `connect_timeout`, `tcp_nodelay`, and
+  `bind_interface`.
+- `dialer::proxy::ProxyDialer` wraps the inner dialer for `http`, `https`,
+  `socks5`, and `socks5h` proxies. It resolves only the proxy host locally;
+  the destination hostname is passed to the proxy, preventing DNS leaks.
 
-### 5.7 Unified Certificate Management and Dynamic Hot-Reloading (`cert` module)
+### 5.7 Certificate hot reload
 
-- **Centralized Reading & Pairing Validation (`cert::reader`)**:
-  All reading, parsing, and syntax validation of PEM certificate chains, private keys,
-  and root CA stores are unified in `cert::reader`. Ad-hoc `rustls_pemfile` calls in
-  `config::loader` and `dialer::tls` delegate directly to `cert::reader`. In addition to
-  PEM syntax validation, `cert::reader` validates that private keys strictly match the
-  public key in the certificate's `SubjectPublicKeyInfo`, preventing mismatched key/cert
-  misconfigurations at load and reload time.
-- **Asynchronous File Watching & Debouncing Strategy (`cert::watcher`)**:
-  Filesystem change events for watched certificate and private key files (e.g. copied by
-  Caddy event hooks or external ACME tools) are captured via cross-platform `notify`.
-  To prevent race conditions during multi-file updates (e.g. `cert.pem` and `key.pem`
-  being written sequentially), events feed into an asynchronous Tokio debouncing loop:
-  - Any write/create/modify event resets a quiet-period timer (default 1 s).
-  - Only when the quiet window elapses without new events does the reload pipeline trigger.
-  - Basic file monitoring tracks target files or their parent directories without complex
-    platform-specific symlink hacks, keeping logic maintainable, portable, and reliable.
-- **Two-Phase Safe Reload Pipeline (`cert::manager`)**:
-  - *Phase 1 (Staging & Validation)*: The reloader reads the updated files from disk into
-    an ephemeral staging object. It verifies PEM syntax, checks certificate validity
-    dates (`not_before` / `not_after`), and validates private key / certificate public key
-    pairing. If any step fails (e.g. truncated file or temporary disk lock), the reload
-    aborts, logs an actionable `warn!`, keeps the currently active valid certificate
-    untouched, and schedules a retry. Invalid files never disrupt live traffic.
-  - *Phase 2 (Atomic In-Memory Commit)*: Upon successful validation, the new `Arc<CertifiedKey>`
-    or `Arc<RootCertStore>` is committed atomically to the dynamic resolver's read-mostly
-    lock (`parking_lot::RwLock`).
-- **Decoupled Dynamic Resolution & Zero Downtime (`cert::resolver`)**:
-  - `DynamicCertResolver` implements `rustls::server::ResolvesServerCert`.
-  - `DynamicClientCertVerifier` implements `rustls::server::danger::ClientCertVerifier`.
-  - Transports (`ws`, `h3`, `quic`, `uds`) build their `rustls::ServerConfig` with
-    `DynamicCertResolver`. Handshakes dynamically acquire the latest certificate in
-    memory with zero lock contention and zero disk I/O.
-  - Existing open connections and active tunnel streams continue uninterrupted. Network
-    listeners require no restarts, rebinds, or connection drops.
-- **Decoupled Event Notification Bus (`cert::events`)**:
-  An internal broadcast channel (`tokio::sync::broadcast`) emits `CertEvent::ReloadSuccess`
-  and `CertEvent::ReloadFailed`. External consumers (such as logging, metrics, audit, or
-  testing harnesses) subscribe to events without coupling to transport or reloader internals.
-  All background tasks respect `CancellationToken` for graceful shutdown.
-- `platform::GenericListener` is either `Tcp(Arc<TcpListener>)` or
-  `Uds(Arc<Mutex<PlatformUdsListener>>)`, exposed via `frontend::tcp::TcpFrontend`.
-- `frontend::udp::UdpFrontend` binds a single `tokio::net::UdpSocket`, runs a
-  background packet demultiplexer task keying client flows by `SocketAddr`,
-  spawns one bounded `mpsc` session (`UDP_SESSION_CHANNEL_SIZE = 256`, drop-tail
-  on burst saturation) wrapped in `UdpFlowChannel` (`IoChannel::Datagram`) for
-  each newly observed peer, and emits `FrontendAccept`. Dropping
-  `UdpFlowChannel` (e.g. on NAT idle expiration) removes that `(peer_addr,
-  flow_id)` entry under an identity guard so a subsequent packet from the same
-  client opens a fresh tunnel flow cleanly.
-- `platform::ConnectedUdpSocket` binds an ephemeral local UDP socket matching the
-  resolved target IP family (`0.0.0.0:0` or `[::]:0`), connects it to the
-  target `SocketAddr`, and implements `DatagramIo` for zero-header batched I/O;
-  `platform::connect_target_channel` / `connect_target_channel_str` dispatch
-  `L4Protocol::Tcp` to TCP/UDS and `L4Protocol::Udp` to `ConnectedUdpSocket`.
-- Both forward and reverse listeners bind through `frontend::bind`, so no
-  runtime module binds a mapping listener directly. `normalize_uds_path` handles
-  `unix://`, `ws+unix://`, `wss+unix://`, query strings, and drive-letter paths.
-  The Windows UDS listener uses `uds_windows`, WSA events, and a dedicated OS
-  accept thread whose handle is owned and joined.
+- `cert::reader` centralizes PEM parsing and validates key/certificate pairing.
+- `cert::watcher` captures filesystem events via `notify` and debounces them in
+  an async loop so multi-file updates are treated as one event.
+- `cert::manager` stages and validates updates, then atomically commits new
+  `Arc<CertifiedKey>` / `Arc<RootCertStore>` values. Invalid files never disrupt
+  live traffic.
+- `cert::resolver` implements `DynamicCertResolver` and
+  `DynamicClientCertVerifier`; handshakes read the current in-memory value with
+  no disk I/O and no listener restart.
+- `cert::events` broadcasts `ReloadSuccess` / `ReloadFailed` to subscribers.
 
-### 5.7 Three-layer boundaries and the Pump registry
+### 5.8 Frontend and platform primitives
 
-This section defines "independent". The dependency rule is one-way:
-`frontend/`, `backend/`, and `core/` each depend on `io/`; none of them imports
-another part's implementation. `io/` contains no business logic and no
-reference to a concrete driver. `transport/` drivers implement
-`TransportDriver` and never appear in `core/`.
-
-```rust
-// io/channel.rs
-pub enum ChannelKind { Stream, Datagram }
-pub enum IoChannel {
-    Stream(Box<dyn TunnelStream>),
-    Datagram(Box<dyn DatagramIo>),
-}
-pub struct FlowKey { pub peer: PeerAddr, pub target: Option<TargetAddr>, pub protocol: L4Protocol }
-pub struct Datagram { pub flow: FlowKey, pub payload: Bytes }
-pub trait DatagramIo: Send + Unpin + 'static {
-    fn poll_recv(&mut self, cx: &mut Context<'_>, batch: &mut [Datagram])
-        -> Poll<io::Result<usize>>;
-    fn poll_send(&mut self, cx: &mut Context<'_>, batch: &[Datagram])
-        -> Poll<io::Result<usize>>;
-}
-
-// io/pump.rs
-pub struct PumpRequest { pub frontend: IoChannel, pub backend: IoChannel }
-pub struct PumpCtx {
-    pub cancel: CancellationToken,
-    pub heartbeat_interval: Duration,
-    pub idle_timeout: Duration,
-}
-pub trait Pump: Send + Sync + 'static {
-    fn run<'a>(&'a self, req: PumpRequest, ctx: PumpCtx)
-        -> BoxFuture<'a, Result<(u64, u64), TunnelError>>;
-}
-pub struct PumpRegistry; // register(kind_pair, pump), lookup(kind_pair)
-pub fn pump_registry() -> &'static PumpRegistry;
-
-// core/serve.rs
-pub async fn serve(req: PumpRequest, ctx: PumpCtx)
-    -> Result<(u64, u64), TunnelError>;
-```
-
-`serve` computes `(req.frontend.kind(), req.backend.kind())`, asks
-`PumpRegistry::lookup`, and returns `TunnelError::UnsupportedChannel` when no
-pump is registered. It contains no `match` on `IoChannel` variants and no
-read/write calls. `PumpRegistry` is a process-wide
-`RwLock<HashMap<(ChannelKind, ChannelKind), Arc<dyn Pump>>>` seeded at first use
-with `StreamStreamPump` for `(Stream, Stream)`, `DatagramStreamPump` for
-`(Datagram, Stream)`, `StreamDatagramPump` for `(Stream, Datagram)`, and
-`DatagramDatagramPump` for `(Datagram, Datagram)`; `register()` allows adding or
-overriding pairs. `FlowKey` provides per-datagram flow metadata for multiplexed
-`DatagramIo` channels; current flow-scoped `DatagramIo` drivers
-(`UdpFlowChannel`, `ConnectedUdpSocket`) already route by their captured peer
-address and ignore `Datagram.flow`, while `[u16 len | payload]` stream framing
-drops `FlowKey` across stream hops (`Default::default()` on decode).
-
-The frontend is an abstraction, not a concrete enum:
-
-```rust
-// frontend/mod.rs
-pub struct FrontendAccept {
-    pub channel: IoChannel,
-    pub peer: PeerAddr,
-}
-pub trait Frontend: Send {
-    fn accept(&mut self, slot: &mut ReusableFutureRef<'static, FrontendOutput>);
-    fn shutdown<'a>(&'a mut self) -> BoxFuture<'a, ()>;
-}
-pub async fn bind(spec: &MappingSpec) -> Result<Box<dyn Frontend>, TunnelError>;
-```
-
-`Frontend` does not declare a channel kind: `IoChannel::kind()` on the accepted
-channel is the single authoritative key that `core::serve` dispatches on, so a
-declared kind could not drift out of sync with what the frontend actually
-yields. `FrontendAccept` carries no `FlowKey` either — stream flows use `peer`,
-and current UDP frontends hand each visitor flow a dedicated flow-scoped
-`DatagramIo` channel (while `Datagram.flow` carries optional metadata for future
-multiplexed datagram drivers).
-
-`frontend::bind` consults `FrontendRegistry` keyed by `L4Protocol`, with both
-`TcpFrontendFactory` (`L4Protocol::Tcp`) and `UdpFrontendFactory` (`L4Protocol::Udp`)
-registered. Both `run_forward_mapping` and `ServerRunner::handle_reverse_control`
-construct `MappingSpec::new(protocol, listen, target)`. Adding complete UDP
-support validated the three-layer architecture directly: `core/serve.rs` `serve()`
-required zero modifications.
+- `frontend::Frontend` owns its listener and exports
+  `accept(&mut ReusableFutureRef<'static, FrontendOutput>)` and async
+  `shutdown()`. The reusable slot lets an in-flight accept survive a competing
+  `select!` branch. `FrontendRegistry` maps `L4Protocol` to a factory.
+- `frontend::udp::UdpFrontend` binds one UDP socket, demultiplexes flows by
+  `SocketAddr`, and gives each peer a bounded `UdpFlowChannel`
+  (`UDP_SESSION_CHANNEL_SIZE = 256`, drop-tail under burst).
+- `platform::ConnectedUdpSocket` connects an ephemeral socket to the target
+  address and implements zero-header batched `DatagramIo`.
+- `platform::GenericListener` covers TCP and UDS; the Windows UDS listener uses
+  an owned and joined OS accept thread.
 
 ---
 
-## 6. Server Data Path
+## 6. Architecture: Coordinator, IO Task, and State
 
-`ServerRunner::run` parses `ServerListenSpec`s, spawns one accept-loop task per
-listener with the effective server TLS config, heartbeat interval, and idle
-timeout, and tracks accepted connections in a nested `TaskTracker`.
+### 6.1 Two-level state model
 
-For each accepted `(channel, StreamMetadata)` — an `IoChannel` from the backend
-and its handshake metadata:
+**Internal state** belongs to the IO Task: read/write futures, pending buffers
+and flush progress, TCP EOF and half-close handling, transport activity clocks
+and keepalive probes, local errors, and waker state. Rust `async`/`await` and
+`Future` manage this state; the design does not build a second explicit state
+machine for it.
+
+**External state** is owned by the Coordinator and describes the lifecycle
+phase and resource ownership visible to scheduling and shutdown:
+
+| State | Meaning |
+| :--- | :--- |
+| `Empty` | The task owns no I/O resource. It waits for `Assign`, `SupplyIdle`, or `Shutdown`. |
+| `Idle` | The task owns a live `PooledTransport` and drives local keepalive and age-based eviction. |
+| `Connecting` | The task owns a `JobId` and input resource; it acquires or activates a backend stream. |
+| `Active` | Both ends are paired; the task exclusively runs the hot-path relay. |
+| `Closing` | The task drains buffered work and releases resources before recycling or exit. |
+| `Closed` | The task event loop has ended; the `JoinHandle` is being reaped. |
+
+Half-close is an **internal** data-plane state, not an external task state.
+
+The two levels may briefly disagree — for example, internal state may have
+reached EOF while external state is still `Active`. That lag is acceptable only
+if invalidated resources are never reallocated, old tasks never touch new-task
+resources, resources are never released early or lost, and state updates never
+break ownership.
+
+### 6.2 Coordinator Actor
+
+The Coordinator is the only writer of external state. It:
+
+- owns the task collection and every `JoinSet` / `JoinHandle`; no task is detached;
+- maintains each task's external state;
+- handles lifecycle events (`Active`, completion, failure, cancellation);
+- drives background forward dialing through an embedded `DialDriver`;
+- coordinates tunnel-level `GracefulStop` and `ForceStop`.
+
+It does **not** perform TCP/QUIC IO, manage buffers, schedule each read/write,
+or implement protocol handling. Microtask handling is strictly synchronous:
+every `Microtask` mutates `StateEngine` and replies through non-blocking
+`oneshot` / `mpsc` operations, never `.await`. This is what lets the accept loop
+be bounded without wrapping every Coordinator call in a defensive timeout.
+
+The event loop uses two channels and one biased `select!`:
+
+- `micro_rx` (unbounded): high-priority, synchronous state synchronization;
+  drained with `while let Ok` at the top of every iteration.
+- `event_rx` (bounded, capacity 1024): external `assign`, `prewarm`,
+  `supply_transport`, queries, and shutdown requests.
+- cancel, dial completion, task completion, and drain deadline branches.
+
+The Coordinator must not become a new bottleneck: resource acquisition,
+activation handshakes, keepalive probes, and relay branches run inside IO Tasks,
+not serially in the Coordinator loop.
+
+### 6.3 IO Task and resource ownership
+
+`TaskPhase<W>` binds the external phase to its exact resource payload, so an
+illegal combination such as `(Idle, no transport)` is unrepresentable.
+`IoTask::run_loop` is a single event loop that dispatches directly on the
+current phase. Every `select!` inside it is `biased` and gives the directive
+channel priority over IO progress.
+
+Ownership rules:
+
+- Frontend listener: owned by the accept loop.
+- Frontend stream: transferred to exactly one IO Task at `accept`.
+- Idle backend stream: owned by the `Idle` IO Task until handed to `Connecting`.
+- Underlying reusable connection: owned by the connector/listener session
+  cache; stream and connection lifetimes are independent.
+- External state: owned by the Coordinator. Internal state: owned by the task.
+
+A transition commits only when the resource is in place. `Connecting -> Active`
+happens only after the backend stream is acquired and activation has succeeded.
+
+### 6.4 Identity and late-event protection
+
+| Identity | Scope |
+| :--- | :--- |
+| `TaskId(u64)` | A long-lived, recyclable worker slot, from spawn until `Closed`. |
+| `JobId(u64)` | One assigned connection cycle on that worker; cleared on recycle. |
+| `IdleId(u64)` | One idle-transport residency on the worker. |
+
+`Microtask::StateChanged` and `Microtask::RecycledToEmpty` carry `job_id`;
+`StateEngine` drops any event whose job does not match `entry.current_job`.
+Recycle (`* -> Empty`) and exit (`* -> Closed`) are distinct: recycling wakes
+only waiters for `Empty` and resolves waiters for older phases as
+`TargetClosed(Empty)`, preventing cross-generation hangs; waiters for `Closed`
+wake only on real exit. `PooledTransport` carries `session_id` for QUIC session
+sweep and `generation` for reverse reconnect filtering.
+
+### 6.5 Transport lifecycle and the idle pool
+
+Production traffic uses QUIC/HTTP/3, where a connection is long-lived and
+carries many independently created streams. Stream lifetime is not connection
+lifetime. This architecture therefore has no standalone `TransportPool` actor:
+
+- Idle pre-warmed or inbound streams live in `TaskPhase::Idle` and run their own
+  keepalive, activity clock, age limit, and eviction.
+- Forward background dialing is driven by the embedded `DialDriver` inside the
+  Coordinator's `select!`.
+- On `Assign`, an `Idle` task hands its stream directly to `Connecting`; if the
+  stream died locally in the same instant, it enters `Connecting` with
+  `transport: None` and the Coordinator supplies a replacement.
+- A stream whose activation fails is dropped, never returned to the idle pool.
+- Wrong-state streams are returned through `Microtask::ReturnTransport` without
+  blocking either side.
+- QUIC session death and reverse reconnect generation changes sweep matching
+  idle tasks through asynchronous `CloseTransport` directives.
+
+Transport streams are **one-shot** in this release: after a relay ends the
+stream is dropped rather than returned to `Idle`. A full application-layer
+half-close FIN handshake for transport recycling and task-level multiplexing are
+planned after the architecture stabilizes; the state-machine architecture no longer blocks
+either feature.
+
+### 6.6 State transition tables
+
+Every explicit state transition is defined by `State`, `Event`, `Guard`,
+`Action`, `Next State`, and `Failure`. Illegal transitions have an explicit
+result — rejection or ignore — rather than relying on execution order.
+
+`TunnelPhase` transitions:
+
+| From | Event | Guard / action | To |
+| :--- | :--- | :--- | :--- |
+| `Running` | `GracefulStop` | Stop accept, clear `DialDriver`, `Shutdown` on `Empty`/`Idle`, `Drain` on `Connecting`/`Active` | `Draining` |
+| `Running` / `Draining` | `ForceStop` or expiry of `drain_timeout` | Cancel root token | `ForceStopping` |
+| `Draining` / `ForceStopping` | `JoinSet` empty | Clear queues | `Stopped` |
+
+`ExternalState` transitions: `Empty -> Idle` (`SupplyIdle`), `Empty/Idle ->
+Connecting` (`Assign`), `Connecting -> Active` (activation OK), `Active ->
+Closing` (EOF, error, or drain), `Closing -> Empty` (recycle while running) or
+`Closed` (shutdown), `Idle -> Empty` (eviction or `CloseTransport`), and any
+phase to `Closed` on shutdown.
+
+### 6.7 Shutdown and cancellation contract
+
+Every IO Task is non-blocking at its boundary. Shutdown has distinct outcomes,
+not one generic `Cancelled`:
+
+1. **Normal end**: both directions reach EOF and write half-close.
+2. **IO error**: read/write failure or reset; release both sides with a reason.
+3. **Idle timeout**: no data activity within `idle_timeout` and no probe refresh.
+4. **Graceful stop**: stop accepting new work; `Connecting` tasks are cancelled;
+   `Active` tasks stop reading new data and flush buffered bytes within a
+   bounded `drain_timeout`, completing half-close so a QUIC `SendStream` is not
+   dropped without `poll_shutdown`.
+5. **Force stop**: exit immediately, drop channels, and await no internal
+   timeout or unfinished flush.
+
+Cancellation-safety checklist:
+
+- `Frontend::accept` / `TransportListener::accept` use `ReusableFutureRef` so an
+  in-flight accept or TLS handshake survives a competing `select!` branch.
+- Partially read bytes are either written inside the drain window or discarded
+  with the task; they never leak across tasks.
+- Stream wrappers must terminate background pump tasks promptly on drop rather
+  than blocking the outer join.
+
+Testable shutdown contract: a permanently `Pending` inner future still stops
+within milliseconds; stop does not wait for long internal timeouts to expire;
+no detached task or pool task remains; all handles are released deterministically;
+graceful stop during partial I/O or half-close preserves resource state; repeated
+stop is idempotent; connections arriving during shutdown are rejected before
+`Active`.
+
+---
+
+## 7. Runtime Data Paths
+
+### 7.1 Startup topology
+
+`TunnelSupervisor::run` starts one `ServerRunner` (if configured) and one
+`ClientRunner::run_tunnel_with_retry` worker per tunnel, all in a `JoinSet`.
+`ClientRunner::supervise_workers` cancels siblings on permanent failure and
+awaits every handle. `TunnelCluster::run` builds the forward and reverse runners
+for one tunnel with a shared transport registry.
+
+### 7.2 Forward mapping
+
+`ForwardRunner` binds a frontend through `frontend::bind`, prewarms `Empty`
+tasks if configured, then accepts into a `ReusableFutureRef` slot with bounded
+backoff. Each accepted `ForwardInput` is assigned to a `Coordinator`, which
+pops the freshest `Idle` task or an `Empty` slot, or spawns a new `Connecting`
+task. `ForwardWorkflow::connect` uses the carried idle stream or requests one
+from the Coordinator, activates it with `0xA5` / `0xA7` and waits for `0xAC`,
+falling back to a direct dial on failure. The resulting `ChannelRelay` runs as
+the `ActiveStage`.
+
+### 7.3 Server ingress
+
+`ServerRunner::run` creates one `Coordinator<ServerForwardWorkflow>` for all
+forward visitors and starts one accept loop per listener. Each accepted
+`(IoChannel, StreamMetadata)` is dispatched by mode:
 
 | `metadata.mode` | Branch |
 | :--- | :--- |
-| `Forward` | Resolve the target, dial it, relay. |
-| `Reverse` with `session_id` | Fulfill a pending reverse session in `SessionManager`. |
-| `Reverse` with `pool_idle` | Enqueue idle stream into the corresponding reverse listener's inbound pool via `SessionManager`. |
-| `Reverse` (control) | Run the reverse control channel handler. |
+| `Forward` | Assign to the forward Coordinator. The workflow resolves target from activation payload, metadata, or `default_target`, dials it, and relays. |
+| `Reverse` with `session_id` | Fulfill a pending reverse session in `ReverseSessionHub`. |
+| `Reverse` with `pool_idle` | Supply the stream to the matching reverse Coordinator as an `Idle` task. |
+| `Reverse` (control) | Run `ReverseControlSession`. |
 
-Forward target resolution order:
+Accept-loop branches are `biased`: cancellation first, then completed reverse
+tasks, then accept. A fatal accept error stops the listener; transient errors
+are backed off.
 
-1. `dynamic_target` from the activation packet (pooled stream only).
-2. `metadata.target` unless it is the pool dummy host `pool.idle`.
-3. `server.default_target`.
+### 7.4 Reverse control channel
 
-If none is available the stream is closed with a log message. Effective L4
-protocol (`effective_proto`) comes from `ACTIVATE_STREAM_UDP` (`Udp`) vs
-`ACTIVATE_STREAM_MAGIC` (`Tcp`) on pooled streams, or `metadata.protocol` on
-unpooled streams. Dialing uses
-`platform::connect_target_channel(&target, effective_proto)` (TCP/UDS stream or
-`ConnectedUdpSocket`). Both sides are handed to `core::serve(req, ctx)` with
-`idle_timeout` (`server.idle_timeout` for TCP, `server.udp_idle_timeout` for
-UDP), which dispatches `StreamStreamPump` or `DatagramStreamPump` / `StreamDatagramPump`.
-Stream-only branches (control framing, session fulfillment, idle pools) call
-`channel.into_stream()` at their own boundary.
+`ReverseControlSession` wraps the control stream in a `SignalingChannel` actor
+that owns heartbeat `Ping`/`Pong`, bounded frame timeouts (`reverse_frame_timeout`),
+and event delivery. The visitor loop consumes `RegisterReverse`, `RegisterAck`,
+`NewConnection`, and disconnect events from `SignalingReceiver`.
 
-### 6.1 Activation packet
+Control-channel sends are bounded inside `SignalingChannel`; the router also
+supports primary/standby failover and a `SendCommitGate` so pre-commit
+cancellation cannot put a frame on the wire after the caller has abandoned it.
+A `CommandDeduplicator` (capacity 256) drops repeated `NewConnection` session
+IDs before any backend work.
+
+`ReverseSessionHub` owns:
+
+- pending oneshot sessions keyed by session ID, with a guarded drop path;
+- reverse Coordinators keyed by `(protocol, listen_addr, tunnel_id)`, with a
+  generation counter;
+- grace slots for brief control-channel disconnects.
+
+`RegisterReverse` binds the visitor listener and registers the Coordinator
+before sending `RegisterAck`. The client clamps `pool_size` once and sends the
+effective value; the server derives its soft cap as `2 x pool_size`. Control
+events are prioritized above visitor accept in the biased select.
+
+### 7.5 Reverse activation and emergency promotion
+
+- **0-RTT pool path**: an idle reverse stream carries `0xA5` (TCP) or `0xA7`
+  (UDP) plus target; the client echoes `0xAC`, then dials the local target and
+  relays. One failed activation affects only that stream, never its QUIC
+  siblings.
+- **On-demand path**: the server allocates a session ID and sends
+  `NewConnection`. A single timed-out `NewConnection` cleans up only that
+  session; it never tears down the listener.
+- **Emergency promotion (`0xA6`)**: if the control channel drops, the server
+  promotes a pooled stream into a replacement signaling channel; the client
+  attaches it to the `SignalingRouter` without a full reconnect.
+- **Grace period**: if no pooled stream is available, the listener stays bound
+  for `reverse_grace_period(idle_timeout)` while a reconnecting control stream
+  reattaches, avoiding `EADDRINUSE`.
+
+### 7.6 Activation packet
 
 ```
 magic (1 byte) | length: u16 big-endian | UTF-8 target string (Forward mode only)
 ```
 
-Magic byte values:
-- `0xA5` (`ACTIVATE_STREAM_MAGIC`): TCP forward/reverse stream activation.
-- `0xA6` (`ACTIVATE_STREAM_PROMOTE`): emergency promotion of an idle reverse pool
-  stream into a replacement `SignalingChannel`.
-- `0xA7` (`ACTIVATE_STREAM_UDP`): UDP forward/reverse stream activation.
-- `0xAC` (`ACTIVATE_STREAM_ACK`): reverse worker round-trip activation acknowledgment byte.
+| Byte | Meaning |
+| :--- | :--- |
+| `0xA5` (`ACTIVATE_STREAM_MAGIC`) | TCP forward/reverse stream activation. |
+| `0xA6` (`ACTIVATE_STREAM_PROMOTE`) | Emergency promotion to a replacement control channel. |
+| `0xA7` (`ACTIVATE_STREAM_UDP`) | UDP forward/reverse stream activation. |
+| `0xAC` (`ACTIVATE_STREAM_ACK`) | Round-trip activation acknowledgment. |
 
-- In **Forward mode**: Produced by `ReplenishingStreamPool::encode_activation_with_proto`
-  on the client, written before any application data. The server reads the magic
-  byte, length and payload with `decode_activation_until_cancel` — no local
-  timeout, only peer EOF or cancellation — because the client owns the idle
-  stream's lifetime. It rejects lengths `>= 512`, parses the string with
-  `parse_target_addr`, and only then dials the target (TCP/UDS or
-  `ConnectedUdpSocket`). An invalid magic byte or a closed idle stream terminates
-  that connection.
-- In **Reverse mode**: The server writes `0xA5` (TCP) or `0xA7` (UDP) directly down
-  the popped idle reverse stream, flushes, and reads back `0xAC` (`ACTIVATE_STREAM_ACK`)
-  bounded by `reverse_frame_timeout(idle_timeout)` before pairing. The client worker
-  reads the magic byte (or `0xA6` to promote an idle stream to control signaling)
-  under `reverse_activation_wait_timeout(idle_timeout)`, echoes `0xAC` within
-  `reverse_ack_timeout(idle_timeout)`, and begins relaying. This
-  round-trip acknowledgment prevents silently dead (half-open) idle connections —
-  where server writes succeed into the local socket send buffer — from blackholing
-  visitors.
+All magic, length, and payload handling is bounded. The ACK closes the
+half-open window where a write succeeds only into the local send buffer.
 
-### 6.2 Reverse control channel, SignalingChannel & Inbound Pool
-
-`handle_reverse_control` decouples the physical transport stream from the visitor
-accept loop by wrapping the accepted stream into a `SignalingChannel` actor
-(`SignalingChannel::spawn`). This actor encapsulates `FramedControlStream`,
-autonomous keepalive heartbeats (`Ping`/`Pong`), derived bounded timeouts
-(`reverse_frame_timeout`), and idle deadline enforcement. The accept loop
-interacts with the channel purely via a decoupled `SignalingHandle` (bounded
-command transmission) and `SignalingReceiver` (yielding application-level control
-events: `RegisterReverse`, `RegisterAck`, `NewConnection`).
-
-1. `handle_reverse_control` receives `RegisterReverse { listen_addr, target_addr, pool_size, protocol }`
-   from `SignalingReceiver`, binds the requested TCP/UDS or UDP listener through
-   `frontend::bind(&MappingSpec::new(protocol, &listen_addr, &target_addr))`,
-   registers an `inbound_pool` keyed by `(protocol, listen_addr)` with
-   `SessionManager` **before** replying `RegisterAck` via `SignalingHandle` (the
-   client starts pre-warming immediately on the ack), and enters the accept loop.
-2. `pool_size` is the effective, already-clamped worker count, so the server's
-   soft cap is derived from the same number the client uses; both `pool_size`
-   and `protocol` carry `#[serde(default)]` for interoperability with older
-   peers. Registration of a new generation drains the previous pool, closing its
-   stale idle streams. Teardown removes the pool only if it is still the same
-   `Arc`, so an overlapping reconnect cannot delete the new generation.
-3. In the event loop, `SignalingReceiver::recv()` is prioritized above
-   `frontend.accept()` in `biased; select!`: this guarantees that control events
-   and disconnect alerts are handled promptly without starvation during visitor floods.
-   Protocol-level keepalive frames (`Ping` and `Pong`) are answered and driven
-   autonomously within the background `SignalingChannel` actor, completely
-   insulating the visitor accept loop from keepalive overhead.
-
-For each inbound connection or new UDP client flow on the reverse listener:
-
-1. **Fast path (0-RTT Pool)**: `pop_live(idle_timeout)` takes the newest idle
-   stream, drops entries older than the effective idle window, and verifies the
-   rest with `poll_check_alive`. To eliminate WAN RTT latency from the accept
-   loop, stream activation is offloaded directly into the spawned relay task in
-   `local_tracker`. The accept loop returns in 0 ms, allowing hundreds of visitors
-   or UDP NAT flows to be paired in parallel without blocking subsequent accepts.
-   `PumpCtx` passes `idle_timeout` for TCP or `udp_idle_timeout` for UDP.
-   - **Round-Trip Liveness ACK (`0xAC`)**: In the spawned task, the server writes
-     the activation magic (`0xA5` for TCP or `0xA7` for UDP), flushes, and reads
-     back `ACTIVATE_STREAM_ACK` (`0xAC`) bounded by `reverse_frame_timeout(idle_timeout)`.
-   - **Channel Failover to Signaling**: If activation fails (missing ACK, timeout, or
-     stream I/O error), the candidate is discarded. Because `TaskTracker` is not `Clone`
-     and spawned tasks cannot mutate accept-loop state, the visitor
-     `(visitor_stream, visitor_addr)` is sent through an `mpsc::channel` (`failover_tx`)
-     into the server's main `tokio::select!` event loop, which routes it to
-     `signal_new_connection` so the visitor is never dropped.
-2. **Fallback path (On-demand Signaling)**: If no live stream is available
-   (empty pool, stale entries, or `pool_size` not set), or if fast-path 0-RTT
-   activation fails, the server routes the visitor to `signal_new_connection`:
-   it allocates a session id (`REVERSE_SESSION_COUNTER`), registers a guarded oneshot
-   receiver in `SessionManager`, and sends `NewConnection` via `SignalingHandle::send`.
-   The send is bounded by `reverse_frame_timeout(idle_timeout)` (10 s by default);
-   if sending times out on a congested channel, the visitor session is dropped
-   and the accept loop continues without tearing down the listening port. The
-   paired data stream is delivered by `SessionManager::fulfill`; pairing is
-   bounded by `DEFAULT_SESSION_PAIR_TIMEOUT` (10 s). Both channels then go to
-   `core::serve`.
-
-On the client side (`run_reverse_mapping`), `SignalingChannel::spawn` is similarly
-used to manage the outbound control connection. The client event loop simply
-drives incoming `NewConnection` events from `SignalingReceiver`, completely
-decoupled from periodic `heartbeat.tick()` and idle timer accounting.
-
-Extension point: Because the business loop depends only on `SignalingHandle` and
-`SignalingReceiver`, `SignalingChannel` can be internally extended to manage
-multiple concurrent physical channels (active-standby multi-path signaling) or
-promote idle connections from `ReverseInboundPool` into active control channels
-upon connection failure without changing the visitor loop.
-
-`FramedControlStream` is a `tokio_util::codec::LengthDelimitedCodec` over any
-`AsyncRead + AsyncWrite` stream, implementing `Stream<Item =
-Result<ControlMessage, TunnelError>>` and `Sink<ControlMessage>` with
-`rmp_serde::to_vec_named` / `from_slice`.
-
-### 6.3 Dual-Channel Emergency Promotion & Command Deduplication
-
-To eliminate port-teardown downtime and WAN reconnection latency upon control channel disruption, culvert incorporates **Server-Initiated 0-RTT Emergency Promotion** and **Multi-Channel Coordination**:
-
-1. **Emergency Promotion Protocol (`ACTIVATE_STREAM_PROMOTE`)**:
-   - `0xA5` (`ACTIVATE_STREAM_MAGIC`): standard pool stream activation for data relay.
-   - `0xA6` (`ACTIVATE_STREAM_PROMOTE`): server-initiated emergency control channel promotion.
-   - When the primary control channel disconnects, the server's `ReverseInboundPool` pops a healthy, pre-warmed inbound pool stream and transmits `0xA6`.
-   - The client pool worker decodes `0xA6` and immediately promotes the stream into a `SignalingChannel` attached to the session's `SignalingRouter`, keeping the tunnel and visitor listener alive without reconnecting. This drops control recovery latency from several RTTs (DNS + TCP SYN + TLS 1.3 handshake) down to 0-RTT.
-
-2. **Frontend Listener Grace Period**:
-   - When the primary control channel drops and no pooled stream is available for immediate `0xA6` promotion, the server does not immediately unregister its public listening port. Instead, the reverse listener enters a bounded grace period (`DEFAULT_REVERSE_GRACE_PERIOD`, `10 s`, capped by `idle_timeout` via `reverse_grace_period()`).
-   - During the grace window, existing data flows (and UDP datagram relays) remain active, and control recovers seamlessly if either a newly pushed `ReverseInboundPool` stream arrives for `0xA6` promotion or a reconnecting control stream sends `RegisterReverse` for the same `(protocol, listen_addr)` (`SessionManager::try_reattach_grace_listener`), reclaiming the already-bound frontend without `EADDRINUSE`.
-   - If the grace period expires (or the server shuts down) before control recovers, the listener is shut down and its grace slot finishes only after the socket closes.
-
-3. **Multi-Channel & Anti-Split-Brain Coordination**:
-   - Senders enforce **Active-Standby routing**: only the designated `Primary` channel transmits application control commands (`NewConnection`, `RegisterReverse`). The `Standby` channel autonomously runs keepalive heartbeats (`Ping`/`Pong`) to stay warm and validated.
-   - If the `Primary` channel faults or closes, `SignalingRouter` atomically fails over to any open `Standby` channel and promotes it to `Primary`, while pruning closed handles before attachment.
-   - Concurrent `0xA6` promotions or control attachments are safely absorbed into `SignalingRouter` as a primary/standby pair without split-brain.
-
-4. **Command Deduplication Guarantee (`CommandDeduplicator`)**:
-   - Dual-channel failover or out-of-order delivery must never produce duplicate command execution.
-   - The receiver maintains a bounded sliding-window deduplication filter (`CommandDeduplicator`, capacity 256).
-   - Any `NewConnection` frame containing an already-observed `session_id` is identified as a duplicate and immediately discarded before any local backend dialing or resource allocation takes place.
-
----
-
-## 7. Client Data Path
-
-`ClientRunner::run` builds an `EndpointContext` for each tunnel and spawns one
-`run_tunnel_with_retry` worker. `run_tunnel_cluster` creates the shared pools
-(outbound forward pool and tunnel-level reverse pre-warm workers) and spawns one task per mapping.
-
-Each tunnel possesses a unique `tunnel_id` (either explicitly configured via `uuid` or
-deterministically generated as a UUID v5 from the per-client UUID and `tag`). Each direction's pool size is configured
-independently under `mappings.forward.pool_size` / `mappings.reverse.pool_size` (alias `pool`),
-giving asymmetric sizing across directions (e.g. `mappings.forward.pool_size: 8`,
-`mappings.reverse.pool_size: 4`).
-
-### 7.1 Forward mapping
-
-`run_forward_mapping` builds a `MappingSpec::new(protocol, &listen, &target_str)`
-and calls `frontend::bind`. For each `FrontendAccept` (TCP connection or per-peer
-`UdpFlowChannel`) it either acquires a stream from the shared forward pool or calls
-`TransportConnector::connect_with_protocol(&target, None, protocol)` on a
-connector shared by the mapping. If a pooled stream was acquired,
-`ReplenishingStreamPool::encode_activation_with_proto(Some(&target), protocol)`
-writes `0xA5` (TCP) or `0xA7` (UDP) + length + target and flushes first. Both
-channels are then passed to `core::serve` with `idle_timeout` (`endpoint_ctx.idle_timeout()`
-for TCP, or per-mapping `udp_idle_timeout` / `endpoint_ctx.udp_idle_timeout()` for
-UDP). An `ActiveStreamGuard` calls `pool.on_stream_closed()` on drop.
-
-### 7.2 Reverse mapping
-
-`run_reverse_mapping` opens the control channel with dummy target
-`control:0`, sends `RegisterReverse { listen_addr, target_addr, pool_size, protocol, tunnel_id }`,
-awaits `RegisterAck`, and then loops on control messages.
-
-When reverse pooling is configured (`reverse_pool_size > 0`), the tunnel cluster pre-warms a single
-shared set of idle reverse streams for the entire tunnel rather than multiplying workers per mapping.
-The worker count is capped at `POOL_MAX_CAPACITY` = 64 (`clamp_reverse_pool_size`). Each worker maintains
-an idle stream connected to the server via `connect_pooled_with_tunnel`
-(`mode = Reverse`, `pool_idle = true`, `tunnel_id = Some(tunnel_id)`).
-
-The worker waits cancellably for an activation packet using the unified `decode_activation`
-codec (reading `0xA5` for TCP or `0xA7` for UDP, plus target length and the target string, or `0xA6`
-for signaling promotion), bounded by `reverse_frame_timeout(idle_timeout)`, and reaps its own relay
-tasks while waiting. It has **no independent recycle timer**: the server is the sole owner of an idle
-stream's lifetime. Upon reading a valid activation packet, the worker echoes `ACTIVATE_STREAM_ACK`
-(`0xAC`) with a bounded 2-second timeout before opening the dynamically received local target channel
-via `platform::connect_target_channel(&target, protocol)` (TCP/UDS or `ConnectedUdpSocket`). It then
-hands `core::serve` to its own `TaskTracker`, and immediately dials a replacement idle stream to
-replenish the tunnel's shared server-side pool.
-
-Pre-warm dials are throttled to at most `POOL_MAX_CONCURRENT_CONNECTS` = 16 concurrent handshakes
-via a shared semaphore, protecting low-bandwidth links from connection storms.
-Dial failures back off exponentially from 200 ms up to 10 s (`POOL_BACKOFF_MAX`),
-capped at 1 s (`POOL_BACKOFF_ACTIVE_WAITERS_MAX`) when requests await replenishment,
-with worker-index stagger to prevent lockstep retries.
-
-Because each consumed slot is replenished by its own worker, an extra server
-signaling round trip would be strictly slower; the control channel is reserved
-for visitors that actually find the pool empty.
-
-On `NewConnection` (the signaling fallback path), it opens the local target
-channel via `connect_target_channel_str(&target_clone, protocol)`, opens a
-`reverse-data` stream via `connect_with_protocol(&dummy_target, Some(&session_id), protocol)`,
-and calls `core::serve`. Reconnect backoff starts at 500 ms, doubles up to 30 s,
-and resets after 30 s of stable operation.
-
-### 7.3 Retry supervision
+### 7.7 Retry supervision
 
 ```
 loop:
-  run_tunnel_cluster(...)
-  Ok / Shutdown                     -> exit
-  error while cancelled             -> exit
-  permanent error                   -> return error, no retry
-  attempts >= max_retries           -> return error
-  sleep_or_cancel(retry.delay)      -> next attempt
+  run tunnel cluster
+  Ok / Shutdown                  -> exit
+  error while cancelled          -> exit
+  permanent error                -> return error, no retry
+  attempts >= max_retries        -> return error
+  sleep_or_cancel(retry.delay)   -> next attempt
 ```
 
-`retry.delay` is a fixed configured delay (default 3 s), not an exponential
-backoff. `retry.max_retries` is optional; omitting it retries indefinitely.
-`TunnelError::is_permanent()` covers `Config`, `UnsupportedScheme`,
+`retry.delay` is a fixed configured delay (default 3 s), not exponential
+backoff. `TunnelError::is_permanent()` covers `Config`, `UnsupportedScheme`,
 `UnsupportedChannel`, `AuthFailed`, and `Tls`.
 
 ---
 
-## 8. Connection Pool
+## 8. Relay Implementation
 
-`ReplenishingStreamPool` is a channel-driven actor. `new_shared` connects idle
-streams without a fixed target so forward mappings can activate any target
-later.
+`ChannelRelay` statically dispatches across `(Stream | Datagram) x
+(Stream | Datagram)` without a boxed relay:
 
-| Element | Behavior |
+| Variant | Implementation |
 | :--- | :--- |
-| `mpsc::Sender<PoolCommand>` | `Acquire`, `PushIdle`, `ActiveReleased` wake hint on a 1024-slot channel. |
-| `idle_streams: VecDeque<ManagedStream>` | Idle streams with per-stream `HeartbeatState` and transport activity clock. |
-| `pending_requests: VecDeque<AcquireRequest>` | Waiters with timestamps; each has a `oneshot` reply. |
-| `connecting_futures: FuturesUnordered` | At most 16 concurrent dials (`POOL_MAX_CONCURRENT_CONNECTS`). |
-| Reactor events | `Cancelled`, `ConnectionResult`, `Command`, `RetryTimerExpired`, `HeartbeatTick`, `StreamsEvicted`. |
-| Heartbeats | `poll_check_alive` sweeps on a 1-second tick with a 5-second probe interval and 5-second probe timeout. Non-destructive via zero-capacity read buffer. |
-| Acquire order | LIFO (freshest first) to avoid silently expired NAT/QUIC pinholes. A stream with an in-flight probe write (`HeartbeatState::SendingPing`) is skipped but kept in the pool; only quiet or `poll_check_alive == Dead` streams are evicted. A stream is quiet when `heartbeat_timing` sees no transport activity for `idle_timeout`; successful probes refresh the clock, so a healthy pool is never retired in a synchronized wave. Keepalive probes never count as TX. Evicting one idle stream never closes the shared QUIC/H3 session: all streams share one `QuicSessionHandle`, and only a connection-level liveness failure or connector dial failure marks that handle dead and closes the session. |
-| Replenishment | Parallel one-turn batch dialing up to `POOL_MAX_CONCURRENT_CONNECTS` (16); backoff from 200 ms up to 10 s, capped at 1 s when waiters are queued (`POOL_BACKOFF_ACTIVE_WAITERS_MAX`). |
-| Limits | Idle pre-warmed inventory bounded by `POOL_MAX_CAPACITY` = 64; `pool_size` acts as the 0-RTT minimum warm inventory floor. Active relay throughput is fully decoupled from replenishment gating; pending callers dial immediately in parallel batches up to 16. Acquire timeout 15 s. |
-| Statistics | `PoolStats { idle_count, active_count, total_created }`. Authoritative `active_count` is tracked atomically (`Arc<AtomicUsize>`). |
+| `StreamStream` | `DuplexRelay` with two `TransferDirection` state machines. |
+| `DatagramStream` | `DatagramStreamRelay` framing datagrams over a byte stream. |
+| `DatagramDatagram` | `DatagramDatagramRelay` batch relay. |
 
-Idle pooled streams are opened with the `pool.idle` dummy target and
-`x-tunnel-pool: idle`; the server never dials a backend for them. Acquired
-streams are **one-shot**: they are not returned to the idle queue after the
-relay ends. `ActiveStreamGuard` decrements the atomic active counter on drop and
-sends an `ActiveReleased` hint to wake the reactor. Cancelled `acquire()` requests
-restore any already-acquired idle stream back into the pool or hand it directly to
-waiting callers instead of discarding it. There is no draining/return protocol.
+`TransferDirection` owns a 64 KiB buffer, an optional in-flight `Bytes` chunk,
+`read_done`, `write_shutdown`, and byte counters. `poll_step` advances writes,
+then reads, then flush and write half-close. A direction finishes only after
+EOF, all buffered bytes written, and write shutdown complete. `caps().owned_write`
+selects zero-copy owned writes; `caps().half_close` selects `poll_shutdown`.
 
-`pool::connection_pool.rs` also contains `StreamPool` / `InMemoryStreamPool`,
-a simple standalone implementation; the runtime data path uses
-`ReplenishingStreamPool`.
+Over byte streams, datagrams use `[u16 len | payload]` framing, preserving
+message boundaries including zero-length datagrams. `DatagramQueue` batches up
+to 16 datagrams with 64 pending entries. Incomplete frames at EOF are an error.
+
+The hot paths are hand-written `poll_fn` state machines inside `ActiveStage`;
+replacing them with `tokio::select!` is not permitted because of measured
+performance impact. Each `Active` task owns its stages directly and preserves
+ownership across cancellation and drain. `ClosingStage::run` is bounded by
+`drain_timeout` and propagates genuine I/O errors instead of masking them as a
+clean drain.
 
 ---
 
-## 9. Stream and Datagram Pumps
-
-`io::pump::StreamStreamPump` implements `Pump` for `(Stream, Stream)`. Its
-`relay_with_heartbeat(a, b, token, heartbeat_interval, idle_timeout)` maintains
-two `TransferState` values (64 KB buffer each, from `RELAY_BUFFER_SIZE`) inside
-one `poll_fn`:
-
-```
-TransferState {
-    buffer, read_pos, write_pos,
-    in_flight_chunk: Option<Bytes>, chunk_pos,
-    read_done, write_shutdown, total_bytes,
-}
-```
-
-On each poll it checks the cancellation future, polls reads and writes for both
-directions, flushes owned `Bytes` chunks via `poll_write_owned` when
-`caps().owned_write` is true, drives activity-gated `poll_send_ping`, and
-terminates a direction only after its buffered bytes are flushed and its write
-side is shut down (`caps().half_close`). `caps()` is read once per direction
-before the loop, not on every poll. On cancellation it allows a bounded 500 ms
-drain (`DEFAULT_RELAY_DRAIN_TIMEOUT`) for in-flight tails. The return value is
-`(bytes_a_to_b, bytes_b_to_a)`.
-
-`StreamStreamPump::run` calls `IoChannel::into_stream()` on both sides once,
-then runs this state machine.
-
-### 9.1 Datagram Pumps
-
-`PumpRegistry` also seeds three datagram-capable pumps in `io/pump.rs`:
-
-- `DatagramStreamPump` for `(Datagram, Stream)` (used by frontends like `UdpFrontend`
-  and reverse server UDP listeners over WS/H3/QUIC streams).
-- `StreamDatagramPump` for `(Stream, Datagram)` (used by the server forward side
-  and reverse client side pairing a relay `TunnelStream` with a `ConnectedUdpSocket`).
-- `DatagramDatagramPump` for `(Datagram, Datagram)` (zero-framing batch relay
-  for pure datagram transports).
-
-Over byte streams, datagrams use explicit packet-boundary framing:
-
-```
-payload_len: u16 big-endian | payload bytes (0..=65507 bytes)
-```
-
-This preserves exact UDP message boundaries across arbitrary TCP/WebSocket/QUIC
-chunking splits, including valid 0-byte empty datagrams. `DatagramStreamPump::relay_datagram_stream`
-runs inside a single `poll_fn` loop using reusable `BytesMut` scratch buffers,
-batched datagram polling (`DATAGRAM_BATCH_SIZE = 16`, `MAX_PENDING_DATAGRAMS = 64`),
-and `StreamCaps` (`owned_write` and `half_close`) queried once up front.
-
-UDP session lifetime is governed by `last_dgram_activity.elapsed() >= ctx.idle_timeout`
-(populated from `udp_idle_timeout`): when no datagram flows in either direction
-before the deadline, the pump returns `Ok((dgram_to_stream, stream_to_dgram))` and
-drops the stream cleanly (propagating TCP/WS/QUIC FIN so the remote peer tears
-down its paired `ConnectedUdpSocket` / `UdpFlowChannel` immediately). Meanwhile,
-if `heartbeat_interval` fires while a UDP flow is quietly open, `poll_send_ping` /
-`poll_check_alive` keep the underlying relay transport healthy with
-`stream.last_activity_ms()` clamped at `pump_start_ms` so long-idle pooled
-streams do not expire immediately upon activation.
-
-Design constraint: these hot paths are intentionally hand-written `poll_fn`
-state machines. Replacing them with `tokio::select!` is not permitted because of
-the measured performance impact. Fairness/hand-written priority behavior in
-these loops and in the pool reactor is deliberately retained.
-
----
-
-## 10. Session Pairing and Inbound Pools
-
-`SessionManager` manages two dispatch tables:
-
-1. **On-demand Sessions**: A `DashMap<String, oneshot::Sender<Box<dyn TunnelStream>>>`.
-   When no idle stream is available, the server calls `register(session_id)`,
-   waits up to 15 s (`DEFAULT_SESSION_PAIR_TIMEOUT`), and the reverse data stream
-   is delivered by `fulfill(session_id, stream)`. `remove` clears timed-out
-   entries.
-2. **Reverse Inbound Pools**:
-   - **Tunnel-Scoped Shared Pools**: When `tunnel_id` is present, `SessionManager` manages `DashMap<String, Arc<ReverseInboundPool>>` (`tunnel_reverse_pools`) keyed by `tunnel_id`. All reverse mappings belonging to that tunnel draw from this unified pool. Pre-warmed reverse streams (`mode = Reverse`, `pool_idle = true`, `tunnel_id = Some(tunnel_id)`) are pushed directly into this shared pool.
-   - **Legacy Per-Mapping Pools**: Keyed by `canonical_reverse_key(protocol, addr)` -> `"{protocol}:{normalized}"` for legacy clients without `tunnel_id`.
-   - In both cases, pre-warmed reverse streams are enqueued via `push_idle_stream_with_tunnel`. Each queue is LIFO with a soft cap of `reverse_pool_soft_cap(pool_size) = 2 x` the negotiated worker count: overflow evicts the oldest entry, tolerating one overlapping reconnect generation while preventing unbounded growth. Entries carry their enqueue time; `pop_live(idle_timeout)` lazily closes over-age entries and skips EOF/dead streams.
-   - When an external visitor arrives at any listener of the tunnel, the server pops a stream from the shared pool and writes an activation packet `[magic (1B)][target_len (2B)][target_str (NB)]` symmetrically with forward mode. The client echoes `ACTIVATE_STREAM_ACK (0xAC)`, dynamically binds to the specified target, and begins relaying.
-   - `drain()` closes a superseded generation on re-registration; listener teardown cleanly releases registrations via `ReversePoolGuard` without blocking reconnecting peers.
-
-Errors are `SessionNotFound`, `SessionClosed`, and `SessionPairTimeout`. This
-whole section is stream-scoped at the pool/control boundary while remaining
-protocol-agnostic via `(protocol, target)` keys: once a session is paired or
-popped for UDP, `IoChannel::Datagram` and `IoChannel::Stream` are handed to
-`core::serve` and driven by `DatagramStreamPump`.
-
----
-
-## 11. Error Model
+## 9. Error Model
 
 `io::error::TunnelError` (re-exported as `core::error::TunnelError`) includes
 `Io`, `UrlParse`, `Config`, `UnsupportedScheme`, `UnsupportedChannel`,
 `DnsResolutionFailed`, `DnsNoAddresses`, `Tls`, `TlsHandshake`,
 `ConnectTimeout`, `AuthFailed`, `SessionNotFound`, `SessionClosed`,
 `SessionPairTimeout`, `ControlProtocol`, `Multiplex`, `PoolExhausted`,
-`Shutdown`, `Internal`. `UnsupportedChannel` reports an unregistered pump pair,
-a missing frontend protocol, or `into_stream()` on a datagram channel; it is
-permanent.
+`Shutdown`, and `Internal`. `UnsupportedChannel` is permanent.
 
-`is_permanent()` and `is_shutdown()` drive the supervisor's retry and shutdown
-decisions. `common::cancel` provides `CancelFutureExt::cancel_with`,
-`CancellationTokenExt::sleep_or_cancel`, and `TimeoutOrCancel`, which give
-every await an explicit cancellation or timeout boundary.
+`core::error::TaskError` models task-stage failures, including `CoordinatorGone`
+and `StageFailed`. `is_permanent()` and `is_shutdown()` drive supervisor retry
+and shutdown decisions. `common::cancel` provides `cancel_with`,
+`sleep_or_cancel`, and `TimeoutOrCancel` for explicit cancellation boundaries.
 
 ---
 
-## 12. Constants and Defaults
+## 10. Constants and Defaults
 
 Selected values from `consts.rs`; all runtime timers come from these or from
 effective configuration values.
@@ -1087,7 +783,7 @@ effective configuration values.
 | Constant | Value |
 | :--- | :--- |
 | `RELAY_BUFFER_SIZE` | 65536 |
-| `MAX_UDP_DATAGRAM_SIZE` | 65507 bytes |
+| `MAX_UDP_DATAGRAM_SIZE` | 65527 bytes (IPv6 payload ceiling) |
 | `UDP_SESSION_CHANNEL_SIZE` | 256 per peer NAT flow |
 | `TOKEN_MAX_LEN` | 256 bytes |
 | `DEFAULT_CONNECT_TIMEOUT` | 10 s |
@@ -1103,8 +799,10 @@ effective configuration values.
 | `POOL_ACQUIRE_TIMEOUT` | 15 s |
 | `POOL_MAX_CAPACITY` / `POOL_MAX_CONCURRENT_CONNECTS` | 64 / 16 |
 | `POOL_HEARTBEAT_TICK_INTERVAL` / `POOL_HEARTBEAT_INTERVAL` | 1 s / 5 s |
-| `POOL_BACKOFF_BASE` / `POOL_BACKOFF_MAX` / `ACTIVE_WAITERS_MAX` | 200 ms / 10 s / 1 s |
+| `POOL_HEARTBEAT_TIMEOUT` | 5 s |
+| `POOL_BACKOFF_BASE` / `POOL_BACKOFF_MAX` / `POOL_BACKOFF_ACTIVE_WAITERS_MAX` | 200 ms / 10 s / 1 s |
 | `DEFAULT_REVERSE_BACKOFF_INITIAL` / `MAX` / reset | 500 ms / 30 s / 30 s |
+| `DEFAULT_REVERSE_GRACE_PERIOD` / `DEFAULT_REVERSE_PROMOTE_WAIT` | 10 s / 1 s |
 | `MAX_ACTIVATION_TARGET_LEN` | 512 bytes |
 | `ACTIVATE_STREAM_MAGIC` / `PROMOTE` / `UDP` / `ACK` | `0xA5` / `0xA6` / `0xA7` / `0xAC` |
 | `HEADER_TUNNEL_PROTO` | `x-tunnel-proto` (`tcp` / `udp`) |
@@ -1112,6 +810,52 @@ effective configuration values.
 | QUIC windows | stream 4 MiB, connection 128 MiB, send 128 MiB |
 | QUIC keep-alive / max idle | 5 s / 30 s |
 | DNS cache capacity / TTL | 1024 entries / 300 s |
+
+Derived timing functions keep both ends consistent and avoid fixed LAN-scale
+constants: `reverse_frame_timeout(idle_timeout)` clamps `idle_timeout / 3`
+between 5 s and 15 s and never exceeds the idle window;
+`reverse_grace_period(idle_timeout)` never exceeds the idle window;
+`reverse_pool_soft_cap(pool_size)` is `2 x pool_size`.
+
+---
+
+## 11. Testing Strategy
+
+Four classes of tests are used:
+
+1. **Pure state tests** (no Tokio or network): every legal transition, illegal
+   transitions, duplicate events, out-of-order and late events. `StateEngine`
+   invariants, cycle detection, recycle-versus-exit waiter semantics, and
+   generation filtering are tested directly.
+2. **Resource ownership tests**: allocation success and failure, activation
+   fallback, cancellation during `Connecting` releasing only the frontend,
+   transport return on wrong-state delivery, and no double release.
+3. **Async behavior tests** (in-memory `duplex` streams and mock streams):
+   permanently `Pending` futures under force stop, EOF, half-close, partial
+   reads/writes, flush and I/O errors, graceful stop versus normal completion.
+4. **Integration and fault tests**: real WS/H3/QUIC tunnels, concurrent stream
+   bursts, dead-session sweeps, pool capacity and waiter fairness, reverse
+   promotion and reattachment, shutdown reclaiming all shared resources.
+
+After the directory cleanup, `cargo test --workspace --lib` runs 185 library
+tests, and the Coordinator/IO Task suites live as integration tests under
+`crates/culvert/tests/`. `config-example.yaml` is asserted to parse cleanly,
+and `culvert --check -c config-example.yaml` exercises the same validation path
+as startup without binding an address.
+
+---
+
+## 12. Non-Goals
+
+The v0.4 architecture deliberately does not:
+
+- rewrite every `async` function as a hand-written `Future` or state machine;
+- split internal IO artificially once its boundary is clear;
+- mirror all internal state into the Coordinator;
+- introduce a larger message system only to avoid necessary synchronization;
+- build a general-purpose state-machine framework;
+- change `Frontend`, `Transport`, or backend responsibilities or wire semantics;
+- add features unrelated to lifecycle correctness.
 
 ---
 
@@ -1121,14 +865,14 @@ effective configuration values.
 | :--- | :--- | :--- |
 | `MultiplexConfig` | `config/model.rs` | Rejected by `ConfigLoader::validate`. |
 | `FailoverConfig` | `config/model.rs` | Rejected by `ConfigLoader::validate`. |
-| `mux/` (frame, session, stream) | `crates/culvert/src/mux/` | Standalone module with its own tests; no data-path references to `MuxSession`. |
+| `mux/` (frame, session, stream) | `crates/culvert/src/mux/` | Standalone module with its own tests; no data-path references. |
 | `core/failover.rs` | `crates/culvert/src/core/` | Not referenced by config or runtime. |
-| Native datagram relay drivers (`TransportDriver` yielding `IoChannel::Datagram`) | `transport/` | `DatagramDatagramPump` is registered, while current WS/H3/QUIC drivers deliver UDP over length-framed streams; future P2P/QUIC-datagram drivers plug in without core changes. |
+| Transport-level application FIN handshake for stream recycling | — | Production uses QUIC streams; planned after the architecture stabilizes. |
+| Task-level multiplexing (multiple frontend streams per IO Task) | — | Not wired into this runtime; the state-machine architecture supports it. |
 
 Consequently there is no cross-endpoint primary/standby failover, no seamless
-transport migration with stream-offset replay buffer, no P2P/STUN/ICE path,
-and no automatic HTTP/3-to-WSS fallback. Each tunnel uses exactly the scheme in
-its endpoint URL.
+transport migration with stream-offset replay, no P2P/STUN/ICE path, and no
+automatic HTTP/3-to-WSS fallback. Each tunnel uses the scheme in its endpoint URL.
 
 ---
 
@@ -1136,10 +880,10 @@ its endpoint URL.
 
 ```rust
 // lib.rs
-pub use client::ClientRunner;
 pub use daemon::run_daemon;
-pub use server::ServerRunner;
-pub use supervisor::TunnelSupervisor;
+pub use server::{ReverseSessionHub, ServerRunner};
+pub use supervisor::{ClientRunner, TunnelSupervisor};
+pub use tunnel::TunnelCluster;
 
 pub async fn run_server(config: ServerConfig, cancel_token: CancellationToken)
     -> Result<(), TunnelError>;
@@ -1149,31 +893,25 @@ pub async fn run(config: AppConfig, cancel_token: CancellationToken)
     -> Result<(), TunnelError>;
 ```
 
-All modules are public. `io/` exports the neutral vocabulary (`TargetAddr`,
-`PeerAddr`, `L4Protocol`, `MappingSpec`, `IoChannel`, `Datagram`, `DatagramIo`,
-`StreamCaps`, `TunnelError`, `Pump`, `PumpRequest`, `PumpCtx`, `pump_registry`,
-`StreamStreamPump`, `DatagramStreamPump`, `StreamDatagramPump`,
-`DatagramDatagramPump`); `frontend/` exports `Frontend`, `FrontendAccept`, and
-`bind`; `backend/` exports the `Transport*` traits and `TransportRegistry`;
-`core::serve` is the pump-dispatch entry point. `ConfigLoader`,
-`ReplenishingStreamPool`, and the protocol types are also usable directly.
-Callers own the `CancellationToken` and are responsible for cancelling and
-awaiting.
+All modules are public. `core/` exports the Coordinator, IO Task, stage traits,
+and state vocabulary; `relay/` exports relay stages; `tunnel/` exports forward
+and reverse workflows and runners; `server/` exports ingress workflows and
+`ServerRunner`. `io/` exports the neutral vocabulary; `frontend/` exports
+`Frontend`, `FrontendAccept`, and `bind`; `backend/` exports the `Transport*`
+traits and `TransportRegistry`. Callers own the `CancellationToken` and are
+responsible for cancelling and awaiting.
 
 ---
 
-## 15. Verification
+## 15. Verification and Benchmarks
 
-- `cargo test --workspace` runs unit tests in the config model/loader,
-  control protocol, auth, session manager, task tracker, daemon watchdog,
-  `frontend/udp`, `io::pump`, and the end-to-end tests in `crates/culvert/tests/`
-  (including `test_udp_tunnel.rs` for forward/reverse UDP over WS, HTTP/3, and
-  raw QUIC, NAT demultiplexing, same-port TCP+UDP coexistence, 0-RTT pool &
-  signaling fallback, and `udp_idle_timeout` expiration/recreation).
-- `config-example.yaml` is asserted to parse cleanly by
-  `config::loader::tests::test_load_config_example_file`.
-- `culvert --check -c config-example.yaml` exercises the same validation path
-  as startup without binding any address.
-- Benchmarks live in `crates/culvert/benches/tunnel_benchmark.rs` and
-  `benchmarks/`; they are development tooling, not a specification of
-  throughput or latency.
+- `cargo check --workspace --all-targets` is clean.
+- `cargo test --workspace --lib` passes 185 library tests.
+- Integration tests under `crates/culvert/tests/` cover real WS/H3/QUIC forward
+  and reverse tunnels, UDP framed datagrams, NAT demultiplexing, 0-RTT pool plus
+  signaling fallback, reverse promotion and reattachment, and shared-pool
+  resource reclamation.
+- `config-example.yaml` is parsed by a config test.
+- `culvert --check -c config-example.yaml` exercises validation without binding.
+- Benchmarks in `crates/culvert/benches/` are development tooling, not a
+  throughput or latency specification.

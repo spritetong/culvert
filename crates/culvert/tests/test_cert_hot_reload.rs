@@ -99,7 +99,7 @@ fn issue_new_server_cert(pki: &TestPki) -> (String, String) {
 
     let mut srv_params = CertificateParams::default();
     let mut srv_dn = DistinguishedName::new();
-    srv_dn.push(DnType::CommonName, "localhost-v2");
+    srv_dn.push(DnType::CommonName, "localhost-c");
     srv_params.distinguished_name = srv_dn;
     srv_params
         .subject_alt_names

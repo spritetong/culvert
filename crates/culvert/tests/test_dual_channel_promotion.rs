@@ -226,7 +226,7 @@ mod e2e_reverse_promotion_tests {
     use culvert::dialer::endpoint::EndpointContext;
     use culvert::io::addr::L4Protocol;
     use culvert::transport::ws::WsTransportDriver;
-    use culvert::v2::{ReverseClientConfig, ReverseClientRunner};
+    use culvert::tunnel::reverse::{ReverseClientConfig, ReverseClientRunner};
     use culvert::{ReverseSessionHub, ServerRunner, TunnelSupervisor};
 
     struct DroppingTcpProxy {

@@ -21,6 +21,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
+use culvert::TunnelSupervisor;
 use culvert::config::model::{
     AppConfig, DialerConfig, EndpointConfig, MappingRuleConfig, ServerConfig, TlsConfig,
     TunnelConfig, TunnelMappingsConfig,
@@ -28,13 +29,13 @@ use culvert::config::model::{
 use culvert::consts::{
     MAX_UDP_DATAGRAM_SIZE, MAX_UDP_SESSIONS, UDP_SESSION_CHANNEL_SIZE, UDP_SESSION_QUEUE_MAX_BYTES,
 };
+use culvert::core::error::TaskError;
+use culvert::core::stage::ActiveStage;
 use culvert::core::stream::{HeartbeatStatus, StreamCaps, TunnelStream};
 use culvert::frontend::udp::UdpFrontend;
 use culvert::frontend::{Frontend, FrontendAccept, FrontendOutput};
 use culvert::io::channel::{Datagram, DatagramIo, IoChannel};
-use culvert::v2::relay::{ChannelRelay, RelayCounters};
-use culvert::v2::stage::ActiveStage;
-use culvert::{TunnelSupervisor, v2::TaskError};
+use culvert::relay::{ChannelRelay, RelayCounters};
 
 const PACKET_MAGIC: &[u8; 4] = b"CVT2";
 const DIR_C2S: u8 = 1;

@@ -19,17 +19,19 @@ use culvert::consts::{
     DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_IDLE_TIMEOUT, DEFAULT_RELAY_DRAIN_TIMEOUT,
 };
 use culvert::control::stream::ControlMessage;
+use culvert::core::coordinator::Coordinator;
+use culvert::core::error::TaskError;
 use culvert::core::error::TunnelError;
+use culvert::core::stage::{ActiveStage, ClosingStage};
+use culvert::core::state::{CloseReason, CoordinatorConfig, PooledTransport};
 use culvert::core::stream::{BoxFuture, TunnelStream};
 use culvert::io::addr::{L4Protocol, TargetAddr};
 use culvert::io::channel::IoChannel;
 use culvert::mux::{MuxCodec, MuxFrame, MuxSession};
+use culvert::relay::{DuplexRelay, RelayCounters};
 use culvert::transport::TransportConnector;
 use culvert::transport::ws::stream::WsTunnelStream;
-use culvert::v2::forward::{ForwardInput, ForwardWorkflow};
-use culvert::v2::relay::{DuplexRelay, RelayCounters};
-use culvert::v2::stage::{ActiveStage, ClosingStage};
-use culvert::v2::{CloseReason, Coordinator, CoordinatorConfig, PooledTransport, TaskError};
+use culvert::tunnel::forward::{ForwardInput, ForwardWorkflow};
 
 /// Benchmark MessagePack control serialization performance.
 fn bench_messagepack_serialization(c: &mut Criterion) {
@@ -257,7 +259,7 @@ impl TransportConnector for DummyConnector {
     }
 }
 
-/// Benchmark v2 0-RTT idle stream dispatch vs mux stream open.
+/// Benchmark 0-RTT idle stream dispatch vs mux stream open.
 fn bench_pool_acquisition(c: &mut Criterion) {
     let mut group = c.benchmark_group("pool_acquisition");
     let rt = Runtime::new().unwrap();

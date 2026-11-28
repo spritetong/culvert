@@ -418,8 +418,8 @@ impl DatagramIo for UdpFlowChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2::relay::ChannelRelay;
-    use crate::v2::stage::ActiveStage;
+    use crate::core::stage::ActiveStage;
+    use crate::relay::ChannelRelay;
     use std::time::Duration;
 
     #[test]

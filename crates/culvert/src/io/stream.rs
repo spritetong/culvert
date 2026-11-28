@@ -127,7 +127,7 @@ pub trait TunnelStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {
 
     /// Optional stable identifier of a shared underlying session (such as a QUIC connection).
     ///
-    /// Used by `v2::Coordinator` to batch-sweep sibling `Idle` tasks when a shared session dies.
+    /// Used by `Coordinator` to batch-sweep sibling `Idle` tasks when a shared session dies.
     fn session_id(&self) -> Option<u64> {
         None
     }
