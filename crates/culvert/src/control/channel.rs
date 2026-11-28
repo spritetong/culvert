@@ -9,7 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::collections::{HashSet, VecDeque};
 use std::future::poll_fn;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -44,11 +44,76 @@ impl Default for SignalingConfig {
     }
 }
 
+const GATE_PENDING: u8 = 0;
+const GATE_CANCELLED: u8 = 1;
+const GATE_COMMITTED: u8 = 2;
+
+/// Atomic two-phase wire-commit gate synchronizing caller cancellation with
+/// irrevocable frame serialization (`start_send`) inside `SignalingChannel`.
+///
+/// Exactly one side can win the initial `PENDING` -> `CANCELLED | COMMITTED` transition:
+/// - If caller cancels first (`try_cancel() == true`), zero bytes are written to the wire.
+/// - If `SignalingChannel` commits first (`try_commit() == true`), caller cancellation sees
+///   `try_cancel() == false` and retains pending session state until fulfillment or timeout.
+pub struct SendCommitGate {
+    state: AtomicU8,
+}
+
+impl Default for SendCommitGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SendCommitGate {
+    /// Creates a gate in the `Pending` state.
+    pub fn new() -> Self {
+        Self {
+            state: AtomicU8::new(GATE_PENDING),
+        }
+    }
+
+    /// Attempts to cancel before wire commit. Returns `true` if cancelled before `start_send`,
+    /// or `false` if the frame was already committed to the wire.
+    pub fn try_cancel(&self) -> bool {
+        match self.state.compare_exchange(
+            GATE_PENDING,
+            GATE_CANCELLED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => true,
+            Err(cur) => cur == GATE_CANCELLED,
+        }
+    }
+
+    /// Returns `true` if caller already cancelled this send prior to commit.
+    pub fn is_cancelled(&self) -> bool {
+        self.state.load(Ordering::SeqCst) == GATE_CANCELLED
+    }
+
+    /// Attempts to claim wire commit inside `SignalingChannel` right before `start_send`.
+    /// Returns `false` only if already cancelled; succeeds for both `PENDING` -> `COMMITTED`
+    /// and subsequent failover retries of an already-committed request.
+    pub(crate) fn try_commit(&self) -> bool {
+        match self.state.compare_exchange(
+            GATE_PENDING,
+            GATE_COMMITTED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => true,
+            Err(cur) => cur == GATE_COMMITTED,
+        }
+    }
+}
+
 struct OutboundCommand {
     msg: ControlMessage,
     tx: oneshot::Sender<Result<(), TunnelError>>,
     timeout: Duration,
     cancel: CancellationToken,
+    gate: Arc<SendCommitGate>,
 }
 
 /// Cloned handle used by business logic to transmit control commands asynchronously.
@@ -79,8 +144,13 @@ impl SignalingHandle {
         msg: ControlMessage,
         send_timeout: Duration,
     ) -> Result<(), TunnelError> {
-        self.send_cancellable(msg, Some(send_timeout), CancellationToken::new())
-            .await
+        self.send_cancellable(
+            msg,
+            Some(send_timeout),
+            CancellationToken::new(),
+            Arc::new(SendCommitGate::new()),
+        )
+        .await
     }
 
     pub(super) async fn send_cancellable(
@@ -88,8 +158,9 @@ impl SignalingHandle {
         msg: ControlMessage,
         send_timeout: Option<Duration>,
         cancel: CancellationToken,
+        gate: Arc<SendCommitGate>,
     ) -> Result<(), TunnelError> {
-        if cancel.is_cancelled() {
+        if cancel.is_cancelled() || gate.is_cancelled() {
             return Err(TunnelError::Shutdown);
         }
         let (tx, rx) = oneshot::channel();
@@ -98,6 +169,7 @@ impl SignalingHandle {
             tx,
             timeout: send_timeout.unwrap_or(self.default_frame_timeout),
             cancel: cancel.clone(),
+            gate,
         };
         tokio::select! {
             biased;
@@ -400,13 +472,16 @@ impl SignalingChannel {
                 cmd_opt = cmd_rx.recv() => {
                     match cmd_opt {
                         Some(cmd) => {
-                            if cmd.cancel.is_cancelled() || cmd.tx.is_closed() {
+                            if cmd.cancel.is_cancelled()
+                                || cmd.gate.is_cancelled()
+                                || cmd.tx.is_closed()
+                            {
                                 let _ = cmd.tx.send(Err(TunnelError::Shutdown));
                                 continue;
                             }
 
                             // Allow caller cancellation cleanly while waiting for sink readiness
-                            // (before `start_send` serializes/commits any bytes onto the stream).
+                            // (before atomic wire commit and `start_send`).
                             let ready_res = tokio::select! {
                                 biased;
                                 _ = cancel_token.cancelled() => {
@@ -424,7 +499,10 @@ impl SignalingChannel {
                             };
                             match ready_res {
                                 Ok(Ok(())) => {
-                                    if cmd.cancel.is_cancelled() || cmd.tx.is_closed() {
+                                    // Atomic wire-commit boundary: if caller cancelled prior to this
+                                    // CAS, skip `start_send`; if we win, `PendingSessionGuard` will
+                                    // preserve the pending session across flush/pairing.
+                                    if !cmd.gate.try_commit() {
                                         let _ = cmd.tx.send(Err(TunnelError::Shutdown));
                                         continue;
                                     }

@@ -8,13 +8,14 @@
 
 use std::collections::VecDeque;
 use std::future::pending;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::control::channel::SignalingHandle;
+use crate::control::channel::{SendCommitGate, SignalingHandle};
 use crate::control::stream::ControlMessage;
 use crate::core::error::TunnelError;
 
@@ -27,6 +28,7 @@ enum RouterCommand {
     Send {
         message: ControlMessage,
         timeout: Option<Duration>,
+        gate: Arc<SendCommitGate>,
         reply: oneshot::Sender<Result<(), TunnelError>>,
     },
     Attach {
@@ -50,6 +52,7 @@ struct ChannelSlot {
 struct PendingSend {
     message: ControlMessage,
     timeout: Option<Duration>,
+    gate: Arc<SendCommitGate>,
     reply: oneshot::Sender<Result<(), TunnelError>>,
     retried_on_failover: bool,
 }
@@ -205,7 +208,7 @@ impl SignalingRouterActor {
             return;
         }
         while let Some(req) = self.pending_sends.pop_front() {
-            if req.reply.is_closed() {
+            if req.reply.is_closed() || req.gate.is_cancelled() {
                 continue;
             }
             if !self.state.promote_standby_if_closed() {
@@ -222,12 +225,13 @@ impl SignalingRouterActor {
             let handle = slot.handle.clone();
             let msg = req.message.clone();
             let explicit_timeout = req.timeout;
+            let gate = Arc::clone(&req.gate);
             let wire_cancel = CancellationToken::new();
             let task_cancel = wire_cancel.clone();
 
             let task = tokio::spawn(async move {
                 handle
-                    .send_cancellable(msg, explicit_timeout, task_cancel)
+                    .send_cancellable(msg, explicit_timeout, task_cancel, gate)
                     .await
             });
             self.publish_epoch();
@@ -260,7 +264,9 @@ impl SignalingRouterActor {
             Ok(()) => {
                 let _ = completed.pending.reply.send(Ok(()));
             }
-            Err(TunnelError::Shutdown) if completed.cancelled_by_caller => {
+            Err(TunnelError::Shutdown)
+                if completed.cancelled_by_caller || completed.pending.reply.is_closed() =>
+            {
                 // Pre-commit cancellation avoided wire transmission; channel remains healthy.
             }
             Err(err) => {
@@ -308,6 +314,7 @@ impl SignalingRouterActor {
                         InFlightEvent::CallerCancelled => {
                             if let Some(ref mut active) = self.in_flight {
                                 active.cancelled_by_caller = true;
+                                let _ = active.pending.gate.try_cancel();
                                 active.wire_cancel.cancel();
                             }
                         }
@@ -321,11 +328,12 @@ impl SignalingRouterActor {
                         break;
                     };
                     match cmd {
-                        RouterCommand::Send { message, timeout, reply } => {
-                            if !reply.is_closed() {
+                        RouterCommand::Send { message, timeout, gate, reply } => {
+                            if !reply.is_closed() && !gate.is_cancelled() {
                                 self.pending_sends.push_back(PendingSend {
                                     message,
                                     timeout,
+                                    gate,
                                     reply,
                                     retried_on_failover: false,
                                 });
@@ -451,7 +459,19 @@ impl SignalingRouter {
 
     /// Sends a message using the active primary channel, with automatic single failover to standby.
     pub async fn send(&self, msg: ControlMessage) -> Result<(), TunnelError> {
-        self.send_inner(msg, None).await
+        self.send_inner(msg, None, Arc::new(SendCommitGate::new()))
+            .await
+    }
+
+    /// Sends a message guarded by a caller-shared [`SendCommitGate`] so pre-commit
+    /// cancellation can atomically suppress wire transmission without affecting
+    /// already-committed frames.
+    pub async fn send_with_gate(
+        &self,
+        msg: ControlMessage,
+        gate: Arc<SendCommitGate>,
+    ) -> Result<(), TunnelError> {
+        self.send_inner(msg, None, gate).await
     }
 
     /// Sends a message with an explicit timeout.
@@ -460,19 +480,22 @@ impl SignalingRouter {
         msg: ControlMessage,
         timeout: Duration,
     ) -> Result<(), TunnelError> {
-        self.send_inner(msg, Some(timeout)).await
+        self.send_inner(msg, Some(timeout), Arc::new(SendCommitGate::new()))
+            .await
     }
 
     async fn send_inner(
         &self,
         msg: ControlMessage,
         explicit_timeout: Option<Duration>,
+        gate: Arc<SendCommitGate>,
     ) -> Result<(), TunnelError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
             .send(RouterCommand::Send {
                 message: msg,
                 timeout: explicit_timeout,
+                gate,
                 reply: reply_tx,
             })
             .map_err(|_| TunnelError::ControlProtocol("Signaling router closed".into()))?;

@@ -41,7 +41,7 @@ async fn router_reverse_signaler_pairs_and_cleans_up_on_cancellation() {
     let signaler = RouterReverseSignaler::new(
         router,
         Arc::clone(&hub),
-        Duration::from_secs(2),
+        Duration::from_millis(120),
         disconnect_notify,
     );
 
@@ -67,7 +67,8 @@ async fn router_reverse_signaler_pairs_and_cleans_up_on_cancellation() {
     server_data.read_exact(&mut got).await.unwrap();
     assert_eq!(&got, b"paired-ok");
 
-    // 2. Cancelling request_pair future removes session_id via RAII guard.
+    // 2. Cancelling request_pair after NewConnection was already committed/received
+    //    lingers until pair_timeout and then cleans up session_id via RAII guard.
     let drop_task =
         tokio::spawn(signaler.request_pair(PeerAddr::Socket("127.0.0.1:42001".parse().unwrap())));
     let cancelled_sid = match client_rx.recv().await.unwrap().unwrap() {
@@ -76,7 +77,7 @@ async fn router_reverse_signaler_pairs_and_cleans_up_on_cancellation() {
     };
     drop_task.abort();
     let _ = drop_task.await;
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
     let (dummy_a, _dummy_b) = duplex(64);
     assert!(hub.fulfill(&cancelled_sid, Box::new(dummy_a)).is_err());
 
@@ -682,60 +683,64 @@ async fn last_mapping_shutdown_stops_shared_coordinator() {
     assert!(t2.coord.query_phase().await.is_err());
 }
 
+struct FlushStallingStream {
+    reader: tokio::io::DuplexStream,
+    writer: tokio::io::DuplexStream,
+    allow_flush: Arc<std::sync::atomic::AtomicBool>,
+    flush_entered: Arc<Notify>,
+    flush_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+    write_entered: Option<Arc<Notify>>,
+}
+
+impl tokio::io::AsyncRead for FlushStallingStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.reader).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for FlushStallingStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if let Some(ref notify) = self.write_entered {
+            notify.notify_waiters();
+        }
+        std::pin::Pin::new(&mut self.writer).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if !self.allow_flush.load(std::sync::atomic::Ordering::Acquire) {
+            if let Ok(mut slot) = self.flush_waker.lock() {
+                *slot = Some(cx.waker().clone());
+            }
+            self.flush_entered.notify_waiters();
+            return std::task::Poll::Pending;
+        }
+        std::pin::Pin::new(&mut self.writer).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.writer).poll_shutdown(cx)
+    }
+}
+
 #[tokio::test]
 async fn cancelled_inflight_reverse_request_does_not_dispatch_orphan_signal() {
     use crate::control::{ControlMessage, FramedControlStream};
     use futures_util::StreamExt;
-    use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::task::{Context, Poll};
-    use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
-
-    struct FlushStallingStream {
-        reader: DuplexStream,
-        writer: DuplexStream,
-        allow_flush: Arc<AtomicBool>,
-        flush_entered: Arc<Notify>,
-        flush_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
-    }
-
-    impl AsyncRead for FlushStallingStream {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &mut ReadBuf<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            Pin::new(&mut self.reader).poll_read(cx, buf)
-        }
-    }
-
-    impl AsyncWrite for FlushStallingStream {
-        fn poll_write(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<std::io::Result<usize>> {
-            Pin::new(&mut self.writer).poll_write(cx, buf)
-        }
-
-        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            if !self.allow_flush.load(Ordering::Acquire) {
-                if let Ok(mut slot) = self.flush_waker.lock() {
-                    *slot = Some(cx.waker().clone());
-                }
-                self.flush_entered.notify_waiters();
-                return Poll::Pending;
-            }
-            Pin::new(&mut self.writer).poll_flush(cx)
-        }
-
-        fn poll_shutdown(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            Pin::new(&mut self.writer).poll_shutdown(cx)
-        }
-    }
 
     let (client_in, _server_in) = duplex(1024);
     let (actor_out, peer_out) = duplex(4096);
@@ -755,6 +760,7 @@ async fn cancelled_inflight_reverse_request_does_not_dispatch_orphan_signal() {
             allow_flush: Arc::clone(&allow_flush),
             flush_entered: Arc::clone(&flush_entered),
             flush_waker: Arc::clone(&flush_waker),
+            write_entered: None,
         },
         cfg,
         cancel.child_token(),
@@ -830,6 +836,146 @@ async fn cancelled_inflight_reverse_request_does_not_dispatch_orphan_signal() {
         other => panic!("unexpected frame after cancelled in-flight request: {other:?}"),
     }
     assert!(pair_ok.await.unwrap().is_ok());
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn cancelled_request_after_wire_commit_keeps_pending_session_until_cleanup() {
+    use crate::control::{ControlMessage, FramedControlStream};
+    use futures_util::StreamExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (client_in, _server_in) = duplex(1024);
+    let (actor_out, peer_out) = duplex(4096);
+    let allow_flush = Arc::new(AtomicBool::new(false));
+    let flush_entered = Arc::new(Notify::new());
+    let flush_waker = Arc::new(std::sync::Mutex::new(None::<std::task::Waker>));
+    let write_entered = Arc::new(Notify::new());
+
+    let cancel = CancellationToken::new();
+    let cfg = SignalingConfig {
+        heartbeat_interval: Duration::from_secs(30),
+        idle_timeout: Duration::from_secs(30),
+    };
+    let (sig_handle, _sig_rx) = SignalingChannel::spawn(
+        FlushStallingStream {
+            reader: client_in,
+            writer: actor_out,
+            allow_flush: Arc::clone(&allow_flush),
+            flush_entered: Arc::clone(&flush_entered),
+            flush_waker: Arc::clone(&flush_waker),
+            write_entered: Some(Arc::clone(&write_entered)),
+        },
+        cfg,
+        cancel.child_token(),
+    );
+
+    let router = SignalingRouter::new(sig_handle);
+    let hub = Arc::new(ReverseSessionHub::new());
+    let disconnect_notify = Arc::new(Notify::new());
+    let signaler = RouterReverseSignaler::new(
+        router,
+        Arc::clone(&hub),
+        Duration::from_millis(80),
+        disconnect_notify,
+    );
+
+    // 1. Start request_pair() and wait until NewConnection has been committed via start_send()
+    //    and written into the stream before poll_flush() stalls.
+    let write_wait = write_entered.notified();
+    tokio::pin!(write_wait);
+    write_wait.as_mut().enable();
+
+    let mut pair_fut =
+        Box::pin(signaler.request_pair(PeerAddr::Socket("127.0.0.1:43220".parse().unwrap())));
+    tokio::select! {
+        _ = &mut pair_fut => panic!("request_pair should remain pending while flush is blocked"),
+        _ = &mut write_wait => {}
+    }
+
+    // 2. Cancel request_pair() after wire commit: PendingSessionGuard must keep the session alive.
+    drop(pair_fut);
+    assert_eq!(hub.pending_session_count(), 1);
+
+    // 3. Release flush so the peer receives the committed NewConnection and dials back cleanly.
+    allow_flush.store(true, Ordering::Release);
+    if let Some(w) = flush_waker.lock().ok().and_then(|mut g| g.take()) {
+        w.wake();
+    }
+
+    let mut peer_ctrl = FramedControlStream::new(peer_out);
+    let committed_msg = tokio::time::timeout(Duration::from_millis(500), peer_ctrl.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let committed_sid = match committed_msg {
+        ControlMessage::NewConnection {
+            session_id,
+            client_addr,
+        } => {
+            assert_eq!(client_addr, "127.0.0.1:43220");
+            session_id
+        }
+        other => panic!("expected committed NewConnection frame, got {other:?}"),
+    };
+
+    let (dial_back, _peer_dial) = duplex(64);
+    assert!(hub.fulfill(&committed_sid, Box::new(dial_back)).is_ok());
+    assert_eq!(hub.pending_session_count(), 0);
+
+    // 4. Verify an unfulfilled post-commit cancelled session expires via the linger timeout.
+    //    Use a fresh channel/signaler so step 3's flush completion cannot race with stalling the next send.
+    let (client_in_2, _server_in_2) = duplex(1024);
+    let (actor_out_2, _peer_out_2) = duplex(4096);
+    let allow_flush_2 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flush_entered_2 = Arc::new(Notify::new());
+    let flush_waker_2 = Arc::new(std::sync::Mutex::new(None::<std::task::Waker>));
+    let write_entered_2 = Arc::new(Notify::new());
+    let (sig_handle_2, _sig_rx_2) = SignalingChannel::spawn(
+        FlushStallingStream {
+            reader: client_in_2,
+            writer: actor_out_2,
+            allow_flush: allow_flush_2,
+            flush_entered: flush_entered_2,
+            flush_waker: flush_waker_2,
+            write_entered: Some(Arc::clone(&write_entered_2)),
+        },
+        cfg,
+        cancel.child_token(),
+    );
+    let signaler_2 = RouterReverseSignaler::new(
+        SignalingRouter::new(sig_handle_2),
+        Arc::clone(&hub),
+        Duration::from_millis(80),
+        Arc::new(Notify::new()),
+    );
+
+    let write_wait_2 = write_entered_2.notified();
+    tokio::pin!(write_wait_2);
+    write_wait_2.as_mut().enable();
+
+    let mut pair_fut_2 =
+        Box::pin(signaler_2.request_pair(PeerAddr::Socket("127.0.0.1:43221".parse().unwrap())));
+    tokio::select! {
+        res = &mut pair_fut_2 => panic!(
+            "second request_pair should block on stalled flush, got err={:?}",
+            res.err()
+        ),
+        _ = &mut write_wait_2 => {}
+    }
+    drop(pair_fut_2);
+    assert_eq!(hub.pending_session_count(), 1);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while hub.pending_session_count() > 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "committed cancelled session must expire after linger timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
 
     cancel.cancel();
 }

@@ -12,8 +12,8 @@ use crate::consts::{
     reverse_frame_timeout, reverse_grace_period, reverse_pool_soft_cap,
 };
 use crate::control::{
-    ControlMessage, FramedControlStream, SignalingChannel, SignalingConfig, SignalingReceiver,
-    SignalingRouter,
+    ControlMessage, FramedControlStream, SendCommitGate, SignalingChannel, SignalingConfig,
+    SignalingReceiver, SignalingRouter,
 };
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, TunnelStream};
@@ -135,10 +135,17 @@ impl Drop for GraceHandle {
 struct PendingSessionGuard {
     hub: Arc<ReverseSessionHub>,
     session_id: String,
+    gate: Arc<SendCommitGate>,
+    rx: Option<oneshot::Receiver<Box<dyn TunnelStream>>>,
+    linger_timeout: Duration,
     active: bool,
 }
 
 impl PendingSessionGuard {
+    fn rx_mut(&mut self) -> Option<&mut oneshot::Receiver<Box<dyn TunnelStream>>> {
+        self.rx.as_mut()
+    }
+
     fn defuse(mut self) {
         self.active = false;
     }
@@ -146,8 +153,22 @@ impl PendingSessionGuard {
 
 impl Drop for PendingSessionGuard {
     fn drop(&mut self) {
-        if self.active {
+        if !self.active {
+            return;
+        }
+        if self.gate.try_cancel() {
+            // Cancelled before wire commit: clean up immediately.
             self.hub.remove_session(&self.session_id);
+        } else if let Some(rx) = self.rx.take() {
+            // Already committed on the wire (`start_send`): keep pending session alive
+            // until either paired via `fulfill()` or `linger_timeout` expires.
+            let hub = Arc::clone(&self.hub);
+            let session_id = self.session_id.clone();
+            let timeout = self.linger_timeout;
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(timeout, rx).await;
+                hub.remove_session(&session_id);
+            });
         }
     }
 }
@@ -213,22 +234,28 @@ impl ReverseSessionHub {
         Self::default()
     }
 
-    /// Registers a pending session ID with an RAII drop guard that cleans up on cancellation.
+    /// Registers a pending session ID with an atomic commit-guarded cleanup drop handler.
     fn register_guarded(
         self: &Arc<Self>,
         session_id: String,
-    ) -> (
-        oneshot::Receiver<Box<dyn TunnelStream>>,
-        PendingSessionGuard,
-    ) {
+        gate: Arc<SendCommitGate>,
+        linger_timeout: Duration,
+    ) -> PendingSessionGuard {
         let (tx, rx) = oneshot::channel();
         self.pending_sessions.insert(session_id.clone(), tx);
-        let guard = PendingSessionGuard {
+        PendingSessionGuard {
             hub: Arc::clone(self),
             session_id,
+            gate,
+            rx: Some(rx),
+            linger_timeout,
             active: true,
-        };
-        (rx, guard)
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn pending_session_count(&self) -> usize {
+        self.pending_sessions.len()
     }
 
     fn remove_session(&self, session_id: &str) {
@@ -483,19 +510,24 @@ impl ReverseSignaler for RouterReverseSignaler {
         Box::pin(async move {
             let seq = NEXT_SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
             let session_id = format!("v2s-{seq}");
-            let (rx, guard) = hub.register_guarded(session_id.clone());
+            let gate = Arc::new(SendCommitGate::new());
+            let mut guard =
+                hub.register_guarded(session_id.clone(), Arc::clone(&gate), pair_timeout);
 
             let msg = ControlMessage::NewConnection {
                 session_id,
                 client_addr: visitor_peer.to_string(),
             };
-            if let Err(err) = router.send(msg).await {
+            if let Err(err) = router.send_with_gate(msg, gate).await {
                 disconnect_notify.notify_one();
                 return Err(TaskError::StageFailed(format!(
                     "failed to send NewConnection signal: {err}"
                 )));
             }
 
+            let rx = guard
+                .rx_mut()
+                .ok_or_else(|| TaskError::StageFailed("reverse receiver missing".to_string()))?;
             let stream = tokio::time::timeout(pair_timeout, rx)
                 .await
                 .map_err(|_| TaskError::StageFailed("reverse pair timeout".to_string()))?

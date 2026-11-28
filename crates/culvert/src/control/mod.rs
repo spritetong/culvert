@@ -10,8 +10,8 @@ pub mod router;
 pub mod stream;
 
 pub use channel::{
-    CommandDeduplicator, SignalingChannel, SignalingConfig, SignalingHandle, SignalingReceiver,
-    SignalingSink,
+    CommandDeduplicator, SendCommitGate, SignalingChannel, SignalingConfig, SignalingHandle,
+    SignalingReceiver, SignalingSink,
 };
 pub use router::SignalingRouter;
 pub use stream::{ControlMessage, ControlStream, FramedControlStream};
