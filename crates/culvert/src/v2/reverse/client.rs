@@ -619,7 +619,9 @@ impl ReverseClientRunner {
                             }
                             Some(Ok(_)) => {}
                             _ => {
-                                if router.promote_standby_if_closed() || router.has_active_channel() {
+                                if router.promote_standby_if_closed().await
+                                    || router.has_active_channel().await
+                                {
                                     continue;
                                 }
                                 if pool_workers > 0
@@ -674,7 +676,7 @@ impl ReverseClientRunner {
         loop {
             let mut attached = std::pin::pin!(router.notified());
             attached.as_mut().enable();
-            if router.promote_standby_if_closed() || router.has_active_channel() {
+            if router.promote_standby_if_closed().await || router.has_active_channel().await {
                 return true;
             }
             tokio::select! {
@@ -682,7 +684,7 @@ impl ReverseClientRunner {
                 _ = shutdown_token.cancelled() => return false,
                 _ = &mut deadline => return false,
                 () = &mut attached => {
-                    if router.promote_standby_if_closed() || router.has_active_channel() {
+                    if router.promote_standby_if_closed().await || router.has_active_channel().await {
                         return true;
                     }
                 }

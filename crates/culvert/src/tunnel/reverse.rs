@@ -510,7 +510,9 @@ pub async fn run_reverse_mapping(
                         }
                         Some(Ok(_)) => {}
                         _ => {
-                            if router.promote_standby_if_closed() || router.has_active_channel() {
+                            if router.promote_standby_if_closed().await
+                                || router.has_active_channel().await
+                            {
                                 debug!(tag = %tag, "Primary signaling channel ended while standby remains active");
                                 continue;
                             }
@@ -521,10 +523,10 @@ pub async fn run_reverse_mapping(
                                 tokio::pin!(promote_deadline);
                                 let mut promoted = false;
                                 loop {
-                                    let attached = router.notified();
-                                    tokio::pin!(attached);
-                                    if router.promote_standby_if_closed()
-                                        || router.has_active_channel()
+                                    let mut attached = std::pin::pin!(router.notified());
+                                    attached.as_mut().enable();
+                                    if router.promote_standby_if_closed().await
+                                        || router.has_active_channel().await
                                     {
                                         promoted = true;
                                         break;
@@ -533,9 +535,9 @@ pub async fn run_reverse_mapping(
                                         biased;
                                         _ = cancel_token.cancelled() => break,
                                         _ = &mut promote_deadline => break,
-                                        _ = &mut attached => {
-                                            if router.promote_standby_if_closed()
-                                                || router.has_active_channel()
+                                        () = &mut attached => {
+                                            if router.promote_standby_if_closed().await
+                                                || router.has_active_channel().await
                                             {
                                                 promoted = true;
                                                 break;

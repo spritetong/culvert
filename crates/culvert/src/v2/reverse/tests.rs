@@ -558,8 +558,8 @@ async fn reverse_old_generation_cannot_promote_new_signaling_attachment() {
     assert!(replenish_rx.try_recv().is_err());
     drop(ctrl_server);
     tokio::time::sleep(Duration::from_millis(20)).await;
-    assert!(!router.promote_standby_if_closed());
-    assert!(!router.has_active_channel());
+    assert!(!router.promote_standby_if_closed().await);
+    assert!(!router.has_active_channel().await);
 
     router_cancel.cancel();
     coord.graceful_stop().await.unwrap();
@@ -622,7 +622,7 @@ async fn router_standby_attach_during_promotion_wait_is_observed() {
 
         // Ensure primary channel is closed before starting the standby recovery wait.
         tokio::time::sleep(Duration::from_millis(5)).await;
-        assert!(!router.has_active_channel());
+        assert!(!router.has_active_channel().await);
 
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
         let b_attach = Arc::clone(&barrier);

@@ -606,7 +606,7 @@ impl ServerRunner {
         if cancel_token.is_cancelled() {
             return;
         }
-        if router.promote_standby_if_closed() {
+        if router.promote_standby_if_closed().await {
             debug!(addr = %listen_addr, "Primary reverse signaling channel closed; failed over to standby");
             return;
         }
@@ -745,7 +745,7 @@ impl ServerRunner {
     ) {
         // SLOW PATH (Fallback): if signaling is temporarily in its grace window with an empty pool,
         // drop only this fallback visitor without tearing down the bound port.
-        if !router.has_active_channel() {
+        if !router.has_active_channel().await {
             debug!(
                 visitor = %visitor_addr,
                 protocol = %protocol,

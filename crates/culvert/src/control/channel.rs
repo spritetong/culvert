@@ -8,13 +8,15 @@
 use futures_util::{SinkExt, StreamExt};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::{Instant, interval, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
+
+pub use crate::control::router::SignalingRouter;
 
 use crate::common::CancelFutureExt;
 use crate::consts::{
@@ -58,6 +60,10 @@ impl SignalingHandle {
     /// Returns `true` when the backing signaling actor has exited.
     pub fn is_closed(&self) -> bool {
         self.cmd_tx.is_closed()
+    }
+
+    pub(super) async fn closed(&self) {
+        self.cmd_tx.closed().await;
     }
 
     /// Transmits a control message using the session's derived frame timeout.
@@ -140,158 +146,6 @@ impl CommandDeduplicator {
 impl Default for CommandDeduplicator {
     fn default() -> Self {
         Self::new(DEFAULT_DEDUPLICATION_WINDOW_CAPACITY)
-    }
-}
-
-/// Multi-channel signaling router providing active-standby failover and single-flight dispatch.
-///
-/// Guarantees that at any given moment, commands are transmitted strictly over ONE channel,
-/// eliminating duplicate message dispatch. If the primary channel drops, it atomically
-/// promotes the standby channel and increments the generation epoch.
-#[derive(Clone)]
-pub struct SignalingRouter {
-    primary: Arc<parking_lot::Mutex<Option<SignalingHandle>>>,
-    standby: Arc<parking_lot::Mutex<Option<SignalingHandle>>>,
-    epoch: Arc<AtomicU64>,
-    attach_notify: Arc<Notify>,
-}
-
-impl SignalingRouter {
-    /// Creates a router with an initial primary channel.
-    pub fn new(primary: SignalingHandle) -> Self {
-        Self {
-            primary: Arc::new(parking_lot::Mutex::new(Some(primary))),
-            standby: Arc::new(parking_lot::Mutex::new(None)),
-            epoch: Arc::new(AtomicU64::new(1)),
-            attach_notify: Arc::new(Notify::new()),
-        }
-    }
-
-    /// Attaches an additional channel as standby (or as primary if none exists or primary is closed).
-    pub fn attach(&self, handle: SignalingHandle) {
-        {
-            let mut prim = self.primary.lock();
-            if prim.as_ref().is_none_or(|h| h.is_closed()) {
-                *prim = Some(handle);
-                self.epoch.fetch_add(1, Ordering::SeqCst);
-            } else {
-                let mut sec = self.standby.lock();
-                *sec = Some(handle);
-            }
-        }
-        self.attach_notify.notify_waiters();
-    }
-
-    /// Returns a future resolved when a new channel is attached to the router.
-    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
-        self.attach_notify.notified()
-    }
-
-    /// Returns the active epoch generation counter.
-    pub fn epoch(&self) -> u64 {
-        self.epoch.load(Ordering::Relaxed)
-    }
-
-    /// Checks if at least one live (non-closed) channel is attached.
-    pub fn has_active_channel(&self) -> bool {
-        self.primary.lock().as_ref().is_some_and(|h| !h.is_closed())
-            || self.standby.lock().as_ref().is_some_and(|h| !h.is_closed())
-    }
-
-    /// Promotes a live standby channel to primary if primary is missing or closed.
-    ///
-    /// Returns `true` if a live primary channel is available after promotion.
-    pub fn promote_standby_if_closed(&self) -> bool {
-        let mut prim = self.primary.lock();
-        if prim.as_ref().is_some_and(|h| !h.is_closed()) {
-            return true;
-        }
-        let next = {
-            let mut sec = self.standby.lock();
-            sec.take().filter(|h| !h.is_closed())
-        };
-        if let Some(handle) = next {
-            *prim = Some(handle);
-            self.epoch.fetch_add(1, Ordering::SeqCst);
-            true
-        } else {
-            *prim = None;
-            false
-        }
-    }
-
-    /// Sends a message using the active primary channel, with automatic failover to standby.
-    pub async fn send(&self, msg: ControlMessage) -> Result<(), TunnelError> {
-        self.send_inner(msg, None).await
-    }
-
-    /// Sends a message with an explicit timeout.
-    pub async fn send_timeout(
-        &self,
-        msg: ControlMessage,
-        timeout: Duration,
-    ) -> Result<(), TunnelError> {
-        self.send_inner(msg, Some(timeout)).await
-    }
-
-    async fn send_inner(
-        &self,
-        msg: ControlMessage,
-        explicit_timeout: Option<Duration>,
-    ) -> Result<(), TunnelError> {
-        let primary = { self.primary.lock().clone() };
-        if let Some(ref handle) = primary {
-            if !handle.is_closed() {
-                let res = match explicit_timeout {
-                    Some(t) => handle.send_timeout(msg.clone(), t).await,
-                    None => handle.send(msg.clone()).await,
-                };
-                match res {
-                    Ok(()) => return Ok(()),
-                    Err(e) => {
-                        warn!("Primary channel send failed: {}; promoting standby", e);
-                        let mut p = self.primary.lock();
-                        if p.as_ref()
-                            .is_some_and(|cur| cur.cmd_tx.same_channel(&handle.cmd_tx))
-                        {
-                            *p = None;
-                        }
-                    }
-                }
-            } else {
-                let mut p = self.primary.lock();
-                if p.as_ref()
-                    .is_some_and(|cur| cur.cmd_tx.same_channel(&handle.cmd_tx))
-                {
-                    *p = None;
-                }
-            }
-        }
-
-        // Failover: promote standby to primary
-        let standby = {
-            let mut sec = self.standby.lock();
-            sec.take().filter(|h| !h.is_closed())
-        };
-
-        if let Some(new_primary) = standby {
-            self.epoch.fetch_add(1, Ordering::SeqCst);
-            let res = match explicit_timeout {
-                Some(t) => new_primary.send_timeout(msg, t).await,
-                None => new_primary.send(msg).await,
-            };
-            if res.is_ok() {
-                let mut p = self.primary.lock();
-                if p.as_ref().is_none_or(|h| h.is_closed()) {
-                    *p = Some(new_primary);
-                }
-            }
-            res
-        } else {
-            Err(TunnelError::ControlProtocol(
-                "No signaling channels available".into(),
-            ))
-        }
     }
 }
 
@@ -887,7 +741,7 @@ mod tests {
 
         let (h1, mut unified_rx) = SignalingChannel::spawn(ch1_rx, cfg, cancel.child_token());
         let router = SignalingRouter::new(h1);
-        assert!(router.has_active_channel());
+        assert!(router.has_active_channel().await);
 
         // Drop ch1_tx so primary exits with clean EOF -> zero active actors
         drop(ch1_tx);
@@ -905,7 +759,7 @@ mod tests {
             .expect("event sink must remain valid across zero-actor gap");
         let h2 = SignalingChannel::spawn_with_event_sink(ch2_rx, cfg, sink, cancel.child_token());
         router.attach(h2);
-        assert!(router.has_active_channel());
+        assert!(router.has_active_channel().await);
 
         // Attach a third channel carrying corrupted bytes; its decode error must not poison h2
         let (mut bad_tx, bad_rx) = duplex(4096);

@@ -701,7 +701,7 @@ impl ReverseControlSession {
                     break;
                 }
                 _ = disconnect_notify.notified(), if grace_handle.is_none() => {
-                    if !router.has_active_channel()
+                    if !router.has_active_channel().await
                         && !Self::recover_or_enter_grace(
                             &listen_addr,
                             protocol,
@@ -788,7 +788,7 @@ impl ReverseControlSession {
         if cancel_token.is_cancelled() {
             return false;
         }
-        if router.promote_standby_if_closed() {
+        if router.promote_standby_if_closed().await {
             return true;
         }
         if grace_handle.is_none() {

@@ -6,10 +6,12 @@
 //! All comments and docstrings must be in English.
 
 pub mod channel;
+pub mod router;
 pub mod stream;
 
 pub use channel::{
     CommandDeduplicator, SignalingChannel, SignalingConfig, SignalingHandle, SignalingReceiver,
-    SignalingRouter, SignalingSink,
+    SignalingSink,
 };
+pub use router::SignalingRouter;
 pub use stream::{ControlMessage, ControlStream, FramedControlStream};
