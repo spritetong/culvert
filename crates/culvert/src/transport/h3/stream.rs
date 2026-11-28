@@ -64,6 +64,9 @@ impl AsyncRead for QuinnTunnelStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         if let Some(ref session) = self.session {
             if !session.is_alive() {
                 return Poll::Ready(Err(io::Error::new(
@@ -555,6 +558,9 @@ impl AsyncRead for H3TunnelStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         if let Some(ref session) = self.session {
             if !session.is_alive() {
                 return Poll::Ready(Err(io::Error::new(
@@ -1260,5 +1266,112 @@ mod tests {
         let mut eof_buf = [0u8; 8];
         let n = stream.read(&mut eof_buf).await.unwrap();
         assert_eq!(n, 0, "EOF must only occur after all real DATA chunks");
+    }
+
+    #[tokio::test]
+    async fn test_quinn_stream_zero_capacity_read_buf_preserves_peeked_byte() {
+        use std::time::Duration;
+
+        let (server_conn, client_conn) =
+            super::super::connector::tests::create_test_quic_connection_pair().await;
+        let (mut c_send, c_recv) = client_conn.open_bi().await.unwrap();
+        c_send.write_all(b"init").await.unwrap();
+        let (mut s_send, mut s_recv) = server_conn.accept_bi().await.unwrap();
+        let mut init_buf = [0u8; 4];
+        s_recv.read_exact(&mut init_buf).await.unwrap();
+
+        let mut stream = QuinnTunnelStream::new(c_send, c_recv)
+            .with_session(QuicSessionHandle::new(client_conn));
+
+        // Send data from peer and drive poll_check_alive() until QuinnTunnelStream peeks 1 byte.
+        s_send.write_all(b"Zhello").await.unwrap();
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while stream.read_buf.is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for poll_check_alive to peek first byte"
+            );
+            assert_eq!(
+                stream.poll_check_alive(&mut cx),
+                Poll::Ready(HeartbeatStatus::Alive)
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(stream.read_buf, Some(b'Z'));
+
+        let before = stream.last_activity_ms().unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        // Zero-capacity ReadBuf must return Ready(Ok(())) without panicking, without
+        // consuming the peeked byte, and without refreshing activity.
+        let mut empty = [];
+        let mut zero_buf = ReadBuf::new(&mut empty);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read(&mut cx, &mut zero_buf),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(stream.read_buf, Some(b'Z'));
+        assert_eq!(stream.last_activity_ms(), Some(before));
+
+        // Normal read must still receive the peeked byte followed by the rest.
+        let mut out = [0u8; 6];
+        stream.read_exact(&mut out).await.unwrap();
+        assert_eq!(&out, b"Zhello");
+
+        drop((s_send, s_recv, server_conn));
+    }
+
+    #[tokio::test]
+    async fn test_h3_stream_zero_capacity_read_buf_preserves_data_and_activity() {
+        use std::collections::VecDeque;
+        use std::time::Duration;
+
+        struct OnceRecvStream(VecDeque<Bytes>);
+        impl H3RecvStream for OnceRecvStream {
+            async fn recv_chunk(&mut self) -> Result<Option<Bytes>, io::Error> {
+                match self.0.pop_front() {
+                    Some(b) => Ok(Some(b)),
+                    None => {
+                        std::future::pending::<()>().await;
+                        Ok(None)
+                    }
+                }
+            }
+        }
+
+        let send = MockSendStream {
+            sent: vec![],
+            finished: false,
+        };
+        let recv = OnceRecvStream(VecDeque::from([Bytes::from_static(b"hello")]));
+        let mut stream = H3TunnelStream::spawn_split_pump(send, recv);
+
+        // Wait until inbound task delivers chunk so poll_check_alive buffers it.
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while stream.read_buf.is_none() {
+            assert!(tokio::time::Instant::now() < deadline);
+            assert_eq!(
+                stream.poll_check_alive(&mut cx),
+                Poll::Ready(HeartbeatStatus::Alive)
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let before = stream.last_activity_ms().unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        let mut empty = [];
+        let mut zero_buf = ReadBuf::new(&mut empty);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read(&mut cx, &mut zero_buf),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(stream.last_activity_ms(), Some(before));
+
+        let mut out = [0u8; 5];
+        stream.read_exact(&mut out).await.unwrap();
+        assert_eq!(&out, b"hello");
     }
 }

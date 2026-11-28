@@ -192,9 +192,12 @@ impl WsTunnelStream {
     }
 }
 
-impl AsyncRead for WsTunnelStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
+impl WsTunnelStream {
+    /// Drives the WebSocket inbound `ReadState` machine. Separated from `AsyncRead::poll_read`
+    /// so external callers with a zero-capacity `ReadBuf` return early without side effects,
+    /// while `poll_check_alive` can still advance frame/FIN/Close processing non-destructively.
+    fn poll_read_state(
+        &mut self,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
@@ -371,6 +374,19 @@ impl AsyncRead for WsTunnelStream {
                 }
             }
         }
+    }
+}
+
+impl AsyncRead for WsTunnelStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        self.poll_read_state(cx, buf)
     }
 }
 
@@ -734,7 +750,7 @@ impl TunnelStream for WsTunnelStream {
         // symptom. It also discarded the read half on Close/error paths.
         let mut empty = [0u8; 0];
         let mut buf = ReadBuf::new(&mut empty);
-        let status = match Pin::new(&mut *self).poll_read(cx, &mut buf) {
+        let status = match self.poll_read_state(cx, &mut buf) {
             Poll::Ready(Err(_)) => Poll::Ready(HeartbeatStatus::Dead),
             Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
             Poll::Ready(Ok(())) => match self.read_state {
@@ -1563,5 +1579,46 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn test_ws_zero_capacity_read_buf_preserves_data_and_activity() {
+        use std::time::Duration;
+
+        let (raw_client, raw_server) = duplex(65536);
+        let mut client = WsTunnelStream::new(raw_client, Role::Client);
+        let mut server = WsTunnelStream::new(raw_server, Role::Server);
+
+        server.write_all(b"hello").await.unwrap();
+        server.flush().await.unwrap();
+
+        let before = client.last_activity_ms().unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        let mut empty = [];
+        let mut zero_buf = ReadBuf::new(&mut empty);
+        assert!(matches!(
+            Pin::new(&mut client).poll_read(&mut cx, &mut zero_buf),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(client.last_activity_ms(), Some(before));
+
+        // Partial read leaves remaining bytes in ReadState::Buffered; a zero-capacity
+        // poll_read in Buffered state must also preserve the remaining bytes.
+        let mut head = [0u8; 2];
+        client.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head, b"he");
+
+        let mut empty_buffered = [];
+        let mut zero_buffered = ReadBuf::new(&mut empty_buffered);
+        assert!(matches!(
+            Pin::new(&mut client).poll_read(&mut cx, &mut zero_buffered),
+            Poll::Ready(Ok(()))
+        ));
+
+        let mut tail = [0u8; 3];
+        client.read_exact(&mut tail).await.unwrap();
+        assert_eq!(&tail, b"llo");
     }
 }
