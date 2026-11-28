@@ -1374,3 +1374,233 @@ async fn relay_graceful_drain_reports_io_errors_and_honors_timeout() {
         }
     }
 }
+
+#[tokio::test]
+async fn datagram_stream_graceful_drain_rejects_incomplete_rx_frame() {
+    use crate::io::channel::{Datagram, FlowKey, IoChannel};
+    use crate::v2::relay::ChannelRelay;
+    use crate::v2::stage::ConnectingContext;
+    use crate::v2::{Coordinator, TaskError, TaskOutcome, TaskWorkflow};
+    use bytes::Bytes;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf, duplex};
+    use tokio::sync::Notify;
+
+    struct RelayInput {
+        a: IoChannel,
+        b: IoChannel,
+    }
+
+    struct RelayWf;
+
+    impl TaskWorkflow for RelayWf {
+        type Input = RelayInput;
+        type Active = ChannelRelay;
+
+        async fn connect(
+            &self,
+            _ctx: &mut ConnectingContext<'_>,
+            input: Self::Input,
+        ) -> Result<Self::Active, TaskError> {
+            Ok(ChannelRelay::from_channels(
+                input.a,
+                input.b,
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                Duration::from_millis(200),
+                None,
+            ))
+        }
+    }
+
+    struct ReadTrackedStream {
+        inner: DuplexStream,
+        bytes_read: Arc<AtomicUsize>,
+        read_notify: Arc<Notify>,
+    }
+
+    impl AsyncRead for ReadTrackedStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let before = buf.filled().len();
+            let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+            if let Poll::Ready(Ok(())) = &poll {
+                let delta = buf.filled().len().saturating_sub(before);
+                if delta > 0 {
+                    self.bytes_read.fetch_add(delta, Ordering::AcqRel);
+                    self.read_notify.notify_waiters();
+                }
+            }
+            poll
+        }
+    }
+
+    impl AsyncWrite for ReadTrackedStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl TunnelStream for ReadTrackedStream {
+        fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+            Pin::new(&mut self.inner).poll_check_alive(cx)
+        }
+    }
+
+    struct VecDatagramIo {
+        inbound_rx: tokio::sync::mpsc::UnboundedReceiver<Datagram>,
+        outbound_tx: tokio::sync::mpsc::UnboundedSender<Datagram>,
+    }
+
+    impl crate::io::channel::DatagramIo for VecDatagramIo {
+        fn poll_recv(
+            &mut self,
+            cx: &mut Context<'_>,
+            batch: &mut [Datagram],
+        ) -> Poll<io::Result<usize>> {
+            match self.inbound_rx.poll_recv(cx) {
+                Poll::Ready(Some(d)) if !batch.is_empty() => {
+                    batch[0] = d;
+                    Poll::Ready(Ok(1))
+                }
+                Poll::Ready(None) => Poll::Ready(Ok(0)),
+                _ => Poll::Pending,
+            }
+        }
+
+        fn poll_send(
+            &mut self,
+            _cx: &mut Context<'_>,
+            batch: &[Datagram],
+        ) -> Poll<io::Result<usize>> {
+            for d in batch {
+                let _ = self.outbound_tx.send(d.clone());
+            }
+            Poll::Ready(Ok(batch.len()))
+        }
+    }
+
+    // 1. Both partial header (1 byte) and partial payload (u16 length=10 + 3 payload bytes)
+    //    must fail closing rather than reporting `TaskOutcome::GracefullyDrained`.
+    for partial_payload in [vec![0x00u8], vec![0x00, 0x0A, b'a', b'b', b'c']] {
+        let (handle, join) = Coordinator::start(
+            RelayWf,
+            Duration::from_millis(500),
+            CancellationToken::new(),
+        );
+        let (_dgram_in_tx, dgram_in_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (dgram_out_tx, _dgram_out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut stream_peer, stream_end) = duplex(1024);
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let read_notify = Arc::new(Notify::new());
+
+        handle
+            .assign(RelayInput {
+                a: IoChannel::from_datagram(VecDatagramIo {
+                    inbound_rx: dgram_in_rx,
+                    outbound_tx: dgram_out_tx,
+                }),
+                b: IoChannel::from_boxed_stream(Box::new(ReadTrackedStream {
+                    inner: stream_end,
+                    bytes_read: Arc::clone(&bytes_read),
+                    read_notify: Arc::clone(&read_notify),
+                })),
+            })
+            .await
+            .unwrap();
+
+        let expected_len = partial_payload.len();
+        stream_peer.write_all(&partial_payload).await.unwrap();
+        stream_peer.flush().await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let notified = read_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if bytes_read.load(Ordering::Acquire) >= expected_len {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("relay must pull partial frame bytes into rx_buf");
+
+        handle.graceful_stop().await.unwrap();
+        let summary = tokio::time::timeout(Duration::from_secs(2), join)
+            .await
+            .expect("coordinator must finish drain")
+            .unwrap();
+        assert_eq!(summary.completed_jobs.len(), 1);
+        assert!(
+            matches!(
+                summary.completed_jobs[0].outcome,
+                TaskOutcome::Failed(TaskError::StageFailed(ref msg))
+                    if msg.contains("incomplete UDP datagram frame")
+            ),
+            "expected Failed outcome for buffered incomplete frame during drain, got {:?}",
+            summary.completed_jobs[0].outcome
+        );
+        drop(stream_peer);
+    }
+
+    // 2. Positive control: complete frame drained cleanly leaves rx_buf empty -> GracefullyDrained.
+    {
+        let (handle, join) = Coordinator::start(
+            RelayWf,
+            Duration::from_millis(500),
+            CancellationToken::new(),
+        );
+        let (_dgram_in_tx, dgram_in_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (dgram_out_tx, mut dgram_out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut stream_peer, stream_end) = duplex(1024);
+
+        handle
+            .assign(RelayInput {
+                a: IoChannel::from_datagram(VecDatagramIo {
+                    inbound_rx: dgram_in_rx,
+                    outbound_tx: dgram_out_tx,
+                }),
+                b: IoChannel::from_stream(stream_end),
+            })
+            .await
+            .unwrap();
+
+        stream_peer.write_all(b"\x00\x04ping").await.unwrap();
+        stream_peer.flush().await.unwrap();
+
+        let delivered = tokio::time::timeout(Duration::from_secs(2), dgram_out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered.payload, Bytes::from_static(b"ping"));
+        let _ = FlowKey::default();
+
+        handle.graceful_stop().await.unwrap();
+        let summary = tokio::time::timeout(Duration::from_secs(2), join)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.completed_jobs.len(), 1);
+        assert_eq!(
+            summary.completed_jobs[0].outcome,
+            TaskOutcome::GracefullyDrained
+        );
+    }
+}

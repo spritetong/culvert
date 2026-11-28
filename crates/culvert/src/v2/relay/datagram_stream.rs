@@ -315,13 +315,13 @@ impl DatagramStreamRelay {
             Err(err) => return Poll::Ready(Err(err)),
         }
 
-        if self.stream_read_done && self.pending_dgrams.is_empty() {
+        if (self.stream_read_done || drain_only) && self.pending_dgrams.is_empty() {
             match self.pending_dgrams.decode_frames(&mut self.rx_buf) {
                 Ok(true) => progress = true,
                 Ok(false) => {}
                 Err(err) => return Poll::Ready(Err(TaskError::StageFailed(err.to_string()))),
             }
-            if self.pending_dgrams.is_empty() && !self.rx_buf.is_empty() {
+            if self.stream_read_done && self.pending_dgrams.is_empty() && !self.rx_buf.is_empty() {
                 return Poll::Ready(Err(TaskError::StageFailed(
                     "truncated UDP datagram frame at end of stream".into(),
                 )));
@@ -333,6 +333,11 @@ impl DatagramStreamRelay {
             && self.pending_dgrams.is_empty()
             && (self.stream_read_done || drain_only)
         {
+            if !self.rx_buf.is_empty() {
+                return Poll::Ready(Err(TaskError::StageFailed(
+                    "incomplete UDP datagram frame left in buffer during drain".into(),
+                )));
+            }
             return Poll::Ready(Ok(()));
         }
 
