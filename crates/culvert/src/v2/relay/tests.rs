@@ -993,3 +993,384 @@ async fn udp_counters_exclude_unsent_queued_packets_on_force_stop() {
     // Unsent queued packet must NOT be counted as delivered bytes.
     assert_eq!(counters.snapshot(), (0, 0));
 }
+
+#[tokio::test]
+async fn relay_graceful_drain_reports_io_errors_and_honors_timeout() {
+    use crate::io::channel::{Datagram, FlowKey, IoChannel};
+    use bytes::Bytes;
+
+    struct DrainControllableStream {
+        inner: DuplexStream,
+        allow_write: Arc<AtomicBool>,
+        fail_write: Arc<AtomicBool>,
+        waker_slot: Arc<parking_lot::Mutex<Option<std::task::Waker>>>,
+    }
+
+    impl tokio::io::AsyncRead for DrainControllableStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for DrainControllableStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.fail_write.load(Ordering::Acquire) {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "simulated drain broken pipe",
+                )));
+            }
+            if !self.allow_write.load(Ordering::Acquire) {
+                *self.waker_slot.lock() = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.fail_write.load(Ordering::Acquire) {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "simulated flush broken pipe",
+                )));
+            }
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.fail_write.load(Ordering::Acquire) {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "simulated shutdown broken pipe",
+                )));
+            }
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl TunnelStream for DrainControllableStream {
+        fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+            Pin::new(&mut self.inner).poll_check_alive(cx)
+        }
+    }
+
+    struct FaultingDatagram {
+        inbound_rx: tokio::sync::mpsc::UnboundedReceiver<Datagram>,
+        allow_send: Arc<AtomicBool>,
+        fail_send: Arc<AtomicBool>,
+        waker_slot: Arc<parking_lot::Mutex<Option<std::task::Waker>>>,
+    }
+
+    impl crate::io::channel::DatagramIo for FaultingDatagram {
+        fn poll_recv(
+            &mut self,
+            cx: &mut Context<'_>,
+            batch: &mut [Datagram],
+        ) -> Poll<io::Result<usize>> {
+            match self.inbound_rx.poll_recv(cx) {
+                Poll::Ready(Some(d)) if !batch.is_empty() => {
+                    batch[0] = d;
+                    Poll::Ready(Ok(1))
+                }
+                Poll::Ready(None) => Poll::Ready(Ok(0)),
+                _ => Poll::Pending,
+            }
+        }
+
+        fn poll_send(
+            &mut self,
+            cx: &mut Context<'_>,
+            batch: &[Datagram],
+        ) -> Poll<io::Result<usize>> {
+            if self.fail_send.load(Ordering::Acquire) {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "simulated datagram drain broken pipe",
+                )));
+            }
+            if !self.allow_send.load(Ordering::Acquire) {
+                *self.waker_slot.lock() = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            Poll::Ready(Ok(batch.len()))
+        }
+    }
+
+    // 1. DuplexRelay: normal drain finishes cleanly -> TaskOutcome::GracefullyDrained.
+    {
+        let (handle, join) = Coordinator::start(
+            SingleShotRelayWorkflow {
+                idle_timeout: Duration::from_secs(5),
+                counters: Arc::new(RelayCounters::new()),
+            },
+            Duration::from_millis(200),
+            CancellationToken::new(),
+        );
+        let (mut peer_a, stream_a) = duplex(1024);
+        let (mut peer_b, stream_b) = duplex(1024);
+        let allow_b = Arc::new(AtomicBool::new(false));
+        let fail_b = Arc::new(AtomicBool::new(false));
+        let waker_b = Arc::new(parking_lot::Mutex::new(None));
+
+        handle
+            .assign(SingleShotInput {
+                a: IoChannel::from_stream(stream_a),
+                b: IoChannel::from_boxed_stream(Box::new(DrainControllableStream {
+                    inner: stream_b,
+                    allow_write: Arc::clone(&allow_b),
+                    fail_write: Arc::clone(&fail_b),
+                    waker_slot: Arc::clone(&waker_b),
+                })),
+            })
+            .await
+            .unwrap();
+
+        peer_a.write_all(b"drain-ok").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        handle.graceful_stop().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        allow_b.store(true, Ordering::Release);
+        if let Some(w) = waker_b.lock().take() {
+            w.wake();
+        }
+        let mut got = [0u8; 8];
+        peer_b.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"drain-ok");
+
+        let summary = join.await.unwrap();
+        assert_eq!(summary.completed_jobs.len(), 1);
+        assert_eq!(
+            summary.completed_jobs[0].outcome,
+            TaskOutcome::GracefullyDrained
+        );
+    }
+
+    // 2. DuplexRelay: BrokenPipe during graceful drain must report TaskOutcome::Failed.
+    {
+        let (handle, join) = Coordinator::start(
+            SingleShotRelayWorkflow {
+                idle_timeout: Duration::from_secs(5),
+                counters: Arc::new(RelayCounters::new()),
+            },
+            Duration::from_millis(300),
+            CancellationToken::new(),
+        );
+        let (mut peer_a, stream_a) = duplex(1024);
+        let (_peer_b, stream_b) = duplex(1024);
+        let allow_b = Arc::new(AtomicBool::new(false));
+        let fail_b = Arc::new(AtomicBool::new(false));
+        let waker_b = Arc::new(parking_lot::Mutex::new(None));
+
+        handle
+            .assign(SingleShotInput {
+                a: IoChannel::from_stream(stream_a),
+                b: IoChannel::from_boxed_stream(Box::new(DrainControllableStream {
+                    inner: stream_b,
+                    allow_write: Arc::clone(&allow_b),
+                    fail_write: Arc::clone(&fail_b),
+                    waker_slot: Arc::clone(&waker_b),
+                })),
+            })
+            .await
+            .unwrap();
+
+        peer_a.write_all(b"will-fail-drain").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        handle.graceful_stop().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        fail_b.store(true, Ordering::Release);
+        if let Some(w) = waker_b.lock().take() {
+            w.wake();
+        }
+
+        let summary = join.await.unwrap();
+        assert_eq!(summary.completed_jobs.len(), 1);
+        assert!(matches!(
+            summary.completed_jobs[0].outcome,
+            TaskOutcome::Failed(_)
+        ));
+    }
+
+    // 3. DuplexRelay: forever Pending during drain exits bounded by Relay's drain_timeout.
+    {
+        let (handle, join) = Coordinator::start(
+            SingleShotRelayWorkflow {
+                idle_timeout: Duration::from_secs(5),
+                counters: Arc::new(RelayCounters::new()),
+            },
+            Duration::from_secs(2),
+            CancellationToken::new(),
+        );
+        let (mut peer_a, stream_a) = duplex(1024);
+        let (_peer_b, stream_b) = duplex(1024);
+        let allow_b = Arc::new(AtomicBool::new(false));
+        let fail_b = Arc::new(AtomicBool::new(false));
+        let waker_b = Arc::new(parking_lot::Mutex::new(None));
+
+        handle
+            .assign(SingleShotInput {
+                a: IoChannel::from_stream(stream_a),
+                b: IoChannel::from_boxed_stream(Box::new(DrainControllableStream {
+                    inner: stream_b,
+                    allow_write: Arc::clone(&allow_b),
+                    fail_write: Arc::clone(&fail_b),
+                    waker_slot: Arc::clone(&waker_b),
+                })),
+            })
+            .await
+            .unwrap();
+
+        peer_a.write_all(b"stuck-drain").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        handle.graceful_stop().await.unwrap();
+        let summary = tokio::time::timeout(Duration::from_millis(1500), join)
+            .await
+            .expect("forever-pending drain must exit within relay drain_timeout (500ms)")
+            .unwrap();
+        assert_eq!(summary.completed_jobs.len(), 1);
+        assert_eq!(
+            summary.completed_jobs[0].outcome,
+            TaskOutcome::GracefullyDrained
+        );
+    }
+
+    // 4. DatagramStreamRelay: BrokenPipe during drain -> Failed; forever Pending -> bounded timeout.
+    for fail_during_drain in [true, false] {
+        let (handle, join) = Coordinator::start(
+            SingleShotRelayWorkflow {
+                idle_timeout: Duration::from_secs(5),
+                counters: Arc::new(RelayCounters::new()),
+            },
+            Duration::from_secs(2),
+            CancellationToken::new(),
+        );
+        let (dgram_tx, dgram_rx) = tokio::sync::mpsc::unbounded_channel();
+        let allow_stream = Arc::new(AtomicBool::new(false));
+        let fail_stream = Arc::new(AtomicBool::new(false));
+        let waker_stream = Arc::new(parking_lot::Mutex::new(None));
+        let (_peer_s, stream_end) = duplex(1024);
+
+        handle
+            .assign(SingleShotInput {
+                a: IoChannel::from_datagram(MockDatagramChannel {
+                    inbound_rx: dgram_rx,
+                    outbound_tx: tokio::sync::mpsc::unbounded_channel().0,
+                }),
+                b: IoChannel::from_boxed_stream(Box::new(DrainControllableStream {
+                    inner: stream_end,
+                    allow_write: Arc::clone(&allow_stream),
+                    fail_write: Arc::clone(&fail_stream),
+                    waker_slot: Arc::clone(&waker_stream),
+                })),
+            })
+            .await
+            .unwrap();
+
+        dgram_tx
+            .send(Datagram {
+                flow: FlowKey::default(),
+                payload: Bytes::from_static(b"ds-drain"),
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        if fail_during_drain {
+            handle.graceful_stop().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            fail_stream.store(true, Ordering::Release);
+            if let Some(w) = waker_stream.lock().take() {
+                w.wake();
+            }
+            let summary = join.await.unwrap();
+            assert!(matches!(
+                summary.completed_jobs[0].outcome,
+                TaskOutcome::Failed(_)
+            ));
+        } else {
+            handle.graceful_stop().await.unwrap();
+            let summary = tokio::time::timeout(Duration::from_millis(1500), join)
+                .await
+                .expect("datagram-stream pending drain must exit cleanly within 500ms")
+                .unwrap();
+            assert_eq!(
+                summary.completed_jobs[0].outcome,
+                TaskOutcome::GracefullyDrained
+            );
+        }
+    }
+
+    // 5. DatagramDatagramRelay: BrokenPipe during drain -> Failed; forever Pending -> bounded timeout.
+    for fail_during_drain in [true, false] {
+        let (handle, join) = Coordinator::start(
+            SingleShotRelayWorkflow {
+                idle_timeout: Duration::from_secs(5),
+                counters: Arc::new(RelayCounters::new()),
+            },
+            Duration::from_secs(2),
+            CancellationToken::new(),
+        );
+        let (a_tx, a_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_b_tx, b_rx) = tokio::sync::mpsc::unbounded_channel();
+        let allow_b = Arc::new(AtomicBool::new(false));
+        let fail_b = Arc::new(AtomicBool::new(false));
+        let waker_b = Arc::new(parking_lot::Mutex::new(None));
+
+        handle
+            .assign(SingleShotInput {
+                a: IoChannel::from_datagram(MockDatagramChannel {
+                    inbound_rx: a_rx,
+                    outbound_tx: tokio::sync::mpsc::unbounded_channel().0,
+                }),
+                b: IoChannel::from_datagram(FaultingDatagram {
+                    inbound_rx: b_rx,
+                    allow_send: Arc::clone(&allow_b),
+                    fail_send: Arc::clone(&fail_b),
+                    waker_slot: Arc::clone(&waker_b),
+                }),
+            })
+            .await
+            .unwrap();
+
+        a_tx.send(Datagram {
+            flow: FlowKey::default(),
+            payload: Bytes::from_static(b"dd-drain"),
+        })
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        if fail_during_drain {
+            handle.graceful_stop().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            fail_b.store(true, Ordering::Release);
+            if let Some(w) = waker_b.lock().take() {
+                w.wake();
+            }
+            let summary = join.await.unwrap();
+            assert!(matches!(
+                summary.completed_jobs[0].outcome,
+                TaskOutcome::Failed(_)
+            ));
+        } else {
+            handle.graceful_stop().await.unwrap();
+            let summary = tokio::time::timeout(Duration::from_millis(1500), join)
+                .await
+                .expect("datagram-datagram pending drain must exit cleanly within 500ms")
+                .unwrap();
+            assert_eq!(
+                summary.completed_jobs[0].outcome,
+                TaskOutcome::GracefullyDrained
+            );
+        }
+    }
+}

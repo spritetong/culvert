@@ -11,7 +11,7 @@ use crate::v2::relay::datagram_queue::{DATAGRAM_BATCH_SIZE, DatagramQueue};
 use crate::v2::relay::duplex::RelayCounters;
 use crate::v2::stage::{ActiveStage, ClosingStage};
 use crate::v2::state::CloseReason;
-use std::future::{Future, poll_fn};
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -218,21 +218,16 @@ pub struct DatagramDatagramClosing {
 
 impl ClosingStage for DatagramDatagramClosing {
     fn run(&mut self) -> impl Future<Output = Result<(), TaskError>> + Send {
-        let mut relay = self.relay.take();
+        let relay = self.relay.take();
         let reason = self.reason;
         let drain_timeout = self.drain_timeout;
 
-        async move {
-            if matches!(reason, CloseReason::GracefulDrain)
-                && let Some(ref mut r) = relay
-            {
-                let _ =
-                    tokio::time::timeout(drain_timeout, poll_fn(|cx| r.poll_step_inner(cx, true)))
-                        .await;
-                r.sync_counters();
-            }
-            drop(relay);
-            Ok(())
-        }
+        super::run_bounded_closing(
+            relay,
+            reason,
+            drain_timeout,
+            |r, cx| r.poll_step_inner(cx, true),
+            DatagramDatagramRelay::sync_counters,
+        )
     }
 }
