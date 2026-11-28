@@ -374,17 +374,24 @@ impl AsyncRead for WsTunnelStream {
     }
 }
 
-impl AsyncWrite for WsTunnelStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
+impl WsTunnelStream {
+    fn poll_write_frame(
+        &mut self,
         cx: &mut Context<'_>,
-        buf: &[u8],
+        len: usize,
+        make_payload: impl FnOnce() -> Payload<'static>,
     ) -> Poll<io::Result<usize>> {
         if self.peer_closed || self.close_sent || self.fin_sent || self.fin_queued {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "WebSocket peer or write half closed",
             )));
+        }
+
+        // Zero-length WebSocket binary frames encode in-band logical FIN, so empty
+        // caller writes must return Ok(0) before entering the frame state machine.
+        if len == 0 {
+            return Poll::Ready(Ok(0));
         }
 
         match self.poll_flush_control(cx) {
@@ -395,11 +402,10 @@ impl AsyncWrite for WsTunnelStream {
 
         match std::mem::replace(&mut self.write_state, WriteState::Failed) {
             WriteState::Idle(mut tx) => {
-                let len = buf.len();
                 self.liveness.record_tx();
-                let payload = buf.to_vec();
+                let payload = make_payload();
                 let mut fut = Box::pin(async move {
-                    let res = tx.write_frame(Frame::binary(Payload::Owned(payload))).await;
+                    let res = tx.write_frame(Frame::binary(payload)).await;
                     (tx, res)
                 });
                 match fut.as_mut().poll(cx) {
@@ -457,6 +463,16 @@ impl AsyncWrite for WsTunnelStream {
                 "WebSocket write half in failed state",
             ))),
         }
+    }
+}
+
+impl AsyncWrite for WsTunnelStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_write_frame(cx, buf.len(), || Payload::Owned(buf.to_vec()))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -590,87 +606,12 @@ impl AsyncWrite for WsTunnelStream {
 
 impl TunnelStream for WsTunnelStream {
     fn poll_write_owned(&mut self, cx: &mut Context<'_>, buf: Bytes) -> Poll<io::Result<usize>> {
-        if self.peer_closed || self.close_sent || self.fin_sent || self.fin_queued {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "WebSocket peer or write half closed",
-            )));
-        }
-
-        match self.poll_flush_control(cx) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Ready(Ok(())) => {}
-        }
-
-        match std::mem::replace(&mut self.write_state, WriteState::Failed) {
-            WriteState::Idle(mut tx) => {
-                let len = buf.len();
-                // `BytesMut::from(Bytes)` reuses the original allocation when the
-                // chunk is uniquely owned (the normal relay path) and only copies
-                // for shared/sliced buffers. Converting via `buf.as_ref()` always
-                // copied the whole payload a second time.
-                self.liveness.record_tx();
-                let payload = bytes::BytesMut::from(buf);
-                let mut fut = Box::pin(async move {
-                    let res = tx.write_frame(Frame::binary(Payload::Bytes(payload))).await;
-                    (tx, res)
-                });
-                match fut.as_mut().poll(cx) {
-                    Poll::Ready((tx, Ok(()))) => {
-                        self.write_state = WriteState::Idle(tx);
-                        Poll::Ready(Ok(len))
-                    }
-                    Poll::Ready((_tx, Err(e))) => {
-                        self.write_state = WriteState::Failed;
-                        Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)))
-                    }
-                    Poll::Pending => {
-                        self.write_state = WriteState::Writing {
-                            fut,
-                            written_len: len,
-                        };
-                        Poll::Pending
-                    }
-                }
-            }
-            WriteState::Writing {
-                mut fut,
-                written_len,
-            } => match fut.as_mut().poll(cx) {
-                Poll::Pending => {
-                    self.write_state = WriteState::Writing { fut, written_len };
-                    Poll::Pending
-                }
-                Poll::Ready((tx, Ok(()))) => {
-                    self.write_state = WriteState::Idle(tx);
-                    Poll::Ready(Ok(written_len))
-                }
-                Poll::Ready((_tx, Err(e))) => {
-                    self.write_state = WriteState::Failed;
-                    Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)))
-                }
-            },
-            WriteState::WritingControl(mut fut) => match fut.as_mut().poll(cx) {
-                Poll::Pending => {
-                    self.write_state = WriteState::WritingControl(fut);
-                    Poll::Pending
-                }
-                Poll::Ready((tx, Ok(()))) => {
-                    self.write_state = WriteState::Idle(tx);
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-                Poll::Ready((_tx, Err(e))) => {
-                    self.write_state = WriteState::Failed;
-                    Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)))
-                }
-            },
-            WriteState::Failed => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "WebSocket write half in failed state",
-            ))),
-        }
+        let len = buf.len();
+        // `BytesMut::from(Bytes)` reuses the original allocation when the
+        // chunk is uniquely owned (the normal relay path) and only copies
+        // for shared/sliced buffers. Converting via `buf.as_ref()` always
+        // copied the whole payload a second time.
+        self.poll_write_frame(cx, len, || Payload::Bytes(bytes::BytesMut::from(buf)))
     }
 
     fn caps(&self) -> StreamCaps {
@@ -1551,5 +1492,76 @@ mod tests {
         assert_eq!(received, expected);
 
         let _ = sender.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_ws_empty_writes_do_not_send_fin_or_break_stream() {
+        use std::future::poll_fn;
+        use std::time::Duration;
+
+        let (raw_client, raw_server) = duplex(65536);
+        let mut client = WsTunnelStream::new(raw_client, Role::Client);
+        let mut server = WsTunnelStream::new(raw_server, Role::Server);
+
+        let activity_before = client.last_activity_ms().unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        // 1. Both borrowed poll_write(&[]) and owned poll_write_owned(Bytes::new()) must return Ok(0)
+        //    without emitting a 0-length Binary FIN frame or updating TX activity.
+        let n_borrowed = poll_fn(|cx| Pin::new(&mut client).poll_write(cx, &[]))
+            .await
+            .unwrap();
+        assert_eq!(n_borrowed, 0);
+
+        let n_owned = poll_fn(|cx| client.poll_write_owned(cx, Bytes::new()))
+            .await
+            .unwrap();
+        assert_eq!(n_owned, 0);
+
+        assert_eq!(
+            client.last_activity_ms().unwrap(),
+            activity_before,
+            "empty writes must not count as outbound activity"
+        );
+        client.flush().await.unwrap();
+
+        // 2. Peer must NOT observe EOF or any frame after empty writes.
+        let mut probe_buf = [0u8; 16];
+        let premature_read =
+            tokio::time::timeout(Duration::from_millis(30), server.read(&mut probe_buf)).await;
+        assert!(
+            premature_read.is_err(),
+            "peer must not observe EOF or bytes from empty writes"
+        );
+
+        // 3. Subsequent bidirectional transfer on both paths still works normally.
+        client.write_all(b"after-empty-").await.unwrap();
+        let n = poll_fn(|cx| client.poll_write_owned(cx, Bytes::from_static(b"owned")))
+            .await
+            .unwrap();
+        assert_eq!(n, 5);
+        client.flush().await.unwrap();
+
+        let mut received = [0u8; 17];
+        server.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"after-empty-owned");
+
+        server.write_all(b"server-reply").await.unwrap();
+        server.flush().await.unwrap();
+        let mut reply = [0u8; 12];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"server-reply");
+
+        // 4. Only explicit shutdown() emits FIN and produces EOF on peer.
+        client.shutdown().await.unwrap();
+        let mut eof_buf = [0u8; 1];
+        let eof_n = server.read(&mut eof_buf).await.unwrap();
+        assert_eq!(eof_n, 0, "peer must observe EOF only after shutdown()");
+
+        // Empty write after shutdown still rejects with BrokenPipe.
+        let err = poll_fn(|cx| Pin::new(&mut client).poll_write(cx, &[]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
     }
 }

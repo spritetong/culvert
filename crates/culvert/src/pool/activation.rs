@@ -89,24 +89,55 @@ pub async fn decode_activation_until_cancel<S: AsyncReadExt + Unpin + Send>(
     decode_activation_inner(stream, cancel_token, None).await
 }
 
+async fn read_activation_bytes<S: AsyncReadExt + Unpin + Send>(
+    stream: &mut S,
+    buf: &mut [u8],
+    cancel_token: &CancellationToken,
+    timeout: Option<Duration>,
+    field_name: &str,
+    eof_is_clean: bool,
+) -> Result<bool, TunnelError> {
+    let io_res = match read_activation_field(stream, buf, cancel_token, timeout).await {
+        TimeoutOrCancel::Ok(r) => r,
+        TimeoutOrCancel::TimedOut => {
+            return Err(TunnelError::ControlProtocol(format!(
+                "Timed out reading activation {field_name}"
+            )));
+        }
+        TimeoutOrCancel::Cancelled => return Ok(false),
+    };
+
+    match io_res {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            if eof_is_clean {
+                Ok(false)
+            } else {
+                Err(TunnelError::ControlProtocol(format!(
+                    "Truncated activation header while reading {field_name}: {e}"
+                )))
+            }
+        }
+        Err(e) => Err(TunnelError::Io(e)),
+    }
+}
+
 async fn decode_activation_inner<S: AsyncReadExt + Unpin + Send>(
     stream: &mut S,
     cancel_token: &CancellationToken,
     timeout_duration: Option<Duration>,
 ) -> Result<Option<ActivationHeader>, TunnelError> {
     let mut magic = [0u8; 1];
-    let read_magic =
-        match read_activation_field(&mut *stream, &mut magic, cancel_token, timeout_duration).await
-        {
-            TimeoutOrCancel::Ok(r) => r,
-            TimeoutOrCancel::TimedOut => {
-                return Err(TunnelError::ControlProtocol(
-                    "Timed out reading activation magic".into(),
-                ));
-            }
-            TimeoutOrCancel::Cancelled => return Ok(None),
-        };
-    if read_magic.is_err() {
+    if !read_activation_bytes(
+        &mut *stream,
+        &mut magic,
+        cancel_token,
+        timeout_duration,
+        "magic",
+        true,
+    )
+    .await?
+    {
         return Ok(None);
     }
 
@@ -132,20 +163,16 @@ async fn decode_activation_inner<S: AsyncReadExt + Unpin + Send>(
 
     // Read 2-byte big-endian target length
     let mut len_bytes = [0u8; 2];
-    let read_len =
-        match read_activation_field(&mut *stream, &mut len_bytes, cancel_token, timeout_duration)
-            .await
-        {
-            TimeoutOrCancel::Ok(r) => r,
-            TimeoutOrCancel::TimedOut => {
-                return Err(TunnelError::ControlProtocol(
-                    "Timed out reading activation target length".into(),
-                ));
-            }
-            TimeoutOrCancel::Cancelled => return Ok(None),
-        };
-
-    if read_len.is_err() {
+    if !read_activation_bytes(
+        &mut *stream,
+        &mut len_bytes,
+        cancel_token,
+        timeout_duration,
+        "target length",
+        false,
+    )
+    .await?
+    {
         return Ok(None);
     }
 
@@ -159,24 +186,16 @@ async fn decode_activation_inner<S: AsyncReadExt + Unpin + Send>(
 
     let target = if target_len > 0 {
         let mut target_bytes = vec![0u8; target_len];
-        let read_target = match read_activation_field(
+        if !read_activation_bytes(
             &mut *stream,
             &mut target_bytes,
             cancel_token,
             timeout_duration,
+            "target payload",
+            false,
         )
-        .await
+        .await?
         {
-            TimeoutOrCancel::Ok(r) => r,
-            TimeoutOrCancel::TimedOut => {
-                return Err(TunnelError::ControlProtocol(
-                    "Timed out reading activation target payload".into(),
-                ));
-            }
-            TimeoutOrCancel::Cancelled => return Ok(None),
-        };
-
-        if read_target.is_err() {
             return Ok(None);
         }
 
@@ -277,5 +296,80 @@ mod tests {
             .unwrap();
 
         assert!(decoded.is_promotion);
+    }
+
+    #[tokio::test]
+    async fn test_decode_activation_truncation_by_offset_and_io_errors() {
+        use std::io;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, ReadBuf};
+
+        struct PrefixThenErrorReader {
+            prefix: Vec<u8>,
+            pos: usize,
+            err_kind: io::ErrorKind,
+        }
+
+        impl AsyncRead for PrefixThenErrorReader {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                if self.pos < self.prefix.len() {
+                    let remaining = self.prefix.len() - self.pos;
+                    let n = remaining.min(buf.remaining());
+                    buf.put_slice(&self.prefix[self.pos..self.pos + n]);
+                    self.pos += n;
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Ready(Err(io::Error::new(
+                        self.err_kind,
+                        "simulated transport read error",
+                    )))
+                }
+            }
+        }
+
+        let target = parse_target_addr("127.0.0.1:8080").unwrap();
+        let encoded = encode_activation_with_proto(Some(&target), L4Protocol::Tcp);
+        let cancel = CancellationToken::new();
+
+        // 0-byte clean EOF before magic -> Ok(None)
+        let mut empty_cursor = Cursor::new(Vec::<u8>::new());
+        let zero_res = decode_activation(&mut empty_cursor, &cancel, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(zero_res.is_none());
+
+        // Truncated at any non-zero byte offset (magic only, partial len, full len, partial target)
+        // must fail as a protocol framing error rather than returning Ok(None).
+        for offset in 1..encoded.len() {
+            let mut truncated = Cursor::new(encoded[..offset].to_vec());
+            let err = decode_activation(&mut truncated, &cancel, Duration::from_secs(1))
+                .await
+                .expect_err("truncated activation frame must return error");
+            assert!(
+                matches!(err, TunnelError::ControlProtocol(_)),
+                "offset {offset} should produce ControlProtocol error, got {err:?}"
+            );
+        }
+
+        // Underlying non-EOF I/O errors must be preserved at magic, length, and target stages.
+        for prefix_len in [0usize, 1, 2, 3, 5] {
+            let mut reader = PrefixThenErrorReader {
+                prefix: encoded[..prefix_len].to_vec(),
+                pos: 0,
+                err_kind: io::ErrorKind::ConnectionReset,
+            };
+            let err = decode_activation(&mut reader, &cancel, Duration::from_secs(1))
+                .await
+                .expect_err("ConnectionReset must propagate");
+            match err {
+                TunnelError::Io(e) => assert_eq!(e.kind(), io::ErrorKind::ConnectionReset),
+                other => panic!("prefix_len {prefix_len} expected TunnelError::Io, got {other:?}"),
+            }
+        }
     }
 }
