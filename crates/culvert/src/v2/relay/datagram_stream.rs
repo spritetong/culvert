@@ -32,6 +32,7 @@ pub struct DatagramStreamRelay {
     recv_batch: Vec<Datagram>,
     tx_scratch: BytesMut,
     in_flight_chunk: Option<Bytes>,
+    in_flight_payload_bytes: u64,
     chunk_pos: usize,
     need_flush: bool,
     dgram_read_done: bool,
@@ -75,6 +76,7 @@ impl DatagramStreamRelay {
             recv_batch: vec![Datagram::default(); DATAGRAM_BATCH_SIZE],
             tx_scratch: BytesMut::with_capacity(RELAY_BUFFER_SIZE),
             in_flight_chunk: None,
+            in_flight_payload_bytes: 0,
             chunk_pos: 0,
             need_flush: false,
             dgram_read_done: false,
@@ -188,6 +190,8 @@ impl DatagramStreamRelay {
                     self.last_dgram_activity = Instant::now();
                     progress = true;
                     if self.chunk_pos >= chunk.len() {
+                        self.dgram_to_stream_bytes += self.in_flight_payload_bytes;
+                        self.in_flight_payload_bytes = 0;
                         self.in_flight_chunk = None;
                         self.chunk_pos = 0;
                         self.need_flush = true;
@@ -207,15 +211,18 @@ impl DatagramStreamRelay {
                     progress = true;
                 }
                 Poll::Ready(Ok(n)) => {
-                    if let Err(err) = DatagramQueue::encode_batch(
+                    let payload_bytes = match DatagramQueue::encode_batch(
                         &mut self.tx_scratch,
                         &self.recv_batch[..n],
-                        &mut self.dgram_to_stream_bytes,
                     ) {
-                        return Poll::Ready(Err(TaskError::StageFailed(err.to_string())));
-                    }
+                        Ok(bytes) => bytes,
+                        Err(err) => {
+                            return Poll::Ready(Err(TaskError::StageFailed(err.to_string())));
+                        }
+                    };
                     if !self.tx_scratch.is_empty() {
                         self.in_flight_chunk = Some(self.tx_scratch.split().freeze());
+                        self.in_flight_payload_bytes = payload_bytes;
                         self.chunk_pos = 0;
                         self.last_dgram_activity = Instant::now();
                         progress = true;

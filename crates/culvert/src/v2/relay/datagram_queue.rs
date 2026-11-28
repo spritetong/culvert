@@ -18,6 +18,9 @@ pub(crate) const MAX_PENDING_DATAGRAMS: usize = 64;
 pub(crate) const MAX_PENDING_DATAGRAM_BYTES: usize = 256 * 1024;
 
 /// Bounded outbound datagram queue with byte-budget enforcement.
+///
+/// `total_bytes()` tracks payload bytes actually accepted by `dst.poll_send()`
+/// in `poll_flush()`, matching TCP `TransferDirection::total_bytes()` semantics.
 pub struct DatagramQueue {
     queue: VecDeque<Datagram>,
     queued_bytes: usize,
@@ -39,6 +42,7 @@ impl DatagramQueue {
         self.queue.is_empty()
     }
 
+    /// Returns total payload bytes successfully written to the outbound `DatagramIo`.
     #[inline]
     pub fn total_bytes(&self) -> u64 {
         self.total_bytes
@@ -75,7 +79,6 @@ impl DatagramQueue {
                 "UDP datagram batch exceeded pending byte budget",
             ));
         }
-        self.total_bytes += plen as u64;
         self.queued_bytes += plen;
         self.queue.push_back(datagram);
         Ok(())
@@ -101,7 +104,6 @@ impl DatagramQueue {
 
             rx_buf.advance(2);
             let payload = rx_buf.split_to(frame_len).freeze();
-            self.total_bytes += frame_len as u64;
             self.queued_bytes += frame_len;
             self.queue.push_back(Datagram {
                 flow: FlowKey::default(),
@@ -111,13 +113,11 @@ impl DatagramQueue {
         Ok(self.queue.len() > before)
     }
 
-    /// Encodes a received batch of datagrams into `[u16 len | payload]` frames in `scratch`.
-    pub fn encode_batch(
-        scratch: &mut BytesMut,
-        batch: &[Datagram],
-        total_bytes: &mut u64,
-    ) -> io::Result<()> {
+    /// Encodes a received batch of datagrams into `[u16 len | payload]` frames in `scratch`,
+    /// returning total unframed payload bytes contained in the encoded batch.
+    pub fn encode_batch(scratch: &mut BytesMut, batch: &[Datagram]) -> io::Result<u64> {
         scratch.clear();
+        let mut payload_bytes = 0u64;
         for d in batch {
             let plen = d.payload.len();
             if plen > MAX_UDP_DATAGRAM_SIZE {
@@ -134,9 +134,9 @@ impl DatagramQueue {
             }
             scratch.put_u16(plen as u16);
             scratch.extend_from_slice(&d.payload);
-            *total_bytes += plen as u64;
+            payload_bytes += plen as u64;
         }
-        Ok(())
+        Ok(payload_bytes)
     }
 
     /// Flushes queued datagrams to `dst`, returning `Ok(true)` if any datagrams were sent.
@@ -159,6 +159,7 @@ impl DatagramQueue {
                         self.queue.iter().take(count).map(|d| d.payload.len()).sum();
                     self.queue.drain(..count);
                     self.queued_bytes -= sent_bytes;
+                    self.total_bytes += sent_bytes as u64;
                     flushed_any = true;
                 }
                 Poll::Ready(Err(err)) => {

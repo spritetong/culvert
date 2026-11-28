@@ -159,8 +159,9 @@ impl DatagramDatagramRelay {
             }
         }
 
-        if ((self.a_done && self.queue_a_to_b.is_empty())
-            || (self.b_done && self.queue_b_to_a.is_empty()))
+        let a_to_b_done = self.a_done && self.queue_a_to_b.is_empty();
+        let b_to_a_done = self.b_done && self.queue_b_to_a.is_empty();
+        if (a_to_b_done && b_to_a_done)
             || (drain_only && self.queue_a_to_b.is_empty() && self.queue_b_to_a.is_empty())
         {
             return Poll::Ready(Ok(()));

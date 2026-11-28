@@ -827,4 +827,169 @@ async fn udp_relay_backpressure_does_not_drop_queued_datagrams_on_idle_timeout()
         .unwrap()
         .unwrap();
     assert_eq!(summary.final_phase, TunnelPhase::Stopped);
+    assert_eq!(counters.snapshot(), (32, 0));
+}
+
+#[tokio::test]
+async fn datagram_datagram_asymmetric_close_continues_reverse_direction() {
+    use crate::io::channel::{Datagram, FlowKey, IoChannel};
+    use bytes::Bytes;
+    use std::collections::VecDeque;
+
+    let cancel = CancellationToken::new();
+    let counters = Arc::new(RelayCounters::new());
+    let (handle, join) = Coordinator::start(
+        SingleShotRelayWorkflow {
+            idle_timeout: Duration::from_secs(5),
+            counters: Arc::clone(&counters),
+        },
+        DEFAULT_RELAY_DRAIN_TIMEOUT,
+        cancel,
+    );
+
+    let (a_in_tx, a_in_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (b_in_tx, b_in_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (b_out_tx, mut b_out_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    // Side A uses BackpressuredDatagram for its outbound half while its inbound half closes early.
+    let allow_send_a = Arc::new(AtomicBool::new(false));
+    let sent_a = Arc::new(parking_lot::Mutex::new(VecDeque::new()));
+    let waker_a = Arc::new(parking_lot::Mutex::new(None));
+
+    let a_dev = BackpressuredDatagram {
+        inbound_rx: a_in_rx,
+        allow_send: Arc::clone(&allow_send_a),
+        sent: Arc::clone(&sent_a),
+        waker_slot: Arc::clone(&waker_a),
+    };
+    let b_dev = MockDatagramChannel {
+        inbound_rx: b_in_rx,
+        outbound_tx: b_out_tx,
+    };
+
+    handle
+        .assign(SingleShotInput {
+            a: IoChannel::from_datagram(a_dev),
+            b: IoChannel::from_datagram(b_dev),
+        })
+        .await
+        .unwrap();
+
+    // A -> B succeeds first.
+    a_in_tx
+        .send(Datagram {
+            flow: FlowKey::default(),
+            payload: Bytes::from_static(b"req-1"),
+        })
+        .unwrap();
+    assert_eq!(b_out_rx.recv().await.unwrap().payload.as_ref(), b"req-1");
+
+    // B queues a reply while A's send direction is backpressured, AND A immediately closes recv!
+    b_in_tx
+        .send(Datagram {
+            flow: FlowKey::default(),
+            payload: Bytes::from_static(b"reply-while-a-closed"),
+        })
+        .unwrap();
+    drop(a_in_tx);
+
+    // Relay MUST stay active while B -> A queued reply awaits flush AND further replies arrive.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    allow_send_a.store(true, Ordering::Release);
+    if let Some(w) = waker_a.lock().take() {
+        w.wake();
+    }
+
+    // Even after a_in_tx closed, B can still send additional reply packets until B itself closes.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    b_in_tx
+        .send(Datagram {
+            flow: FlowKey::default(),
+            payload: Bytes::from_static(b"reply-after-a-closed"),
+        })
+        .unwrap();
+    drop(b_in_tx);
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    {
+        let mut got = sent_a.lock();
+        assert_eq!(
+            got.pop_front().as_deref(),
+            Some(&b"reply-while-a-closed"[..])
+        );
+        assert_eq!(
+            got.pop_front().as_deref(),
+            Some(&b"reply-after-a-closed"[..])
+        );
+        assert!(got.is_empty());
+    }
+    assert_eq!(counters.snapshot(), (5, 40));
+
+    handle.graceful_stop().await.unwrap();
+    let summary = tokio::time::timeout(Duration::from_secs(1), join)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.final_phase, TunnelPhase::Stopped);
+}
+
+#[tokio::test]
+async fn udp_counters_exclude_unsent_queued_packets_on_force_stop() {
+    use crate::io::channel::{Datagram, FlowKey, IoChannel};
+    use bytes::Bytes;
+    use std::collections::VecDeque;
+
+    let cancel = CancellationToken::new();
+    let counters = Arc::new(RelayCounters::new());
+    let (handle, join) = Coordinator::start(
+        SingleShotRelayWorkflow {
+            idle_timeout: Duration::from_secs(5),
+            counters: Arc::clone(&counters),
+        },
+        DEFAULT_RELAY_DRAIN_TIMEOUT,
+        cancel,
+    );
+
+    let (a_in_tx, a_in_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_b_in_tx, b_in_rx) = tokio::sync::mpsc::unbounded_channel();
+    let allow_send_b = Arc::new(AtomicBool::new(false));
+    let sent_b = Arc::new(parking_lot::Mutex::new(VecDeque::new()));
+    let waker_b = Arc::new(parking_lot::Mutex::new(None));
+
+    let a_dev = MockDatagramChannel {
+        inbound_rx: a_in_rx,
+        outbound_tx: tokio::sync::mpsc::unbounded_channel().0,
+    };
+    let b_dev = BackpressuredDatagram {
+        inbound_rx: b_in_rx,
+        allow_send: Arc::clone(&allow_send_b),
+        sent: Arc::clone(&sent_b),
+        waker_slot: Arc::clone(&waker_b),
+    };
+
+    handle
+        .assign(SingleShotInput {
+            a: IoChannel::from_datagram(a_dev),
+            b: IoChannel::from_datagram(b_dev),
+        })
+        .await
+        .unwrap();
+
+    // Enqueue 11 bytes into queue_a_to_b while poll_send() returns Pending, then ForceStop.
+    a_in_tx
+        .send(Datagram {
+            flow: FlowKey::default(),
+            payload: Bytes::from_static(b"never-sent!"),
+        })
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    handle.force_stop();
+    let summary = tokio::time::timeout(Duration::from_secs(1), join)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.final_phase, TunnelPhase::Stopped);
+    assert!(sent_b.lock().is_empty());
+    // Unsent queued packet must NOT be counted as delivered bytes.
+    assert_eq!(counters.snapshot(), (0, 0));
 }

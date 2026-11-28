@@ -49,15 +49,26 @@ pub struct Datagram {
 
 /// Batched datagram I/O. The batch shape keeps high-rate UDP/QUIC datagram
 /// paths allocation-free once a pump allocates its scratch array.
+///
+/// The receive and send directions are independent half-duplex operations: closing
+/// the receive side (`poll_recv` returning `Poll::Ready(Ok(0))`) does **not** close
+/// or invalidate `poll_send` for outbound replies.
 pub trait DatagramIo: Send + Unpin + 'static {
     /// Fills `batch` with received datagrams and returns how many were filled.
+    ///
+    /// - `Poll::Pending`: no datagrams are currently available.
+    /// - `Poll::Ready(Ok(n))` with `n > 0`: filled `batch[..n]` datagrams.
+    /// - `Poll::Ready(Ok(0))` when `!batch.is_empty()`: the receive direction has
+    ///   permanently closed (EOF); `poll_send` remains valid independently.
     fn poll_recv(
         &mut self,
         cx: &mut Context<'_>,
         batch: &mut [Datagram],
     ) -> Poll<io::Result<usize>>;
 
-    /// Sends as many leading datagrams from `batch` as the transport accepts.
+    /// Sends as many leading datagrams from `batch` as the transport accepts,
+    /// returning how many datagrams were written (with `0` indicating write-side
+    /// closure unless `batch` is empty).
     fn poll_send(&mut self, cx: &mut Context<'_>, batch: &[Datagram]) -> Poll<io::Result<usize>>;
 }
 
