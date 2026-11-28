@@ -6,7 +6,7 @@
 //! All comments and docstrings must be in English.
 
 use crate::core::error::TunnelError;
-use crate::frontend::{Frontend, FrontendOutput};
+use crate::frontend::{AcceptBackoff, Frontend, FrontendOutput, next_frontend_accept};
 use crate::io::addr::{L4Protocol, TargetAddr};
 use crate::v2::coordinator::{Coordinator, CoordinatorSummary};
 use crate::v2::forward::workflow::{ForwardInput, ForwardWorkflow};
@@ -64,39 +64,30 @@ impl ForwardRunner {
 
         let mut accept_slot: ReusableFutureRef<'static, FrontendOutput> =
             ReusableFutureRef::default();
+        let mut accept_backoff = AcceptBackoff::default();
 
-        loop {
-            if accept_slot.is_empty() {
-                self.frontend.accept(&mut accept_slot);
-            }
-
-            tokio::select! {
-                biased;
-                _ = shutdown_token.cancelled() => {
-                    break;
-                }
-                accept_res = &mut accept_slot => {
-                    match accept_res {
-                        Ok(accepted) => {
-                            let input = ForwardInput::new(
-                                accepted.channel,
-                                self.target.clone(),
-                                self.protocol,
-                            );
-                            if let Err(err) = coord.assign(input).await {
-                                tracing::debug!(error = %err, "Forward assignment rejected during shutdown");
-                                break;
-                            }
-                        }
-                        Err(err) => {
-                            if !shutdown_token.is_cancelled() && !matches!(err, TunnelError::Shutdown) {
-                                tracing::error!(error = %err, "Forward frontend accept failed");
-                            }
-                        }
+        let accept_res: Result<(), TunnelError> = loop {
+            match next_frontend_accept(
+                &mut *self.frontend,
+                &mut accept_slot,
+                &mut accept_backoff,
+                &shutdown_token,
+                "Forward frontend",
+            )
+            .await
+            {
+                Ok(Some(accepted)) => {
+                    let input =
+                        ForwardInput::new(accepted.channel, self.target.clone(), self.protocol);
+                    if let Err(err) = coord.assign(input).await {
+                        tracing::debug!(error = %err, "Forward assignment rejected during shutdown");
+                        break Ok(());
                     }
                 }
+                Ok(None) => break Ok(()),
+                Err(err) => break Err(err),
             }
-        }
+        };
 
         accept_slot.reset();
         self.frontend.shutdown().await;
@@ -106,6 +97,7 @@ impl ForwardRunner {
             .await
             .map_err(|e| TunnelError::Internal(format!("v2 coordinator join error: {e}")))?;
 
+        accept_res?;
         Ok(summary)
     }
 }

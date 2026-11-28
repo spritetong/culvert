@@ -257,8 +257,7 @@ impl TunnelCluster {
                             coord_clone,
                             tok,
                         )
-                        .await;
-                        Ok(())
+                        .await
                     });
                 }
                 TunnelMode::Reverse => {
@@ -357,44 +356,40 @@ impl TunnelCluster {
         relay_idle_timeout: Duration,
         coord: CoordinatorHandle<ForwardWorkflow>,
         shutdown_token: CancellationToken,
-    ) {
+    ) -> Result<(), TunnelError> {
         let mut accept_slot: ReusableFutureRef<'static, FrontendOutput> =
             ReusableFutureRef::default();
+        let mut accept_backoff = crate::frontend::AcceptBackoff::default();
 
-        loop {
-            if accept_slot.is_empty() {
-                frontend.accept(&mut accept_slot);
-            }
-
-            tokio::select! {
-                biased;
-                _ = shutdown_token.cancelled() => break,
-                accept_res = &mut accept_slot => {
-                    match accept_res {
-                        Ok(accepted) => {
-                            let input = ForwardInput {
-                                frontend: accepted.channel,
-                                target: target.clone(),
-                                protocol,
-                                relay_idle_timeout: Some(relay_idle_timeout),
-                            };
-                            if let Err(err) = coord.assign(input).await {
-                                tracing::debug!(error = %err, "Forward assignment rejected during shutdown");
-                                break;
-                            }
-                        }
-                        Err(TunnelError::Shutdown) => break,
-                        Err(err) => {
-                            if !shutdown_token.is_cancelled() {
-                                tracing::error!(error = %err, "Forward frontend accept failed");
-                            }
-                        }
+        let accept_res: Result<(), TunnelError> = loop {
+            match crate::frontend::next_frontend_accept(
+                &mut *frontend,
+                &mut accept_slot,
+                &mut accept_backoff,
+                &shutdown_token,
+                "Forward frontend",
+            )
+            .await
+            {
+                Ok(Some(accepted)) => {
+                    let input = ForwardInput {
+                        frontend: accepted.channel,
+                        target: target.clone(),
+                        protocol,
+                        relay_idle_timeout: Some(relay_idle_timeout),
+                    };
+                    if let Err(err) = coord.assign(input).await {
+                        tracing::debug!(error = %err, "Forward assignment rejected during shutdown");
+                        break Ok(());
                     }
                 }
+                Ok(None) => break Ok(()),
+                Err(err) => break Err(err),
             }
-        }
+        };
 
         accept_slot.reset();
         frontend.shutdown().await;
+        accept_res
     }
 }

@@ -6,7 +6,7 @@
 //! All comments and docstrings must be in English.
 
 use crate::core::error::TunnelError;
-use crate::frontend::{Frontend, FrontendOutput};
+use crate::frontend::{AcceptBackoff, Frontend, FrontendOutput, next_frontend_accept};
 use crate::io::addr::{L4Protocol, TargetAddr};
 use crate::v2::coordinator::{Coordinator, CoordinatorHandle, CoordinatorSummary};
 use crate::v2::reverse::visitor::{ReverseSignaler, ReverseVisitorInput, ReverseVisitorWorkflow};
@@ -129,40 +129,36 @@ impl ReverseServerRunner {
 
         let mut accept_slot: ReusableFutureRef<'static, FrontendOutput> =
             ReusableFutureRef::default();
+        let mut accept_backoff = AcceptBackoff::default();
 
-        loop {
-            if accept_slot.is_empty() {
-                self.frontend.accept(&mut accept_slot);
-            }
-
-            tokio::select! {
-                biased;
-                _ = shutdown_token.cancelled() => break,
-                accept_res = &mut accept_slot => {
-                    match accept_res {
-                        Ok(accepted) => {
-                            let input = ReverseVisitorInput {
-                                visitor: accepted.channel,
-                                peer: accepted.peer,
-                                target: self.target.clone(),
-                                protocol: self.protocol,
-                                relay_idle_timeout,
-                                signaler: signaler_override.clone(),
-                            };
-                            if let Err(err) = coord.assign(input).await {
-                                tracing::debug!(error = %err, "Reverse visitor rejected during shutdown");
-                                break;
-                            }
-                        }
-                        Err(err) => {
-                            if !shutdown_token.is_cancelled() && !matches!(err, TunnelError::Shutdown) {
-                                tracing::error!(error = %err, "Reverse visitor accept failed");
-                            }
-                        }
+        let accept_res: Result<(), TunnelError> = loop {
+            match next_frontend_accept(
+                &mut *self.frontend,
+                &mut accept_slot,
+                &mut accept_backoff,
+                &shutdown_token,
+                "Reverse visitor",
+            )
+            .await
+            {
+                Ok(Some(accepted)) => {
+                    let input = ReverseVisitorInput {
+                        visitor: accepted.channel,
+                        peer: accepted.peer,
+                        target: self.target.clone(),
+                        protocol: self.protocol,
+                        relay_idle_timeout,
+                        signaler: signaler_override.clone(),
+                    };
+                    if let Err(err) = coord.assign(input).await {
+                        tracing::debug!(error = %err, "Reverse visitor rejected during shutdown");
+                        break Ok(());
                     }
                 }
+                Ok(None) => break Ok(()),
+                Err(err) => break Err(err),
             }
-        }
+        };
 
         accept_slot.reset();
         self.frontend.shutdown().await;
@@ -172,8 +168,10 @@ impl ReverseServerRunner {
             let summary = join.await.map_err(|e| {
                 TunnelError::Internal(format!("v2 reverse coordinator join error: {e}"))
             })?;
+            accept_res?;
             Ok(Some(summary))
         } else {
+            accept_res?;
             Ok(None)
         }
     }

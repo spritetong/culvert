@@ -12,7 +12,10 @@ use crate::io::error::TunnelError;
 use crate::io::stream::BoxFuture;
 use reusable_future::ReusableFutureRef;
 use std::collections::HashMap;
+use std::io;
 use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 pub mod tcp;
 pub mod udp;
@@ -96,6 +99,124 @@ pub async fn bind(spec: &MappingSpec) -> Result<Box<dyn Frontend>, TunnelError> 
         ))
     })?;
     factory.bind(spec.clone()).await
+}
+
+const FRONTEND_ACCEPT_BACKOFF_BASE: Duration = Duration::from_millis(10);
+const FRONTEND_ACCEPT_BACKOFF_MAX: Duration = Duration::from_millis(200);
+
+/// Bounded exponential backoff for transient listener/UDP error recovery.
+pub(crate) struct AcceptBackoff {
+    current: Duration,
+    base: Duration,
+    max: Duration,
+}
+
+impl Default for AcceptBackoff {
+    fn default() -> Self {
+        Self::new(FRONTEND_ACCEPT_BACKOFF_BASE, FRONTEND_ACCEPT_BACKOFF_MAX)
+    }
+}
+
+impl AcceptBackoff {
+    pub(crate) fn new(base: Duration, max: Duration) -> Self {
+        Self {
+            current: base,
+            base,
+            max,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn reset(&mut self) {
+        self.current = self.base;
+    }
+
+    pub(crate) fn next_delay(&mut self) -> Duration {
+        let delay = self.current;
+        self.current = (self.current.saturating_mul(2)).min(self.max);
+        delay
+    }
+
+    /// Sleeps for `delay` or returns `false` immediately when `cancel` triggers.
+    pub(crate) async fn sleep_cancel(&self, delay: Duration, cancel: &CancellationToken) -> bool {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => false,
+            _ = tokio::time::sleep(delay) => true,
+        }
+    }
+}
+
+/// Returns `true` when an OS I/O error indicates a permanent socket/config failure
+/// rather than a transient resource exhaustion (`EMFILE`, `ENOBUFS`, etc.) or peer reset.
+pub(crate) fn is_unrecoverable_io_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::InvalidInput
+            | io::ErrorKind::PermissionDenied
+            | io::ErrorKind::AddrInUse
+            | io::ErrorKind::AddrNotAvailable
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::Unsupported
+            | io::ErrorKind::NotFound
+    )
+}
+
+/// Returns `true` when a frontend accept error is permanent and should abort the accept loop.
+pub(crate) fn is_unrecoverable_accept_error(err: &TunnelError) -> bool {
+    match err {
+        TunnelError::Io(io_err) => is_unrecoverable_io_error(io_err),
+        other => other.is_permanent(),
+    }
+}
+
+/// Awaits the next accepted frontend connection/flow or shutdown, backing off on
+/// recoverable accept errors and failing fast on unrecoverable errors.
+pub(crate) async fn next_frontend_accept(
+    frontend: &mut dyn Frontend,
+    accept_slot: &mut ReusableFutureRef<'static, FrontendOutput>,
+    backoff: &mut AcceptBackoff,
+    shutdown_token: &CancellationToken,
+    label: &str,
+) -> Result<Option<FrontendAccept>, TunnelError> {
+    loop {
+        if accept_slot.is_empty() {
+            frontend.accept(accept_slot);
+        }
+
+        tokio::select! {
+            biased;
+            _ = shutdown_token.cancelled() => return Ok(None),
+            accept_res = &mut *accept_slot => {
+                match accept_res {
+                    Ok(accepted) => {
+                        backoff.reset();
+                        return Ok(Some(accepted));
+                    }
+                    Err(TunnelError::Shutdown) => return Ok(None),
+                    Err(err) if shutdown_token.is_cancelled() => {
+                        tracing::debug!(error = %err, "{label} accept ended during shutdown");
+                        return Ok(None);
+                    }
+                    Err(err) if is_unrecoverable_accept_error(&err) => {
+                        tracing::error!(error = %err, "{label} accept hit unrecoverable error");
+                        return Err(err);
+                    }
+                    Err(err) => {
+                        let delay = backoff.next_delay();
+                        tracing::warn!(
+                            error = %err,
+                            backoff = ?delay,
+                            "{label} accept failed; backing off before retry"
+                        );
+                        if !backoff.sleep_cancel(delay, shutdown_token).await {
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -20,10 +20,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::common::CancelFutureExt;
 use crate::consts::{
-    ACCEPTED_STREAM_QUEUE_SIZE, MAX_UDP_DATAGRAM_SIZE, MAX_UDP_SESSIONS,
-    UDP_SESSION_CHANNEL_SIZE, UDP_SESSION_QUEUE_MAX_BYTES,
+    ACCEPTED_STREAM_QUEUE_SIZE, MAX_UDP_DATAGRAM_SIZE, MAX_UDP_SESSIONS, UDP_SESSION_CHANNEL_SIZE,
+    UDP_SESSION_QUEUE_MAX_BYTES,
 };
-use crate::frontend::{Frontend, FrontendAccept, FrontendFactory, FrontendOutput};
+use crate::frontend::{
+    AcceptBackoff, Frontend, FrontendAccept, FrontendFactory, FrontendOutput,
+    is_unrecoverable_io_error,
+};
 use crate::io::addr::{L4Protocol, ListenAddr, MappingSpec, PeerAddr, parse_listen_addr};
 use crate::io::channel::{Datagram, DatagramIo, FlowKey, IoChannel};
 use crate::io::error::TunnelError;
@@ -55,7 +58,6 @@ fn udp_session_semaphore() -> &'static Arc<tokio::sync::Semaphore> {
     LIMIT.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_UDP_SESSIONS)))
 }
 
-
 /// Registered frontend factory for UDP port mappings.
 pub struct UdpFrontendFactory;
 
@@ -79,9 +81,35 @@ impl FrontendFactory for UdpFrontendFactory {
 pub struct UdpFrontend {
     socket: Arc<UdpSocket>,
     sessions: Arc<Mutex<UdpSessionMap>>,
-    accept_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<FrontendAccept>>>,
+    accept_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<FrontendOutput>>>,
     cancel_token: CancellationToken,
     recv_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+async fn handle_udp_recv_error(
+    err: io::Error,
+    backoff: &mut AcceptBackoff,
+    accept_tx: &mpsc::Sender<FrontendOutput>,
+    cancel: &CancellationToken,
+) -> std::ops::ControlFlow<()> {
+    if cancel.is_cancelled() {
+        return std::ops::ControlFlow::Break(());
+    }
+    if is_unrecoverable_io_error(&err) {
+        tracing::error!(error = %err, "UDP frontend recv_from failed permanently");
+        let _ = accept_tx
+            .send(Err(TunnelError::Io(err)))
+            .cancel_with(cancel)
+            .await;
+        return std::ops::ControlFlow::Break(());
+    }
+    let delay = backoff.next_delay();
+    tracing::debug!(error = %err, backoff = ?delay, "UDP frontend recv_from error; backing off");
+    if backoff.sleep_cancel(delay, cancel).await {
+        std::ops::ControlFlow::Continue(())
+    } else {
+        std::ops::ControlFlow::Break(())
+    }
 }
 
 impl Drop for UdpFrontend {
@@ -127,6 +155,7 @@ impl UdpFrontend {
         let recv_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
             let mut next_flow_id = 1u64;
+            let mut recv_backoff = AcceptBackoff::default();
 
             loop {
                 let recv_res = tokio::select! {
@@ -136,10 +165,16 @@ impl UdpFrontend {
                 };
 
                 let (n, raw_peer_addr) = match recv_res {
-                    Ok(pair) => pair,
+                    Ok(pair) => {
+                        recv_backoff.reset();
+                        pair
+                    }
                     Err(e) => {
-                        if !task_cancel.is_cancelled() {
-                            tracing::debug!(error = %e, "UDP frontend recv_from error");
+                        if handle_udp_recv_error(e, &mut recv_backoff, &accept_tx, &task_cancel)
+                            .await
+                            .is_break()
+                        {
+                            break;
                         }
                         continue;
                     }
@@ -168,9 +203,9 @@ impl UdpFrontend {
                 // Look up existing session sender without holding the mutex across awaits.
                 let existing_session = {
                     let guard = task_sessions.lock();
-                    guard.get(&peer_addr).map(|(_, tx, queued)| {
-                        (tx.clone(), Arc::clone(queued))
-                    })
+                    guard
+                        .get(&peer_addr)
+                        .map(|(_, tx, queued)| (tx.clone(), Arc::clone(queued)))
                 };
 
                 let pending_first = if let Some((tx, queued_bytes)) = existing_session {
@@ -248,7 +283,7 @@ impl UdpFrontend {
                         peer: PeerAddr::Socket(peer_addr),
                     };
 
-                    accept_permit.send(accepted);
+                    accept_permit.send(Ok(accepted));
                 }
             }
         });
@@ -282,7 +317,7 @@ impl Frontend for UdpFrontend {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => Err(TunnelError::Shutdown),
-                item = guard.recv() => item.ok_or(TunnelError::Shutdown),
+                item = guard.recv() => item.unwrap_or(Err(TunnelError::Shutdown)),
             }
         });
     }
@@ -390,11 +425,17 @@ mod tests {
     #[test]
     fn session_queue_byte_budget_is_strict_and_releasable() {
         let queued = AtomicUsize::new(0);
-        assert!(try_reserve_session_bytes(&queued, UDP_SESSION_QUEUE_MAX_BYTES - 1));
+        assert!(try_reserve_session_bytes(
+            &queued,
+            UDP_SESSION_QUEUE_MAX_BYTES - 1
+        ));
         assert!(!try_reserve_session_bytes(&queued, 2));
         release_session_bytes(&queued, UDP_SESSION_QUEUE_MAX_BYTES - 1);
         assert_eq!(queued.load(Ordering::Acquire), 0);
-        assert!(try_reserve_session_bytes(&queued, UDP_SESSION_QUEUE_MAX_BYTES));
+        assert!(try_reserve_session_bytes(
+            &queued,
+            UDP_SESSION_QUEUE_MAX_BYTES
+        ));
         release_session_bytes(&queued, UDP_SESSION_QUEUE_MAX_BYTES);
         assert_eq!(queued.load(Ordering::Acquire), 0);
     }
@@ -629,5 +670,59 @@ mod tests {
 
         drop(accepted);
         fe.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn handle_udp_recv_error_backs_off_recoverable_and_exits_fatal() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let mut backoff = AcceptBackoff::new(Duration::from_millis(20), Duration::from_millis(80));
+
+        // 1. Recoverable errors (ConnectionReset / EMFILE) back off exponentially and reset cleanly.
+        let t0 = std::time::Instant::now();
+        let flow = handle_udp_recv_error(
+            io::Error::new(io::ErrorKind::ConnectionReset, "ICMP unreachable"),
+            &mut backoff,
+            &tx,
+            &cancel,
+        )
+        .await;
+        assert!(matches!(flow, std::ops::ControlFlow::Continue(())));
+        assert!(t0.elapsed() >= Duration::from_millis(10));
+        assert!(rx.try_recv().is_err());
+
+        // 2. Cancellation immediately interrupts backoff sleep.
+        let long_cancel = CancellationToken::new();
+        let mut long_backoff = AcceptBackoff::new(Duration::from_secs(5), Duration::from_secs(10));
+        let killer = long_cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            killer.cancel();
+        });
+        let started_cancel = std::time::Instant::now();
+        let flow_cancel = handle_udp_recv_error(
+            io::Error::other("simulated EMFILE"),
+            &mut long_backoff,
+            &tx,
+            &long_cancel,
+        )
+        .await;
+        assert!(matches!(flow_cancel, std::ops::ControlFlow::Break(())));
+        assert!(started_cancel.elapsed() < Duration::from_millis(300));
+
+        // 3. Unrecoverable error breaks immediately and reports Err through accept queue.
+        let flow_fatal = handle_udp_recv_error(
+            io::Error::new(io::ErrorKind::PermissionDenied, "fatal socket error"),
+            &mut backoff,
+            &tx,
+            &cancel,
+        )
+        .await;
+        assert!(matches!(flow_fatal, std::ops::ControlFlow::Break(())));
+        let delivered = rx.recv().await.unwrap().err().unwrap();
+        assert!(matches!(
+            delivered,
+            TunnelError::Io(ref e) if e.kind() == io::ErrorKind::PermissionDenied
+        ));
     }
 }

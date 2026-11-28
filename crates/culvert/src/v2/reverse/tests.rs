@@ -1118,3 +1118,93 @@ async fn reverse_activation_write_and_flush_backpressure_timeout_and_cancel() {
         assert_eq!(summary.final_phase, TunnelPhase::Stopped);
     }
 }
+
+#[tokio::test]
+async fn reverse_runner_accept_backoff_bounds_retries_and_exits_on_fatal() {
+    struct ErrorFrontend {
+        attempts: Arc<AtomicUsize>,
+        err_kind: std::io::ErrorKind,
+    }
+
+    impl Frontend for ErrorFrontend {
+        fn accept(&mut self, slot: &mut ReusableFutureRef<'static, FrontendOutput>) {
+            if !slot.is_empty() {
+                return;
+            }
+            let attempts = Arc::clone(&self.attempts);
+            let kind = self.err_kind;
+            slot.set(move || async move {
+                attempts.fetch_add(1, Ordering::AcqRel);
+                Err(TunnelError::Io(std::io::Error::new(
+                    kind,
+                    "simulated reverse frontend accept error",
+                )))
+            });
+        }
+
+        fn shutdown<'a>(&'a mut self) -> BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    let make_runner = |attempts: Arc<AtomicUsize>, err_kind: std::io::ErrorKind| {
+        let signaler = Arc::new(MockSignaler {
+            calls: Arc::new(AtomicUsize::new(0)),
+            hang_forever: false,
+        });
+        ReverseServerRunner::new(
+            Box::new(ErrorFrontend { attempts, err_kind }),
+            TargetAddr::Ip("127.0.0.1:8080".parse().unwrap()),
+            L4Protocol::Tcp,
+            ReverseVisitorWorkflow::new(
+                signaler,
+                DEFAULT_HEARTBEAT_INTERVAL,
+                DEFAULT_IDLE_TIMEOUT,
+                Duration::from_millis(50),
+            ),
+            CoordinatorConfig::plain(Duration::from_millis(50)),
+        )
+    };
+
+    // 1. Recoverable accept errors rate-limit retries and exit immediately on shutdown.
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let cancel = CancellationToken::new();
+    let handle = tokio::spawn(
+        make_runner(Arc::clone(&attempts), std::io::ErrorKind::Other).run(cancel.clone()),
+    );
+    tokio::time::sleep(Duration::from_millis(90)).await;
+    let count = attempts.load(Ordering::Acquire);
+    assert!(
+        (1..=6).contains(&count),
+        "expected bounded accept attempts during 90ms backoff window, got {count}"
+    );
+
+    let cancel_started = std::time::Instant::now();
+    cancel.cancel();
+    let summary = tokio::time::timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("shutdown must interrupt reverse accept backoff promptly")
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(cancel_started.elapsed() < Duration::from_millis(300));
+    assert_eq!(summary.final_phase, TunnelPhase::Stopped);
+
+    // 2. Unrecoverable accept errors (PermissionDenied) exit runner immediately with Err.
+    let fatal_attempts = Arc::new(AtomicUsize::new(0));
+    let fatal_res = tokio::time::timeout(
+        Duration::from_secs(1),
+        make_runner(
+            Arc::clone(&fatal_attempts),
+            std::io::ErrorKind::PermissionDenied,
+        )
+        .run(CancellationToken::new()),
+    )
+    .await
+    .expect("fatal reverse accept error must exit runner immediately");
+    assert!(matches!(
+        fatal_res,
+        Err(TunnelError::Io(ref e)) if e.kind() == std::io::ErrorKind::PermissionDenied
+    ));
+    assert_eq!(fatal_attempts.load(Ordering::Acquire), 1);
+}
