@@ -18,12 +18,116 @@ use crate::core::error::TunnelError;
 use crate::core::serve::serve;
 use crate::dialer::endpoint::EndpointContext;
 use crate::frontend::{self, FrontendOutput};
-use crate::io::addr::{L4Protocol, MappingSpec, parse_target_addr};
+use crate::io::addr::{L4Protocol, MappingSpec, TargetAddr, parse_target_addr};
 use crate::io::channel::IoChannel;
 use crate::io::pump::{PumpCtx, PumpRequest};
 use crate::pool::ReplenishingStreamPool;
 use crate::transport::{TransportConnector, TransportRegistry};
 use reusable_future::ReusableFutureRef;
+
+/// RAII lease releasing a pooled stream's `active_count` slot exactly once when dropped.
+struct PoolStreamLease(Option<Arc<ReplenishingStreamPool>>);
+
+impl Drop for PoolStreamLease {
+    fn drop(&mut self) {
+        if let Some(pool) = self.0.take() {
+            pool.on_stream_closed();
+        }
+    }
+}
+
+async fn acquire_and_activate_channel(
+    tag: &str,
+    target: &TargetAddr,
+    protocol: L4Protocol,
+    idle_timeout: Duration,
+    pool: Option<&Arc<ReplenishingStreamPool>>,
+    connector: Option<&Arc<dyn TransportConnector>>,
+    conn_token: &CancellationToken,
+) -> Option<(IoChannel, PoolStreamLease)> {
+    let max_attempts = if pool.is_some() { 2 } else { 1 };
+    let mut attempts = 0usize;
+
+    while attempts < max_attempts {
+        attempts += 1;
+        let acquire_fut = async {
+            if let Some(p) = pool {
+                p.acquire(Some(target))
+                    .await
+                    .map(IoChannel::from_boxed_stream)
+            } else if let Some(c) = connector {
+                c.connect_with_protocol(target, None, protocol).await
+            } else {
+                Err(TunnelError::Internal("Connector unavailable".into()))
+            }
+        };
+
+        let remote_res = acquire_fut.cancel_with(conn_token).await?;
+
+        match remote_res {
+            Ok(mut channel) => {
+                // Register the close hook right after `acquire()` succeeds so handshake
+                // cancellation, activation failure, or relay exit always releases `active_count`.
+                let lease = PoolStreamLease(pool.cloned());
+                if pool.is_some() {
+                    let activation_pkt = ReplenishingStreamPool::encode_activation_with_proto(
+                        Some(target),
+                        protocol,
+                    );
+                    let ack_timeout = reverse_ack_timeout(idle_timeout);
+                    let write_act_res = async {
+                        channel.write_all(&activation_pkt).await?;
+                        channel.flush().await?;
+                        let mut ack = [0u8; 1];
+                        tokio::time::timeout(ack_timeout, channel.read_exact(&mut ack))
+                            .await
+                            .map_err(|_| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "Timed out waiting for activation ACK",
+                                )
+                            })??;
+                        if ack[0] == ACTIVATE_STREAM_ACK {
+                            Ok::<(), std::io::Error>(())
+                        } else {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "Invalid activation ACK byte",
+                            ))
+                        }
+                    }
+                    .cancel_with(conn_token)
+                    .await?;
+
+                    if let Err(e) = write_act_res {
+                        if attempts < max_attempts {
+                            debug!(
+                                "Pooled stream activation failed (stale stream); retrying once with fresh stream: {}",
+                                e
+                            );
+                            continue;
+                        }
+                        debug!("Failed to write stream activation packet: {}", e);
+                        return None;
+                    }
+                }
+                return Some((channel, lease));
+            }
+            Err(e) => {
+                if attempts < max_attempts {
+                    debug!("Acquire failed on attempt {}, retrying: {}", attempts, e);
+                    continue;
+                }
+                if !conn_token.is_cancelled() {
+                    warn!(tag = %tag, "Failed to open remote tunnel stream: {}", e);
+                }
+                return None;
+            }
+        }
+    }
+
+    None
+}
 
 /// Runs a single forward mapping listener and forwards inbound connections to remote peer.
 #[allow(clippy::too_many_arguments)]
@@ -94,95 +198,22 @@ pub async fn run_forward_mapping(
                         let target = target.clone();
                         let pool_clone = pool.clone();
                         let connector_clone = shared_connector.clone();
-                        let pool_for_close = pool.clone();
                         let tag_for_task = tag.clone();
 
                         conn_tracker.spawn_with_cancel(move |conn_token| async move {
-                            let mut remote_channel = None;
-                            let mut attempts = 0usize;
-                            let max_attempts = if pool_clone.is_some() { 2 } else { 1 };
-
-                            while attempts < max_attempts {
-                                attempts += 1;
-                                let acquire_fut = async {
-                                    if let Some(ref p) = pool_clone {
-                                        p.acquire(Some(&target))
-                                            .await
-                                            .map(IoChannel::from_boxed_stream)
-                                    } else if let Some(ref c) = connector_clone {
-                                        c.connect_with_protocol(&target, None, protocol).await
-                                    } else {
-                                        Err(TunnelError::Internal("Connector unavailable".into()))
-                                    }
-                                };
-
-                                let Some(remote_res) = acquire_fut.cancel_with(&conn_token).await else {
-                                    return;
-                                };
-
-                                match remote_res {
-                                    Ok(mut channel) => {
-                                        if pool_clone.is_some() {
-                                            let activation_pkt = ReplenishingStreamPool::encode_activation_with_proto(Some(&target), protocol);
-                                            let ack_timeout = reverse_ack_timeout(idle_timeout);
-                                            let write_act_res = async {
-                                                channel.write_all(&activation_pkt).await?;
-                                                channel.flush().await?;
-                                                let mut ack = [0u8; 1];
-                                                tokio::time::timeout(ack_timeout, channel.read_exact(&mut ack))
-                                                    .await
-                                                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Timed out waiting for activation ACK"))??;
-                                                if ack[0] == ACTIVATE_STREAM_ACK {
-                                                    Ok::<(), std::io::Error>(())
-                                                } else {
-                                                    Err(std::io::Error::new(
-                                                        std::io::ErrorKind::InvalidData,
-                                                        "Invalid activation ACK byte",
-                                                    ))
-                                                }
-                                            }
-                                            .cancel_with(&conn_token)
-                                            .await;
-                                            let Some(write_act_res) = write_act_res else {
-                                                return;
-                                            };
-
-                                            if let Err(e) = write_act_res {
-                                                if let Some(ref p) = pool_for_close {
-                                                    p.on_stream_closed();
-                                                }
-                                                if attempts < max_attempts {
-                                                    debug!("Pooled stream activation failed (stale stream); retrying once with fresh stream: {}", e);
-                                                    continue;
-                                                }
-                                                debug!("Failed to write stream activation packet: {}", e);
-                                                return;
-                                            }
-                                        }
-                                        remote_channel = Some(channel);
-                                        break;
-                                    }
-                                    Err(e) => {
-                                        if attempts < max_attempts {
-                                            debug!("Acquire failed on attempt {}, retrying: {}", attempts, e);
-                                            continue;
-                                        }
-                                        if !conn_token.is_cancelled() {
-                                            warn!(tag = %tag_for_task, "Failed to open remote tunnel stream: {}", e);
-                                        }
-                                        return;
-                                    }
-                                }
-                            }
-
-                            let Some(backend) = remote_channel else {
+                            let Some((backend, _lease)) = acquire_and_activate_channel(
+                                &tag_for_task,
+                                &target,
+                                protocol,
+                                idle_timeout,
+                                pool_clone.as_ref(),
+                                connector_clone.as_ref(),
+                                &conn_token,
+                            )
+                            .await
+                            else {
                                 return;
                             };
-                            scopeguard::defer! {
-                                if let Some(ref p) = pool_for_close {
-                                    p.on_stream_closed();
-                                }
-                            }
 
                             let res = serve(
                                 PumpRequest {
@@ -264,4 +295,128 @@ pub async fn run_forward_tunnel(
         cancel_token,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consts::{DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_IDLE_TIMEOUT};
+    use crate::core::stream::BoxFuture;
+
+    struct PendingConnector;
+
+    impl TransportConnector for PendingConnector {
+        fn connect<'a>(
+            &'a self,
+            _target: &'a TargetAddr,
+            _session_id: Option<&'a str>,
+        ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn connect_pooled<'a>(
+            &'a self,
+            target: &'a TargetAddr,
+        ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
+            self.connect(target, None)
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_activation_cancellation_and_retry_do_not_leak_active_count() {
+        let cancel = CancellationToken::new();
+        let pool = Arc::new(ReplenishingStreamPool::new_shared(
+            Arc::new(PendingConnector),
+            0,
+            cancel.clone(),
+            DEFAULT_HEARTBEAT_INTERVAL,
+            DEFAULT_IDLE_TIMEOUT,
+        ));
+        let target = parse_target_addr("127.0.0.1:8080").unwrap();
+        let mut magic = [0u8; 1];
+
+        // 1. Cancel while awaiting activation ACK -> must release active_count back to 0.
+        let (c_cancel, mut s_cancel) = tokio::io::duplex(256);
+        pool.push_idle(Box::new(c_cancel));
+        let req_token = CancellationToken::new();
+        let req_token_task = req_token.clone();
+        let pool_cancel = Arc::clone(&pool);
+        let target_cancel = target.clone();
+        let cancel_handle = tokio::spawn(async move {
+            acquire_and_activate_channel(
+                "t-cancel",
+                &target_cancel,
+                L4Protocol::Tcp,
+                Duration::from_secs(5),
+                Some(&pool_cancel),
+                None,
+                &req_token_task,
+            )
+            .await
+        });
+        s_cancel.read_exact(&mut magic).await.unwrap();
+        assert_eq!(pool.stats().active_count, 1);
+        req_token.cancel();
+        assert!(cancel_handle.await.unwrap().is_none());
+        assert_eq!(
+            pool.stats().active_count,
+            0,
+            "cancelling during activation must release active_count"
+        );
+
+        // 2. First stream fails activation (closed without ACK), retry succeeds on second stream:
+        //    active_count must stay 1 (not 2) while leased, and return to 0 on lease drop.
+        let (healthy_c, mut healthy_s) = tokio::io::duplex(256);
+        let (dead_ack_c, dead_ack_s) = tokio::io::duplex(256);
+        pool.push_idle(Box::new(healthy_c)); // popped second (LIFO)
+        pool.push_idle(Box::new(dead_ack_c)); // popped first (LIFO)
+        drop(dead_ack_s);
+
+        let ack_task = tokio::spawn(async move {
+            let mut hdr_buf = [0u8; 17];
+            healthy_s.read_exact(&mut hdr_buf).await.unwrap();
+            healthy_s.write_all(&[ACTIVATE_STREAM_ACK]).await.unwrap();
+            healthy_s
+        });
+
+        let retry_token = CancellationToken::new();
+        let res = acquire_and_activate_channel(
+            "t-retry",
+            &target,
+            L4Protocol::Tcp,
+            Duration::from_secs(5),
+            Some(&pool),
+            None,
+            &retry_token,
+        )
+        .await;
+        assert!(res.is_some());
+        assert_eq!(pool.stats().active_count, 1);
+        drop(res);
+        assert_eq!(pool.stats().active_count, 0);
+        let _ = ack_task.await.unwrap();
+
+        // 3. Cancelling while pool.acquire() itself is pending must not underflow active_count.
+        let empty_token = CancellationToken::new();
+        let empty_token_task = empty_token.clone();
+        let pool_empty = Arc::clone(&pool);
+        let empty_handle = tokio::spawn(async move {
+            acquire_and_activate_channel(
+                "t-empty",
+                &target,
+                L4Protocol::Tcp,
+                Duration::from_secs(5),
+                Some(&pool_empty),
+                None,
+                &empty_token_task,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        empty_token.cancel();
+        assert!(empty_handle.await.unwrap().is_none());
+        assert_eq!(pool.stats().active_count, 0);
+
+        cancel.cancel();
+    }
 }
