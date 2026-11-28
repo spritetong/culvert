@@ -108,55 +108,33 @@ impl ForwardWorkflow {
         let ack_timeout = reverse_ack_timeout(self.idle_timeout);
 
         // 1. Zero-RTT transport handed directly via Idle -> Connecting transition.
-        if let Some(mut transport) = ctx.take_transport() {
-            match Self::activate_stream(&mut *transport.stream, target, protocol, ack_timeout).await
-            {
-                Ok(()) => return Ok(IoChannel::from_boxed_stream(transport.stream)),
-                Err(err) => {
-                    tracing::debug!(
-                        target = %target,
-                        error = %err,
-                        "Idle transport activation failed; sweeping sibling streams and falling back"
-                    );
-                    if let Some(sid) = transport.session_id {
-                        ctx.report_dead_session(sid);
-                    }
-                    drop(transport);
-                    return self
-                        .fallback_after_pool_failure(ctx, target, protocol, ack_timeout)
-                        .await;
-                }
-            }
+        if let Some(transport) = ctx.take_transport() {
+            return self
+                .activate_or_fallback(
+                    ctx,
+                    transport,
+                    target,
+                    protocol,
+                    ack_timeout,
+                    "Idle transport activation failed",
+                )
+                .await;
         }
 
         // 2. Pooled mode without an Idle stream on this slot: await Coordinator dial/inbound dispatch.
         if self.pooled {
             match ctx.request_transport(self.acquire_timeout).await {
-                Ok(mut transport) => {
-                    match Self::activate_stream(
-                        &mut *transport.stream,
-                        target,
-                        protocol,
-                        ack_timeout,
-                    )
-                    .await
-                    {
-                        Ok(()) => return Ok(IoChannel::from_boxed_stream(transport.stream)),
-                        Err(err) => {
-                            tracing::debug!(
-                                target = %target,
-                                error = %err,
-                                "Dispatched pooled transport activation failed; falling back"
-                            );
-                            if let Some(sid) = transport.session_id {
-                                ctx.report_dead_session(sid);
-                            }
-                            drop(transport);
-                            return self
-                                .fallback_after_pool_failure(ctx, target, protocol, ack_timeout)
-                                .await;
-                        }
-                    }
+                Ok(transport) => {
+                    return self
+                        .activate_or_fallback(
+                            ctx,
+                            transport,
+                            target,
+                            protocol,
+                            ack_timeout,
+                            "Dispatched pooled transport activation failed",
+                        )
+                        .await;
                 }
                 Err(err) => {
                     tracing::debug!(
@@ -181,6 +159,32 @@ impl ForwardWorkflow {
         Self::dial_direct(conn.as_ref(), target, protocol).await
     }
 
+    async fn activate_or_fallback(
+        &self,
+        ctx: &ConnectingContext<'_>,
+        mut transport: crate::v2::PooledTransport,
+        target: &TargetAddr,
+        protocol: L4Protocol,
+        ack_timeout: Duration,
+        context_label: &str,
+    ) -> Result<IoChannel, TaskError> {
+        match Self::activate_stream(&mut *transport.stream, target, protocol, ack_timeout).await {
+            Ok(()) => Ok(IoChannel::from_boxed_stream(transport.stream)),
+            Err(err) => {
+                // Activation handshake failures are stream-scoped; never sweep sibling idle
+                // streams sharing the underlying session because of a single bad stream.
+                tracing::debug!(
+                    target = %target,
+                    error = %err,
+                    "{context_label}; discarding stream and falling back"
+                );
+                drop(transport);
+                self.fallback_after_pool_failure(ctx, target, protocol, ack_timeout)
+                    .await
+            }
+        }
+    }
+
     async fn fallback_after_pool_failure(
         &self,
         ctx: &ConnectingContext<'_>,
@@ -195,12 +199,7 @@ impl ForwardWorkflow {
             let mut retry = ctx.request_transport(self.acquire_timeout).await?;
             Self::activate_stream(&mut *retry.stream, target, protocol, ack_timeout)
                 .await
-                .map_err(|e| {
-                    if let Some(sid) = retry.session_id {
-                        ctx.report_dead_session(sid);
-                    }
-                    TaskError::StageFailed(e.to_string())
-                })?;
+                .map_err(|e| TaskError::StageFailed(e.to_string()))?;
             return Ok(IoChannel::from_boxed_stream(retry.stream));
         }
         Err(TaskError::StageFailed(

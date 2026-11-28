@@ -127,14 +127,13 @@ impl ReverseVisitorWorkflow {
             {
                 Ok(()) => return Ok(IoChannel::from_boxed_stream(transport.stream)),
                 Err(err) => {
+                    // Activation handshake failure only proves this stream failed; keep
+                    // sibling idle streams on the shared session intact.
                     tracing::debug!(
                         visitor = %peer,
                         error = %err,
                         "Reverse 0-RTT idle stream failed activation ACK; falling back to signaling"
                     );
-                    if let Some(sid) = transport.session_id {
-                        ctx.report_dead_session(sid);
-                    }
                     drop(transport);
                 }
             }

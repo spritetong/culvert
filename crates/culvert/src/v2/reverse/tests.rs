@@ -660,3 +660,235 @@ async fn router_standby_attach_during_promotion_wait_is_observed() {
         cancel.cancel();
     }
 }
+
+#[tokio::test]
+async fn reverse_activation_failure_preserves_sibling_idle_and_session_close_sweeps_siblings() {
+    use crate::core::stream::HeartbeatStatus;
+    use crate::v2::IdlePolicy;
+    use crate::v2::reverse::ReverseVisitorInput;
+    use std::pin::Pin;
+    use std::sync::atomic::AtomicBool;
+    use std::task::{Context, Poll};
+
+    struct SessionIdleStream {
+        inner: DuplexStream,
+        session_id: u64,
+        alive: Arc<AtomicBool>,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl Drop for SessionIdleStream {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    impl tokio::io::AsyncRead for SessionIdleStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for SessionIdleStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl TunnelStream for SessionIdleStream {
+        fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+            if !self.alive.load(Ordering::Acquire) {
+                return Poll::Ready(HeartbeatStatus::Dead);
+            }
+            Pin::new(&mut self.inner).poll_check_alive(cx)
+        }
+
+        fn session_id(&self) -> Option<u64> {
+            Some(self.session_id)
+        }
+    }
+
+    let spawn_ack_peer = |mut srv: DuplexStream, ack_byte: u8| {
+        tokio::spawn(async move {
+            let mut hdr = [0u8; 3];
+            if srv.read_exact(&mut hdr).await.is_err() {
+                return;
+            }
+            let len = u16::from_be_bytes([hdr[1], hdr[2]]) as usize;
+            let mut target_buf = vec![0u8; len];
+            if srv.read_exact(&mut target_buf).await.is_err() {
+                return;
+            }
+            let _ = srv.write_all(&[ack_byte]).await;
+            let _ = srv.flush().await;
+            if ack_byte != ACTIVATE_STREAM_ACK {
+                return;
+            }
+            let mut buf = [0u8; 256];
+            loop {
+                match srv.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if srv.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ = srv.shutdown().await;
+        })
+    };
+
+    let signal_calls = Arc::new(AtomicUsize::new(0));
+    let signaler = Arc::new(MockSignaler {
+        calls: Arc::clone(&signal_calls),
+        hang_forever: false,
+    });
+    let workflow = ReverseVisitorWorkflow::new(
+        signaler,
+        DEFAULT_HEARTBEAT_INTERVAL,
+        DEFAULT_IDLE_TIMEOUT,
+        DEFAULT_RELAY_DRAIN_TIMEOUT,
+    );
+
+    let cfg = CoordinatorConfig {
+        drain_timeout: DEFAULT_RELAY_DRAIN_TIMEOUT,
+        max_idle_capacity: 8,
+        idle_policy: IdlePolicy::reverse_inbound(Duration::from_secs(30)),
+        dial: None,
+    };
+    let (handle, join) = Coordinator::start_with_config(workflow, cfg, CancellationToken::new());
+
+    let shared_alive = Arc::new(AtomicBool::new(true));
+    let good_dropped = Arc::new(AtomicUsize::new(0));
+    let bad_dropped = Arc::new(AtomicUsize::new(0));
+
+    let (c_good, s_good) = duplex(4096);
+    let (c_bad, s_bad) = duplex(4096);
+    spawn_ack_peer(s_good, ACTIVATE_STREAM_ACK);
+    spawn_ack_peer(s_bad, 0xFF);
+
+    assert!(
+        handle
+            .supply_transport(PooledTransport::new(
+                Box::new(SessionIdleStream {
+                    inner: c_good,
+                    session_id: 777,
+                    alive: Arc::clone(&shared_alive),
+                    dropped: Arc::clone(&good_dropped),
+                }),
+                1,
+            ))
+            .await
+            .unwrap()
+    );
+    assert!(
+        handle
+            .supply_transport(PooledTransport::new(
+                Box::new(SessionIdleStream {
+                    inner: c_bad,
+                    session_id: 777,
+                    alive: Arc::clone(&shared_alive),
+                    dropped: Arc::clone(&bad_dropped),
+                }),
+                1,
+            ))
+            .await
+            .unwrap()
+    );
+    assert_eq!(handle.query_idle_count().await.unwrap(), 2);
+
+    // 1. Visitor 1 hits bad-ACK stream A, fails 0xAC handshake, and falls back to signaling.
+    let (mut v1, v1_stream) = duplex(4096);
+    handle
+        .assign(ReverseVisitorInput {
+            visitor: IoChannel::from_stream(v1_stream),
+            peer: PeerAddr::Socket("127.0.0.1:41010".parse().unwrap()),
+            target: TargetAddr::Ip("127.0.0.1:8080".parse().unwrap()),
+            protocol: L4Protocol::Tcp,
+            relay_idle_timeout: None,
+            signaler: None,
+        })
+        .await
+        .unwrap();
+    v1.write_all(b"sig-fallbk").await.unwrap();
+    v1.shutdown().await.unwrap();
+    let mut got1 = [0u8; 10];
+    v1.read_exact(&mut got1).await.unwrap();
+    assert_eq!(&got1, b"sig-fallbk");
+    assert_eq!(signal_calls.load(Ordering::Acquire), 1);
+
+    // Healthy sibling B on session 777 MUST stay Idle and NOT be swept!
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(handle.query_idle_count().await.unwrap(), 1);
+    assert_eq!(good_dropped.load(Ordering::Acquire), 0);
+
+    // 2. Visitor 2 activates healthy sibling B cleanly via 0-RTT without calling signaling.
+    let (mut v2, v2_stream) = duplex(4096);
+    handle
+        .assign(ReverseVisitorInput {
+            visitor: IoChannel::from_stream(v2_stream),
+            peer: PeerAddr::Socket("127.0.0.1:41011".parse().unwrap()),
+            target: TargetAddr::Ip("127.0.0.1:8080".parse().unwrap()),
+            protocol: L4Protocol::Tcp,
+            relay_idle_timeout: None,
+            signaler: None,
+        })
+        .await
+        .unwrap();
+    v2.write_all(b"rev-0rtt!!").await.unwrap();
+    v2.shutdown().await.unwrap();
+    let mut got2 = [0u8; 10];
+    v2.read_exact(&mut got2).await.unwrap();
+    assert_eq!(&got2, b"rev-0rtt!!");
+    assert_eq!(signal_calls.load(Ordering::Acquire), 1);
+
+    // 3. Explicit session sweep still evicts all matching siblings on a dead session.
+    let sweep_alive = Arc::new(AtomicBool::new(true));
+    let sweep_dropped = Arc::new(AtomicUsize::new(0));
+    let mut _sweep_peers = Vec::new();
+    for _ in 0..2 {
+        let (c_sweep, s_sweep) = duplex(256);
+        _sweep_peers.push(s_sweep);
+        assert!(
+            handle
+                .supply_transport(PooledTransport::new(
+                    Box::new(SessionIdleStream {
+                        inner: c_sweep,
+                        session_id: 888,
+                        alive: Arc::clone(&sweep_alive),
+                        dropped: Arc::clone(&sweep_dropped),
+                    }),
+                    1,
+                ))
+                .await
+                .unwrap()
+        );
+    }
+    assert_eq!(handle.sweep_session(888).await.unwrap(), 2);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(sweep_dropped.load(Ordering::Acquire), 2);
+    assert_eq!(handle.query_idle_count().await.unwrap(), 0);
+
+    handle.graceful_stop().await.unwrap();
+    let _ = join.await.unwrap();
+}

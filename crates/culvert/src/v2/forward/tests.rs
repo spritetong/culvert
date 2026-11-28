@@ -811,3 +811,256 @@ async fn forward_runner_coordinated_pool_drain_halts_replenish_and_zeroes_leases
     // Once Coordinator enters Draining, no extra background dials are launched during drain.
     assert_eq!(pooled_dials.load(Ordering::Acquire), dials_at_shutdown);
 }
+
+#[tokio::test]
+async fn forward_activation_failure_preserves_sibling_idle_and_session_close_sweeps_siblings() {
+    use crate::core::stream::{HeartbeatStatus, TunnelStream};
+    use crate::v2::forward::ForwardInput;
+    use crate::v2::{Coordinator, IdlePolicy, PooledTransport};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct SessionIdleStream {
+        inner: DuplexStream,
+        session_id: u64,
+        alive: Arc<AtomicBool>,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl Drop for SessionIdleStream {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    impl tokio::io::AsyncRead for SessionIdleStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for SessionIdleStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl TunnelStream for SessionIdleStream {
+        fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+            if !self.alive.load(Ordering::Acquire) {
+                return Poll::Ready(HeartbeatStatus::Dead);
+            }
+            Pin::new(&mut self.inner).poll_check_alive(cx)
+        }
+
+        fn session_id(&self) -> Option<u64> {
+            Some(self.session_id)
+        }
+    }
+
+    let spawn_activation_peer = |mut srv: DuplexStream, ack_byte: u8| {
+        tokio::spawn(async move {
+            let mut hdr = [0u8; 3];
+            if srv.read_exact(&mut hdr).await.is_err() {
+                return;
+            }
+            let len = u16::from_be_bytes([hdr[1], hdr[2]]) as usize;
+            let mut target_buf = vec![0u8; len];
+            if srv.read_exact(&mut target_buf).await.is_err() {
+                return;
+            }
+            let _ = srv.write_all(&[ack_byte]).await;
+            let _ = srv.flush().await;
+            if ack_byte != ACTIVATE_STREAM_ACK {
+                return;
+            }
+            let mut buf = [0u8; 256];
+            loop {
+                match srv.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if srv.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ = srv.shutdown().await;
+        })
+    };
+
+    let direct_dials = Arc::new(AtomicUsize::new(0));
+    let connector = Arc::new(EchoConnector {
+        direct_dials: Arc::clone(&direct_dials),
+        pooled_dials: Arc::new(AtomicUsize::new(0)),
+        fail_first_pooled_ack: Arc::new(AtomicBool::new(false)),
+    });
+    let workflow = ForwardWorkflow::new(
+        Some(connector),
+        DEFAULT_HEARTBEAT_INTERVAL,
+        DEFAULT_IDLE_TIMEOUT,
+        DEFAULT_RELAY_DRAIN_TIMEOUT,
+    )
+    .with_pooled(true);
+
+    let cfg = CoordinatorConfig {
+        drain_timeout: DEFAULT_RELAY_DRAIN_TIMEOUT,
+        max_idle_capacity: 8,
+        idle_policy: IdlePolicy::forward(Duration::from_millis(15), Duration::from_secs(30)),
+        dial: None,
+    };
+    let (handle, join) = Coordinator::start_with_config(workflow, cfg, CancellationToken::new());
+
+    // Push healthy sibling B first, then bad-ACK stream A second (LIFO pops A first).
+    let shared_alive = Arc::new(AtomicBool::new(true));
+    let good_dropped = Arc::new(AtomicUsize::new(0));
+    let bad_dropped = Arc::new(AtomicUsize::new(0));
+
+    let (c_good, s_good) = duplex(4096);
+    let (c_bad, s_bad) = duplex(4096);
+    spawn_activation_peer(s_good, ACTIVATE_STREAM_ACK);
+    spawn_activation_peer(s_bad, 0xFF);
+
+    assert!(
+        handle
+            .supply_transport(PooledTransport::new(
+                Box::new(SessionIdleStream {
+                    inner: c_good,
+                    session_id: 777,
+                    alive: Arc::clone(&shared_alive),
+                    dropped: Arc::clone(&good_dropped),
+                }),
+                1,
+            ))
+            .await
+            .unwrap()
+    );
+    assert!(
+        handle
+            .supply_transport(PooledTransport::new(
+                Box::new(SessionIdleStream {
+                    inner: c_bad,
+                    session_id: 777,
+                    alive: Arc::clone(&shared_alive),
+                    dropped: Arc::clone(&bad_dropped),
+                }),
+                1,
+            ))
+            .await
+            .unwrap()
+    );
+    assert_eq!(handle.query_idle_count().await.unwrap(), 2);
+
+    // 1. Job 1 picks bad-ACK stream A, fails activation, and falls back to direct dial.
+    let (mut v1, v1_stream) = duplex(4096);
+    handle
+        .assign(ForwardInput::new(
+            IoChannel::from_stream(v1_stream),
+            TargetAddr::Domain("app.internal".into(), 8080),
+            L4Protocol::Tcp,
+        ))
+        .await
+        .unwrap();
+    v1.write_all(b"fallback-1").await.unwrap();
+    v1.shutdown().await.unwrap();
+    let mut got1 = [0u8; 10];
+    v1.read_exact(&mut got1).await.unwrap();
+    assert_eq!(&got1, b"fallback-1");
+    assert_eq!(direct_dials.load(Ordering::Acquire), 1);
+
+    // Healthy sibling B on session 777 MUST still be Idle and NOT swept!
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(handle.query_idle_count().await.unwrap(), 1);
+    assert_eq!(good_dropped.load(Ordering::Acquire), 0);
+
+    // 2. Job 2 consumes healthy sibling B directly without falling back to direct dial.
+    let (mut v2, v2_stream) = duplex(4096);
+    handle
+        .assign(ForwardInput::new(
+            IoChannel::from_stream(v2_stream),
+            TargetAddr::Domain("app.internal".into(), 8080),
+            L4Protocol::Tcp,
+        ))
+        .await
+        .unwrap();
+    v2.write_all(b"sibling-ok").await.unwrap();
+    v2.shutdown().await.unwrap();
+    let mut got2 = [0u8; 10];
+    v2.read_exact(&mut got2).await.unwrap();
+    assert_eq!(&got2, b"sibling-ok");
+    assert_eq!(direct_dials.load(Ordering::Acquire), 1);
+
+    // 3. True underlying session closure / sweep still evicts all matching siblings.
+    let dead_session_alive = Arc::new(AtomicBool::new(false));
+    let dead_session_dropped = Arc::new(AtomicUsize::new(0));
+    let sweep_alive = Arc::new(AtomicBool::new(true));
+    let sweep_dropped = Arc::new(AtomicUsize::new(0));
+
+    let mut _dead_peers = Vec::new();
+    for _ in 0..2 {
+        let (c_dead, s_dead) = duplex(256);
+        _dead_peers.push(s_dead);
+        assert!(
+            handle
+                .supply_transport(PooledTransport::new(
+                    Box::new(SessionIdleStream {
+                        inner: c_dead,
+                        session_id: 888,
+                        alive: Arc::clone(&dead_session_alive),
+                        dropped: Arc::clone(&dead_session_dropped),
+                    }),
+                    1,
+                ))
+                .await
+                .unwrap()
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(dead_session_dropped.load(Ordering::Acquire), 2);
+
+    let mut _sweep_peers = Vec::new();
+    for _ in 0..2 {
+        let (c_sweep, s_sweep) = duplex(256);
+        _sweep_peers.push(s_sweep);
+        assert!(
+            handle
+                .supply_transport(PooledTransport::new(
+                    Box::new(SessionIdleStream {
+                        inner: c_sweep,
+                        session_id: 999,
+                        alive: Arc::clone(&sweep_alive),
+                        dropped: Arc::clone(&sweep_dropped),
+                    }),
+                    1,
+                ))
+                .await
+                .unwrap()
+        );
+    }
+    assert_eq!(handle.sweep_session(999).await.unwrap(), 2);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(sweep_dropped.load(Ordering::Acquire), 2);
+    assert_eq!(handle.query_idle_count().await.unwrap(), 0);
+
+    handle.graceful_stop().await.unwrap();
+    let _ = join.await.unwrap();
+}
