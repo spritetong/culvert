@@ -663,7 +663,8 @@ impl Pump for DatagramDatagramPump {
                 }
 
                 if idle_timer.as_mut().poll(cx).is_ready() {
-                    if last_activity.elapsed() >= ctx.idle_timeout {
+                    let has_pending_outbound = !queue_a_to_b.is_empty() || !queue_b_to_a.is_empty();
+                    if !has_pending_outbound && last_activity.elapsed() >= ctx.idle_timeout {
                         return Poll::Ready(Ok((bytes_a_to_b, bytes_b_to_a)));
                     }
                     idle_timer
@@ -2070,6 +2071,118 @@ mod tests {
             b_to_a_bytes,
             reverse_payloads.iter().map(|p| p.len() as u64).sum::<u64>()
         );
+    }
+
+    #[tokio::test]
+    async fn test_datagram_datagram_pump_idle_timeout_preserves_pending_outbound() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct GatedSendDatagramIo {
+            rx: tokio::sync::mpsc::UnboundedReceiver<Datagram>,
+            allow_send: Arc<AtomicBool>,
+            send_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+            delivered_tx: tokio::sync::mpsc::UnboundedSender<Datagram>,
+        }
+
+        impl DatagramIo for GatedSendDatagramIo {
+            fn poll_recv(
+                &mut self,
+                cx: &mut Context<'_>,
+                batch: &mut [Datagram],
+            ) -> Poll<io::Result<usize>> {
+                if batch.is_empty() {
+                    return Poll::Ready(Ok(0));
+                }
+                match self.rx.poll_recv(cx) {
+                    Poll::Ready(Some(d)) => {
+                        batch[0] = d;
+                        Poll::Ready(Ok(1))
+                    }
+                    Poll::Ready(None) => Poll::Ready(Ok(0)),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+
+            fn poll_send(
+                &mut self,
+                cx: &mut Context<'_>,
+                batch: &[Datagram],
+            ) -> Poll<io::Result<usize>> {
+                if !self.allow_send.load(Ordering::Acquire) {
+                    *self.send_waker.lock().unwrap() = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+                for d in batch {
+                    let _ = self.delivered_tx.send(d.clone());
+                }
+                Poll::Ready(Ok(batch.len()))
+            }
+        }
+
+        let (a_out_tx, _a_out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (a_in_tx, a_in_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (b_delivered_tx, mut b_delivered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (b_in_tx, b_in_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let allow_send = Arc::new(AtomicBool::new(false));
+        let send_waker = Arc::new(std::sync::Mutex::new(None::<std::task::Waker>));
+
+        let req = PumpRequest::new(
+            IoChannel::from_datagram(ChannelDatagramIo {
+                rx: a_in_rx,
+                tx: a_out_tx,
+            }),
+            IoChannel::from_datagram(GatedSendDatagramIo {
+                rx: b_in_rx,
+                allow_send: Arc::clone(&allow_send),
+                send_waker: Arc::clone(&send_waker),
+                delivered_tx: b_delivered_tx,
+            }),
+        );
+        let ctx = PumpCtx {
+            cancel: CancellationToken::new(),
+            heartbeat_interval: Duration::from_millis(20),
+            idle_timeout: Duration::from_millis(100),
+        };
+
+        let pump = tokio::spawn(async move { DatagramDatagramPump.run(req, ctx).await });
+
+        let payload = b"pending-past-idle-timeout";
+        a_in_tx
+            .send(Datagram {
+                flow: Default::default(),
+                payload: Bytes::from_static(payload),
+            })
+            .unwrap();
+
+        // Wait well past idle_timeout (100ms) while poll_send stays Pending.
+        tokio::time::sleep(Duration::from_millis(220)).await;
+        assert!(
+            !pump.is_finished(),
+            "pump exited on idle_timeout while outbound queue still held datagrams"
+        );
+
+        // Unblock poll_send and verify the queued datagram is delivered intact.
+        allow_send.store(true, Ordering::Release);
+        if let Some(w) = send_waker.lock().unwrap().take() {
+            w.wake();
+        }
+        let delivered = tokio::time::timeout(Duration::from_secs(2), b_delivered_rx.recv())
+            .await
+            .expect("queued datagram was lost instead of delivered after unblocking poll_send")
+            .unwrap();
+        assert_eq!(delivered.payload.as_ref(), payload);
+
+        // Once the queue is drained and both sides go idle, normal idle timeout still expires.
+        let (a_to_b_bytes, b_to_a_bytes) = tokio::time::timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("pump did not terminate on normal idle timeout after queue drained")
+            .unwrap()
+            .unwrap();
+        assert_eq!(a_to_b_bytes, payload.len() as u64);
+        assert_eq!(b_to_a_bytes, 0);
+        drop(a_in_tx);
+        drop(b_in_tx);
     }
 }
 
