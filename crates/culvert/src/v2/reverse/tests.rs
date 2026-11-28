@@ -892,3 +892,229 @@ async fn reverse_activation_failure_preserves_sibling_idle_and_session_close_swe
     handle.graceful_stop().await.unwrap();
     let _ = join.await.unwrap();
 }
+
+#[tokio::test]
+async fn reverse_activation_write_and_flush_backpressure_timeout_and_cancel() {
+    use crate::core::stream::HeartbeatStatus;
+    use crate::v2::IdlePolicy;
+    use crate::v2::reverse::ReverseVisitorInput;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::sync::Notify;
+
+    #[derive(Clone, Copy)]
+    enum StallStage {
+        None,
+        Write,
+        Flush,
+    }
+
+    struct StallWriteStream {
+        inner: DuplexStream,
+        session_id: u64,
+        stall: StallStage,
+        entered: Option<Arc<Notify>>,
+    }
+
+    impl tokio::io::AsyncRead for StallWriteStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for StallWriteStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if matches!(self.stall, StallStage::Write) {
+                if let Some(ref notify) = self.entered {
+                    notify.notify_waiters();
+                }
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            if matches!(self.stall, StallStage::Flush) {
+                if let Some(ref notify) = self.entered {
+                    notify.notify_waiters();
+                }
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl TunnelStream for StallWriteStream {
+        fn poll_check_alive(&mut self, cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+            Pin::new(&mut self.inner).poll_check_alive(cx)
+        }
+
+        fn session_id(&self) -> Option<u64> {
+            Some(self.session_id)
+        }
+    }
+
+    // 1. poll_flush() returning Pending forever times out at ack_timeout and falls back to signaler,
+    //    while preserving healthy sibling idle tasks on the same session_id.
+    {
+        let signal_calls = Arc::new(AtomicUsize::new(0));
+        let signaler = Arc::new(MockSignaler {
+            calls: Arc::clone(&signal_calls),
+            hang_forever: false,
+        });
+        let workflow = ReverseVisitorWorkflow::new(
+            signaler,
+            DEFAULT_HEARTBEAT_INTERVAL,
+            DEFAULT_IDLE_TIMEOUT,
+            DEFAULT_RELAY_DRAIN_TIMEOUT,
+        )
+        .with_ack_timeout(Duration::from_millis(60));
+
+        let cfg = CoordinatorConfig {
+            drain_timeout: DEFAULT_RELAY_DRAIN_TIMEOUT,
+            max_idle_capacity: 4,
+            idle_policy: IdlePolicy::reverse_inbound(Duration::from_secs(30)),
+            dial: None,
+        };
+        let (handle, join) =
+            Coordinator::start_with_config(workflow, cfg, CancellationToken::new());
+
+        let (c_sibling, _s_sibling) = duplex(256);
+        let (c_flush, _s_flush) = duplex(256);
+        assert!(
+            handle
+                .supply_transport(PooledTransport::new(
+                    Box::new(StallWriteStream {
+                        inner: c_sibling,
+                        session_id: 601,
+                        stall: StallStage::None,
+                        entered: None,
+                    }),
+                    1,
+                ))
+                .await
+                .unwrap()
+        );
+        assert!(
+            handle
+                .supply_transport(PooledTransport::new(
+                    Box::new(StallWriteStream {
+                        inner: c_flush,
+                        session_id: 601,
+                        stall: StallStage::Flush,
+                        entered: None,
+                    }),
+                    1,
+                ))
+                .await
+                .unwrap()
+        );
+
+        let (mut visitor, stream) = duplex(4096);
+        handle
+            .assign(ReverseVisitorInput::new(
+                IoChannel::from_stream(stream),
+                PeerAddr::Socket("127.0.0.1:41020".parse().unwrap()),
+                TargetAddr::Ip("127.0.0.1:8080".parse().unwrap()),
+                L4Protocol::Tcp,
+            ))
+            .await
+            .unwrap();
+
+        visitor.write_all(b"rev-flush-fb").await.unwrap();
+        visitor.shutdown().await.unwrap();
+        let mut got = [0u8; 12];
+        tokio::time::timeout(Duration::from_secs(1), visitor.read_exact(&mut got))
+            .await
+            .expect("flush-stalled reverse activation must time out and fall back to signaler")
+            .unwrap();
+        assert_eq!(&got, b"rev-flush-fb");
+        assert_eq!(signal_calls.load(Ordering::Acquire), 1);
+        assert_eq!(handle.query_idle_count().await.unwrap(), 1);
+
+        handle.graceful_stop().await.unwrap();
+        let _ = join.await.unwrap();
+    }
+
+    // 2. poll_write() returning Pending forever with a long 5s ack_timeout is cancelled
+    //    immediately on ForceStop / Drain without waiting for ack_timeout.
+    {
+        let signaler = Arc::new(MockSignaler {
+            calls: Arc::new(AtomicUsize::new(0)),
+            hang_forever: false,
+        });
+        let workflow = ReverseVisitorWorkflow::new(
+            signaler,
+            DEFAULT_HEARTBEAT_INTERVAL,
+            DEFAULT_IDLE_TIMEOUT,
+            Duration::from_millis(80),
+        );
+        let cfg = CoordinatorConfig {
+            drain_timeout: Duration::from_millis(80),
+            max_idle_capacity: 4,
+            idle_policy: IdlePolicy::reverse_inbound(Duration::from_secs(30)),
+            dial: None,
+        };
+        let (handle, join) =
+            Coordinator::start_with_config(workflow, cfg, CancellationToken::new());
+
+        let entered = Arc::new(Notify::new());
+        let (c_write, _s_write) = duplex(256);
+        assert!(
+            handle
+                .supply_transport(PooledTransport::new(
+                    Box::new(StallWriteStream {
+                        inner: c_write,
+                        session_id: 602,
+                        stall: StallStage::Write,
+                        entered: Some(Arc::clone(&entered)),
+                    }),
+                    1,
+                ))
+                .await
+                .unwrap()
+        );
+
+        let entered_wait = entered.notified();
+        tokio::pin!(entered_wait);
+        entered_wait.as_mut().enable();
+
+        let (_visitor, stream) = duplex(1024);
+        handle
+            .assign(ReverseVisitorInput::new(
+                IoChannel::from_stream(stream),
+                PeerAddr::Socket("127.0.0.1:41021".parse().unwrap()),
+                TargetAddr::Ip("127.0.0.1:8080".parse().unwrap()),
+                L4Protocol::Tcp,
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered_wait)
+            .await
+            .expect("reverse activation must enter stalled poll_write");
+
+        let started = std::time::Instant::now();
+        handle.graceful_stop().await.unwrap();
+        let summary = tokio::time::timeout(Duration::from_secs(1), join)
+            .await
+            .expect("Drain must cancel stalled reverse activation before 5s ack_timeout")
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(summary.final_phase, TunnelPhase::Stopped);
+    }
+}

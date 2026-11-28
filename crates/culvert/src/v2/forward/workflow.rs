@@ -6,20 +6,18 @@
 //! backend streams, activates pooled streams with `0xA5`/`0xAC`, and runs `ChannelRelay`.
 //! All comments and docstrings must be in English.
 
-use crate::consts::{ACTIVATE_STREAM_ACK, POOL_ACQUIRE_TIMEOUT, reverse_ack_timeout};
+use crate::consts::{POOL_ACQUIRE_TIMEOUT, reverse_ack_timeout};
 use crate::core::error::TunnelError;
 use crate::io::addr::{L4Protocol, TargetAddr};
 use crate::io::channel::IoChannel;
-use crate::pool::activation::encode_activation_with_proto;
+use crate::pool::activation::activate_and_verify_stream;
 use crate::transport::TransportConnector;
 use crate::v2::error::TaskError;
 use crate::v2::relay::{ChannelRelay, RelayCounters};
 use crate::v2::stage::{ConnectingContext, TaskWorkflow};
 use std::future::Future;
-use std::io;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Input payload delivered from `Frontend::accept` to a Forward `IoTask`.
 pub struct ForwardInput {
@@ -52,6 +50,8 @@ pub struct ForwardWorkflow {
     relay_idle_timeout: Duration,
     drain_timeout: Duration,
     counters: Option<Arc<RelayCounters>>,
+    #[cfg(test)]
+    ack_timeout_override: Option<Duration>,
 }
 
 impl ForwardWorkflow {
@@ -72,7 +72,24 @@ impl ForwardWorkflow {
             relay_idle_timeout: idle_timeout,
             drain_timeout,
             counters: None,
+            #[cfg(test)]
+            ack_timeout_override: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_ack_timeout(mut self, timeout: Duration) -> Self {
+        self.ack_timeout_override = Some(timeout);
+        self
+    }
+
+    #[inline]
+    fn effective_ack_timeout(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(timeout) = self.ack_timeout_override {
+            return timeout;
+        }
+        reverse_ack_timeout(self.idle_timeout)
     }
 
     /// Enables requesting/consuming pooled transports from `Coordinator` `Idle` tasks & `DialDriver`.
@@ -105,7 +122,7 @@ impl ForwardWorkflow {
         target: &TargetAddr,
         protocol: L4Protocol,
     ) -> Result<IoChannel, TaskError> {
-        let ack_timeout = reverse_ack_timeout(self.idle_timeout);
+        let ack_timeout = self.effective_ack_timeout();
 
         // 1. Zero-RTT transport handed directly via Idle -> Connecting transition.
         if let Some(transport) = ctx.take_transport() {
@@ -168,7 +185,14 @@ impl ForwardWorkflow {
         ack_timeout: Duration,
         context_label: &str,
     ) -> Result<IoChannel, TaskError> {
-        match Self::activate_stream(&mut *transport.stream, target, protocol, ack_timeout).await {
+        match activate_and_verify_stream(
+            &mut *transport.stream,
+            Some(target),
+            protocol,
+            ack_timeout,
+        )
+        .await
+        {
             Ok(()) => Ok(IoChannel::from_boxed_stream(transport.stream)),
             Err(err) => {
                 // Activation handshake failures are stream-scoped; never sweep sibling idle
@@ -197,7 +221,7 @@ impl ForwardWorkflow {
         }
         if self.pooled {
             let mut retry = ctx.request_transport(self.acquire_timeout).await?;
-            Self::activate_stream(&mut *retry.stream, target, protocol, ack_timeout)
+            activate_and_verify_stream(&mut *retry.stream, Some(target), protocol, ack_timeout)
                 .await
                 .map_err(|e| TaskError::StageFailed(e.to_string()))?;
             return Ok(IoChannel::from_boxed_stream(retry.stream));
@@ -205,37 +229,6 @@ impl ForwardWorkflow {
         Err(TaskError::StageFailed(
             "forward activation failed with no fallback connector".into(),
         ))
-    }
-
-    async fn activate_stream<S>(
-        stream: &mut S,
-        target: &TargetAddr,
-        protocol: L4Protocol,
-        ack_timeout: Duration,
-    ) -> io::Result<()>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + ?Sized,
-    {
-        let pkt = encode_activation_with_proto(Some(target), protocol);
-        stream.write_all(&pkt).await?;
-        stream.flush().await?;
-
-        let mut ack = [0u8; 1];
-        tokio::time::timeout(ack_timeout, stream.read_exact(&mut ack))
-            .await
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "timed out waiting for activation ACK",
-                )
-            })??;
-        if ack[0] != ACTIVATE_STREAM_ACK {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid activation ACK byte",
-            ));
-        }
-        Ok(())
     }
 
     async fn dial_direct(

@@ -11,7 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::common::{CancelFutureExt, TimeoutOrCancel};
 use crate::consts::{
-    ACTIVATE_STREAM_MAGIC, ACTIVATE_STREAM_PROMOTE, ACTIVATE_STREAM_UDP, MAX_ACTIVATION_TARGET_LEN,
+    ACTIVATE_STREAM_ACK, ACTIVATE_STREAM_MAGIC, ACTIVATE_STREAM_PROMOTE, ACTIVATE_STREAM_UDP,
+    MAX_ACTIVATION_TARGET_LEN,
 };
 use crate::core::error::TunnelError;
 use crate::io::addr::{L4Protocol, TargetAddr, parse_target_addr};
@@ -45,6 +46,47 @@ pub fn encode_activation_with_proto(target: Option<&TargetAddr>, protocol: L4Pro
         pkt.extend_from_slice(&0u16.to_be_bytes());
     }
     pkt
+}
+
+/// Sends an activation header and verifies the `0xAC` ACK within a single bounded
+/// `ack_timeout` covering write, flush, and ACK reading.
+pub async fn activate_and_verify_stream<S>(
+    stream: &mut S,
+    target: Option<&TargetAddr>,
+    protocol: L4Protocol,
+    ack_timeout: Duration,
+) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized,
+{
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let pkt = encode_activation_with_proto(target, protocol);
+    tokio::time::timeout(ack_timeout, async {
+        stream.write_all(&pkt).await?;
+        stream.flush().await?;
+
+        let mut ack = [0u8; 1];
+        stream.read_exact(&mut ack).await?;
+
+        if ack[0] != ACTIVATE_STREAM_ACK {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid activation ACK byte",
+            ));
+        }
+
+        Ok(())
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "activation handshake timed out",
+        )
+    })??;
+
+    Ok(())
 }
 
 async fn read_activation_field<S: AsyncReadExt + Unpin + Send>(
