@@ -75,6 +75,8 @@ pub struct H3Connector {
     last_quic_failure: Arc<RwLock<Option<(std::time::Instant, String)>>>,
     h3_establish_gate: Arc<Mutex<()>>,
     quic_establish_gate: Arc<Mutex<()>>,
+    #[cfg(test)]
+    h3_request_timeout: std::time::Duration,
 }
 
 impl H3Connector {
@@ -172,6 +174,8 @@ impl H3Connector {
             last_quic_failure: Arc::new(RwLock::new(None)),
             h3_establish_gate: Arc::new(Mutex::new(())),
             quic_establish_gate: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            h3_request_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         })
     }
 
@@ -347,6 +351,40 @@ impl H3Connector {
         }
     }
 
+    #[inline]
+    fn effective_h3_request_timeout(&self) -> std::time::Duration {
+        #[cfg(test)]
+        {
+            self.h3_request_timeout
+        }
+        #[cfg(not(test))]
+        {
+            DEFAULT_HANDSHAKE_TIMEOUT
+        }
+    }
+
+    /// Distinguishes connection-scoped HTTP/3 errors from per-stream failures so a
+    /// single stalled/reset request never tears down healthy sibling streams.
+    fn handle_h3_stream_error(&self, session: &H3Session, err: &h3::error::StreamError) {
+        match err {
+            h3::error::StreamError::ConnectionError { .. } => {
+                self.invalidate_h3_session_if_same(session.id);
+            }
+            h3::error::StreamError::RemoteClosing { .. } => {
+                // Peer sent GOAWAY: stop routing new requests to this slot without
+                // force-killing streams that are still actively relaying.
+                let mut guard = self.cached_h3_session.write();
+                if guard.as_ref().is_some_and(|cur| cur.id == session.id) {
+                    guard.take();
+                }
+            }
+            _ if !session.is_alive() => {
+                self.invalidate_h3_session_if_same(session.id);
+            }
+            _ => {}
+        }
+    }
+
     /// Establishes or returns an active raw QUIC session.
     async fn get_or_connect_quic_raw(&self) -> Result<Arc<RawQuicSession>, TunnelError> {
         if let Some(ref session) = *self.cached_quic_session.read()
@@ -502,41 +540,41 @@ impl H3Connector {
             .map_err(|e| TunnelError::Config(format!("Invalid request headers: {:?}", e)))?;
 
         debug!(path = %path, target = %target, pool_idle, "Sending HTTP/3 CONNECT tunnel request");
-        let mut stream = match tokio::time::timeout(
-            DEFAULT_HANDSHAKE_TIMEOUT,
-            send_request.send_request(request),
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                self.invalidate_h3_session_if_same(session_id_val);
-                return Err(TunnelError::ControlProtocol(format!(
-                    "Failed to send H3 request: {:?}",
-                    e
-                )));
-            }
-            Err(_) => {
-                self.invalidate_h3_session_if_same(session_id_val);
-                return Err(TunnelError::ConnectTimeout(DEFAULT_HANDSHAKE_TIMEOUT));
-            }
-        };
-
-        let response =
-            match tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, stream.recv_response()).await {
-                Ok(Ok(r)) => r,
+        let h3_timeout = self.effective_h3_request_timeout();
+        let mut stream =
+            match tokio::time::timeout(h3_timeout, send_request.send_request(request)).await {
+                Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
-                    self.invalidate_h3_session_if_same(session_id_val);
+                    self.handle_h3_stream_error(&session, &e);
                     return Err(TunnelError::ControlProtocol(format!(
-                        "Failed to receive H3 response: {:?}",
+                        "Failed to send H3 request: {:?}",
                         e
                     )));
                 }
                 Err(_) => {
-                    self.invalidate_h3_session_if_same(session_id_val);
-                    return Err(TunnelError::ConnectTimeout(DEFAULT_HANDSHAKE_TIMEOUT));
+                    if !session.is_alive() {
+                        self.invalidate_h3_session_if_same(session_id_val);
+                    }
+                    return Err(TunnelError::ConnectTimeout(h3_timeout));
                 }
             };
+
+        let response = match tokio::time::timeout(h3_timeout, stream.recv_response()).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                self.handle_h3_stream_error(&session, &e);
+                return Err(TunnelError::ControlProtocol(format!(
+                    "Failed to receive H3 response: {:?}",
+                    e
+                )));
+            }
+            Err(_) => {
+                if !session.is_alive() {
+                    self.invalidate_h3_session_if_same(session_id_val);
+                }
+                return Err(TunnelError::ConnectTimeout(h3_timeout));
+            }
+        };
 
         if response.status() == StatusCode::UNAUTHORIZED
             || response.status() == StatusCode::FORBIDDEN
@@ -581,7 +619,11 @@ impl H3Connector {
                     )));
                 }
                 Err(_) => {
-                    self.invalidate_quic_session_if_same(session_id_val);
+                    // `open_bi()` can stall when the peer's concurrent stream limit is
+                    // temporarily exhausted; keep healthy sessions and sibling streams alive.
+                    if !session.is_alive() {
+                        self.invalidate_quic_session_if_same(session_id_val);
+                    }
                     return Err(TunnelError::ConnectTimeout(connect_timeout));
                 }
             };
@@ -616,11 +658,15 @@ impl H3Connector {
         match write_res {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                self.invalidate_quic_session_if_same(session_id_val);
+                if !session.is_alive() {
+                    self.invalidate_quic_session_if_same(session_id_val);
+                }
                 return Err(TunnelError::Io(e));
             }
             Err(_) => {
-                self.invalidate_quic_session_if_same(session_id_val);
+                if !session.is_alive() {
+                    self.invalidate_quic_session_if_same(session_id_val);
+                }
                 return Err(TunnelError::ConnectTimeout(connect_timeout));
             }
         }
@@ -820,5 +866,247 @@ pub(super) mod tests {
         assert!(connector.cached_quic_session.read().is_none());
         assert!(!dummy_quic_session.handle.is_alive());
         drop(server_conn);
+    }
+
+    fn build_test_quic_server_endpoint(
+        alpn: &[u8],
+        max_bidi_streams: Option<u32>,
+    ) -> (quinn::Endpoint, SocketAddr) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_chain = vec![rustls::pki_types::CertificateDer::from(
+            cert.cert.der().to_vec(),
+        )];
+        let private_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()),
+        );
+        let mut server_crypto = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, private_key)
+            .unwrap();
+        server_crypto.alpn_protocols = vec![alpn.to_vec()];
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap(),
+        ));
+        if let Some(limit) = max_bidi_streams {
+            let mut transport = quinn::TransportConfig::default();
+            transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(limit));
+            server_config.transport_config(Arc::new(transport));
+        }
+        let server_ep =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server_ep.local_addr().unwrap();
+        (server_ep, addr)
+    }
+
+    #[tokio::test]
+    async fn test_quic_raw_open_bi_timeout_keeps_healthy_session_alive() {
+        use crate::config::model::{AppConfig, DialerConfig, EndpointConfig, TlsConfig};
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+        use tokio::sync::Notify;
+
+        let (server_ep, server_addr) =
+            build_test_quic_server_endpoint(ALPN_QUIC.as_bytes(), Some(1));
+        let release_first = Arc::new(Notify::new());
+        let release_clone = Arc::clone(&release_first);
+        let server_task = tokio::spawn(async move {
+            let conn = server_ep.accept().await.unwrap().await.unwrap();
+            // Stream 1: hold open until `release_clone` fires so stream credit remains exhausted.
+            let (mut s_send1, mut s_recv1) = conn.accept_bi().await.unwrap();
+            let mut buf = [0u8; 256];
+            let n = s_recv1.read(&mut buf).await.unwrap().unwrap();
+            assert!(n > 0);
+            s_send1.write_all(b"pong1").await.unwrap();
+            release_clone.notified().await;
+            let _ = s_send1.finish();
+            drop((s_send1, s_recv1));
+
+            // Stream 2 (after stream 1 closes and credit refills): verify same connection still works.
+            let (mut s_send2, mut s_recv2) = conn.accept_bi().await.unwrap();
+            let n2 = s_recv2.read(&mut buf).await.unwrap().unwrap();
+            assert!(n2 > 0);
+            s_send2.write_all(b"pong2").await.unwrap();
+            let _ = s_send2.finish();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+
+        let ep_cfg = EndpointConfig::Detailed {
+            url: format!("quic://{server_addr}/tunnel"),
+            dns: None,
+            dialer: Some(DialerConfig {
+                connect_timeout: Some(Duration::from_millis(80)),
+                ..Default::default()
+            }),
+            tls: Some(TlsConfig {
+                insecure: Some(true),
+                server_name: Some("localhost".to_string()),
+                ..Default::default()
+            }),
+            http_headers: None,
+        };
+        let ctx = EndpointContext::build(&ep_cfg, &AppConfig::default()).unwrap();
+        let connector = H3Connector::new(&ctx, "tok", TunnelMode::Forward).unwrap();
+        let target = TargetAddr::Domain("echo.local".to_string(), 80);
+
+        // 1. Open stream 1, exhausting peer bidi stream quota (= 1).
+        let mut s1 = connector
+            .connect_quic_raw(&target, None, false, L4Protocol::Tcp, None)
+            .await
+            .unwrap();
+        let session_id_1 = connector.cached_quic_session.read().as_ref().unwrap().id;
+        let mut r1 = [0u8; 5];
+        s1.read_exact(&mut r1).await.unwrap();
+        assert_eq!(&r1, b"pong1");
+
+        // 2. While quota is exhausted, open_bi() times out; request must fail with ConnectTimeout,
+        //    but cached session MUST stay alive.
+        let timed_out = connector
+            .connect_quic_raw(&target, None, false, L4Protocol::Tcp, None)
+            .await;
+        assert!(
+            matches!(timed_out, Err(TunnelError::ConnectTimeout(_))),
+            "expected ConnectTimeout under exhausted stream credit"
+        );
+        {
+            let guard = connector.cached_quic_session.read();
+            let cached = guard.as_ref().expect("cached raw QUIC session must remain");
+            assert_eq!(cached.id, session_id_1);
+            assert!(cached.is_alive());
+        }
+
+        // 3. Release stream 1 to replenish quota; next request reuses the EXACT same session.
+        release_first.notify_one();
+        drop(s1);
+
+        let mut s2 = connector
+            .connect_quic_raw(&target, None, false, L4Protocol::Tcp, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            connector.cached_quic_session.read().as_ref().unwrap().id,
+            session_id_1
+        );
+        let mut r2 = [0u8; 5];
+        s2.read_exact(&mut r2).await.unwrap();
+        assert_eq!(&r2, b"pong2");
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_h3_connect_timeout_keeps_healthy_session_and_sibling_alive() {
+        use crate::config::model::{AppConfig, EndpointConfig, TlsConfig};
+        use bytes::Buf;
+        use http::Response;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::Notify;
+
+        let (server_ep, server_addr) = build_test_quic_server_endpoint(ALPN_H3.as_bytes(), None);
+        let stop_slow = Arc::new(Notify::new());
+        let stop_slow_srv = Arc::clone(&stop_slow);
+        let server_task = tokio::spawn(async move {
+            let conn = server_ep.accept().await.unwrap().await.unwrap();
+            let mut h3_conn =
+                h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(conn))
+                    .await
+                    .unwrap();
+            let mut held = Vec::new();
+            while let Ok(Some(resolver)) = h3_conn.accept().await {
+                let stop_clone = Arc::clone(&stop_slow_srv);
+                let h = tokio::spawn(async move {
+                    let (req, mut stream) = resolver.resolve_request().await.unwrap();
+                    let target_hdr = req
+                        .headers()
+                        .get(HEADER_TUNNEL_TARGET)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    if target_hdr.starts_with("slow.") {
+                        // Withhold response so the client's recv_response() times out.
+                        stop_clone.notified().await;
+                        return;
+                    }
+                    stream.send_response(Response::new(())).await.unwrap();
+                    while let Ok(Some(mut chunk)) = stream.recv_data().await {
+                        let data = chunk.copy_to_bytes(chunk.remaining());
+                        stream.send_data(data).await.unwrap();
+                    }
+                    let _ = stream.finish().await;
+                });
+                held.push(h);
+            }
+            for h in held {
+                let _ = h.await;
+            }
+        });
+
+        let ep_cfg = EndpointConfig::Detailed {
+            url: format!("h3://{server_addr}/tunnel"),
+            dns: None,
+            dialer: None,
+            tls: Some(TlsConfig {
+                insecure: Some(true),
+                server_name: Some("localhost".to_string()),
+                ..Default::default()
+            }),
+            http_headers: None,
+        };
+        let ctx = EndpointContext::build(&ep_cfg, &AppConfig::default()).unwrap();
+        let mut connector = H3Connector::new(&ctx, "tok", TunnelMode::Forward).unwrap();
+        connector.h3_request_timeout = Duration::from_millis(80);
+
+        let fast_target = TargetAddr::Domain("fast.local".to_string(), 80);
+        let slow_target = TargetAddr::Domain("slow.local".to_string(), 80);
+
+        // 1. Establish healthy H3 session with fast sibling #1.
+        let mut fast_1 = connector
+            .connect_h3(&fast_target, None, false, L4Protocol::Tcp, None)
+            .await
+            .unwrap();
+        let session_id_1 = connector.cached_h3_session.read().as_ref().unwrap().id;
+
+        // 2. Send a slow CONNECT request whose recv_response() times out.
+        let slow_res = connector
+            .connect_h3(&slow_target, None, false, L4Protocol::Tcp, None)
+            .await;
+        assert!(
+            matches!(slow_res, Err(TunnelError::ConnectTimeout(_))),
+            "expected slow CONNECT to time out"
+        );
+
+        // Session MUST stay cached & alive, and fast sibling #1 MUST continue relaying.
+        {
+            let guard = connector.cached_h3_session.read();
+            let cached = guard.as_ref().expect("cached H3 session must remain");
+            assert_eq!(cached.id, session_id_1);
+            assert!(cached.is_alive());
+        }
+
+        fast_1.write_all(b"ping1").await.unwrap();
+        fast_1.flush().await.unwrap();
+        let mut echo1 = [0u8; 5];
+        fast_1.read_exact(&mut echo1).await.unwrap();
+        assert_eq!(&echo1, b"ping1");
+
+        // 3. Another CONNECT request MUST reuse the same H3 session and work normally.
+        let mut fast_2 = connector
+            .connect_h3(&fast_target, None, false, L4Protocol::Tcp, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            connector.cached_h3_session.read().as_ref().unwrap().id,
+            session_id_1
+        );
+        fast_2.write_all(b"ping2").await.unwrap();
+        fast_2.flush().await.unwrap();
+        let mut echo2 = [0u8; 5];
+        fast_2.read_exact(&mut echo2).await.unwrap();
+        assert_eq!(&echo2, b"ping2");
+
+        stop_slow.notify_waiters();
+        drop((fast_1, fast_2));
+        server_task.abort();
+        let _ = server_task.await;
     }
 }
