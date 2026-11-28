@@ -704,7 +704,7 @@ async fn test_udp_extreme_datagram_sizes_under_backpressure() {
     // --- Part B: DatagramDatagramPump backpressure with 0-byte & 65507-byte mix ---
     {
         let (a_in_tx, a_in_rx) = tokio::sync::mpsc::channel(64);
-        let (_b_in_tx, b_in_rx) = tokio::sync::mpsc::channel(64);
+        let (b_in_tx, b_in_rx) = tokio::sync::mpsc::channel(64);
         let a_sent = Arc::new(Mutex::new(Vec::new()));
         let b_sent = Arc::new(Mutex::new(Vec::new()));
         let b_allow = Arc::new(AtomicBool::new(false));
@@ -766,6 +766,7 @@ async fn test_udp_extreme_datagram_sizes_under_backpressure() {
                 .unwrap();
         }
         drop(a_in_tx);
+        drop(b_in_tx);
 
         // Hold backpressure long enough for bounded_datagram_batch_len to throttle at 256 KiB.
         tokio::time::sleep(Duration::from_millis(60)).await;

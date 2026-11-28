@@ -495,8 +495,7 @@ fn bounded_datagram_batch_len(
     batch_capacity: usize,
 ) -> usize {
     let packet_slots = MAX_PENDING_DATAGRAMS.saturating_sub(pending_datagrams);
-    let byte_slots = MAX_PENDING_DATAGRAM_BYTES
-        .saturating_sub(pending_bytes)
+    let byte_slots = MAX_PENDING_DATAGRAM_BYTES.saturating_sub(pending_bytes)
         / crate::consts::MAX_UDP_DATAGRAM_SIZE;
     packet_slots.min(byte_slots).min(batch_capacity)
 }
@@ -774,8 +773,9 @@ impl Pump for DatagramDatagramPump {
                     }
                 }
 
-                if ((a_done && queue_a_to_b.is_empty()) || (b_done && queue_b_to_a.is_empty()))
-                    || (is_cancelled && queue_a_to_b.is_empty() && queue_b_to_a.is_empty())
+                if ((a_done && b_done) || is_cancelled)
+                    && queue_a_to_b.is_empty()
+                    && queue_b_to_a.is_empty()
                 {
                     return Poll::Ready(Ok((bytes_a_to_b, bytes_b_to_a)));
                 }
@@ -1038,7 +1038,11 @@ impl DatagramStreamPump {
                         ))));
                     }
                     Poll::Ready(Ok(sent)) => {
-                        let sent_bytes: usize = pending_dgrams.iter().take(sent).map(|d| d.payload.len()).sum();
+                        let sent_bytes: usize = pending_dgrams
+                            .iter()
+                            .take(sent)
+                            .map(|d| d.payload.len())
+                            .sum();
                         pending_dgrams.drain(..sent);
                         pending_dgram_bytes -= sent_bytes;
                         last_dgram_activity = Instant::now();
@@ -1594,10 +1598,12 @@ mod tests {
         // Half-close only the stream read direction. UDP->stream must remain live.
         stream_b.shutdown().await.unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
-        udp_tx.send(Datagram {
-            flow: Default::default(),
-            payload: Bytes::from_static(b"still-alive"),
-        }).unwrap();
+        udp_tx
+            .send(Datagram {
+                flow: Default::default(),
+                payload: Bytes::from_static(b"still-alive"),
+            })
+            .unwrap();
 
         let mut header = [0u8; 2];
         tokio::time::timeout(Duration::from_secs(1), stream_b.read_exact(&mut header))
@@ -1656,10 +1662,12 @@ mod tests {
     async fn test_datagram_stream_pump_rejects_oversized_outbound_datagram() {
         let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
         let (packet_tx, packet_rx) = tokio::sync::mpsc::unbounded_channel();
-        packet_tx.send(Datagram {
-            flow: Default::default(),
-            payload: Bytes::from(vec![0u8; crate::consts::MAX_UDP_DATAGRAM_SIZE + 1]),
-        }).unwrap();
+        packet_tx
+            .send(Datagram {
+                flow: Default::default(),
+                payload: Bytes::from(vec![0u8; crate::consts::MAX_UDP_DATAGRAM_SIZE + 1]),
+            })
+            .unwrap();
         drop(packet_tx);
 
         let dgram_io = ChannelDatagramIo {
@@ -1674,7 +1682,8 @@ mod tests {
             CancellationToken::new(),
             Duration::from_secs(5),
             Duration::from_secs(10),
-        ).await;
+        )
+        .await;
         match result {
             Err(TunnelError::Io(e)) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput),
             other => panic!("expected InvalidInput, got: {other:?}"),
@@ -1985,8 +1994,84 @@ mod tests {
         );
         assert!(res.unwrap().is_ok(), "UDP idle expiration is clean Ok exit");
     }
-}
 
+    #[tokio::test]
+    async fn test_datagram_datagram_pump_asymmetric_half_close_continues_reverse_direction() {
+        let (a_out_tx, mut a_out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (a_in_tx, a_in_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (b_out_tx, mut b_out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (b_in_tx, b_in_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let req = PumpRequest::new(
+            IoChannel::from_datagram(ChannelDatagramIo {
+                rx: a_in_rx,
+                tx: a_out_tx,
+            }),
+            IoChannel::from_datagram(ChannelDatagramIo {
+                rx: b_in_rx,
+                tx: b_out_tx,
+            }),
+        );
+        let ctx = PumpCtx {
+            cancel: CancellationToken::new(),
+            heartbeat_interval: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(10),
+        };
+
+        let pump = tokio::spawn(async move { DatagramDatagramPump.run(req, ctx).await });
+
+        a_in_tx
+            .send(Datagram {
+                flow: Default::default(),
+                payload: Bytes::from_static(b"a-to-b-1"),
+            })
+            .unwrap();
+        let got_b = tokio::time::timeout(Duration::from_secs(2), b_out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got_b.payload.as_ref(), b"a-to-b-1");
+
+        // Close A's recv side while B remains open; A -> B queue is already empty.
+        drop(a_in_tx);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !pump.is_finished(),
+            "pump terminated prematurely when only A closed recv"
+        );
+
+        let reverse_payloads = [b"b-to-a-1", b"b-to-a-2", b"b-to-a-3"];
+        for payload in reverse_payloads {
+            b_in_tx
+                .send(Datagram {
+                    flow: Default::default(),
+                    payload: Bytes::from_static(payload),
+                })
+                .unwrap();
+        }
+
+        for expected in reverse_payloads {
+            let got_a = tokio::time::timeout(Duration::from_secs(2), a_out_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(got_a.payload.as_ref(), expected);
+        }
+
+        // Now close B's recv side; pump must finish cleanly once both sides are EOF and drained.
+        drop(b_in_tx);
+        let (a_to_b_bytes, b_to_a_bytes) = tokio::time::timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("pump timed out after both sides closed")
+            .unwrap()
+            .unwrap();
+        assert_eq!(a_to_b_bytes, b"a-to-b-1".len() as u64);
+        assert_eq!(
+            b_to_a_bytes,
+            reverse_payloads.iter().map(|p| p.len() as u64).sum::<u64>()
+        );
+    }
+}
 
 #[cfg(test)]
 mod udp_frame_tests {
@@ -2045,12 +2130,14 @@ mod udp_frame_tests {
 
     #[test]
     fn decoder_rejects_payload_length_above_udp_limit() {
-        let mut rx = BytesMut::from(&((crate::consts::MAX_UDP_DATAGRAM_SIZE + 1) as u16).to_be_bytes()[..]);
+        let mut rx =
+            BytesMut::from(&((crate::consts::MAX_UDP_DATAGRAM_SIZE + 1) as u16).to_be_bytes()[..]);
         rx.resize(2 + crate::consts::MAX_UDP_DATAGRAM_SIZE + 1, 0);
         let mut pending = VecDeque::new();
         let mut total = 0;
         let mut pending_bytes = 0;
-        let err = decode_pending_datagrams(&mut rx, &mut pending, &mut total, &mut pending_bytes).unwrap_err();
+        let err = decode_pending_datagrams(&mut rx, &mut pending, &mut total, &mut pending_bytes)
+            .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }
