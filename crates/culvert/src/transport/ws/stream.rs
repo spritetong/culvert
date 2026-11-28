@@ -72,10 +72,18 @@ impl WsLivenessTracker {
 type DynRead = Box<dyn AsyncRead + Send + Unpin>;
 type DynWrite = Box<dyn AsyncWrite + Send + Unpin>;
 
+enum WsReadOutcome {
+    Data(Bytes),
+    ControlYield,
+    LogicalFin,
+    PeerClose(Bytes),
+}
+
 type WsReadResult = (
     WebSocketRead<DynRead>,
+    Option<OpCode>,
     Vec<Frame<'static>>,
-    Result<(OpCode, Bytes), WebSocketError>,
+    Result<WsReadOutcome, WebSocketError>,
 );
 type WsReadFuture = BoxFuture<'static, WsReadResult>;
 
@@ -109,6 +117,7 @@ const MAX_CONTROL_QUEUE: usize = crate::consts::WS_MAX_CONTROL_QUEUE;
 
 pub struct WsTunnelStream {
     read_state: ReadState,
+    fragment_opcode: Option<OpCode>,
     write_state: WriteState,
     control_queue: std::collections::VecDeque<Frame<'static>>,
     liveness: Arc<WsLivenessTracker>,
@@ -137,6 +146,7 @@ impl WsTunnelStream {
 
         Self {
             read_state: ReadState::Idle(rx),
+            fragment_opcode: None,
             write_state: WriteState::Idle(tx),
             control_queue: std::collections::VecDeque::new(),
             liveness: Arc::new(WsLivenessTracker::new()),
@@ -228,9 +238,15 @@ impl WsTunnelStream {
                 }
                 ReadState::Idle(mut rx) => {
                     let liveness = Arc::clone(&self.liveness);
+                    let mut fragment_opcode = self.fragment_opcode;
                     let fut = Box::pin(async move {
                         let mut obligated = Vec::new();
                         let mut budget = 32usize;
+                        let payload_to_bytes = |payload: Payload<'_>| match payload {
+                            Payload::Bytes(b) => b.freeze(),
+                            Payload::Owned(v) => Bytes::from(v),
+                            other => Bytes::copy_from_slice(&other),
+                        };
                         let res = loop {
                             let mut send_fn = |f: Frame<'_>| {
                                 let frame_to_queue = match f.opcode {
@@ -255,20 +271,54 @@ impl WsTunnelStream {
                             liveness.record_rx();
                             match frame.opcode {
                                 OpCode::Binary | OpCode::Text => {
-                                    let payload = match frame.payload {
-                                        Payload::Bytes(b) => b.freeze(),
-                                        Payload::Owned(v) => Bytes::from(v),
-                                        other => Bytes::copy_from_slice(&other),
-                                    };
-                                    break Ok((frame.opcode, payload));
+                                    if fragment_opcode.is_some() {
+                                        break Err(WebSocketError::InvalidFragment);
+                                    }
+                                    let payload = payload_to_bytes(frame.payload);
+                                    if !frame.fin {
+                                        fragment_opcode = Some(frame.opcode);
+                                        if payload.is_empty() {
+                                            budget = budget.saturating_sub(1);
+                                            if budget == 0 {
+                                                break Ok(WsReadOutcome::ControlYield);
+                                            }
+                                            continue;
+                                        }
+                                        break Ok(WsReadOutcome::Data(payload));
+                                    }
+                                    if frame.opcode == OpCode::Binary && payload.is_empty() {
+                                        // In-band logical FIN only applies to a final empty Binary frame.
+                                        break Ok(WsReadOutcome::LogicalFin);
+                                    }
+                                    if payload.is_empty() {
+                                        budget = budget.saturating_sub(1);
+                                        if budget == 0 {
+                                            break Ok(WsReadOutcome::ControlYield);
+                                        }
+                                        continue;
+                                    }
+                                    break Ok(WsReadOutcome::Data(payload));
+                                }
+                                OpCode::Continuation => {
+                                    if fragment_opcode.is_none() {
+                                        break Err(WebSocketError::InvalidContinuationFrame);
+                                    }
+                                    let payload = payload_to_bytes(frame.payload);
+                                    if frame.fin {
+                                        fragment_opcode = None;
+                                    }
+                                    if payload.is_empty() {
+                                        budget = budget.saturating_sub(1);
+                                        if budget == 0 {
+                                            break Ok(WsReadOutcome::ControlYield);
+                                        }
+                                        continue;
+                                    }
+                                    break Ok(WsReadOutcome::Data(payload));
                                 }
                                 OpCode::Close => {
-                                    let payload = match frame.payload {
-                                        Payload::Bytes(b) => b.freeze(),
-                                        Payload::Owned(v) => Bytes::from(v),
-                                        other => Bytes::copy_from_slice(&other),
-                                    };
-                                    break Ok((OpCode::Close, payload));
+                                    let payload = payload_to_bytes(frame.payload);
+                                    break Ok(WsReadOutcome::PeerClose(payload));
                                 }
                                 OpCode::Ping => {
                                     // Optional, cheap echo: its only purpose is to give the
@@ -278,18 +328,18 @@ impl WsTunnelStream {
                                     // obligated frames inside this in-flight future.
                                     obligated
                                         .push(Frame::pong(Payload::Owned(frame.payload.to_vec())));
-                                    break Ok((frame.opcode, Bytes::new()));
+                                    break Ok(WsReadOutcome::ControlYield);
                                 }
-                                _ => {
+                                OpCode::Pong => {
                                     budget = budget.saturating_sub(1);
                                     if budget == 0 {
                                         // Reached budget limit on control frames: yield to avoid worker starvation
-                                        break Ok((frame.opcode, Bytes::new()));
+                                        break Ok(WsReadOutcome::ControlYield);
                                     }
                                 }
                             }
                         };
-                        (rx, obligated, res)
+                        (rx, fragment_opcode, obligated, res)
                     });
                     self.read_state = ReadState::Reading(fut);
                 }
@@ -298,7 +348,13 @@ impl WsTunnelStream {
                         self.read_state = ReadState::Reading(fut);
                         return Poll::Pending;
                     }
-                    Poll::Ready((_rx, obligated, Ok((OpCode::Close, payload)))) => {
+                    Poll::Ready((
+                        _rx,
+                        fragment_opcode,
+                        obligated,
+                        Ok(WsReadOutcome::PeerClose(payload)),
+                    )) => {
+                        self.fragment_opcode = fragment_opcode;
                         if !obligated.is_empty() {
                             while self.control_queue.len() + obligated.len() >= MAX_CONTROL_QUEUE {
                                 self.control_queue.pop_front();
@@ -321,7 +377,8 @@ impl WsTunnelStream {
                         self.read_state = ReadState::Eof;
                         return Poll::Ready(Ok(()));
                     }
-                    Poll::Ready((rx, obligated, Ok((opcode, payload)))) => {
+                    Poll::Ready((rx, fragment_opcode, obligated, Ok(outcome))) => {
+                        self.fragment_opcode = fragment_opcode;
                         if !obligated.is_empty() {
                             if self.control_queue.len() + obligated.len() > MAX_CONTROL_QUEUE {
                                 self.read_state = ReadState::Failed;
@@ -333,24 +390,29 @@ impl WsTunnelStream {
                             self.control_queue.extend(obligated);
                             let _ = self.poll_flush_control(cx);
                         }
-                        if opcode == OpCode::Binary && payload.is_empty() {
-                            // In-band logical FIN received: remote write direction is closed
-                            self.read_state = ReadState::Eof;
-                            return Poll::Ready(Ok(()));
+                        match outcome {
+                            WsReadOutcome::LogicalFin => {
+                                self.read_state = ReadState::Eof;
+                                return Poll::Ready(Ok(()));
+                            }
+                            WsReadOutcome::ControlYield => {
+                                self.read_state = ReadState::Idle(rx);
+                                cx.waker().wake_by_ref();
+                                return Poll::Pending;
+                            }
+                            WsReadOutcome::Data(payload) => {
+                                self.read_state = ReadState::Buffered {
+                                    rx,
+                                    payload,
+                                    cursor: 0,
+                                };
+                                continue;
+                            }
+                            WsReadOutcome::PeerClose(_) => unreachable!(),
                         }
-                        if payload.is_empty() {
-                            self.read_state = ReadState::Idle(rx);
-                            cx.waker().wake_by_ref();
-                            return Poll::Pending;
-                        }
-                        self.read_state = ReadState::Buffered {
-                            rx,
-                            payload,
-                            cursor: 0,
-                        };
-                        continue;
                     }
-                    Poll::Ready((_rx, obligated, Err(e))) => {
+                    Poll::Ready((_rx, fragment_opcode, obligated, Err(e))) => {
+                        self.fragment_opcode = fragment_opcode;
                         if !obligated.is_empty() {
                             while self.control_queue.len() + obligated.len() > MAX_CONTROL_QUEUE {
                                 self.control_queue.pop_front();
@@ -359,7 +421,14 @@ impl WsTunnelStream {
                             let _ = self.poll_flush_control(cx);
                         }
                         self.read_state = ReadState::Failed;
-                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, e)));
+                        let kind = match e {
+                            WebSocketError::InvalidFragment
+                            | WebSocketError::InvalidContinuationFrame => {
+                                io::ErrorKind::InvalidData
+                            }
+                            _ => io::ErrorKind::ConnectionReset,
+                        };
+                        return Poll::Ready(Err(io::Error::new(kind, e)));
                     }
                 },
                 ReadState::Eof => {
@@ -1620,5 +1689,76 @@ mod tests {
         let mut tail = [0u8; 3];
         client.read_exact(&mut tail).await.unwrap();
         assert_eq!(&tail, b"llo");
+    }
+
+    #[tokio::test]
+    async fn test_ws_fragmentation_and_fin_boundaries() {
+        let send_raw = |stream: tokio::io::DuplexStream,
+                        frames: Vec<(bool, OpCode, &'static [u8])>| async move {
+            let (r, w) = tokio::io::split(stream);
+            let (_rx, mut tx) = after_handshake_split(r, w, Role::Server);
+            for (fin, opcode, data) in frames {
+                tx.write_frame(Frame::new(fin, opcode, None, Payload::Borrowed(data)))
+                    .await
+                    .unwrap();
+            }
+            tx
+        };
+
+        // 1. Single binary frame + 2-frame fragmentation + 3-frame fragmentation (with interleaved
+        //    Ping) + empty non-final Binary frame -> followed by final empty Binary FIN.
+        let (raw_client, raw_server) = duplex(65536);
+        let mut client = WsTunnelStream::new(raw_client, Role::Client);
+        let _tx_keep = send_raw(
+            raw_server,
+            vec![
+                (true, OpCode::Binary, b"one;"),
+                (false, OpCode::Binary, b"two-"),
+                (true, OpCode::Continuation, b"end;"),
+                (false, OpCode::Binary, b"abc"),
+                (true, OpCode::Ping, b"p"),
+                (false, OpCode::Continuation, b"def"),
+                (true, OpCode::Continuation, b"ghi;"),
+                // Empty non-final Binary frame must NOT trigger EOF
+                (false, OpCode::Binary, b""),
+                (true, OpCode::Continuation, b"after-empty-frag"),
+                // Final empty Binary frame triggers logical FIN (EOF)
+                (true, OpCode::Binary, b""),
+            ],
+        )
+        .await;
+
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"one;two-end;abcdefghi;after-empty-frag");
+
+        // 2. Unexpected Continuation frame without prior fragmented message must fail with InvalidData.
+        let (raw_client_err1, raw_server_err1) = duplex(4096);
+        let mut client_err1 = WsTunnelStream::new(raw_client_err1, Role::Client);
+        let _tx1 = send_raw(
+            raw_server_err1,
+            vec![(true, OpCode::Continuation, b"orphan")],
+        )
+        .await;
+        let mut buf1 = [0u8; 16];
+        let err1 = client_err1.read(&mut buf1).await.unwrap_err();
+        assert_eq!(err1.kind(), io::ErrorKind::InvalidData);
+
+        // 3. New Binary frame arriving before active fragmented message finishes must fail with InvalidData.
+        let (raw_client_err2, raw_server_err2) = duplex(4096);
+        let mut client_err2 = WsTunnelStream::new(raw_client_err2, Role::Client);
+        let _tx2 = send_raw(
+            raw_server_err2,
+            vec![
+                (false, OpCode::Binary, b"unterminated"),
+                (true, OpCode::Binary, b"interleaved-binary"),
+            ],
+        )
+        .await;
+        let mut first = [0u8; 12];
+        client_err2.read_exact(&mut first).await.unwrap();
+        assert_eq!(&first, b"unterminated");
+        let err2 = client_err2.read(&mut buf1).await.unwrap_err();
+        assert_eq!(err2.kind(), io::ErrorKind::InvalidData);
     }
 }
