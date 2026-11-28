@@ -546,7 +546,7 @@ impl ReplenishingStreamPool {
                     PoolEvent::Command(cmd_opt) => {
                         match cmd_opt {
                             Some(PoolCommand::Acquire(req)) => {
-                                let (mut acquired, evicted_dead) = std::future::poll_fn(|cx| {
+                                let (acquired, _evicted_dead) = std::future::poll_fn(|cx| {
                                     Poll::Ready(take_live_idle_stream(
                                         &mut idle_streams,
                                         cx,
@@ -556,15 +556,9 @@ impl ReplenishingStreamPool {
                                 })
                                 .await;
 
-                                // A dead idle stream is retired on its own; expiry is routine
-                                // turnover. Closing the shared session here would reset every
-                                // sibling still relaying live traffic (e.g. iperf3 -P streams).
-                                // Genuine transport failures invalidate the cached session in
-                                // the connector's own dial path.
-                                if evicted_dead {
-                                    acquired = None;
-                                }
-
+                                // A dead idle stream is retired independently without discarding
+                                // a healthy stream already found in this scan or closing the
+                                // shared transport session.
                                 if let Some(stream) = acquired {
                                     match req.reply.send(Ok(stream)) {
                                         Ok(()) => {}
@@ -751,7 +745,7 @@ mod tests {
     use crate::consts::{DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_IDLE_TIMEOUT};
     use crate::io::channel::IoChannel;
     use std::io;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::time::Duration;
 
     struct MockFailingConnector {
@@ -1574,5 +1568,144 @@ mod tests {
         assert!(acquired.is_none(), "the quiet stream must retire");
         assert!(!evicted_dead, "expiry is not a transport death");
         assert!(idle.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_acquire_preserves_healthy_stream_when_evicting_dead_stream() {
+        struct CountingHealthyConnector {
+            dials: AtomicUsize,
+        }
+
+        impl TransportConnector for CountingHealthyConnector {
+            fn connect<'a>(
+                &'a self,
+                _target: &'a TargetAddr,
+                _session_id: Option<&'a str>,
+            ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
+                self.dials.fetch_add(1, Ordering::SeqCst);
+                let (client, _server) = tokio::io::duplex(64);
+                Box::pin(async move { Ok(IoChannel::from_boxed_stream(Box::new(client))) })
+            }
+
+            fn connect_pooled<'a>(
+                &'a self,
+                target: &'a TargetAddr,
+            ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
+                self.connect(target, None)
+            }
+        }
+
+        struct MarkedIdleStream {
+            inner: tokio::io::DuplexStream,
+            alive: bool,
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl Drop for MarkedIdleStream {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
+        impl tokio::io::AsyncRead for MarkedIdleStream {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.inner).poll_read(cx, buf)
+            }
+        }
+
+        impl tokio::io::AsyncWrite for MarkedIdleStream {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Pin::new(&mut self.inner).poll_write(cx, buf)
+            }
+
+            fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.inner).poll_flush(cx)
+            }
+
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.inner).poll_shutdown(cx)
+            }
+        }
+
+        impl TunnelStream for MarkedIdleStream {
+            fn poll_check_alive(&mut self, _cx: &mut Context<'_>) -> Poll<HeartbeatStatus> {
+                if self.alive {
+                    Poll::Ready(HeartbeatStatus::Alive)
+                } else {
+                    Poll::Ready(HeartbeatStatus::Dead)
+                }
+            }
+        }
+
+        let connector = Arc::new(CountingHealthyConnector {
+            dials: AtomicUsize::new(0),
+        });
+        let cancel = CancellationToken::new();
+        let pool = ReplenishingStreamPool::new_shared(
+            connector.clone(),
+            0,
+            cancel.clone(),
+            DEFAULT_HEARTBEAT_INTERVAL,
+            DEFAULT_IDLE_TIMEOUT,
+        );
+
+        let healthy_dropped = Arc::new(AtomicBool::new(false));
+        let dead_dropped = Arc::new(AtomicBool::new(false));
+        let (healthy_end, mut healthy_peer) = tokio::io::duplex(256);
+        let (dead_end, _dead_peer) = tokio::io::duplex(64);
+
+        // Push healthy first, then dead second (LIFO pops dead first, then finds healthy).
+        pool.push_idle(Box::new(MarkedIdleStream {
+            inner: healthy_end,
+            alive: true,
+            dropped: Arc::clone(&healthy_dropped),
+        }));
+        pool.push_idle(Box::new(MarkedIdleStream {
+            inner: dead_end,
+            alive: false,
+            dropped: Arc::clone(&dead_dropped),
+        }));
+
+        let mut acquired = tokio::time::timeout(Duration::from_secs(1), pool.acquire(None))
+            .await
+            .expect("acquire must not hang")
+            .expect("acquire must succeed with healthy idle stream");
+
+        assert!(
+            dead_dropped.load(Ordering::SeqCst),
+            "dead idle stream must be evicted and dropped"
+        );
+        assert!(
+            !healthy_dropped.load(Ordering::SeqCst),
+            "healthy idle stream must be returned rather than discarded"
+        );
+        assert_eq!(
+            connector.dials.load(Ordering::SeqCst),
+            0,
+            "acquire must reuse the remaining healthy idle stream without dialing"
+        );
+        assert_eq!(pool.stats().idle_count, 0);
+
+        tokio::io::AsyncWriteExt::write_all(&mut acquired, b"from-healthy-idle")
+            .await
+            .unwrap();
+        let mut got = [0u8; 17];
+        tokio::io::AsyncReadExt::read_exact(&mut healthy_peer, &mut got)
+            .await
+            .unwrap();
+        assert_eq!(&got, b"from-healthy-idle");
+
+        cancel.cancel();
     }
 }

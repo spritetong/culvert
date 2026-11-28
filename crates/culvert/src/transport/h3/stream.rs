@@ -504,6 +504,9 @@ impl H3TunnelStream {
             loop {
                 match recv_stream.recv_chunk().await {
                     Ok(Some(data)) => {
+                        if data.is_empty() {
+                            continue;
+                        }
                         if tx_inbound.send(Ok(data)).await.is_err() {
                             break;
                         }
@@ -566,7 +569,10 @@ impl AsyncRead for H3TunnelStream {
                 )));
             }
         }
-        if let Some(mut current) = self.read_buf.take() {
+        while let Some(mut current) = self.read_buf.take() {
+            if current.is_empty() {
+                continue;
+            }
             let to_copy = std::cmp::min(buf.remaining(), current.len());
             buf.put_slice(&current[..to_copy]);
             current.advance(to_copy);
@@ -577,20 +583,23 @@ impl AsyncRead for H3TunnelStream {
             return Poll::Ready(Ok(()));
         }
 
-        match self.rx_inbound.poll_recv(cx) {
-            Poll::Ready(Some(Ok(mut bytes))) => {
-                let to_copy = std::cmp::min(buf.remaining(), bytes.len());
-                buf.put_slice(&bytes[..to_copy]);
-                bytes.advance(to_copy);
-                if bytes.has_remaining() {
-                    self.read_buf = Some(bytes);
+        loop {
+            match self.rx_inbound.poll_recv(cx) {
+                Poll::Ready(Some(Ok(bytes))) if bytes.is_empty() => continue,
+                Poll::Ready(Some(Ok(mut bytes))) => {
+                    let to_copy = std::cmp::min(buf.remaining(), bytes.len());
+                    buf.put_slice(&bytes[..to_copy]);
+                    bytes.advance(to_copy);
+                    if bytes.has_remaining() {
+                        self.read_buf = Some(bytes);
+                    }
+                    self.touch_activity();
+                    return Poll::Ready(Ok(()));
                 }
-                self.touch_activity();
-                Poll::Ready(Ok(()))
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
+                Poll::Ready(None) => return Poll::Ready(Ok(())), // EOF
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(e)),
-            Poll::Ready(None) => Poll::Ready(Ok(())), // EOF
-            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -733,17 +742,23 @@ impl TunnelStream for H3TunnelStream {
         {
             return Poll::Ready(HeartbeatStatus::Dead);
         }
-        if self.read_buf.is_some() {
+        if self.read_buf.as_ref().is_some_and(|b| !b.is_empty()) {
             return Poll::Ready(HeartbeatStatus::Alive);
         }
-        match self.rx_inbound.poll_recv(cx) {
-            Poll::Ready(Some(Ok(bytes))) => {
-                self.touch_activity();
-                self.read_buf = Some(bytes);
-                Poll::Ready(HeartbeatStatus::Alive)
+        self.read_buf.take();
+        loop {
+            match self.rx_inbound.poll_recv(cx) {
+                Poll::Ready(Some(Ok(bytes))) if bytes.is_empty() => continue,
+                Poll::Ready(Some(Ok(bytes))) => {
+                    self.touch_activity();
+                    self.read_buf = Some(bytes);
+                    return Poll::Ready(HeartbeatStatus::Alive);
+                }
+                Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
+                    return Poll::Ready(HeartbeatStatus::Dead);
+                }
+                Poll::Pending => return Poll::Ready(HeartbeatStatus::Alive),
             }
-            Poll::Ready(Some(Err(_))) | Poll::Ready(None) => Poll::Ready(HeartbeatStatus::Dead),
-            Poll::Pending => Poll::Ready(HeartbeatStatus::Alive),
         }
     }
 
@@ -1199,5 +1214,51 @@ mod tests {
             .expect("flush must surface send_chunk failure")
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn test_h3_stream_empty_data_chunk_is_not_treated_as_eof() {
+        use std::collections::VecDeque;
+
+        struct SequenceRecvStream {
+            chunks: VecDeque<Result<Option<Bytes>, io::Error>>,
+        }
+
+        impl H3RecvStream for SequenceRecvStream {
+            async fn recv_chunk(&mut self) -> Result<Option<Bytes>, io::Error> {
+                match self.chunks.pop_front() {
+                    Some(res) => res,
+                    None => Ok(None),
+                }
+            }
+        }
+
+        let send = MockSendStream {
+            sent: vec![],
+            finished: false,
+        };
+        let recv = SequenceRecvStream {
+            chunks: VecDeque::from([
+                Ok(Some(Bytes::new())),
+                Ok(Some(Bytes::from_static(b"hello"))),
+                Ok(Some(Bytes::new())),
+                Ok(None),
+            ]),
+        };
+        let mut stream = H3TunnelStream::spawn_split_pump(send, recv);
+
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert_eq!(
+            stream.poll_check_alive(&mut cx),
+            Poll::Ready(HeartbeatStatus::Alive)
+        );
+
+        let mut buf = [0u8; 5];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+
+        let mut eof_buf = [0u8; 8];
+        let n = stream.read(&mut eof_buf).await.unwrap();
+        assert_eq!(n, 0, "EOF must only occur after all real DATA chunks");
     }
 }
