@@ -990,11 +990,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_h3_stream_ping_does_not_refresh_activity_and_expires_idle_timeout() {
-        use crate::core::error::TunnelError;
-        use crate::io::pump::StreamStreamPump;
+        use crate::v2::TaskError;
+        use crate::v2::relay::DuplexRelay;
+        use crate::v2::stage::ActiveStage;
         use std::future::poll_fn;
         use std::time::Duration;
-        use tokio_util::sync::CancellationToken;
 
         let (server_conn, client_conn) =
             super::super::connector::tests::create_test_quic_connection_pair().await;
@@ -1019,35 +1019,34 @@ mod tests {
         );
 
         let (peer_stream, _peer_keep) = tokio::io::duplex(1024);
-        let cancel = CancellationToken::new();
-        let res = tokio::time::timeout(
-            Duration::from_secs(2),
-            StreamStreamPump::relay_with_heartbeat(
-                Box::new(stream),
-                Box::new(peer_stream),
-                cancel.child_token(),
-                Duration::from_millis(20),
-                Duration::from_millis(80),
-            ),
-        )
-        .await
-        .expect("relay must hit idle_timeout instead of hanging");
+        let mut relay = DuplexRelay::new(
+            Box::new(stream),
+            Box::new(peer_stream),
+            Duration::from_millis(20),
+            Duration::from_millis(80),
+            Duration::from_millis(100),
+        );
+        let res = tokio::time::timeout(Duration::from_secs(2), poll_fn(|cx| relay.poll_drive(cx)))
+            .await
+            .expect("relay must hit idle_timeout instead of hanging");
 
         match res {
-            Err(TunnelError::Io(e)) => assert_eq!(e.kind(), io::ErrorKind::TimedOut),
-            other => panic!("expected idle TimedOut error, got {other:?}"),
+            Err(TaskError::StageFailed(msg)) => assert!(
+                msg.contains("idle timeout"),
+                "expected idle timeout error, got {msg}"
+            ),
+            other => panic!("expected idle timeout error, got {other:?}"),
         }
-        cancel.cancel();
         drop(server_conn);
     }
 
     #[tokio::test]
     async fn test_quinn_stream_ping_does_not_refresh_activity_and_expires_idle_timeout() {
-        use crate::core::error::TunnelError;
-        use crate::io::pump::StreamStreamPump;
+        use crate::v2::TaskError;
+        use crate::v2::relay::DuplexRelay;
+        use crate::v2::stage::ActiveStage;
         use std::future::poll_fn;
         use std::time::Duration;
-        use tokio_util::sync::CancellationToken;
 
         let (server_conn, client_conn) =
             super::super::connector::tests::create_test_quic_connection_pair().await;
@@ -1077,25 +1076,24 @@ mod tests {
         );
 
         let (peer_stream, _peer_keep) = tokio::io::duplex(1024);
-        let cancel = CancellationToken::new();
-        let res = tokio::time::timeout(
-            Duration::from_secs(2),
-            StreamStreamPump::relay_with_heartbeat(
-                Box::new(stream),
-                Box::new(peer_stream),
-                cancel.child_token(),
-                Duration::from_millis(20),
-                Duration::from_millis(80),
-            ),
-        )
-        .await
-        .expect("relay must hit idle_timeout instead of hanging");
+        let mut relay = DuplexRelay::new(
+            Box::new(stream),
+            Box::new(peer_stream),
+            Duration::from_millis(20),
+            Duration::from_millis(80),
+            Duration::from_millis(100),
+        );
+        let res = tokio::time::timeout(Duration::from_secs(2), poll_fn(|cx| relay.poll_drive(cx)))
+            .await
+            .expect("relay must hit idle_timeout instead of hanging");
 
         match res {
-            Err(TunnelError::Io(e)) => assert_eq!(e.kind(), io::ErrorKind::TimedOut),
-            other => panic!("expected idle TimedOut error, got {other:?}"),
+            Err(TaskError::StageFailed(msg)) => assert!(
+                msg.contains("idle timeout"),
+                "expected idle timeout error, got {msg}"
+            ),
+            other => panic!("expected idle timeout error, got {other:?}"),
         }
-        cancel.cancel();
         drop((s_send, s_recv, server_conn));
     }
 

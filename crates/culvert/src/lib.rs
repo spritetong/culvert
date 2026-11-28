@@ -7,7 +7,6 @@
 
 pub mod backend;
 pub mod cert;
-pub mod client;
 pub mod common;
 pub mod config;
 pub mod consts;
@@ -20,17 +19,11 @@ pub mod io;
 pub mod mux;
 pub mod platform;
 pub mod pool;
-pub mod server;
-pub mod session;
-pub mod supervisor;
 pub mod transport;
-pub mod tunnel;
 pub mod v2;
 
-pub use client::ClientRunner;
 pub use daemon::run_daemon;
-pub use server::ServerRunner;
-pub use supervisor::TunnelSupervisor;
+pub use v2::{ClientRunner, ReverseSessionHub, ServerRunner, TunnelCluster, TunnelSupervisor};
 
 /// Runs an ingress server until cancelled.
 pub async fn run_server(

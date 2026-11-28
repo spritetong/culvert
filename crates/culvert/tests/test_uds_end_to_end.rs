@@ -10,9 +10,9 @@ use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
+use culvert::TunnelSupervisor;
 use culvert::config::model::*;
 use culvert::platform::*;
-use culvert::supervisor::TunnelSupervisor;
 
 #[tokio::test]
 async fn test_e2e_server_uds_url_and_mappings() {

@@ -281,10 +281,9 @@ async fn forward_runner_real_ws_server_e2e_pooled_and_recycled() {
     use crate::dialer::endpoint::EndpointContext;
     use crate::frontend;
     use crate::io::addr::MappingSpec;
-    use crate::server::ServerRunner;
-    use crate::session::SessionManager;
     use crate::transport::TransportRegistry;
     use crate::transport::ws::WsTransportDriver;
+    use crate::v2::server::{ReverseSessionHub, ServerRunner};
 
     let probe_echo = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let echo_port = probe_echo.local_addr().unwrap().port();
@@ -330,7 +329,7 @@ async fn forward_runner_real_ws_server_e2e_pooled_and_recycled() {
             ..Default::default()
         },
         Arc::clone(&registry),
-        Arc::new(SessionManager::new()),
+        Arc::new(ReverseSessionHub::new()),
     );
     let server_tok = server_cancel.clone();
     let server_handle = tokio::spawn(async move { server_runner.run(server_tok).await });
@@ -431,10 +430,9 @@ async fn forward_runner_real_ws_udp_e2e() {
     use crate::dialer::endpoint::EndpointContext;
     use crate::frontend;
     use crate::io::addr::MappingSpec;
-    use crate::server::ServerRunner;
-    use crate::session::SessionManager;
     use crate::transport::TransportRegistry;
     use crate::transport::ws::WsTransportDriver;
+    use crate::v2::server::{ReverseSessionHub, ServerRunner};
 
     let udp_echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let echo_port = udp_echo.local_addr().unwrap().port();
@@ -477,7 +475,7 @@ async fn forward_runner_real_ws_udp_e2e() {
             ..Default::default()
         },
         Arc::clone(&registry),
-        Arc::new(SessionManager::new()),
+        Arc::new(ReverseSessionHub::new()),
     );
     let server_tok = server_cancel.clone();
     let server_handle = tokio::spawn(async move { server_runner.run(server_tok).await });
@@ -553,10 +551,9 @@ async fn forward_runner_real_h3_concurrent_streams_and_quic_shutdown() {
     use crate::dialer::endpoint::EndpointContext;
     use crate::frontend;
     use crate::io::addr::MappingSpec;
-    use crate::server::ServerRunner;
-    use crate::session::SessionManager;
     use crate::transport::TransportRegistry;
     use crate::transport::h3::H3TransportDriver;
+    use crate::v2::server::{ReverseSessionHub, ServerRunner};
 
     let cert =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
@@ -628,7 +625,7 @@ async fn forward_runner_real_h3_concurrent_streams_and_quic_shutdown() {
             ..Default::default()
         },
         Arc::clone(&registry),
-        Arc::new(SessionManager::new()),
+        Arc::new(ReverseSessionHub::new()),
     );
     let server_tok = server_cancel.clone();
     let server_handle = tokio::spawn(async move { server_runner.run(server_tok).await });

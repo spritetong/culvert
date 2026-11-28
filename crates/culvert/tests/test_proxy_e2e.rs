@@ -17,10 +17,8 @@ use culvert::config::model::{
     TunnelMappingsConfig,
 };
 use culvert::dialer::endpoint::EndpointContext;
-use culvert::server::ServerRunner;
-use culvert::session::SessionManager;
 use culvert::transport::TransportRegistry;
-use culvert::tunnel::run_forward_tunnel;
+use culvert::{ReverseSessionHub, ServerRunner, TunnelCluster};
 
 #[tokio::test]
 async fn test_forward_tunnel_over_http_proxy() {
@@ -51,7 +49,7 @@ async fn test_forward_tunnel_over_http_proxy() {
     drop(server_listener); // release port for culvert server bind
 
     let registry = Arc::new(TransportRegistry::default());
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
     let server_config = ServerConfig {
         listen: vec![format!("ws://{}/tunnel", server_addr)],
         token: Some("secret-token".to_string()),
@@ -133,8 +131,14 @@ async fn test_forward_tunnel_over_http_proxy() {
     let client_cancel = cancel_token.clone();
     let client_registry = Arc::clone(&registry);
     tokio::spawn(async move {
-        let _ =
-            run_forward_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
+        let _ = TunnelCluster::run(
+            tunnel_config,
+            endpoint_ctx,
+            client_registry,
+            client_cancel,
+            "proxy-test",
+        )
+        .await;
     });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -188,7 +192,7 @@ async fn test_forward_tunnel_over_socks5_proxy() {
     drop(server_listener);
 
     let registry = Arc::new(TransportRegistry::default());
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
     let server_config = ServerConfig {
         listen: vec![format!("ws://{}/tunnel", server_addr)],
         token: Some("secret-token".to_string()),
@@ -284,8 +288,14 @@ async fn test_forward_tunnel_over_socks5_proxy() {
     let client_cancel = cancel_token.clone();
     let client_registry = Arc::clone(&registry);
     tokio::spawn(async move {
-        let _ =
-            run_forward_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
+        let _ = TunnelCluster::run(
+            tunnel_config,
+            endpoint_ctx,
+            client_registry,
+            client_cancel,
+            "proxy-test",
+        )
+        .await;
     });
 
     tokio::time::sleep(Duration::from_millis(200)).await;

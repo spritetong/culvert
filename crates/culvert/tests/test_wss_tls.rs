@@ -26,11 +26,9 @@ use culvert::config::model::{
     TunnelConfig, TunnelMappingsConfig, TunnelMode,
 };
 use culvert::dialer::endpoint::EndpointContext;
-use culvert::server::ServerRunner;
-use culvert::session::SessionManager;
 use culvert::transport::TransportRegistry;
 use culvert::transport::ws::WsTransportDriver;
-use culvert::tunnel::{run_forward_tunnel, run_reverse_tunnel};
+use culvert::{ReverseSessionHub, ServerRunner, TunnelCluster};
 
 /// Helper to get an available random ephemeral port assigned by the OS.
 fn get_available_port() -> u16 {
@@ -275,7 +273,7 @@ async fn test_wss_forward_tunnel_with_custom_ca_and_sni() {
     let mut registry = TransportRegistry::new();
     registry.register(WsTransportDriver);
     let registry = Arc::new(registry);
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
 
     let server_config = ServerConfig {
         listen: vec![format!("ws://127.0.0.1:{}/tunnel", backend_server_port)],
@@ -334,8 +332,14 @@ async fn test_wss_forward_tunnel_with_custom_ca_and_sni() {
     let client_cancel = cancel_token.clone();
     let client_registry = Arc::clone(&registry);
     let client_handle = tokio::spawn(async move {
-        let _ =
-            run_forward_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
+        let _ = TunnelCluster::run(
+            tunnel_config,
+            endpoint_ctx,
+            client_registry,
+            client_cancel,
+            "wss-e2e",
+        )
+        .await;
     });
 
     // 5. Connect to client listen port with retry loop and verify bidirectional echo
@@ -393,7 +397,7 @@ async fn test_wss_forward_tunnel_insecure_mode() {
     let mut registry = TransportRegistry::new();
     registry.register(WsTransportDriver);
     let registry = Arc::new(registry);
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
 
     let server_config = ServerConfig {
         listen: vec![format!("ws://127.0.0.1:{}/tunnel", backend_server_port)],
@@ -450,8 +454,14 @@ async fn test_wss_forward_tunnel_insecure_mode() {
     let client_cancel = cancel_token.clone();
     let client_registry = Arc::clone(&registry);
     let client_handle = tokio::spawn(async move {
-        let _ =
-            run_forward_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
+        let _ = TunnelCluster::run(
+            tunnel_config,
+            endpoint_ctx,
+            client_registry,
+            client_cancel,
+            "wss-e2e",
+        )
+        .await;
     });
 
     let mut stream = None;
@@ -507,7 +517,7 @@ async fn test_wss_mtls_mutual_authentication() {
     let mut registry = TransportRegistry::new();
     registry.register(WsTransportDriver);
     let registry = Arc::new(registry);
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
 
     let server_config = ServerConfig {
         listen: vec![format!("ws://127.0.0.1:{}/tunnel", backend_server_port)],
@@ -568,8 +578,14 @@ async fn test_wss_mtls_mutual_authentication() {
     let client_cancel = cancel_token.clone();
     let client_registry = Arc::clone(&registry);
     let client_handle = tokio::spawn(async move {
-        let _ =
-            run_forward_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
+        let _ = TunnelCluster::run(
+            tunnel_config,
+            endpoint_ctx,
+            client_registry,
+            client_cancel,
+            "wss-e2e",
+        )
+        .await;
     });
 
     let mut stream = None;
@@ -627,7 +643,7 @@ async fn test_wss_reverse_tunnel_e2e() {
     let mut registry = TransportRegistry::new();
     registry.register(WsTransportDriver);
     let registry = Arc::new(registry);
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
 
     let server_config = ServerConfig {
         listen: vec![format!("ws://127.0.0.1:{}/tunnel", backend_server_port)],
@@ -686,8 +702,14 @@ async fn test_wss_reverse_tunnel_e2e() {
     let client_cancel = cancel_token.clone();
     let client_registry = Arc::clone(&registry);
     let client_handle = tokio::spawn(async move {
-        let _ =
-            run_reverse_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
+        let _ = TunnelCluster::run(
+            tunnel_config,
+            endpoint_ctx,
+            client_registry,
+            client_cancel,
+            "wss-e2e",
+        )
+        .await;
     });
 
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -735,7 +757,7 @@ async fn test_wss_server_tls_version_enforcement() {
     let mut reg = TransportRegistry::new();
     reg.register(WsTransportDriver);
     let registry = Arc::new(reg);
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
 
     // 1. Configure Server to strictly enforce TLS 1.3
     let server_config = ServerConfig {
@@ -834,7 +856,7 @@ async fn test_wss_server_inherits_global_tls_config() {
     let mut reg = TransportRegistry::new();
     reg.register(WsTransportDriver);
     let registry = Arc::new(reg);
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
 
     // 1. Configure Server with server.tls = None, but supply top-level global TLS
     let server_config = ServerConfig {
@@ -946,7 +968,7 @@ async fn test_server_listen_dual_stack_wss_port() {
     let mut reg = TransportRegistry::new();
     reg.register(WsTransportDriver);
     let registry = Arc::new(reg);
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
     let server_runner = ServerRunner::new(server_cfg, registry.clone(), session_mgr);
 
     let cancel_server = cancel_token.child_token();
@@ -1038,7 +1060,7 @@ async fn test_wss_server_native_mandatory_mtls() {
     let mut server_registry = TransportRegistry::new();
     server_registry.register(WsTransportDriver);
     let server_registry = Arc::new(server_registry);
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
 
     let server_config = ServerConfig {
         listen: vec![format!("wss://127.0.0.1:{}/tunnel", server_port)],
@@ -1097,8 +1119,14 @@ async fn test_wss_server_native_mandatory_mtls() {
     let client_cancel = cancel_token.clone();
     let client_registry = Arc::clone(&server_registry);
     let client_handle = tokio::spawn(async move {
-        let _ =
-            run_forward_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
+        let _ = TunnelCluster::run(
+            tunnel_config,
+            endpoint_ctx,
+            client_registry,
+            client_cancel,
+            "wss-e2e",
+        )
+        .await;
     });
 
     let mut stream = None;

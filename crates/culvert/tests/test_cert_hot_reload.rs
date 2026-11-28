@@ -19,10 +19,9 @@ use culvert::config::model::{
     AppConfig, ClientAuthMode, EndpointConfig, ServerConfig, TlsConfig, TunnelMode,
 };
 use culvert::dialer::endpoint::EndpointContext;
-use culvert::server::ServerRunner;
-use culvert::session::SessionManager;
 use culvert::transport::TransportRegistry;
 use culvert::transport::ws::WsTransportDriver;
+use culvert::{ReverseSessionHub, ServerRunner};
 
 fn get_available_port() -> u16 {
     let listener =
@@ -127,7 +126,7 @@ async fn test_server_dynamic_cert_hot_reload() {
     let mut server_registry = TransportRegistry::new();
     server_registry.register(WsTransportDriver);
     let server_registry = Arc::new(server_registry);
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
 
     let server_config = ServerConfig {
         listen: vec![format!("wss://127.0.0.1:{}/tunnel", server_port)],
@@ -274,7 +273,7 @@ async fn test_server_dynamic_client_ca_hot_reload() {
     let mut server_registry = TransportRegistry::new();
     server_registry.register(WsTransportDriver);
     let server_registry = Arc::new(server_registry);
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
 
     let server_config = ServerConfig {
         listen: vec![format!("wss://127.0.0.1:{}/tunnel", server_port)],
@@ -412,7 +411,7 @@ async fn test_optional_client_auth_allows_anonymous_client() {
     let server_runner = ServerRunner::new(
         server_config,
         Arc::clone(&server_registry),
-        Arc::new(SessionManager::new()),
+        Arc::new(ReverseSessionHub::new()),
     );
     let cancel_server = cancel_token.child_token();
     let server_handle = tokio::spawn(async move {

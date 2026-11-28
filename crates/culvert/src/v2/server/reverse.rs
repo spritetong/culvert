@@ -18,8 +18,7 @@ use crate::control::{
 use crate::core::error::TunnelError;
 use crate::core::stream::{BoxFuture, TunnelStream};
 use crate::frontend;
-use crate::io::addr::{L4Protocol, MappingSpec, PeerAddr, TargetAddr};
-use crate::session::manager::canonical_reverse_key;
+use crate::io::addr::{L4Protocol, MappingSpec, PeerAddr, TargetAddr, canonical_reverse_key};
 use crate::v2::coordinator::{Coordinator, CoordinatorHandle, CoordinatorSummary};
 use crate::v2::error::TaskError;
 use crate::v2::reverse::{ReverseServerRunner, ReverseSignaler, ReverseVisitorWorkflow};
@@ -256,6 +255,11 @@ impl ReverseSessionHub {
     #[cfg(test)]
     pub(super) fn pending_session_count(&self) -> usize {
         self.pending_sessions.len()
+    }
+
+    /// Returns the number of reverse listeners currently held in their reconnection grace period.
+    pub fn grace_listener_count(&self) -> usize {
+        self.grace_listeners.len()
     }
 
     fn remove_session(&self, session_id: &str) {

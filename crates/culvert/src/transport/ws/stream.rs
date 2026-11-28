@@ -1260,6 +1260,48 @@ mod tests {
         assert_eq!(&buf, b"late payload");
     }
 
+    async fn drive_ws_duplex_relay(
+        a: Box<dyn TunnelStream>,
+        b: Box<dyn TunnelStream>,
+        cancel: tokio_util::sync::CancellationToken,
+        heartbeat_interval: std::time::Duration,
+        idle_timeout: std::time::Duration,
+    ) -> Result<(u64, u64), crate::v2::TaskError> {
+        use crate::v2::relay::{DuplexRelay, RelayCounters};
+        use crate::v2::stage::{ActiveStage, ClosingStage};
+        use crate::v2::state::CloseReason;
+
+        let counters = std::sync::Arc::new(RelayCounters::new());
+        let mut relay = DuplexRelay::new(
+            a,
+            b,
+            heartbeat_interval,
+            idle_timeout,
+            std::time::Duration::from_millis(200),
+        )
+        .with_counters(std::sync::Arc::clone(&counters));
+
+        let mut reason = CloseReason::StageError;
+        let res = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                reason = CloseReason::GracefulDrain;
+                Ok(())
+            }
+            r = std::future::poll_fn(|cx| relay.poll_drive(cx)) => {
+                if r.is_ok() {
+                    reason = CloseReason::NormalEnd;
+                }
+                r
+            }
+        };
+        let mut closing = relay.into_closing(reason);
+        let close_res = closing.run().await;
+        res?;
+        close_res?;
+        Ok(counters.snapshot())
+    }
+
     /// End-to-end reproduction of "curl pauses before exit": the relay has an
     /// in-flight WS read future while heartbeat liveness sweeps run, then the
     /// peer sends a response tail followed by the in-band FIN. The FIN must
@@ -1267,7 +1309,6 @@ mod tests {
     /// promptly instead of waiting for the idle timeout.
     #[tokio::test]
     async fn test_ws_liveness_sweep_does_not_stall_relay_exit() {
-        use crate::io::pump::StreamStreamPump;
         use tokio_util::sync::CancellationToken;
 
         let (raw_client, raw_server) = duplex(65536);
@@ -1276,7 +1317,7 @@ mod tests {
 
         let (mut visitor, visitor_side) = duplex(65536);
         let cancel = CancellationToken::new();
-        let relay = tokio::spawn(StreamStreamPump::relay_with_heartbeat(
+        let relay = tokio::spawn(drive_ws_duplex_relay(
             Box::new(visitor_side),
             Box::new(server),
             cancel.clone(),
@@ -1357,7 +1398,6 @@ mod tests {
     /// Every heartbeat sweep in that window must leave the relay running.
     #[tokio::test]
     async fn test_ws_liveness_after_half_close_does_not_truncate_response() {
-        use crate::io::pump::StreamStreamPump;
         use tokio_util::sync::CancellationToken;
 
         let (raw_client, raw_server) = duplex(65536);
@@ -1366,7 +1406,7 @@ mod tests {
 
         let (mut visitor, visitor_side) = duplex(65536);
         let cancel = CancellationToken::new();
-        let relay = tokio::spawn(StreamStreamPump::relay_with_heartbeat(
+        let relay = tokio::spawn(drive_ws_duplex_relay(
             Box::new(visitor_side),
             Box::new(server),
             cancel.clone(),

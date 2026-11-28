@@ -32,8 +32,9 @@ use culvert::core::stream::{HeartbeatStatus, StreamCaps, TunnelStream};
 use culvert::frontend::udp::UdpFrontend;
 use culvert::frontend::{Frontend, FrontendAccept, FrontendOutput};
 use culvert::io::channel::{Datagram, DatagramIo, IoChannel};
-use culvert::io::pump::{DatagramDatagramPump, DatagramStreamPump, Pump, PumpCtx, PumpRequest};
-use culvert::supervisor::TunnelSupervisor;
+use culvert::v2::relay::{ChannelRelay, RelayCounters};
+use culvert::v2::stage::ActiveStage;
+use culvert::{TunnelSupervisor, v2::TaskError};
 
 const PACKET_MAGIC: &[u8; 4] = b"CVT2";
 const DIR_C2S: u8 = 1;
@@ -606,14 +607,17 @@ async fn test_udp_extreme_datagram_sizes_under_backpressure() {
         });
 
         let pump = tokio::spawn(async move {
-            DatagramStreamPump::relay_datagram_stream(
-                Box::new(dgram_io),
-                Box::new(throttled_a),
-                CancellationToken::new(),
+            let counters = Arc::new(RelayCounters::new());
+            let mut relay = ChannelRelay::from_channels(
+                IoChannel::from_datagram(dgram_io),
+                IoChannel::from_stream(throttled_a),
                 Duration::from_secs(5),
                 Duration::from_secs(15),
-            )
-            .await
+                Duration::from_millis(200),
+                Some(Arc::clone(&counters)),
+            );
+            poll_fn(|cx| relay.poll_drive(cx)).await?;
+            Ok::<(u64, u64), TaskError>(counters.snapshot())
         });
 
         // Gradually release write budget in small steps while dgram poll_send stays blocked,
@@ -726,19 +730,15 @@ async fn test_udp_extreme_datagram_sizes_under_backpressure() {
         };
 
         let pump = tokio::spawn(async move {
-            DatagramDatagramPump
-                .run(
-                    PumpRequest::new(
-                        IoChannel::from_datagram(a_io),
-                        IoChannel::from_datagram(b_io),
-                    ),
-                    PumpCtx {
-                        cancel: CancellationToken::new(),
-                        heartbeat_interval: Duration::from_secs(5),
-                        idle_timeout: Duration::from_secs(10),
-                    },
-                )
-                .await
+            let mut relay = ChannelRelay::from_channels(
+                IoChannel::from_datagram(a_io),
+                IoChannel::from_datagram(b_io),
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                Duration::from_millis(200),
+                None,
+            );
+            poll_fn(|cx| relay.poll_drive(cx)).await
         });
 
         let pattern = [

@@ -12,16 +12,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
-use culvert::client::ClientRunner;
 use culvert::config::model::{
     AppConfig, EndpointConfig, MappingRuleConfig, ServerConfig, TunnelConfig, TunnelMappingsConfig,
     TunnelMode,
 };
 use culvert::dialer::endpoint::EndpointContext;
-use culvert::server::ServerRunner;
-use culvert::session::SessionManager;
 use culvert::transport::ws::WsConnector;
 use culvert::transport::{TargetAddr, TransportConnector, TransportRegistry};
+use culvert::{ClientRunner, ReverseSessionHub, ServerRunner};
 
 #[tokio::test]
 async fn test_ws_connector_sends_custom_host_and_http_headers() {
@@ -107,7 +105,7 @@ async fn test_e2e_ws_tunnel_with_custom_host_and_headers() {
 
     let auth_token = "secure_token_abc";
     let registry = Arc::new(TransportRegistry::default());
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
 
     let server_config = ServerConfig {
         listen: vec![format!("ws://127.0.0.1:{}/tunnel", server_port)],

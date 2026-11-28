@@ -11,11 +11,9 @@ use tokio::io::duplex;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-use culvert::consts::ACTIVATE_STREAM_PROMOTE;
 use culvert::control::{
     ControlMessage, FramedControlStream, SignalingChannel, SignalingConfig, SignalingRouter,
 };
-use culvert::session::manager::ReverseInboundPool;
 
 #[tokio::test]
 async fn test_dual_channel_strictly_no_duplicate_dispatch() {
@@ -139,54 +137,6 @@ async fn test_dual_channel_burst_deduplication() {
 }
 
 #[tokio::test]
-async fn test_inbound_pool_stream_emergency_promotion_e2e() {
-    let pool = ReverseInboundPool::new(8);
-    let (client, mut server) = duplex(1024);
-
-    assert!(pool.push(Box::new(client)));
-    assert_eq!(pool.len(), 1);
-
-    // Promote idle connection to signaling stream
-    let promoted = pool
-        .promote_idle(Duration::from_secs(5))
-        .await
-        .expect("promotion should succeed");
-    assert_eq!(pool.len(), 0);
-
-    // Peer reading the stream must detect the 0xA6 promotion byte
-    let mut magic = [0u8; 1];
-    tokio::io::AsyncReadExt::read_exact(&mut server, &mut magic)
-        .await
-        .expect("read magic");
-    assert_eq!(magic[0], ACTIVATE_STREAM_PROMOTE);
-
-    // Both ends can now safely establish a new SignalingChannel over the promoted stream
-    let cancel = CancellationToken::new();
-    let cfg = SignalingConfig {
-        heartbeat_interval: Duration::from_millis(50),
-        idle_timeout: Duration::from_millis(500),
-    };
-
-    let (srv_handle, _srv_rx) = SignalingChannel::spawn(promoted, cfg, cancel.child_token());
-    let mut client_framed = FramedControlStream::new(server);
-
-    // Verify control communication over promoted stream
-    let test_msg = ControlMessage::NewConnection {
-        session_id: "promoted_stream_test".into(),
-        client_addr: "127.0.0.1:9999".into(),
-    };
-    srv_handle
-        .send(test_msg.clone())
-        .await
-        .expect("send over promoted");
-
-    let received = client_framed.next().await.unwrap().unwrap();
-    assert_eq!(received, test_msg);
-
-    cancel.cancel();
-}
-
-#[tokio::test]
 async fn test_dual_channel_failover_maintains_deduplication_integrity() {
     let cancel = CancellationToken::new();
     let (ch1_tx, ch1_rx) = duplex(4096);
@@ -267,14 +217,17 @@ mod e2e_reverse_promotion_tests {
     use culvert::backend::registry::TransportRegistry;
     use culvert::config::model::{
         AppConfig, EndpointConfig, MappingRuleConfig, ServerConfig, TunnelConfig,
-        TunnelMappingsConfig, TunnelRetryConfig,
+        TunnelMappingsConfig, TunnelMode, TunnelRetryConfig,
+    };
+    use culvert::consts::{
+        DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_IDLE_TIMEOUT, DEFAULT_RELAY_DRAIN_TIMEOUT,
+        DEFAULT_UDP_IDLE_TIMEOUT,
     };
     use culvert::dialer::endpoint::EndpointContext;
-    use culvert::server::ServerRunner;
-    use culvert::session::SessionManager;
-    use culvert::supervisor::TunnelSupervisor;
+    use culvert::io::addr::L4Protocol;
     use culvert::transport::ws::WsTransportDriver;
-    use culvert::tunnel::run_reverse_tunnel;
+    use culvert::v2::{ReverseClientConfig, ReverseClientRunner};
+    use culvert::{ReverseSessionHub, ServerRunner, TunnelSupervisor};
 
     struct DroppingTcpProxy {
         proxy_port: u16,
@@ -427,7 +380,7 @@ mod e2e_reverse_promotion_tests {
         let mut registry = TransportRegistry::new();
         registry.register(WsTransportDriver);
         let registry = Arc::new(registry);
-        let session_mgr = Arc::new(SessionManager::new());
+        let session_mgr = Arc::new(ReverseSessionHub::new());
 
         let server_runner = ServerRunner::new(
             ServerConfig {
@@ -446,28 +399,31 @@ mod e2e_reverse_promotion_tests {
         tokio::time::sleep(Duration::from_millis(80)).await;
         let proxy = DroppingTcpProxy::start(server_ws_port, cancel.clone());
 
-        let tunnel_cfg = TunnelConfig {
-            tag: "e2e-0xa6-udp".to_string(),
-            uuid: None,
-            endpoint: EndpointConfig::Simple(format!("ws://127.0.0.1:{}/tunnel", proxy.proxy_port)),
-            token: Some(auth_token.to_string()),
-            failover: None,
-            multiplex: None,
-            retry: None,
-            http_headers: None,
-            mappings: TunnelMappingsConfig::reverse_pool(
-                3,
-                vec![MappingRuleConfig::udp(
-                    reverse_listen.clone(),
-                    format!("127.0.0.1:{}", echo_port),
-                )],
-            ),
-        };
-        let ep_ctx = EndpointContext::build(&tunnel_cfg.endpoint, &AppConfig::default()).unwrap();
+        let endpoint =
+            EndpointConfig::Simple(format!("ws://127.0.0.1:{}/tunnel", proxy.proxy_port));
+        let ep_ctx = EndpointContext::build(&endpoint, &AppConfig::default()).unwrap();
+        let connector: Arc<dyn culvert::transport::TransportConnector> = Arc::from(
+            registry
+                .create_connector(&ep_ctx, Some(auth_token), TunnelMode::Reverse)
+                .unwrap(),
+        );
+        let client_runner = ReverseClientRunner::new(
+            ReverseClientConfig {
+                listen_addr: reverse_listen.clone(),
+                target_addr: format!("127.0.0.1:{}", echo_port),
+                protocol: L4Protocol::Udp,
+                pool_size: Some(3),
+                tunnel_id: None,
+                heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+                idle_timeout: DEFAULT_IDLE_TIMEOUT,
+                relay_idle_timeout: DEFAULT_UDP_IDLE_TIMEOUT,
+                drain_timeout: DEFAULT_RELAY_DRAIN_TIMEOUT,
+            },
+            connector,
+        );
         let c_cancel = cancel.clone();
-        let c_reg = Arc::clone(&registry);
         let client_handle = tokio::spawn(async move {
-            let _ = run_reverse_tunnel(tunnel_cfg, ep_ctx, c_reg, c_cancel).await;
+            let _ = client_runner.run(c_cancel).await;
         });
 
         // Wait until primary control (conn 0) + 3 idle pool streams have connected.
@@ -538,7 +494,7 @@ mod e2e_reverse_promotion_tests {
         let mut registry = TransportRegistry::new();
         registry.register(WsTransportDriver);
         let registry = Arc::new(registry);
-        let session_mgr = Arc::new(SessionManager::new());
+        let session_mgr = Arc::new(ReverseSessionHub::new());
 
         let server_runner = ServerRunner::new(
             ServerConfig {

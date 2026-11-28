@@ -10,11 +10,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_util::sync::CancellationToken;
 
+use culvert::TunnelSupervisor;
 use culvert::config::model::{
     AppConfig, EndpointConfig, MappingGroupConfig, MappingRuleConfig, ServerConfig, TunnelConfig,
     TunnelMappingsConfig, TunnelRetryConfig,
 };
-use culvert::supervisor::TunnelSupervisor;
 
 /// Helper to get an available random ephemeral port assigned by the OS.
 fn get_available_port() -> u16 {

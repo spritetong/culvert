@@ -6,7 +6,7 @@
 //! All comments and docstrings must be in English.
 
 pub mod activation;
-pub mod connection_pool;
 
-pub use activation::{ActivationHeader, decode_activation, encode_activation_with_proto};
-pub use connection_pool::{InMemoryStreamPool, PoolStats, ReplenishingStreamPool, StreamPool};
+pub use activation::{
+    ActivationHeader, activate_and_verify_stream, decode_activation, encode_activation_with_proto,
+};

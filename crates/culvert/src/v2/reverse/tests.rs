@@ -334,11 +334,10 @@ async fn reverse_runner_cancels_hanging_signaling_immediately_on_shutdown() {
 async fn reverse_client_real_ws_server_e2e_on_demand_and_prewarmed() {
     use crate::config::model::{AppConfig, EndpointConfig, ServerConfig, TunnelMode};
     use crate::dialer::endpoint::EndpointContext;
-    use crate::server::ServerRunner;
-    use crate::session::SessionManager;
     use crate::transport::ws::WsTransportDriver;
     use crate::transport::{TransportConnector, TransportRegistry};
     use crate::v2::reverse::{ReverseClientConfig, ReverseClientRunner};
+    use crate::v2::server::{ReverseSessionHub, ServerRunner};
 
     let probe_echo = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let echo_port = probe_echo.local_addr().unwrap().port();
@@ -384,7 +383,7 @@ async fn reverse_client_real_ws_server_e2e_on_demand_and_prewarmed() {
             ..Default::default()
         },
         Arc::clone(&registry),
-        Arc::new(SessionManager::new()),
+        Arc::new(ReverseSessionHub::new()),
     );
     let server_tok = server_cancel.clone();
     let server_handle = tokio::spawn(async move { server_runner.run(server_tok).await });

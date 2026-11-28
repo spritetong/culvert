@@ -418,8 +418,8 @@ impl DatagramIo for UdpFlowChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::serve::serve;
-    use crate::io::pump::{PumpCtx, PumpRequest};
+    use crate::v2::relay::ChannelRelay;
+    use crate::v2::stage::ActiveStage;
     use std::time::Duration;
 
     #[test]
@@ -524,15 +524,19 @@ mod tests {
         let serve_task = tokio::spawn({
             let cancel = cancel.clone();
             async move {
-                serve(
-                    PumpRequest::new(acc.channel, IoChannel::from_stream(stream_tunnel)),
-                    PumpCtx {
-                        cancel,
-                        heartbeat_interval: Duration::from_secs(5),
-                        idle_timeout: Duration::from_secs(10),
-                    },
-                )
-                .await
+                let mut relay = ChannelRelay::from_channels(
+                    acc.channel,
+                    IoChannel::from_stream(stream_tunnel),
+                    Duration::from_secs(5),
+                    Duration::from_secs(10),
+                    Duration::from_millis(100),
+                    None,
+                );
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => Ok(()),
+                    res = std::future::poll_fn(|cx| relay.poll_drive(cx)) => res,
+                }
             }
         });
 

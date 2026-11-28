@@ -16,11 +16,9 @@ use culvert::config::model::{
     AppConfig, EndpointConfig, MappingRuleConfig, ServerConfig, TunnelConfig, TunnelMappingsConfig,
 };
 use culvert::dialer::endpoint::EndpointContext;
-use culvert::server::ServerRunner;
-use culvert::session::SessionManager;
 use culvert::transport::TransportRegistry;
 use culvert::transport::ws::WsTransportDriver;
-use culvert::tunnel::run_forward_tunnel;
+use culvert::{ReverseSessionHub, ServerRunner, TunnelCluster};
 
 /// Helper to get an available random ephemeral port assigned by the OS.
 fn get_available_port() -> u16 {
@@ -74,7 +72,7 @@ async fn test_high_volume_duplex_stream_integrity() {
     let mut registry = TransportRegistry::new();
     registry.register(WsTransportDriver);
     let registry = Arc::new(registry);
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
 
     let server_config = ServerConfig {
         listen: vec![format!("ws://{}/ws", server_ws_listen)],
@@ -112,8 +110,14 @@ async fn test_high_volume_duplex_stream_integrity() {
     let client_cancel = cancel_token.clone();
     let client_registry = Arc::clone(&registry);
     let client_handle = tokio::spawn(async move {
-        let _ =
-            run_forward_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
+        let _ = TunnelCluster::run(
+            tunnel_config,
+            endpoint_ctx,
+            client_registry,
+            client_cancel,
+            "duplex-test",
+        )
+        .await;
     });
 
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -218,7 +222,7 @@ async fn test_stream_half_close_and_draining() {
     let mut registry = TransportRegistry::new();
     registry.register(WsTransportDriver);
     let registry = Arc::new(registry);
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
 
     let server_config = ServerConfig {
         listen: vec![format!("ws://{}/ws", server_ws_listen)],
@@ -256,8 +260,14 @@ async fn test_stream_half_close_and_draining() {
     let client_cancel = cancel_token.clone();
     let client_registry = Arc::clone(&registry);
     let client_handle = tokio::spawn(async move {
-        let _ =
-            run_forward_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
+        let _ = TunnelCluster::run(
+            tunnel_config,
+            endpoint_ctx,
+            client_registry,
+            client_cancel,
+            "duplex-test",
+        )
+        .await;
     });
 
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -311,7 +321,7 @@ async fn test_pool_prewarm_and_reuse() {
     let mut registry = TransportRegistry::new();
     registry.register(WsTransportDriver);
     let registry = Arc::new(registry);
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
 
     let server_config = ServerConfig {
         listen: vec![format!("ws://{}/ws", server_ws_listen)],
@@ -353,8 +363,14 @@ async fn test_pool_prewarm_and_reuse() {
     let client_cancel = cancel_token.clone();
     let client_registry = Arc::clone(&registry);
     let client_handle = tokio::spawn(async move {
-        let _ =
-            run_forward_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
+        let _ = TunnelCluster::run(
+            tunnel_config,
+            endpoint_ctx,
+            client_registry,
+            client_cancel,
+            "duplex-test",
+        )
+        .await;
     });
 
     // Give pool time to pre-warm the 4 idle connections
@@ -410,7 +426,7 @@ async fn test_pool_resilience_after_disconnect_and_high_churn() {
     let mut registry = TransportRegistry::new();
     registry.register(WsTransportDriver);
     let registry = Arc::new(registry);
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
 
     let server_config = ServerConfig {
         listen: vec![format!("ws://{}/ws", server_ws_listen)],
@@ -452,8 +468,14 @@ async fn test_pool_resilience_after_disconnect_and_high_churn() {
     let client_cancel = cancel_token.clone();
     let client_registry = Arc::clone(&registry);
     let client_handle = tokio::spawn(async move {
-        let _ =
-            run_forward_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
+        let _ = TunnelCluster::run(
+            tunnel_config,
+            endpoint_ctx,
+            client_registry,
+            client_cancel,
+            "duplex-test",
+        )
+        .await;
     });
 
     tokio::time::sleep(Duration::from_millis(200)).await;

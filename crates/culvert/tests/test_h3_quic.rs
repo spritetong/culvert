@@ -18,12 +18,11 @@ use culvert::config::model::{
 use culvert::core::error::TunnelError;
 use culvert::core::stream::TunnelStream;
 use culvert::dialer::endpoint::EndpointContext;
-use culvert::server::ServerRunner;
-use culvert::session::SessionManager;
 use culvert::transport::h3::H3Connector;
 use culvert::transport::h3::H3TransportDriver;
 use culvert::transport::h3::listener::H3Listener;
 use culvert::transport::{TargetAddr, TransportConnector, TransportListener, TransportRegistry};
+use culvert::{ReverseSessionHub, ServerRunner};
 
 /// Helper to get an available ephemeral port from the OS that is free for both TCP and UDP.
 fn get_ephemeral_port() -> u16 {
@@ -397,7 +396,7 @@ async fn test_h3_tunnel_pool_prewarm_and_activation_end_to_end() {
     let mut server_registry = culvert::transport::TransportRegistry::new();
     server_registry.register(culvert::transport::h3::H3TransportDriver);
     let server_registry = Arc::new(server_registry);
-    let session_mgr = Arc::new(culvert::session::SessionManager::new());
+    let session_mgr = Arc::new(culvert::ReverseSessionHub::new());
 
     let server_config = culvert::config::model::ServerConfig {
         listen: vec![format!("h3://{}/tunnel", server_h3_listen)],
@@ -405,7 +404,7 @@ async fn test_h3_tunnel_pool_prewarm_and_activation_end_to_end() {
         default_target: Some(format!("127.0.0.1:{}", echo_port)),
         ..Default::default()
     };
-    let server_runner = culvert::server::ServerRunner::new(
+    let server_runner = culvert::ServerRunner::new(
         server_config,
         Arc::clone(&server_registry),
         Arc::clone(&session_mgr),
@@ -446,7 +445,7 @@ async fn test_h3_tunnel_pool_prewarm_and_activation_end_to_end() {
     };
 
     let c_cancel = cancel_token.clone();
-    let supervisor = culvert::supervisor::TunnelSupervisor::new(app_config, c_cancel);
+    let supervisor = culvert::TunnelSupervisor::new(app_config, c_cancel);
     let client_handle = tokio::spawn(async move {
         let _ = supervisor.run().await;
     });
@@ -500,7 +499,7 @@ async fn test_quic_raw_tunnel_pool_prewarm_and_activation_end_to_end() {
     let mut server_registry = culvert::transport::TransportRegistry::new();
     server_registry.register(culvert::transport::h3::H3TransportDriver);
     let server_registry = Arc::new(server_registry);
-    let session_mgr = Arc::new(culvert::session::SessionManager::new());
+    let session_mgr = Arc::new(culvert::ReverseSessionHub::new());
 
     let server_config = culvert::config::model::ServerConfig {
         listen: vec![format!("quic://{}/raw", server_quic_listen)],
@@ -508,7 +507,7 @@ async fn test_quic_raw_tunnel_pool_prewarm_and_activation_end_to_end() {
         default_target: Some(format!("127.0.0.1:{}", echo_port)),
         ..Default::default()
     };
-    let server_runner = culvert::server::ServerRunner::new(
+    let server_runner = culvert::ServerRunner::new(
         server_config,
         Arc::clone(&server_registry),
         Arc::clone(&session_mgr),
@@ -548,7 +547,7 @@ async fn test_quic_raw_tunnel_pool_prewarm_and_activation_end_to_end() {
     };
 
     let c_cancel = cancel_token.clone();
-    let supervisor = culvert::supervisor::TunnelSupervisor::new(app_config, c_cancel);
+    let supervisor = culvert::TunnelSupervisor::new(app_config, c_cancel);
     let client_handle = tokio::spawn(async move {
         let _ = supervisor.run().await;
     });
@@ -630,7 +629,7 @@ async fn test_quic_raw_forward_stress_throughput() {
     let mut server_registry = culvert::transport::TransportRegistry::new();
     server_registry.register(culvert::transport::h3::H3TransportDriver);
     let server_registry = Arc::new(server_registry);
-    let session_mgr = Arc::new(culvert::session::SessionManager::new());
+    let session_mgr = Arc::new(culvert::ReverseSessionHub::new());
 
     let server_config = culvert::config::model::ServerConfig {
         listen: vec![format!("quic://{}/raw", server_quic_listen)],
@@ -638,7 +637,7 @@ async fn test_quic_raw_forward_stress_throughput() {
         default_target: Some(format!("127.0.0.1:{}", sink_port)),
         ..Default::default()
     };
-    let server_runner = culvert::server::ServerRunner::new(
+    let server_runner = culvert::ServerRunner::new(
         server_config,
         Arc::clone(&server_registry),
         Arc::clone(&session_mgr),
@@ -678,7 +677,7 @@ async fn test_quic_raw_forward_stress_throughput() {
     };
 
     let c_cancel = cancel_token.clone();
-    let supervisor = culvert::supervisor::TunnelSupervisor::new(app_config, c_cancel);
+    let supervisor = culvert::TunnelSupervisor::new(app_config, c_cancel);
     let client_handle = tokio::spawn(async move {
         let _ = supervisor.run().await;
     });
@@ -732,7 +731,7 @@ async fn test_h3_concurrent_forward_stress() {
     let mut server_registry = culvert::transport::TransportRegistry::new();
     server_registry.register(culvert::transport::h3::H3TransportDriver);
     let server_registry = Arc::new(server_registry);
-    let session_mgr = Arc::new(culvert::session::SessionManager::new());
+    let session_mgr = Arc::new(culvert::ReverseSessionHub::new());
 
     let server_config = culvert::config::model::ServerConfig {
         listen: vec![format!("h3://{}/tunnel", server_h3_listen)],
@@ -740,7 +739,7 @@ async fn test_h3_concurrent_forward_stress() {
         default_target: Some(format!("127.0.0.1:{}", echo_port)),
         ..Default::default()
     };
-    let server_runner = culvert::server::ServerRunner::new(
+    let server_runner = culvert::ServerRunner::new(
         server_config,
         Arc::clone(&server_registry),
         Arc::clone(&session_mgr),
@@ -780,7 +779,7 @@ async fn test_h3_concurrent_forward_stress() {
     };
 
     let c_cancel = cancel_token.clone();
-    let supervisor = culvert::supervisor::TunnelSupervisor::new(app_config, c_cancel);
+    let supervisor = culvert::TunnelSupervisor::new(app_config, c_cancel);
     let client_handle = tokio::spawn(async move {
         let _ = supervisor.run().await;
     });
@@ -1262,7 +1261,7 @@ async fn test_h3_server_native_mandatory_mtls() {
     let mut server_registry = TransportRegistry::new();
     server_registry.register(H3TransportDriver);
     let server_registry = Arc::new(server_registry);
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
 
     let server_config = ServerConfig {
         listen: vec![format!("h3://127.0.0.1:{}/tunnel", server_port)],

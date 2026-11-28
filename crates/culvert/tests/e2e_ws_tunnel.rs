@@ -15,12 +15,9 @@ use culvert::config::model::{
     AppConfig, EndpointConfig, MappingRuleConfig, ServerConfig, TunnelConfig, TunnelMappingsConfig,
 };
 use culvert::dialer::endpoint::EndpointContext;
-use culvert::server::ServerRunner;
-use culvert::session::SessionManager;
-use culvert::supervisor::TunnelSupervisor;
 use culvert::transport::TransportRegistry;
 use culvert::transport::ws::WsTransportDriver;
-use culvert::tunnel::{run_forward_tunnel, run_reverse_tunnel};
+use culvert::{ReverseSessionHub, ServerRunner, TunnelCluster, TunnelSupervisor};
 
 /// Helper to get an available random ephemeral port assigned by the OS.
 fn get_available_port() -> u16 {
@@ -78,7 +75,7 @@ async fn test_forward_tunnel_ws_e2e() {
     let mut registry = TransportRegistry::new();
     registry.register(WsTransportDriver);
     let registry = Arc::new(registry);
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
 
     let server_config = ServerConfig {
         listen: vec![format!("ws://{}/tunnel", server_listen)],
@@ -118,8 +115,14 @@ async fn test_forward_tunnel_ws_e2e() {
     let client_cancel = cancel_token.clone();
     let client_registry = Arc::clone(&registry);
     let client_handle = tokio::spawn(async move {
-        let _ =
-            run_forward_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
+        let _ = TunnelCluster::run(
+            tunnel_config,
+            endpoint_ctx,
+            client_registry,
+            client_cancel,
+            "ws-e2e",
+        )
+        .await;
     });
 
     // Give servers a brief moment to bind and listen
@@ -171,7 +174,7 @@ async fn test_reverse_tunnel_ws_e2e() {
     let mut registry = TransportRegistry::new();
     registry.register(WsTransportDriver);
     let registry = Arc::new(registry);
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
 
     let server_config = ServerConfig {
         listen: vec![format!("ws://{}/tunnel", server_ws_listen)],
@@ -214,8 +217,14 @@ async fn test_reverse_tunnel_ws_e2e() {
     let client_cancel = cancel_token.clone();
     let client_registry = Arc::clone(&registry);
     let client_handle = tokio::spawn(async move {
-        let _ =
-            run_reverse_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
+        let _ = TunnelCluster::run(
+            tunnel_config,
+            endpoint_ctx,
+            client_registry,
+            client_cancel,
+            "ws-e2e",
+        )
+        .await;
     });
 
     // Give reverse registration time to connect and bind reverse_listen port on server
@@ -267,7 +276,7 @@ async fn test_reverse_tunnel_with_inbound_pool_e2e() {
     let mut registry = TransportRegistry::new();
     registry.register(WsTransportDriver);
     let registry = Arc::new(registry);
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
 
     let server_config = ServerConfig {
         listen: vec![format!("ws://{}/tunnel", server_ws_listen)],
@@ -312,8 +321,14 @@ async fn test_reverse_tunnel_with_inbound_pool_e2e() {
     let client_cancel = cancel_token.clone();
     let client_registry = Arc::clone(&registry);
     let client_handle = tokio::spawn(async move {
-        let _ =
-            run_reverse_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
+        let _ = TunnelCluster::run(
+            tunnel_config,
+            endpoint_ctx,
+            client_registry,
+            client_cancel,
+            "ws-e2e",
+        )
+        .await;
     });
 
     // Give time for reverse listener to bind and pool connections to pre-warm
@@ -377,7 +392,7 @@ async fn test_reverse_pool_burst_falls_back_to_signaling_e2e() {
     let mut registry = TransportRegistry::new();
     registry.register(WsTransportDriver);
     let registry = Arc::new(registry);
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
 
     let server_config = ServerConfig {
         listen: vec![format!("ws://{}/tunnel", server_ws_listen)],
@@ -418,8 +433,14 @@ async fn test_reverse_pool_burst_falls_back_to_signaling_e2e() {
     let client_cancel = cancel_token.clone();
     let client_registry = Arc::clone(&registry);
     let client_handle = tokio::spawn(async move {
-        let _ =
-            run_reverse_tunnel(tunnel_config, endpoint_ctx, client_registry, client_cancel).await;
+        let _ = TunnelCluster::run(
+            tunnel_config,
+            endpoint_ctx,
+            client_registry,
+            client_cancel,
+            "ws-e2e",
+        )
+        .await;
     });
     tokio::time::sleep(Duration::from_millis(400)).await;
 

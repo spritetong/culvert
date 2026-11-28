@@ -48,6 +48,17 @@ impl ServerRunner {
         )
     }
 
+    /// Creates a `ServerRunner` with inherited global TLS configuration and default registries.
+    pub fn from_config_with_tls(config: ServerConfig, global_tls: Option<TlsConfig>) -> Self {
+        Self::with_quic_config(
+            config,
+            global_tls,
+            QuicConfig::default(),
+            Arc::new(TransportRegistry::default()),
+            Arc::new(ReverseSessionHub::new()),
+        )
+    }
+
     /// Creates a `ServerRunner` with custom transport registry and session hub.
     pub fn new(
         config: ServerConfig,
@@ -55,6 +66,22 @@ impl ServerRunner {
         hub: Arc<ReverseSessionHub>,
     ) -> Self {
         Self::with_quic_config(config, None, QuicConfig::default(), transport_registry, hub)
+    }
+
+    /// Creates a `ServerRunner` with inherited global TLS configuration.
+    pub fn with_global_tls(
+        config: ServerConfig,
+        global_tls: Option<TlsConfig>,
+        transport_registry: Arc<TransportRegistry>,
+        hub: Arc<ReverseSessionHub>,
+    ) -> Self {
+        Self::with_quic_config(
+            config,
+            global_tls,
+            QuicConfig::default(),
+            transport_registry,
+            hub,
+        )
     }
 
     /// Creates a `ServerRunner` with explicit TLS and QUIC transport tuning.

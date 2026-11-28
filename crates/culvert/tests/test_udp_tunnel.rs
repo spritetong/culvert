@@ -24,12 +24,9 @@ use culvert::io::addr::{L4Protocol, TargetAddr};
 use culvert::io::channel::IoChannel;
 use culvert::io::error::TunnelError;
 use culvert::io::stream::BoxFuture;
-use culvert::server::ServerRunner;
-use culvert::session::SessionManager;
-use culvert::supervisor::TunnelSupervisor;
 use culvert::transport::h3::H3TransportDriver;
 use culvert::transport::ws::WsTransportDriver;
-use culvert::tunnel::{run_forward_tunnel, run_reverse_tunnel};
+use culvert::{ReverseSessionHub, ServerRunner, TunnelCluster, TunnelSupervisor};
 
 /// Finds an available ephemeral port free for both TCP and UDP.
 fn get_dual_ephemeral_port() -> u16 {
@@ -148,7 +145,7 @@ async fn test_forward_udp_ws_unpooled_and_pooled() {
     let mut registry = TransportRegistry::new();
     registry.register(WsTransportDriver);
     let registry = Arc::new(registry);
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
 
     let server_config = ServerConfig {
         listen: vec![format!("ws://127.0.0.1:{}/tunnel", server_ws_port)],
@@ -186,7 +183,7 @@ async fn test_forward_udp_ws_unpooled_and_pooled() {
     let c1 = cancel_token.clone();
     let reg1 = Arc::clone(&registry);
     let client_unpooled = tokio::spawn(async move {
-        let _ = run_forward_tunnel(unpooled_cfg, ep_ctx1, reg1, c1).await;
+        let _ = TunnelCluster::run(unpooled_cfg, ep_ctx1, reg1, c1, "udp-unpooled").await;
     });
 
     // Pooled 0-RTT UDP forward tunnel
@@ -212,7 +209,7 @@ async fn test_forward_udp_ws_unpooled_and_pooled() {
     let c2 = cancel_token.clone();
     let reg2 = Arc::clone(&registry);
     let client_pooled = tokio::spawn(async move {
-        let _ = run_forward_tunnel(pooled_cfg, ep_ctx2, reg2, c2).await;
+        let _ = TunnelCluster::run(pooled_cfg, ep_ctx2, reg2, c2, "udp-pooled").await;
     });
 
     // Allow listeners and pool pre-warming to become ready
@@ -271,7 +268,7 @@ async fn test_forward_udp_h3_and_raw_quic() {
     let mut registry = TransportRegistry::new();
     registry.register(H3TransportDriver);
     let registry = Arc::new(registry);
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
 
     let server_config = ServerConfig {
         listen: vec![
@@ -562,7 +559,7 @@ async fn test_reverse_udp_ws_pooled_and_signaling_fallback() {
     let mut registry = TransportRegistry::new();
     registry.register(WsTransportDriver);
     let registry = Arc::new(registry);
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
 
     let server_config = ServerConfig {
         listen: vec![format!("ws://127.0.0.1:{}/tunnel", server_ws_port)],
@@ -603,7 +600,7 @@ async fn test_reverse_udp_ws_pooled_and_signaling_fallback() {
     let c_cancel = cancel_token.clone();
     let c_reg = Arc::clone(&registry);
     let client_handle = tokio::spawn(async move {
-        let _ = run_reverse_tunnel(tunnel_config, ep_ctx, c_reg, c_cancel).await;
+        let _ = TunnelCluster::run(tunnel_config, ep_ctx, c_reg, c_cancel, "udp-rev").await;
     });
 
     tokio::time::sleep(Duration::from_millis(350)).await;
@@ -807,7 +804,7 @@ async fn test_udp_nat_idle_timeout_expiration_and_recreation() {
         connect_count: Arc::clone(&connect_count),
     });
     let registry = Arc::new(registry);
-    let session_mgr = Arc::new(SessionManager::new());
+    let session_mgr = Arc::new(ReverseSessionHub::new());
 
     let server_config = ServerConfig {
         listen: vec![format!("ws://127.0.0.1:{}/tunnel", server_ws_port)],
@@ -852,7 +849,7 @@ async fn test_udp_nat_idle_timeout_expiration_and_recreation() {
     let c_cancel = cancel_token.clone();
     let c_reg = Arc::clone(&registry);
     let client_handle = tokio::spawn(async move {
-        let _ = run_forward_tunnel(tunnel_cfg, ep_ctx, c_reg, c_cancel).await;
+        let _ = TunnelCluster::run(tunnel_cfg, ep_ctx, c_reg, c_cancel, "udp-fwd-idle").await;
     });
 
     tokio::time::sleep(Duration::from_millis(200)).await;

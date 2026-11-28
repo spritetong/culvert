@@ -7,9 +7,7 @@
 
 pub mod error;
 pub mod failover;
-pub mod serve;
 pub mod stream;
 
 pub use error::TunnelError;
-pub use serve::serve;
 pub use stream::{BoxFuture, TunnelStream};

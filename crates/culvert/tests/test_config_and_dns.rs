@@ -394,7 +394,7 @@ tunnels:
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let shutdown_token = cancel_token.clone();
 
-    let supervisor = culvert::supervisor::TunnelSupervisor::new(config, cancel_token);
+    let supervisor = culvert::TunnelSupervisor::new(config, cancel_token);
 
     // Cancel after 300ms
     tokio::spawn(async move {

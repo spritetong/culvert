@@ -10,22 +10,26 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use fastwebsockets::Role;
 use std::hint::black_box;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 use tokio::runtime::Runtime;
 use tokio_util::codec::{Decoder, Encoder};
 use tokio_util::sync::CancellationToken;
 
-use culvert::consts::{DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_IDLE_TIMEOUT};
+use culvert::consts::{
+    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_IDLE_TIMEOUT, DEFAULT_RELAY_DRAIN_TIMEOUT,
+};
 use culvert::control::stream::ControlMessage;
 use culvert::core::error::TunnelError;
 use culvert::core::stream::{BoxFuture, TunnelStream};
+use culvert::io::addr::{L4Protocol, TargetAddr};
 use culvert::io::channel::IoChannel;
-use culvert::io::pump::StreamStreamPump;
 use culvert::mux::{MuxCodec, MuxFrame, MuxSession};
-use culvert::pool::ReplenishingStreamPool;
+use culvert::transport::TransportConnector;
 use culvert::transport::ws::stream::WsTunnelStream;
-use culvert::transport::{TargetAddr, TransportConnector};
+use culvert::v2::forward::{ForwardInput, ForwardWorkflow};
+use culvert::v2::relay::{DuplexRelay, RelayCounters};
+use culvert::v2::stage::{ActiveStage, ClosingStage};
+use culvert::v2::{CloseReason, Coordinator, CoordinatorConfig, PooledTransport, TaskError};
 
 /// Benchmark MessagePack control serialization performance.
 fn bench_messagepack_serialization(c: &mut Criterion) {
@@ -87,19 +91,41 @@ fn bench_mux_framing(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark stream/stream pump raw throughput across stream adapters.
-fn relay(
+/// Benchmark stream/stream relay raw throughput across stream adapters.
+async fn relay(
     a: Box<dyn TunnelStream>,
     b: Box<dyn TunnelStream>,
     cancel: CancellationToken,
-) -> impl std::future::Future<Output = Result<(u64, u64), TunnelError>> {
-    StreamStreamPump::relay_with_heartbeat(
+) -> Result<(u64, u64), TaskError> {
+    let counters = Arc::new(RelayCounters::new());
+    let mut relay = DuplexRelay::new(
         a,
         b,
-        cancel,
         DEFAULT_HEARTBEAT_INTERVAL,
         DEFAULT_IDLE_TIMEOUT,
+        DEFAULT_RELAY_DRAIN_TIMEOUT,
     )
+    .with_counters(Arc::clone(&counters));
+
+    let mut reason = CloseReason::StageError;
+    let res = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            reason = CloseReason::GracefulDrain;
+            Ok(())
+        }
+        r = std::future::poll_fn(|cx| relay.poll_drive(cx)) => {
+            if r.is_ok() {
+                reason = CloseReason::NormalEnd;
+            }
+            r
+        }
+    };
+    let mut closing = relay.into_closing(reason);
+    let close_res = closing.run().await;
+    res?;
+    close_res?;
+    Ok(counters.snapshot())
 }
 
 fn bench_relay_throughput(c: &mut Criterion) {
@@ -231,7 +257,7 @@ impl TransportConnector for DummyConnector {
     }
 }
 
-/// Benchmark 0-RTT pool acquisition vs on-demand creation.
+/// Benchmark v2 0-RTT idle stream dispatch vs mux stream open.
 fn bench_pool_acquisition(c: &mut Criterion) {
     let mut group = c.benchmark_group("pool_acquisition");
     let rt = Runtime::new().unwrap();
@@ -241,33 +267,32 @@ fn bench_pool_acquisition(c: &mut Criterion) {
     let target = TargetAddr::Domain("127.0.0.1".to_string(), 80);
     let cancel_token = CancellationToken::new();
 
-    let pool = Arc::new(ReplenishingStreamPool::new(
-        connector,
-        target,
-        16,
-        cancel_token.clone(),
+    let workflow = ForwardWorkflow::new(
+        Some(connector),
         DEFAULT_HEARTBEAT_INTERVAL,
         DEFAULT_IDLE_TIMEOUT,
-    ));
+        DEFAULT_RELAY_DRAIN_TIMEOUT,
+    );
+    let (coord, coord_join) = Coordinator::start_with_config(
+        workflow,
+        CoordinatorConfig::plain(DEFAULT_RELAY_DRAIN_TIMEOUT),
+        cancel_token.clone(),
+    );
 
-    // Warm up pool
-    rt.block_on(tokio::time::sleep(Duration::from_millis(50)));
-
-    group.bench_function("0_rtt_prewarmed_acquire", |b| {
-        b.to_async(&rt).iter_custom(|iters| {
-            let pool = Arc::clone(&pool);
-            async move {
-                for _ in 0..iters {
-                    let (a, _) = duplex(1024);
-                    pool.push_idle(Box::new(a));
-                }
-                let start = std::time::Instant::now();
-                for _ in 0..iters {
-                    let stream = pool.acquire(None).await.unwrap();
-                    black_box(stream);
-                }
-                start.elapsed()
-            }
+    group.bench_function("0_rtt_prewarmed_supply", |b| {
+        b.to_async(&rt).iter(|| async {
+            let (a, _b) = duplex(1024);
+            let _ = coord
+                .supply_transport(PooledTransport::new(Box::new(a), 1))
+                .await;
+            let (fe_a, _fe_b) = duplex(1024);
+            let _ = coord
+                .assign(ForwardInput::new(
+                    IoChannel::from_stream(fe_a),
+                    target.clone(),
+                    L4Protocol::Tcp,
+                ))
+                .await;
         });
     });
 
@@ -297,6 +322,7 @@ fn bench_pool_acquisition(c: &mut Criterion) {
     });
 
     cancel_token.cancel();
+    let _ = rt.block_on(coord_join);
     mux_cancel.cancel();
     group.finish();
 }

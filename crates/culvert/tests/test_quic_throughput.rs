@@ -475,9 +475,8 @@ async fn full_relay(label: &'static str, scheme: &str, pool_size: usize, streams
         default_target: Some(format!("127.0.0.1:{sink_port}")),
         ..Default::default()
     };
-    let session_mgr = Arc::new(culvert::session::SessionManager::new());
-    let server_runner =
-        culvert::server::ServerRunner::new(server_config, Arc::new(registry), session_mgr);
+    let session_mgr = Arc::new(culvert::ReverseSessionHub::new());
+    let server_runner = culvert::ServerRunner::new(server_config, Arc::new(registry), session_mgr);
     let server_cancel = cancel.clone();
     let server_handle = tokio::spawn(async move {
         let _ = server_runner.run(server_cancel).await;
@@ -515,7 +514,7 @@ async fn full_relay(label: &'static str, scheme: &str, pool_size: usize, streams
         ..Default::default()
     };
     let client_cancel = cancel.clone();
-    let supervisor = culvert::supervisor::TunnelSupervisor::new(app_config, client_cancel);
+    let supervisor = culvert::TunnelSupervisor::new(app_config, client_cancel);
     let client_handle = tokio::spawn(async move {
         let _ = supervisor.run().await;
     });

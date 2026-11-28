@@ -9,15 +9,14 @@
 pub mod addr;
 pub mod channel;
 pub mod error;
-pub mod pump;
 pub mod stream;
 
 pub use addr::{
-    L4Protocol, ListenAddr, MappingSpec, PeerAddr, TargetAddr, parse_listen_addr, parse_target_addr,
+    L4Protocol, ListenAddr, MappingSpec, PeerAddr, TargetAddr, canonical_reverse_key,
+    parse_listen_addr, parse_target_addr,
 };
 pub use channel::{ChannelKind, Datagram, DatagramIo, FlowKey, IoChannel};
 pub use error::TunnelError;
-pub use pump::{Pump, PumpCtx, PumpRegistry, PumpRequest, StreamStreamPump, pump_registry};
 pub use stream::{
     BoxFuture, BufferedTlsStream, HeartbeatStatus, StreamCaps, TunnelStream, activity_now_ms,
     heartbeat_timing,

@@ -472,6 +472,22 @@ pub fn parse_listen_addr(listen_str: &str) -> Result<ListenAddr, TunnelError> {
     )))
 }
 
+/// Derives a canonical key for matching reverse listener inbound pools.
+///
+/// The client puts its `listen` address into the pre-warm target header while
+/// the server registers the coordinator under `(protocol, listen_addr)` from
+/// `RegisterReverse`. Normalizing both keeps IPv4/IPv6/UDS spellings aligned,
+/// and prefixing by protocol lets TCP and UDP reverse listeners coexist on
+/// the same port without cross-talk.
+pub fn canonical_reverse_key(protocol: L4Protocol, addr: &str) -> String {
+    let s = addr.trim();
+    let normalized = match parse_listen_addr(s) {
+        Ok(target) => target.to_string(),
+        Err(_) => s.to_string(),
+    };
+    format!("{}:{}", protocol, normalized)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,5 +584,38 @@ mod tests {
         assert!(parse_listen_addr(":99999").is_err());
         assert!(parse_listen_addr(":abc").is_err());
         assert!(parse_target_addr(":0").is_err());
+    }
+
+    #[test]
+    fn test_canonical_reverse_key() {
+        assert_eq!(
+            canonical_reverse_key(L4Protocol::Tcp, "0.0.0.0:9090"),
+            "tcp:0.0.0.0:9090"
+        );
+        assert_eq!(
+            canonical_reverse_key(L4Protocol::Udp, "0.0.0.0:9090"),
+            "udp:0.0.0.0:9090"
+        );
+        assert_ne!(
+            canonical_reverse_key(L4Protocol::Tcp, "127.0.0.1:9090"),
+            canonical_reverse_key(L4Protocol::Udp, "127.0.0.1:9090")
+        );
+        assert_eq!(
+            canonical_reverse_key(L4Protocol::Tcp, "127.0.0.1:9090"),
+            "tcp:127.0.0.1:9090"
+        );
+        assert_ne!(
+            canonical_reverse_key(L4Protocol::Tcp, "127.0.0.1:9090"),
+            canonical_reverse_key(L4Protocol::Tcp, "127.0.0.2:9090")
+        );
+        assert_eq!(
+            canonical_reverse_key(L4Protocol::Tcp, "[::1]:9090"),
+            "tcp:[::1]:9090"
+        );
+        let uds_a = canonical_reverse_key(L4Protocol::Tcp, "unix:///tmp/sock");
+        assert!(uds_a.starts_with("tcp:unix://"));
+        let uds_path = uds_a.strip_prefix("tcp:").unwrap();
+        let uds_b = canonical_reverse_key(L4Protocol::Tcp, uds_path);
+        assert_eq!(uds_a, uds_b);
     }
 }

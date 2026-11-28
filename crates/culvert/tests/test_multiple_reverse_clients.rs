@@ -4,19 +4,16 @@
 
 //! Concurrent reverse clients against one server.
 
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use culvert::TunnelSupervisor;
 use culvert::config::model::{
     AppConfig, EndpointConfig, MappingRuleConfig, ServerConfig, TunnelConfig, TunnelMappingsConfig,
 };
-use culvert::io::addr::L4Protocol;
-use culvert::session::SessionManager;
-use culvert::supervisor::TunnelSupervisor;
 
 fn get_available_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
@@ -217,41 +214,4 @@ async fn test_reverse_clients_sharing_uuid_keep_mapping_targets() {
     r_client_a.expect("client A task panicked");
     r_client_b.expect("client B task panicked");
     r_server.expect("server task panicked");
-}
-
-#[tokio::test]
-async fn test_clients_sharing_uuid_share_one_server_pool() {
-    let manager = Arc::new(SessionManager::new());
-    let a = manager.register_pool_guarded_with_tunnel(
-        Some("shared".to_string()),
-        L4Protocol::Tcp,
-        "127.0.0.1:7001",
-        3,
-    );
-    let b = manager.register_pool_guarded_with_tunnel(
-        Some("shared".to_string()),
-        L4Protocol::Tcp,
-        "127.0.0.1:7002",
-        3,
-    );
-    let other = manager.register_pool_guarded_with_tunnel(
-        Some("other".to_string()),
-        L4Protocol::Tcp,
-        "127.0.0.1:7003",
-        3,
-    );
-    assert!(Arc::ptr_eq(&a.pool, &b.pool));
-    assert!(!Arc::ptr_eq(&a.pool, &other.pool));
-
-    let (stream, _peer) = duplex(64);
-    assert!(a.push(Box::new(stream)));
-    assert_eq!(b.len(), 1);
-    assert_eq!(other.len(), 0);
-
-    drop(a);
-    assert_eq!(b.len(), 1, "pool must survive one client leaving");
-    drop(b);
-    assert_eq!(manager.pool_count(), 1);
-    drop(other);
-    assert_eq!(manager.pool_count(), 0);
 }
