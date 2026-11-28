@@ -213,14 +213,37 @@ impl ReverseClientWorkflow {
         protocol: L4Protocol,
     ) -> Result<ChannelRelay, TaskError> {
         let dummy_target = TargetAddr::Domain(REVERSE_CONTROL_TARGET_HOST.to_string(), 0);
-        let (local_res, remote_res) = tokio::join!(
+        self.pair_on_demand(
             crate::platform::connect_target_channel(&target, protocol),
             self.connector
-                .connect_with_protocol(&dummy_target, Some(&session_id), protocol)
-        );
+                .connect_with_protocol(&dummy_target, Some(&session_id), protocol),
+        )
+        .await
+    }
 
-        let local_channel = local_res.map_err(|e| TaskError::StageFailed(e.to_string()))?;
-        let remote_channel = remote_res.map_err(|e| TaskError::StageFailed(e.to_string()))?;
+    async fn pair_on_demand<F1, F2, E1, E2>(
+        &self,
+        local_fut: F1,
+        remote_fut: F2,
+    ) -> Result<ChannelRelay, TaskError>
+    where
+        F1: Future<Output = Result<IoChannel, E1>>,
+        F2: Future<Output = Result<IoChannel, E2>>,
+        E1: std::fmt::Display,
+        E2: std::fmt::Display,
+    {
+        let (local_channel, remote_channel) = tokio::try_join!(
+            async {
+                local_fut
+                    .await
+                    .map_err(|e| TaskError::StageFailed(e.to_string()))
+            },
+            async {
+                remote_fut
+                    .await
+                    .map_err(|e| TaskError::StageFailed(e.to_string()))
+            }
+        )?;
 
         Ok(ChannelRelay::from_channels(
             local_channel,
@@ -734,5 +757,134 @@ impl ReverseClientRunner {
             Ok(ListenAddr::Path(p)) => vec![TargetAddr::Path(p)],
             Err(_) => vec![fallback.clone()],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::error::TunnelError;
+    use crate::core::stream::BoxFuture;
+    use crate::v2::stage::ActiveStage;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+    struct PendingConnector {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl TransportConnector for PendingConnector {
+        fn connect<'a>(
+            &'a self,
+            _target: &'a TargetAddr,
+            _session_id: Option<&'a str>,
+        ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
+            let dropped = Arc::clone(&self.dropped);
+            Box::pin(async move {
+                scopeguard::defer! {
+                    dropped.store(true, Ordering::Release);
+                }
+                std::future::pending::<Result<IoChannel, TunnelError>>().await
+            })
+        }
+
+        fn connect_pooled<'a>(
+            &'a self,
+            target: &'a TargetAddr,
+        ) -> BoxFuture<'a, Result<IoChannel, TunnelError>> {
+            self.connect(target, None)
+        }
+    }
+
+    #[tokio::test]
+    async fn reverse_on_demand_cancels_sibling_dial_on_early_failure() {
+        // 1. Local target refuses immediately while remote connector stays pending:
+        //    connect_on_demand must fail promptly and drop the pending remote future.
+        let closed_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let unused_port = closed_probe.local_addr().unwrap().port();
+        drop(closed_probe);
+
+        let remote_dropped = Arc::new(AtomicBool::new(false));
+        let workflow = ReverseClientWorkflow::new(
+            Arc::new(PendingConnector {
+                dropped: Arc::clone(&remote_dropped),
+            }),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_millis(100),
+        );
+
+        let closed_target = TargetAddr::Ip(format!("127.0.0.1:{unused_port}").parse().unwrap());
+        let res1 = tokio::time::timeout(
+            Duration::from_secs(5),
+            workflow.connect_on_demand("sid-1".into(), closed_target, L4Protocol::Tcp),
+        )
+        .await
+        .expect("local failure must abort pending remote dial promptly");
+        assert!(matches!(res1, Err(TaskError::StageFailed(_))));
+        assert!(
+            remote_dropped.load(Ordering::Acquire),
+            "pending remote future must be dropped on local failure"
+        );
+
+        // 2. Remote fails immediately while local connect future stays pending:
+        //    pair_on_demand must return immediately and drop the pending local future.
+        let local_dropped = Arc::new(AtomicBool::new(false));
+        let local_dropped_flag = Arc::clone(&local_dropped);
+        let res2 = tokio::time::timeout(
+            Duration::from_millis(500),
+            workflow.pair_on_demand(
+                async move {
+                    scopeguard::defer! {
+                        local_dropped_flag.store(true, Ordering::Release);
+                    }
+                    std::future::pending::<Result<IoChannel, TunnelError>>().await
+                },
+                async {
+                    Err::<IoChannel, TunnelError>(TunnelError::ControlProtocol(
+                        "remote dial rejected".into(),
+                    ))
+                },
+            ),
+        )
+        .await
+        .expect("remote failure must abort pending local dial promptly");
+        assert!(matches!(res2, Err(TaskError::StageFailed(_))));
+        assert!(
+            local_dropped.load(Ordering::Acquire),
+            "pending local future must be dropped on remote failure"
+        );
+
+        // 3. Both sides succeed: resulting ChannelRelay forwards bidirectional traffic normally.
+        let (local_a, mut local_peer) = duplex(1024);
+        let (remote_a, mut remote_peer) = duplex(1024);
+        let mut relay = workflow
+            .pair_on_demand(
+                async { Ok::<_, TunnelError>(IoChannel::from_stream(local_a)) },
+                async { Ok::<_, TunnelError>(IoChannel::from_stream(remote_a)) },
+            )
+            .await
+            .unwrap();
+
+        let drive_handle = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| relay.poll_drive(cx)).await;
+        });
+
+        remote_peer.write_all(b"from-remote").await.unwrap();
+        let mut to_local = [0u8; 11];
+        local_peer.read_exact(&mut to_local).await.unwrap();
+        assert_eq!(&to_local, b"from-remote");
+
+        local_peer.write_all(b"from-local").await.unwrap();
+        let mut to_remote = [0u8; 10];
+        remote_peer.read_exact(&mut to_remote).await.unwrap();
+        assert_eq!(&to_remote, b"from-local");
+
+        drop((local_peer, remote_peer));
+        tokio::time::timeout(Duration::from_secs(1), drive_handle)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }
