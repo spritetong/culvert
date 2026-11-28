@@ -25,9 +25,10 @@ use crate::v2::error::TaskError;
 use crate::v2::reverse::{ReverseServerRunner, ReverseSignaler, ReverseVisitorWorkflow};
 use crate::v2::state::CoordinatorConfig;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use futures_util::{SinkExt, StreamExt};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -39,18 +40,19 @@ use tokio_util::sync::CancellationToken;
 static NEXT_SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Reconnected control stream handed over to a grace-period listener.
-struct ReattachPayload {
-    ctrl_stream: Box<FramedControlStream<Box<dyn TunnelStream>>>,
+pub(super) struct ReattachPayload {
+    pub(super) ctrl_stream: Box<FramedControlStream<Box<dyn TunnelStream>>>,
 }
 
 struct GraceSlot {
     id: u64,
     tx: mpsc::Sender<ReattachPayload>,
-    closed: Arc<Notify>,
+    closed_flag: Arc<AtomicBool>,
+    closed_notify: Arc<Notify>,
 }
 
-struct ReverseIdleTarget {
-    coord: CoordinatorHandle<ReverseVisitorWorkflow>,
+pub(super) struct ReverseIdleTarget {
+    pub(super) coord: CoordinatorHandle<ReverseVisitorWorkflow>,
     generation: AtomicU64,
     listeners: AtomicUsize,
     join: Mutex<Option<JoinHandle<CoordinatorSummary>>>,
@@ -83,18 +85,24 @@ impl ReverseIdleTarget {
 }
 
 /// Active grace-period registration preserving a bound reverse listener across brief disconnects.
-struct GraceHandle {
+pub(super) struct GraceHandle {
     key: String,
     slot_id: u64,
     rx: mpsc::Receiver<ReattachPayload>,
-    closed: Arc<Notify>,
+    closed_flag: Arc<AtomicBool>,
+    closed_notify: Arc<Notify>,
     registry: Arc<DashMap<String, GraceSlot>>,
     finished: bool,
 }
 
 impl GraceHandle {
-    async fn recv(&mut self) -> Option<ReattachPayload> {
+    pub(super) async fn recv(&mut self) -> Option<ReattachPayload> {
         self.rx.recv().await
+    }
+
+    #[cfg(test)]
+    pub(super) fn close_rx_only(&mut self) {
+        self.rx.close();
     }
 
     fn close_and_try_recv(&mut self) -> Option<ReattachPayload> {
@@ -102,7 +110,7 @@ impl GraceHandle {
         self.rx.try_recv().ok()
     }
 
-    fn finish(mut self) {
+    pub(super) fn finish(mut self) {
         self.cleanup();
     }
 
@@ -112,7 +120,8 @@ impl GraceHandle {
             self.rx.close();
             self.registry
                 .remove_if(&self.key, |_, slot| slot.id == self.slot_id);
-            self.closed.notify_waiters();
+            self.closed_flag.store(true, Ordering::Release);
+            self.closed_notify.notify_waiters();
         }
     }
 }
@@ -143,7 +152,7 @@ impl Drop for PendingSessionGuard {
     }
 }
 
-struct RegisteredCoordinatorGuard {
+pub(super) struct RegisteredCoordinatorGuard {
     hub: Arc<ReverseSessionHub>,
     protocol: L4Protocol,
     listen_addr: String,
@@ -153,7 +162,7 @@ struct RegisteredCoordinatorGuard {
 }
 
 impl RegisteredCoordinatorGuard {
-    async fn shutdown(mut self) {
+    pub(super) async fn shutdown(mut self) {
         self.released = true;
         let is_last = self.hub.unregister_coordinator(
             self.protocol,
@@ -260,7 +269,7 @@ impl ReverseSessionHub {
 
     /// Registers an exclusive or shared `tunnel_id` `Coordinator` for a bound reverse listener.
     #[allow(clippy::too_many_arguments)]
-    fn register_or_join_coordinator(
+    pub(super) fn register_or_join_coordinator(
         self: &Arc<Self>,
         protocol: L4Protocol,
         listen_addr: &str,
@@ -272,27 +281,33 @@ impl ReverseSessionHub {
         soft_cap: usize,
     ) -> (Arc<ReverseIdleTarget>, RegisteredCoordinatorGuard) {
         if let Some(ref tid) = tunnel_id {
-            let slot = Arc::clone(
-                &*self
-                    .tunnel_coordinators
-                    .entry(tid.clone())
-                    .or_insert_with(|| {
-                        let workflow = ReverseVisitorWorkflow::shared(
-                            heartbeat_interval,
-                            idle_timeout,
-                            DEFAULT_RELAY_DRAIN_TIMEOUT,
-                        );
-                        let cfg = CoordinatorConfig::reverse_inbound(
-                            soft_cap,
-                            idle_timeout,
-                            DEFAULT_RELAY_DRAIN_TIMEOUT,
-                        );
-                        let (coord, join) =
-                            Coordinator::start_with_config(workflow, cfg, CancellationToken::new());
-                        Arc::new(ReverseIdleTarget::new(coord, join))
-                    }),
-            );
-            slot.listeners.fetch_add(1, Ordering::AcqRel);
+            // Mutate `listeners` under the DashMap Entry shard write lock so registration can
+            // never read an Arc that an interleaving last-unregister is about to remove and stop.
+            let slot = match self.tunnel_coordinators.entry(tid.clone()) {
+                Entry::Occupied(entry) => {
+                    let existing = Arc::clone(entry.get());
+                    existing.listeners.fetch_add(1, Ordering::AcqRel);
+                    existing
+                }
+                Entry::Vacant(entry) => {
+                    let workflow = ReverseVisitorWorkflow::shared(
+                        heartbeat_interval,
+                        idle_timeout,
+                        DEFAULT_RELAY_DRAIN_TIMEOUT,
+                    );
+                    let cfg = CoordinatorConfig::reverse_inbound(
+                        soft_cap,
+                        idle_timeout,
+                        DEFAULT_RELAY_DRAIN_TIMEOUT,
+                    );
+                    let (coord, join) =
+                        Coordinator::start_with_config(workflow, cfg, CancellationToken::new());
+                    let created = Arc::new(ReverseIdleTarget::new(coord, join));
+                    created.listeners.store(1, Ordering::Release);
+                    entry.insert(Arc::clone(&created));
+                    created
+                }
+            };
             let guard = RegisteredCoordinatorGuard {
                 hub: Arc::clone(self),
                 protocol,
@@ -341,17 +356,12 @@ impl ReverseSessionHub {
         target: &Arc<ReverseIdleTarget>,
     ) -> bool {
         if let Some(tid) = tunnel_id {
-            let should_remove = self
-                .tunnel_coordinators
-                .get(tid)
-                .is_some_and(|slot| slot.listeners.fetch_sub(1, Ordering::AcqRel) == 1);
-            if should_remove {
-                return self
-                    .tunnel_coordinators
-                    .remove_if(tid, |_, s| s.listeners.load(Ordering::Acquire) == 0)
-                    .is_some();
-            }
-            false
+            // Decrement and decide removal atomically inside the DashMap shard write lock.
+            self.tunnel_coordinators
+                .remove_if(tid, |_, slot| {
+                    Arc::ptr_eq(slot, target) && slot.listeners.fetch_sub(1, Ordering::AcqRel) == 1
+                })
+                .is_some()
         } else {
             let key = canonical_reverse_key(protocol, listen_addr);
             self.reverse_coordinators
@@ -362,30 +372,37 @@ impl ReverseSessionHub {
         }
     }
 
-    fn register_grace_listener(&self, protocol: L4Protocol, listen_addr: &str) -> GraceHandle {
+    pub(super) fn register_grace_listener(
+        &self,
+        protocol: L4Protocol,
+        listen_addr: &str,
+    ) -> GraceHandle {
         let key = canonical_reverse_key(protocol, listen_addr);
         let slot_id = self.next_grace_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(4);
-        let closed = Arc::new(Notify::new());
+        let closed_flag = Arc::new(AtomicBool::new(false));
+        let closed_notify = Arc::new(Notify::new());
         self.grace_listeners.insert(
             key.clone(),
             GraceSlot {
                 id: slot_id,
                 tx,
-                closed: Arc::clone(&closed),
+                closed_flag: Arc::clone(&closed_flag),
+                closed_notify: Arc::clone(&closed_notify),
             },
         );
         GraceHandle {
             key,
             slot_id,
             rx,
-            closed,
+            closed_flag,
+            closed_notify,
             registry: Arc::clone(&self.grace_listeners),
             finished: false,
         }
     }
 
-    async fn try_reattach_grace_listener(
+    pub(super) async fn try_reattach_grace_listener(
         &self,
         protocol: L4Protocol,
         listen_addr: &str,
@@ -394,18 +411,32 @@ impl ReverseSessionHub {
     ) -> Result<(), ReattachPayload> {
         let key = canonical_reverse_key(protocol, listen_addr);
         loop {
-            let (tx, closed) = match self.grace_listeners.get(&key) {
-                Some(entry) => (entry.tx.clone(), Arc::clone(&entry.closed)),
+            let (tx, closed_flag, closed_notify) = match self.grace_listeners.get(&key) {
+                Some(entry) => (
+                    entry.tx.clone(),
+                    Arc::clone(&entry.closed_flag),
+                    Arc::clone(&entry.closed_notify),
+                ),
                 None => return Err(payload),
             };
+            // Pin and enable the Notified waiter BEFORE reading `closed_flag` or calling `tx.send()`
+            // so concurrent cleanup cannot fire `notify_waiters()` before we start awaiting.
+            let mut notified = std::pin::pin!(closed_notify.notified());
+            notified.as_mut().enable();
+            if closed_flag.load(Ordering::Acquire) {
+                continue;
+            }
             match tx.send(payload).await {
                 Ok(()) => return Ok(()),
                 Err(send_err) => {
                     payload = send_err.0;
+                    if closed_flag.load(Ordering::Acquire) {
+                        continue;
+                    }
                     tokio::select! {
                         biased;
                         _ = cancel_token.cancelled() => return Err(payload),
-                        _ = closed.notified() => {}
+                        () = &mut notified => {}
                     }
                 }
             }
