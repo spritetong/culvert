@@ -207,10 +207,7 @@ async fn accept_one_frontend(fe: &mut UdpFrontend) -> FrontendAccept {
         .expect("UdpFrontend::accept returned error")
 }
 
-async fn try_accept_frontend(
-    fe: &mut UdpFrontend,
-    timeout: Duration,
-) -> Option<FrontendAccept> {
+async fn try_accept_frontend(fe: &mut UdpFrontend, timeout: Duration) -> Option<FrontendAccept> {
     let mut slot: ReusableFutureRef<'static, FrontendOutput> = ReusableFutureRef::default();
     fe.accept(&mut slot);
     let res = tokio::time::timeout(timeout, &mut slot).await.ok()?;
@@ -273,7 +270,11 @@ async fn test_udp_flow_limit_exhaustion_and_recovery() {
     // 2. While at ceiling, verify existing flows on both listeners still work bidirectionally.
     for sample_idx in [0usize, fe1_target - 1, fe1_target, MAX_UDP_SESSIONS - 1] {
         let (sock, dgram, client_id) = &mut active_flows[sample_idx];
-        let listen_addr = if sample_idx < fe1_target { addr1 } else { addr2 };
+        let listen_addr = if sample_idx < fe1_target {
+            addr1
+        } else {
+            addr2
+        };
 
         let pkt2 = encode_seq_packet(DIR_C2S, *client_id, 1, 2, 64);
         sock.send_to(&pkt2, listen_addr).await.unwrap();
@@ -372,7 +373,10 @@ async fn test_udp_flow_limit_exhaustion_and_recovery() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(decode_and_verify_seq_packet(&rbuf[..rn]).unwrap().client_id, cid);
+        assert_eq!(
+            decode_and_verify_seq_packet(&rbuf[..rn]).unwrap().client_id,
+            cid
+        );
 
         active_flows.push((sock, dgram, cid));
     }
@@ -724,7 +728,10 @@ async fn test_udp_extreme_datagram_sizes_under_backpressure() {
         let pump = tokio::spawn(async move {
             DatagramDatagramPump
                 .run(
-                    PumpRequest::new(IoChannel::from_datagram(a_io), IoChannel::from_datagram(b_io)),
+                    PumpRequest::new(
+                        IoChannel::from_datagram(a_io),
+                        IoChannel::from_datagram(b_io),
+                    ),
                     PumpCtx {
                         cancel: CancellationToken::new(),
                         heartbeat_interval: Duration::from_secs(5),
@@ -734,7 +741,14 @@ async fn test_udp_extreme_datagram_sizes_under_backpressure() {
                 .await
         });
 
-        let pattern = [0usize, 32, MAX_UDP_DATAGRAM_SIZE, 65_000, 0, MAX_UDP_DATAGRAM_SIZE];
+        let pattern = [
+            0usize,
+            32,
+            MAX_UDP_DATAGRAM_SIZE,
+            65_000,
+            0,
+            MAX_UDP_DATAGRAM_SIZE,
+        ];
         let mut expected = Vec::new();
         for (i, &sz) in pattern.iter().cycle().take(24).enumerate() {
             let payload = if sz == 0 {
@@ -765,7 +779,12 @@ async fn test_udp_extreme_datagram_sizes_under_backpressure() {
             .expect("DatagramDatagramPump deadlocked under byte-budget backpressure")
             .unwrap()
             .unwrap();
-        let recvd: Vec<usize> = b_sent.lock().unwrap().iter().map(|d| d.payload.len()).collect();
+        let recvd: Vec<usize> = b_sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|d| d.payload.len())
+            .collect();
         assert_eq!(recvd, expected);
     }
 
@@ -863,8 +882,8 @@ async fn test_udp_extreme_datagram_sizes_under_backpressure() {
         );
         assert!(slot_drained > 0);
 
-        // Recovery check: mixed 0-byte, small, and MAX_UDP_DATAGRAM_SIZE (65507) after drain.
-        let recovery_sizes = [0usize, 40, MAX_UDP_DATAGRAM_SIZE];
+        // Recovery check: mixed 0-byte, small, and IPv4 max UDP payload (65507) after drain.
+        let recovery_sizes = [0usize, 40, 65_507];
         let mut rec_empty = 0usize;
         let mut rec_seqs = Vec::new();
         for &sz in &recovery_sizes {
@@ -974,17 +993,7 @@ async fn test_udp_extreme_datagram_sizes_under_backpressure() {
         tokio::time::sleep(Duration::from_millis(400)).await;
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let e2e_sizes = [
-            0usize,
-            25,
-            512,
-            1400,
-            65_000,
-            MAX_UDP_DATAGRAM_SIZE,
-            0,
-            MAX_UDP_DATAGRAM_SIZE,
-            64,
-        ];
+        let e2e_sizes = [0usize, 25, 512, 1400, 65_000, 65_507, 0, 65_507, 64];
         let mut rbuf = vec![0u8; 65536];
         for (idx, &sz) in e2e_sizes.iter().enumerate() {
             let pkt = if sz == 0 {

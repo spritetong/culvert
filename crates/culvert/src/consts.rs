@@ -59,8 +59,8 @@ pub const MAX_ACTIVATION_TARGET_LEN: usize = 512;
 /// Maximum supported token length in bytes for constant-time comparison.
 pub const TOKEN_MAX_LEN: usize = 256;
 
-/// Maximum payload size of a UDP datagram over IPv4/IPv6 without fragmentation (65507 bytes).
-pub const MAX_UDP_DATAGRAM_SIZE: usize = 65507;
+/// Maximum payload size of an unfragmented UDP datagram (IPv6 max: 65527 bytes; IPv4 max: 65507 bytes).
+pub const MAX_UDP_DATAGRAM_SIZE: usize = 65527;
 
 /// Default capacity for the command deduplication sliding window across dual channels.
 pub const DEFAULT_DEDUPLICATION_WINDOW_CAPACITY: usize = 256;

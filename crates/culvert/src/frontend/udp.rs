@@ -725,4 +725,66 @@ mod tests {
             TunnelError::Io(ref e) if e.kind() == io::ErrorKind::PermissionDenied
         ));
     }
+
+    #[tokio::test]
+    async fn udp_frontend_ipv6_large_datagram_boundaries() {
+        let probe = std::net::UdpSocket::bind("[::1]:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let mut fe = UdpFrontend::bind(&format!("[::1]:{port}")).await.unwrap();
+        let listen_addr = fe.local_addr().unwrap();
+        assert!(listen_addr.is_ipv6());
+
+        let client = UdpSocket::bind("[::1]:0").await.unwrap();
+        let sizes = [65_507usize, 65_508usize, MAX_UDP_DATAGRAM_SIZE];
+        assert_eq!(MAX_UDP_DATAGRAM_SIZE, 65_527);
+
+        let first_payload = vec![0x11u8; sizes[0]];
+        client.send_to(&first_payload, listen_addr).await.unwrap();
+
+        let mut slot = ReusableFutureRef::default();
+        fe.accept(&mut slot);
+        let acc = tokio::time::timeout(Duration::from_secs(2), &mut slot)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut dgram = acc.channel.into_datagram().unwrap();
+        let mut batch = vec![Datagram::default(); 4];
+
+        let mut received = Vec::new();
+        let n = tokio::time::timeout(
+            Duration::from_secs(2),
+            std::future::poll_fn(|cx| dgram.poll_recv(cx, &mut batch)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(batch[0].payload.len(), sizes[0]);
+        assert!(batch[0].payload.iter().all(|&b| b == 0x11));
+        received.push(batch[0].payload.len());
+
+        for (fill, size) in [(0x22u8, sizes[1]), (0x33u8, sizes[2])] {
+            let payload = vec![fill; size];
+            client.send_to(&payload, listen_addr).await.unwrap();
+
+            let n = tokio::time::timeout(
+                Duration::from_secs(2),
+                std::future::poll_fn(|cx| dgram.poll_recv(cx, &mut batch)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(n, 1);
+            assert_eq!(batch[0].payload.len(), size);
+            assert!(batch[0].payload.iter().all(|&b| b == fill));
+            received.push(batch[0].payload.len());
+        }
+
+        assert_eq!(received, vec![65_507, 65_508, 65_527]);
+
+        drop(dgram);
+        fe.shutdown().await;
+    }
 }
