@@ -681,3 +681,155 @@ async fn last_mapping_shutdown_stops_shared_coordinator() {
     );
     assert!(t2.coord.query_phase().await.is_err());
 }
+
+#[tokio::test]
+async fn cancelled_inflight_reverse_request_does_not_dispatch_orphan_signal() {
+    use crate::control::{ControlMessage, FramedControlStream};
+    use futures_util::StreamExt;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+
+    struct FlushStallingStream {
+        reader: DuplexStream,
+        writer: DuplexStream,
+        allow_flush: Arc<AtomicBool>,
+        flush_entered: Arc<Notify>,
+        flush_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+    }
+
+    impl AsyncRead for FlushStallingStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.reader).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for FlushStallingStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.writer).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            if !self.allow_flush.load(Ordering::Acquire) {
+                if let Ok(mut slot) = self.flush_waker.lock() {
+                    *slot = Some(cx.waker().clone());
+                }
+                self.flush_entered.notify_waiters();
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.writer).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.writer).poll_shutdown(cx)
+        }
+    }
+
+    let (client_in, _server_in) = duplex(1024);
+    let (actor_out, peer_out) = duplex(4096);
+    let allow_flush = Arc::new(AtomicBool::new(false));
+    let flush_entered = Arc::new(Notify::new());
+    let flush_waker = Arc::new(std::sync::Mutex::new(None::<std::task::Waker>));
+
+    let cancel = CancellationToken::new();
+    let cfg = SignalingConfig {
+        heartbeat_interval: Duration::from_secs(30),
+        idle_timeout: Duration::from_secs(30),
+    };
+    let (sig_handle, _sig_rx) = SignalingChannel::spawn(
+        FlushStallingStream {
+            reader: client_in,
+            writer: actor_out,
+            allow_flush: Arc::clone(&allow_flush),
+            flush_entered: Arc::clone(&flush_entered),
+            flush_waker: Arc::clone(&flush_waker),
+        },
+        cfg,
+        cancel.child_token(),
+    );
+
+    // 1. Hold SignalingChannel blocked inside `flush()` on a preparatory Ping frame.
+    let ping_blocker = sig_handle.clone();
+    tokio::spawn(async move {
+        let _ = ping_blocker.send(ControlMessage::Ping).await;
+    });
+    tokio::time::timeout(Duration::from_secs(1), flush_entered.notified())
+        .await
+        .expect("SignalingChannel must enter stalled flush");
+
+    let router = SignalingRouter::new(sig_handle);
+    let hub = Arc::new(ReverseSessionHub::new());
+    let disconnect_notify = Arc::new(Notify::new());
+    let signaler = RouterReverseSignaler::new(
+        router.clone(),
+        Arc::clone(&hub),
+        Duration::from_secs(5),
+        disconnect_notify,
+    );
+
+    // 2. Start request_pair(); Router immediately dispatches this send as in_flight into SignalingChannel.
+    let mut pair_fut =
+        Box::pin(signaler.request_pair(PeerAddr::Socket("127.0.0.1:43210".parse().unwrap())));
+    tokio::select! {
+        _ = &mut pair_fut => panic!("request_pair should remain pending while flush is blocked"),
+        _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+    }
+
+    // 3-4. Cancel request_pair() future: pending session is cleaned immediately via PendingSessionGuard.
+    drop(pair_fut);
+    let (dummy_stream, _dummy_peer) = duplex(64);
+    assert!(hub.fulfill("v2s-1", Box::new(dummy_stream)).is_err());
+
+    // Give Router Actor a brief turn to propagate cancellation down to SignalingChannel.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // 5. Release flush backpressure; remote must receive only Ping and NEVER an orphan NewConnection.
+    allow_flush.store(true, Ordering::Release);
+    if let Some(w) = flush_waker.lock().ok().and_then(|mut g| g.take()) {
+        w.wake();
+    }
+
+    let mut peer_ctrl = FramedControlStream::new(peer_out);
+    let first = tokio::time::timeout(Duration::from_millis(500), peer_ctrl.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(first, ControlMessage::Ping);
+
+    // 6. Verify subsequent healthy request_pair STILL works on the same uncorrupted channel,
+    //    and no orphan NewConnection for the cancelled request ever arrived ahead of it.
+    let pair_ok =
+        tokio::spawn(signaler.request_pair(PeerAddr::Socket("127.0.0.1:43211".parse().unwrap())));
+    let next_msg = tokio::time::timeout(Duration::from_millis(500), peer_ctrl.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    match next_msg {
+        ControlMessage::NewConnection {
+            session_id,
+            client_addr,
+        } => {
+            assert_eq!(client_addr, "127.0.0.1:43211");
+            let (s, _p) = duplex(64);
+            hub.fulfill(&session_id, Box::new(s)).unwrap();
+        }
+        other => panic!("unexpected frame after cancelled in-flight request: {other:?}"),
+    }
+    assert!(pair_ok.await.unwrap().is_ok());
+
+    cancel.cancel();
+}

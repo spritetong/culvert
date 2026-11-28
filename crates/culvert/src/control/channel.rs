@@ -7,6 +7,7 @@
 
 use futures_util::{SinkExt, StreamExt};
 use std::collections::{HashSet, VecDeque};
+use std::future::poll_fn;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -47,6 +48,7 @@ struct OutboundCommand {
     msg: ControlMessage,
     tx: oneshot::Sender<Result<(), TunnelError>>,
     timeout: Duration,
+    cancel: CancellationToken,
 }
 
 /// Cloned handle used by business logic to transmit control commands asynchronously.
@@ -77,16 +79,33 @@ impl SignalingHandle {
         msg: ControlMessage,
         send_timeout: Duration,
     ) -> Result<(), TunnelError> {
+        self.send_cancellable(msg, Some(send_timeout), CancellationToken::new())
+            .await
+    }
+
+    pub(super) async fn send_cancellable(
+        &self,
+        msg: ControlMessage,
+        send_timeout: Option<Duration>,
+        cancel: CancellationToken,
+    ) -> Result<(), TunnelError> {
+        if cancel.is_cancelled() {
+            return Err(TunnelError::Shutdown);
+        }
         let (tx, rx) = oneshot::channel();
         let cmd = OutboundCommand {
             msg,
             tx,
-            timeout: send_timeout,
+            timeout: send_timeout.unwrap_or(self.default_frame_timeout),
+            cancel: cancel.clone(),
         };
-        self.cmd_tx
-            .send(cmd)
-            .await
-            .map_err(|_| TunnelError::ControlProtocol("Signaling channel closed".into()))?;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(TunnelError::Shutdown),
+            send_res = self.cmd_tx.send(cmd) => {
+                send_res.map_err(|_| TunnelError::ControlProtocol("Signaling channel closed".into()))?;
+            }
+        }
 
         rx.await
             .map_err(|_| TunnelError::ControlProtocol("Signaling response dropped".into()))?
@@ -381,10 +400,58 @@ impl SignalingChannel {
                 cmd_opt = cmd_rx.recv() => {
                     match cmd_opt {
                         Some(cmd) => {
-                            let send_res = timeout(cmd.timeout, ctrl_stream.send(cmd.msg))
-                                .cancel_with(&cancel_token)
-                                .await;
-                            match send_res {
+                            if cmd.cancel.is_cancelled() || cmd.tx.is_closed() {
+                                let _ = cmd.tx.send(Err(TunnelError::Shutdown));
+                                continue;
+                            }
+
+                            // Allow caller cancellation cleanly while waiting for sink readiness
+                            // (before `start_send` serializes/commits any bytes onto the stream).
+                            let ready_res = tokio::select! {
+                                biased;
+                                _ = cancel_token.cancelled() => {
+                                    debug!("Signaling actor stopping on cancellation signal");
+                                    break;
+                                }
+                                _ = cmd.cancel.cancelled() => {
+                                    let _ = cmd.tx.send(Err(TunnelError::Shutdown));
+                                    continue;
+                                }
+                                res = timeout(
+                                    cmd.timeout,
+                                    poll_fn(|cx| ctrl_stream.poll_ready_unpin(cx)),
+                                ) => res,
+                            };
+                            match ready_res {
+                                Ok(Ok(())) => {
+                                    if cmd.cancel.is_cancelled() || cmd.tx.is_closed() {
+                                        let _ = cmd.tx.send(Err(TunnelError::Shutdown));
+                                        continue;
+                                    }
+                                }
+                                Ok(Err(e)) => {
+                                    let _ = cmd.tx.send(Err(e));
+                                    break;
+                                }
+                                Err(_) => {
+                                    let err_msg = format!("Send timed out after {:?}", cmd.timeout);
+                                    let _ = cmd.tx.send(Err(TunnelError::ControlProtocol(err_msg)));
+                                    break;
+                                }
+                            }
+
+                            if let Err(e) = ctrl_stream.start_send_unpin(cmd.msg) {
+                                let _ = cmd.tx.send(Err(e));
+                                break;
+                            }
+
+                            let flush_res = timeout(
+                                cmd.timeout,
+                                poll_fn(|cx| ctrl_stream.poll_flush_unpin(cx)),
+                            )
+                            .cancel_with(&cancel_token)
+                            .await;
+                            match flush_res {
                                 Some(Ok(Ok(()))) => {
                                     last_activity_ms = activity_now_ms();
                                     idle_deadline.as_mut().reset(Instant::now() + config.idle_timeout);

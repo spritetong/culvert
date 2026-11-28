@@ -11,11 +11,17 @@ use std::future::pending;
 use std::time::Duration;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::control::channel::SignalingHandle;
 use crate::control::stream::ControlMessage;
 use crate::core::error::TunnelError;
+
+enum InFlightEvent {
+    CallerCancelled,
+    Finished(Result<Result<(), TunnelError>, tokio::task::JoinError>),
+}
 
 enum RouterCommand {
     Send {
@@ -51,6 +57,8 @@ struct PendingSend {
 struct InFlightSend {
     channel_id: u64,
     pending: PendingSend,
+    wire_cancel: CancellationToken,
+    cancelled_by_caller: bool,
     task: JoinHandle<Result<(), TunnelError>>,
 }
 
@@ -178,12 +186,17 @@ impl SignalingRouterActor {
         }
     }
 
-    async fn poll_in_flight(
-        in_flight: &mut Option<InFlightSend>,
-    ) -> Result<Result<(), TunnelError>, tokio::task::JoinError> {
-        match in_flight.as_mut() {
-            Some(active) => (&mut active.task).await,
-            None => pending().await,
+    async fn poll_in_flight_event(in_flight: &mut Option<InFlightSend>) -> InFlightEvent {
+        let Some(active) = in_flight.as_mut() else {
+            return pending().await;
+        };
+        let watch_cancel = !active.cancelled_by_caller;
+        let reply = &mut active.pending.reply;
+        let task = &mut active.task;
+        tokio::select! {
+            biased;
+            () = reply.closed(), if watch_cancel => InFlightEvent::CallerCancelled,
+            res = task => InFlightEvent::Finished(res),
         }
     }
 
@@ -209,17 +222,20 @@ impl SignalingRouterActor {
             let handle = slot.handle.clone();
             let msg = req.message.clone();
             let explicit_timeout = req.timeout;
+            let wire_cancel = CancellationToken::new();
+            let task_cancel = wire_cancel.clone();
 
             let task = tokio::spawn(async move {
-                match explicit_timeout {
-                    Some(t) => handle.send_timeout(msg, t).await,
-                    None => handle.send(msg).await,
-                }
+                handle
+                    .send_cancellable(msg, explicit_timeout, task_cancel)
+                    .await
             });
             self.publish_epoch();
             self.in_flight = Some(InFlightSend {
                 channel_id,
                 pending: req,
+                wire_cancel,
+                cancelled_by_caller: false,
                 task,
             });
             break;
@@ -243,6 +259,9 @@ impl SignalingRouterActor {
         match outcome {
             Ok(()) => {
                 let _ = completed.pending.reply.send(Ok(()));
+            }
+            Err(TunnelError::Shutdown) if completed.cancelled_by_caller => {
+                // Pre-commit cancellation avoided wire transmission; channel remains healthy.
             }
             Err(err) => {
                 let had_standby_before = self.state.standby.is_some();
@@ -284,8 +303,18 @@ impl SignalingRouterActor {
                 () = Self::poll_slot_closed(&self.state.standby), if self.state.standby.is_some() => {
                     self.state.prune_closed_handles();
                 }
-                res = Self::poll_in_flight(&mut self.in_flight), if self.in_flight.is_some() => {
-                    self.handle_in_flight_completion(res);
+                evt = Self::poll_in_flight_event(&mut self.in_flight), if self.in_flight.is_some() => {
+                    match evt {
+                        InFlightEvent::CallerCancelled => {
+                            if let Some(ref mut active) = self.in_flight {
+                                active.cancelled_by_caller = true;
+                                active.wire_cancel.cancel();
+                            }
+                        }
+                        InFlightEvent::Finished(res) => {
+                            self.handle_in_flight_completion(res);
+                        }
+                    }
                 }
                 cmd_opt = self.cmd_rx.recv() => {
                     let Some(cmd) = cmd_opt else {
